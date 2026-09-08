@@ -1,17 +1,15 @@
 """Module related to validating a dataset using an ASR model."""
 
 import logging
-from collections.abc import Iterable
+import typing as t
+from collections.abc import Callable, Iterable
 
 import torch
 from datasets import Audio, Dataset, DatasetDict
 from tqdm.auto import tqdm
-from transformers.pipelines import pipeline
-from transformers.pipelines.automatic_speech_recognition import (
-    AutomaticSpeechRecognitionPipeline,
-)
 from transformers.pipelines.base import KeyDataset
 
+from hviske.cohere import get_asr_call_kwargs, load_asr_transcriber
 from hviske.data import DEFAULT_CONVERSION_DICT, process_example
 from hviske.utils import transformers_output_ignored
 
@@ -31,6 +29,8 @@ def add_validations(
     characters_to_keep: Iterable[str],
     batch_size: int,
     max_cer: float,
+    language: str = "da",
+    punctuation: bool = True,
 ) -> Dataset | DatasetDict:
     """Add the ASR validation columns to the dataset.
 
@@ -53,6 +53,10 @@ def add_validations(
             The batch size to use for transcribing the audio.
         max_cer:
             The maximum CER value to keep the samples.
+        language (optional):
+            Language code for native Cohere prompts. Defaults to ``da``.
+        punctuation (optional):
+            Whether native Cohere should produce punctuation. Defaults to ``True``.
 
     Returns:
         The dataset with the validation columns added.
@@ -96,10 +100,13 @@ def add_validations(
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    transcriber = pipeline(
-        task="automatic-speech-recognition", model=model_id, device=device
+    transcriber = load_asr_transcriber(
+        model_id=model_id,
+        no_lm=False,
+        device=device,
+        language=language,
+        punctuation=punctuation,
     )
-    assert isinstance(transcriber, AutomaticSpeechRecognitionPipeline)
 
     for split_name, split in processed_dataset.items():
         logger.info(f"Validating the {split_name} split of the dataset...")
@@ -111,12 +118,10 @@ def add_validations(
             ) as pbar,
             transformers_output_ignored(),
         ):
-            for out in transcriber(
-                KeyDataset(  # pyrefly: ignore[bad-argument-type,not-callable]
-                    dataset=split, key=audio_column
-                ),
+            for out in t.cast(Callable[..., Iterable[dict[str, str]]], transcriber)(
+                KeyDataset(dataset=split, key=audio_column),
                 batch_size=batch_size,
-                generate_kwargs=dict(language="danish", task="transcribe"),
+                **get_asr_call_kwargs(transcriber),
             ):
                 prediction = process_example(
                     example=dict(text=out["text"]),

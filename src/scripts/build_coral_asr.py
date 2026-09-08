@@ -92,6 +92,8 @@ def main(config: DictConfig) -> None:
         characters_to_keep=config.validation.characters_to_keep,
         batch_size=config.validation.batch_size,
         max_cer=config.validation.max_cer,
+        language=getattr(config.validation, "language", "da"),
+        punctuation=getattr(config.validation, "punctuation", True),
     )
     assert isinstance(read_aloud_dataset, Dataset)
 

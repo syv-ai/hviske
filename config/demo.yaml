@@ -1,6 +1,8 @@
 # ASR model parameters
 model_id: alexandrainst/roest-315m
 sampling_rate: 16_000
+language: da
+punctuation: true
 
 # UI parameters
 title: Røst Speech-to-Text Demo

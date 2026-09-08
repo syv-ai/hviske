@@ -19,6 +19,8 @@ characters_to_keep: 'abcdefghijklmnopqrstuvwxyzæøå0123456789éü'
 model_id: alexandrainst/coral-asr-bootstrap
 batch_size: 16
 max_cer: 0.6
+language: da
+punctuation: true
 
 # Dataset that contains the validation data
 output_dataset_id: CoRal-project/coral

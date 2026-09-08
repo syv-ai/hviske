@@ -2,20 +2,22 @@
 
 import itertools as it
 import logging
+import typing as t
+from collections.abc import Callable, Iterable
 
 import pandas as pd
 import torch
 from datasets import Dataset
 from dotenv import load_dotenv
 from omegaconf import DictConfig
+from torch.utils.data import Dataset as TorchDataset
 from tqdm.auto import tqdm
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-from transformers.pipelines import pipeline
 from transformers.pipelines.automatic_speech_recognition import (
     AutomaticSpeechRecognitionPipeline,
 )
 from transformers.pipelines.pt_utils import KeyDataset
 
+from .cohere import CohereASRTranscriber, get_asr_call_kwargs, load_asr_transcriber
 from .data import DEFAULT_CONVERSION_DICT, load_dataset_for_evaluation, process_example
 from .metrics import cer, wer
 from .utils import transformers_output_ignored
@@ -44,7 +46,12 @@ def evaluate(config: DictConfig) -> pd.DataFrame:
     dataset = load_dataset_for_evaluation(config=config)
 
     logger.info(f"Loading the {config.model_id!r} ASR model...")
-    transcriber = load_asr_pipeline(model_id=config.model_id, no_lm=config.no_lm)
+    transcriber = load_asr_pipeline(
+        model_id=config.model_id,
+        no_lm=config.no_lm,
+        language=getattr(config, "language", "da"),
+        punctuation=getattr(config, "punctuation", True),
+    )
 
     predictions: list[str] = list()
     with (
@@ -53,10 +60,12 @@ def evaluate(config: DictConfig) -> pd.DataFrame:
         ) as pbar,
         transformers_output_ignored(),
     ):
-        for out in transcriber(
-            KeyDataset(dataset=dataset, key=config.audio_column),  # type: ignore[arg-type]
+        for out in t.cast(Callable[..., Iterable[dict[str, str]]], transcriber)(
+            KeyDataset(  # pyrefly: ignore[bad-argument-type]
+                dataset=t.cast(TorchDataset[object], dataset), key=config.audio_column
+            ),
             batch_size=config.batch_size,
-            generate_kwargs=dict(language="danish", task="transcribe"),
+            **get_asr_call_kwargs(transcriber),
         ):
             prediction = process_example(
                 example=dict(text=out["text"]),
@@ -120,7 +129,9 @@ def convert_evaluation_dataset_to_df(
     return df
 
 
-def load_asr_pipeline(model_id: str, no_lm: bool) -> AutomaticSpeechRecognitionPipeline:
+def load_asr_pipeline(
+    model_id: str, no_lm: bool, language: str = "da", punctuation: bool = True
+) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
     """Load the ASR pipeline.
 
     Args:
@@ -129,9 +140,13 @@ def load_asr_pipeline(model_id: str, no_lm: bool) -> AutomaticSpeechRecognitionP
         no_lm:
             Whether to load the ASR pipeline without a language model. Only applicable
             to Wav2Vec 2.0 models.
+        language (optional):
+            Language code for native Cohere prompts. Defaults to ``da``.
+        punctuation (optional):
+            Whether native Cohere should produce punctuation. Defaults to ``True``.
 
     Returns:
-        The ASR pipeline.
+        The ASR pipeline or native Cohere transcriber.
     """
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -139,22 +154,14 @@ def load_asr_pipeline(model_id: str, no_lm: bool) -> AutomaticSpeechRecognitionP
         device = torch.device("cpu")
 
     with transformers_output_ignored():
-        if no_lm:
-            model = Wav2Vec2ForCTC.from_pretrained(model_id)
-            processor = Wav2Vec2Processor.from_pretrained(model_id)
-            transcriber = pipeline(
-                task="automatic-speech-recognition",
-                model=model,
-                tokenizer=processor.tokenizer,
-                feature_extractor=processor.feature_extractor,
-                device=device,
-            )
-        else:
-            transcriber = pipeline(
-                task="automatic-speech-recognition", model=model_id, device=device
-            )
+        transcriber = load_asr_transcriber(
+            model_id=model_id,
+            no_lm=no_lm,
+            device=device,
+            language=language,
+            punctuation=punctuation,
+        )
 
-    assert isinstance(transcriber, AutomaticSpeechRecognitionPipeline)
     return transcriber
 
 

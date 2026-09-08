@@ -5,6 +5,7 @@ import typing as t
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -12,8 +13,11 @@ from omegaconf import OmegaConf
 from hviske.cohere import (
     CohereAsrForConditionalGeneration,
     CohereAsrProcessor,
+    CohereASRTranscriber,
     CohereModelSetup,
     CohereSeq2SeqTrainer,
+    get_asr_call_kwargs,
+    load_asr_transcriber,
 )
 from hviske.data_collators import DataCollatorCohereWithPadding
 from hviske.data_models import Processor
@@ -90,13 +94,14 @@ class _Model(torch.nn.Module):
         super().__init__()
         self.generation_config = SimpleNamespace(max_length=None, max_new_tokens=None)
         self.generated_inputs: dict[str, torch.Tensor] | None = None
+        self.forward_inputs: dict[str, torch.Tensor] | None = None
 
     def generate(self, **kwargs: torch.Tensor) -> torch.Tensor:
         self.generated_inputs = kwargs
         return torch.tensor([[2, 3, 4]])
 
     def forward(self, **kwargs: torch.Tensor) -> SimpleNamespace:
-        del kwargs
+        self.forward_inputs = kwargs
         return SimpleNamespace(loss=torch.tensor(0.5))
 
 
@@ -141,6 +146,42 @@ def test_language_validation_uses_checkpoint_vocabulary() -> None:
         processor.get_decoder_prompt_ids(language="xx")
 
 
+def test_native_cohere_loader_dispatches_model_aware_transcriber(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared loader selects the prompt-aware path for native Cohere."""
+    monkeypatch.setattr(
+        "hviske.cohere.AutoConfig.from_pretrained",
+        MagicMock(return_value=SimpleNamespace(model_type="cohere_asr")),
+    )
+    processor = MagicMock(spec=CohereAsrProcessor)
+    model = MagicMock(spec=CohereAsrForConditionalGeneration)
+    monkeypatch.setattr(
+        CohereAsrProcessor, "from_pretrained", MagicMock(return_value=processor)
+    )
+    monkeypatch.setattr(
+        CohereAsrForConditionalGeneration,
+        "from_pretrained",
+        MagicMock(return_value=model),
+    )
+    transcriber = load_asr_transcriber(
+        model_id="test/cohere",
+        no_lm=False,
+        device=torch.device("cpu"),
+        language="sv",
+        punctuation=False,
+    )
+    assert isinstance(transcriber, CohereASRTranscriber)
+    assert transcriber.language == "sv"
+    assert transcriber.punctuation is False
+
+
+def test_native_cohere_dispatch_omits_whisper_generation_kwargs() -> None:
+    """Native Cohere entry points must not pass Whisper language/task kwargs."""
+    transcriber = object.__new__(CohereASRTranscriber)
+    assert get_asr_call_kwargs(transcriber) == {}
+
+
 def test_cohere_collator_aligns_prompt_transcript_and_mask() -> None:
     """The final prompt position starts the transcript loss."""
     processor = t.cast(Processor, _Processor())
@@ -158,6 +199,101 @@ def test_cohere_collator_aligns_prompt_transcript_and_mask() -> None:
     assert batch["decoder_input_ids"].tolist() == [[10, 11, 20, 21]]
     assert batch["labels"].tolist() == [[-100, 20, 21, 99]]
     assert batch["attention_mask"].tolist() == [[True, True]]
+    assert batch["prompt_length"].tolist() == [2]
+
+
+def test_cohere_collator_truncates_transcripts_to_model_limit() -> None:
+    """Transcript tokens are truncated after reserving prompt and EOS space."""
+    processor = t.cast(Processor, _Processor())
+    collator = DataCollatorCohereWithPadding(
+        processor=processor, padding="longest", max_length=4
+    )
+    batch = collator(
+        [
+            {
+                "input_features": torch.zeros(2, 128),
+                "decoder_input_ids": [10, 11],
+                "labels": [20, 21, 22],
+            }
+        ]
+    )
+    assert batch["decoder_input_ids"].tolist() == [[10, 11, 20, 21]]
+    assert batch["labels"].tolist() == [[-100, 20, 21, 99]]
+
+    boundary_batch = DataCollatorCohereWithPadding(
+        processor=processor, padding="longest", max_length=3
+    )(
+        [
+            {
+                "input_features": torch.zeros(2, 128),
+                "decoder_input_ids": [10, 11],
+                "labels": [20, 21],
+            }
+        ]
+    )
+    assert boundary_batch["decoder_input_ids"].tolist() == [[10, 11, 20]]
+    assert boundary_batch["labels"].tolist() == [[-100, 20, 99]]
+
+    with pytest.raises(ValueError, match="prompt and EOS"):
+        DataCollatorCohereWithPadding(
+            processor=processor, padding="longest", max_length=2
+        )(
+            [
+                {
+                    "input_features": torch.zeros(2, 128),
+                    "decoder_input_ids": [10, 11],
+                    "labels": [20],
+                }
+            ]
+        )
+
+
+def test_native_cohere_transcriber_builds_prompt_and_reassembles_chunks() -> None:
+    """Native inference passes prompt IDs and reassembles processor chunks."""
+
+    class _InferenceProcessor:
+        feature_extractor = SimpleNamespace(sampling_rate=16_000)
+
+        def __call__(self, audio: object, **kwargs: object) -> dict[str, object]:
+            self.call = (audio, kwargs)
+            return {
+                "input_features": torch.zeros(3, 2, 128),
+                "attention_mask": torch.ones(3, 2),
+                "decoder_input_ids": torch.tensor([[10, 11]] * 3),
+                "audio_chunk_index": [(0, 0), (0, 1), (1, None)],
+            }
+
+        def decode(self, sequences: torch.Tensor, **kwargs: object) -> list[str]:
+            self.decode_call = (sequences, kwargs)
+            return ["first", "second"]
+
+    class _InferenceModel:
+        def generate(self, **kwargs: torch.Tensor) -> torch.Tensor:
+            self.inputs = kwargs
+            return torch.tensor([[10, 11, 20], [10, 11, 21], [10, 11, 22]])
+
+    processor = _InferenceProcessor()
+    model = _InferenceModel()
+    transcriber = CohereASRTranscriber(
+        model=t.cast(CohereAsrForConditionalGeneration, model),
+        processor=t.cast(CohereAsrProcessor, processor),
+        device=torch.device("cpu"),
+    )
+    outputs = list(
+        transcriber(
+            [
+                {"array": np.zeros(3), "sampling_rate": 16_000},
+                {"array": np.zeros(3), "sampling_rate": 16_000},
+            ],
+            batch_size=2,
+        )
+    )
+    assert outputs == [{"text": "first"}, {"text": "second"}]
+    assert processor.call[1]["language"] == "da"
+    assert processor.call[1]["punctuation"] is True
+    assert processor.decode_call[1]["audio_chunk_index"] == [(0, 0), (0, 1), (1, None)]
+    assert processor.decode_call[1]["language"] == "da"
+    assert torch.equal(model.inputs["decoder_input_ids"], torch.tensor([[10, 11]] * 3))
 
 
 def test_cohere_trainer_generates_from_prompt_ids() -> None:
@@ -175,6 +311,8 @@ def test_cohere_trainer_generates_from_prompt_ids() -> None:
     inputs = {
         "input_features": torch.zeros(1, 2, 128),
         "decoder_input_ids": torch.tensor([[10, 11, 20, 21]]),
+        "decoder_attention_mask": torch.tensor([[1, 1, 1, 1]]),
+        "prompt_length": torch.tensor([2]),
         "labels": torch.tensor([[-100, 20, 21, 99]]),
     }
     trainer.prediction_step(
@@ -182,6 +320,15 @@ def test_cohere_trainer_generates_from_prompt_ids() -> None:
     )
     assert trainer.model.generated_inputs is not None
     assert torch.equal(
-        trainer.model.generated_inputs["decoder_input_ids"], inputs["decoder_input_ids"]
+        trainer.model.generated_inputs["decoder_input_ids"], torch.tensor([[10, 11]])
+    )
+    assert torch.equal(
+        trainer.model.generated_inputs["decoder_attention_mask"], torch.tensor([[1, 1]])
     )
     assert "labels" not in trainer.model.generated_inputs
+    assert trainer.model.forward_inputs is not None
+    assert torch.equal(
+        trainer.model.forward_inputs["decoder_input_ids"], inputs["decoder_input_ids"]
+    )
+    assert torch.equal(trainer.model.forward_inputs["labels"], inputs["labels"])
+    assert "prompt_length" not in trainer.model.forward_inputs

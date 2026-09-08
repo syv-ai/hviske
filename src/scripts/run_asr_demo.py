@@ -5,6 +5,7 @@ Usage:
 """
 
 import logging
+import typing as t
 import warnings
 
 import gradio as gr
@@ -15,7 +16,8 @@ import torch
 from dotenv import load_dotenv
 from omegaconf import DictConfig
 from punctfix import PunctFixer
-from transformers import pipeline
+
+from hviske.cohere import get_asr_call_kwargs, load_asr_transcriber
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,8 +42,12 @@ def main(config: DictConfig) -> None:
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     logger.info("Loading the ASR model...")
-    transcriber = pipeline(
-        task="automatic-speech-recognition", model=config.model_id, device=device
+    transcriber = load_asr_transcriber(
+        model_id=config.model_id,
+        no_lm=False,
+        device=device,
+        language=getattr(config, "language", "da"),
+        punctuation=getattr(config, "punctuation", True),
     )
 
     logger.info("Loading the punctuation fixer model...")
@@ -74,8 +80,8 @@ def main(config: DictConfig) -> None:
         )
 
         logger.info(f"Transcribing audio clip of {len(audio) / 16_000:.2f} seconds...")
-        transcription = transcriber(
-            inputs=audio, generate_kwargs=dict(language="danish", task="transcribe")
+        transcription = t.cast(t.Callable[..., dict[str, str]], transcriber)(
+            inputs=audio, **get_asr_call_kwargs(transcriber)
         )
         if not isinstance(transcription, dict):
             return ""

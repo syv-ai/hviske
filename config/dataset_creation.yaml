@@ -15,6 +15,8 @@ validation:
   characters_to_keep: 'abcdefghijklmnopqrstuvwxyzæøå0123456789éü'
   batch_size: 16
   max_cer: 0.6
+  language: da
+  punctuation: true
 
 # Hugging Face Hub ID of output dataset
 hub_id: CoRal-project/coral-v3

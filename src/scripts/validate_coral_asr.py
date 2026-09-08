@@ -69,6 +69,8 @@ def main(config: DictConfig) -> None:
         characters_to_keep=config.characters_to_keep,
         batch_size=config.batch_size,
         max_cer=config.max_cer,
+        language=getattr(config, "language", "da"),
+        punctuation=getattr(config, "punctuation", True),
     )
 
     logger.info(

@@ -18,6 +18,8 @@ model_id: null
 no_lm: false  # This is only relevant for Wav2Vec 2.0 models
 sampling_rate: 16_000
 batch_size: 16
+language: da
+punctuation: true
 store_results: true
 
 sub_dialect_to_dialect:

@@ -233,12 +233,22 @@ class DataCollatorCohereWithPadding(DataCollatorMixin):
         eos_token_id = self.processor.tokenizer.eos_token_id
         decoder_features: list[dict[str, list[int]]] = []
         label_features: list[dict[str, list[int]]] = []
+        prompt_lengths: list[int] = []
         for feature in features:
             prompt = _as_int_list(feature["decoder_input_ids"])
             transcript = _as_int_list(feature["labels"])
+            if self.max_length is not None:
+                if self.max_length <= len(prompt):
+                    raise ValueError(
+                        "Cohere model.max_length must leave room for the decoder "
+                        f"prompt and EOS (got max_length={self.max_length}, "
+                        f"prompt_length={len(prompt)})."
+                    )
+                transcript = transcript[: self.max_length - len(prompt)]
             labels = [-100] * max(len(prompt) - 1, 0) + transcript + [eos_token_id]
             decoder_features.append({"input_ids": prompt + transcript})
             label_features.append({"input_ids": labels})
+            prompt_lengths.append(len(prompt))
 
         decoder_batch = self.processor.tokenizer.pad(
             decoder_features,
@@ -257,6 +267,7 @@ class DataCollatorCohereWithPadding(DataCollatorMixin):
         labels = labels_batch["input_ids"]
         labels = labels.masked_fill(labels_batch["attention_mask"].ne(1), -100)
         batch["labels"] = labels
+        batch["prompt_length"] = torch.tensor(prompt_lengths, dtype=torch.long)
         return batch
 
 
