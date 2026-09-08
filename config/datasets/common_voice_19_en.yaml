@@ -1,9 +1,9 @@
-ftspeech:
-  id: alexandrainst/ftspeech
-  subset: null
+common_voice_19_en:
+  id: fsicoli/common_voice_19_0
+  subset: en
   train_name: train
   text_column: sentence
   audio_column: audio
   filter_dataset: true
-  language: da
+  language: en
   revision: null

@@ -28,7 +28,7 @@ Author and maintainer:
 You can use the `finetune_asr_model` script to finetune your own ASR model:
 
 ```bash
-python src/scripts/finetune_asr_model.py [key=value]...
+uv run python src/scripts/finetune_asr_model.py [key=value]...
 ```
 
 Here are some of the more important available keys:
@@ -61,7 +61,11 @@ Here are some of the more important available keys:
   - `nota`
   - `nst`
   - `p1` (streaming audio plus configurable transcript Hub join)
-  - `drtv_local` and `youtube_local` (local WAV/VTT manifests)
+  - `librispeech_clean_train_100`, `librispeech_clean_train_360`, and
+    `librispeech_other_train_500` (streaming English LibriSpeech)
+  - `common_voice_19_en` (streaming English Common Voice 19)
+  - `fleurs_en_us` (English FLEURS validation source)
+  - `drtv_local` and `youtube_local` (local WAV/VTT manifests; both Danish)
 - `dataset_probabilities`: In case you are finetuning on several datasets, you need to
   specify the probability of sampling each one. This is an array of probabilities that
   need to sum to 1. If not set, the datasets are sampled uniformly.
@@ -70,7 +74,9 @@ Here are some of the more important available keys:
 - `push_to_hub`, `hub_organisation` and `private`: Whether to push the finetuned model
   to the Hugging Face Hub, and if so, which organisation to push it to. If `private` is
   set to `True`, the model will be private. The default is not to push the model to the
-  Hub.
+  Hub. `private_only` hard-fails public destinations and verifies Hub visibility before
+  and after upload. The production Sparkie preset keeps publication off during training;
+  use its separate `publish_private_model.py` command after review.
 - `enable_experiment_tracking`: Whether training monitoring during training should be
   enabled. Defaults to false. You can also set `experiment_tracking` to either `wandb`
   or `mlflow` to specify which experiment tracking tool to use (`wandb` is used by
@@ -104,6 +110,11 @@ uv run python src/scripts/build_vtt_manifest.py \
 Use `config/datasets/drtv_local.yaml` or `youtube_local.yaml` as the dataset
 configuration. Training seeks and reads only each cue from the original WAV when it
 is consumed; the manifest stores paths, offsets, text, IDs, durations, and language.
+
+The reproducible Sparkie bilingual preset is `config/sparkie_bilingual.yaml`. Resolve
+it with the existing fixed Hydra entry point using `--config-name sparkie_bilingual`.
+The complete operational procedure, including the private publication command, is in
+[`docs/sparkie-bilingual-runbook.md`](docs/sparkie-bilingual-runbook.md).
 
 See all the finetuning options in the `config/asr_finetuning.yaml` file.
 

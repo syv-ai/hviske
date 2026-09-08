@@ -434,16 +434,19 @@ def load_data_for_finetuning(
         Returns:
             The loaded dataset.
         """
+        validation_kwargs: dict[str, Any] = {
+            "path": dataset_config.id,
+            "name": dataset_config.subset,
+            "split": dataset_config.val_name,
+            "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+            "streaming": True,
+            "cache_dir": config.cache_dir,
+            "trust_remote_code": True,
+        }
+        if dataset_config.get("revision") is not None:
+            validation_kwargs["revision"] = dataset_config.revision
         with no_datasets_progress_bars():
-            val = load_dataset(
-                path=dataset_config.id,
-                name=dataset_config.subset,
-                split=dataset_config.val_name,
-                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-                streaming=True,
-                cache_dir=config.cache_dir,
-                trust_remote_code=True,
-            )
+            val = load_dataset(**validation_kwargs)
         assert isinstance(val, IterableDataset)
         val = convert_iterable_dataset_to_dataset(
             iterable_dataset=val,
@@ -455,9 +458,16 @@ def load_data_for_finetuning(
             val = val.rename_column(dataset_config.text_column, "text")
         if dataset_config.audio_column != "audio":
             val = val.rename_column(dataset_config.audio_column, "audio")
-        return val.cast_column(
+        val = val.cast_column(
             column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
         ).select_columns(column_names=["text", "audio"])
+        return val.map(
+            function=partial(
+                _set_source_language,
+                language=dataset_config.get("language")
+                or getattr(config.model, "language", None),
+            )
+        )
 
     vals = [
         load_validation_dataset(dataset_config=dataset_config)
@@ -489,6 +499,7 @@ def load_data_for_finetuning(
             processor=processor,
             num_proc=config.dataset_num_workers,
             language=getattr(config.model, "language", None),
+            language_column="language",
             punctuation=getattr(config.model, "punctuation", True),
         )
         for val in vals
