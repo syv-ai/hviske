@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import typing as t
 from collections.abc import Callable, Iterable, Sized
 from functools import partial
 from pathlib import Path
@@ -28,6 +29,7 @@ from datasets import (
 from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
+from .local_vtt import decode_vtt_audio, load_vtt_manifest
 from .types import Data
 from .utils import (
     NUMERAL_REGEX,
@@ -38,6 +40,117 @@ from .utils import (
 )
 
 logger = logging.getLogger(__package__)
+
+
+def join_audio_and_transcripts(
+    audio_dataset: Dataset | IterableDataset,
+    transcript_dataset: Dataset,
+    audio_join_column: str,
+    transcript_join_column: str,
+    transcript_text_column: str,
+) -> Dataset | IterableDataset:
+    """Join a streaming audio dataset to an indexed transcript dataset.
+
+    The audio side is never materialised. The compact transcript side is indexed in
+    memory, then looked up as audio examples are consumed. Missing transcript keys are
+    reported when the corresponding streaming example is read.
+
+    Args:
+        audio_dataset:
+            Audio dataset, normally loaded with ``streaming=True``.
+        transcript_dataset:
+            Compact, non-streaming transcript dataset.
+        audio_join_column:
+            Key column in the audio dataset.
+        transcript_join_column:
+            Key column in the transcript dataset.
+        transcript_text_column:
+            Transcript text column in the transcript dataset.
+
+    Returns:
+        The audio dataset with a ``text`` column.
+
+    Raises:
+        ValueError:
+            If a configured column is absent or transcript keys are duplicated.
+    """
+    _require_columns(
+        dataset=audio_dataset, columns=[audio_join_column], dataset_name="audio"
+    )
+    _require_columns(
+        dataset=transcript_dataset,
+        columns=[transcript_join_column, transcript_text_column],
+        dataset_name="transcript",
+    )
+    transcript_by_key: dict[object, str] = {}
+    for raw_row in transcript_dataset:
+        row = t.cast(dict[str, Any], raw_row)
+        key = row[transcript_join_column]
+        if key in transcript_by_key:
+            raise ValueError(f"Duplicate transcript key: {key!r}")
+        text = row[transcript_text_column]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"Empty transcript for key: {key!r}")
+        transcript_by_key[key] = text
+
+    def add_transcript(example: dict[str, Any]) -> dict[str, Any]:
+        key = example[audio_join_column]
+        if key not in transcript_by_key:
+            raise ValueError(f"No transcript found for audio key: {key!r}")
+        example["text"] = transcript_by_key[key]
+        return example
+
+    return t.cast(Dataset | IterableDataset, audio_dataset.map(add_transcript))
+
+
+def _load_transcript_dataset(
+    dataset_id: str,
+    subset: str | None,
+    split: str,
+    revision: str | None,
+    cache_dir: str | None,
+) -> Dataset:
+    """Load the compact transcript side without streaming.
+
+    Returns:
+        A non-streaming transcript dataset.
+
+    Raises:
+        ValueError:
+            If the Hub returns a streaming or otherwise unsupported dataset.
+    """
+    kwargs: dict[str, Any] = {
+        "path": dataset_id,
+        "name": subset,
+        "split": split,
+        "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+        "streaming": False,
+        "cache_dir": cache_dir,
+        "trust_remote_code": True,
+    }
+    if revision is not None:
+        kwargs["revision"] = revision
+    with no_datasets_progress_bars():
+        dataset = load_dataset(**kwargs)
+    if not isinstance(dataset, Dataset):
+        raise ValueError("The transcript dataset must be a non-streaming Dataset")
+    return dataset
+
+
+def _require_columns(
+    dataset: Dataset | IterableDataset, columns: list[str], dataset_name: str
+) -> None:
+    available = set(dataset.column_names or [])
+    missing = sorted(set(columns) - available)
+    if missing:
+        raise ValueError(f"Missing {dataset_name} dataset columns: {missing}")
+
+
+def _set_source_language(
+    example: dict[str, Any], language: str | None
+) -> dict[str, Any]:
+    example["language"] = language
+    return example
 
 
 # Dictionary that contains characters to be converted (from the key to the value). Some
@@ -117,9 +230,18 @@ def load_data_for_finetuning(
         if is_main_process:
             logger.info(f"Loading dataset {dataset_name!r}")
 
+        is_local_vtt = dataset_config.get("type") == "local_vtt"
+        transcript_dataset_id = dataset_config.get("transcript_dataset_id")
+
+        if is_local_vtt:
+            ds = load_vtt_manifest(
+                manifest_path=Path(dataset_config.manifest_path),
+                min_seconds=config.min_seconds_per_example,
+                max_seconds=config.max_seconds_per_example,
+            )
         # Load from disk if the dataset ID is a path and it is stored as an arrow
         # dataset
-        if Path(dataset_config.id).exists():
+        elif Path(dataset_config.id).exists():
             train_path = Path(dataset_config.id) / dataset_config.train_name
             data_files = list(map(str, train_path.glob("data-*.arrow")))
             if len(data_files) == 0:
@@ -159,27 +281,67 @@ def load_data_for_finetuning(
         # used during CI - normally it is expected that the user is logged in to the
         # Hugging Face Hub using the `huggingface-cli login` command.
         else:
+            kwargs: dict[str, Any] = {
+                "path": dataset_config.id,
+                "name": dataset_config.subset,
+                "split": dataset_config.train_name,
+                "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+                "streaming": (
+                    True if transcript_dataset_id is not None else config.streaming
+                ),
+                "cache_dir": config.cache_dir,
+                "trust_remote_code": True,
+            }
+            if dataset_config.get("revision") is not None:
+                kwargs["revision"] = dataset_config.revision
             with no_datasets_progress_bars():
-                ds = load_dataset(
-                    path=dataset_config.id,
-                    name=dataset_config.subset,
-                    split=dataset_config.train_name,
-                    token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-                    streaming=config.streaming,
-                    cache_dir=config.cache_dir,
-                    trust_remote_code=True,
-                )
+                ds = load_dataset(**kwargs)
 
         assert isinstance(ds, Dataset | IterableDataset), (
             f"Unsupported dataset type: {type(ds)}"
         )
 
-        if dataset_config.text_column != "text":
+        if not is_local_vtt and dataset_config.text_column != "text":
             ds = ds.rename_column(dataset_config.text_column, "text")
-        if dataset_config.audio_column != "audio":
+        if not is_local_vtt and dataset_config.audio_column != "audio":
             ds = ds.rename_column(dataset_config.audio_column, "audio")
+        if not is_local_vtt:
+            ds = ds.cast_column(
+                column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
+            )
 
-        if dataset_config.filter_dataset:
+        if transcript_dataset_id is not None:
+            transcript = _load_transcript_dataset(
+                dataset_id=transcript_dataset_id,
+                subset=dataset_config.get("transcript_subset"),
+                split=dataset_config.get("transcript_split", "train"),
+                revision=dataset_config.get("transcript_revision"),
+                cache_dir=config.cache_dir,
+            )
+            ds = join_audio_and_transcripts(
+                audio_dataset=ds,
+                transcript_dataset=transcript,
+                audio_join_column=dataset_config.audio_join_column,
+                transcript_join_column=dataset_config.transcript_join_column,
+                transcript_text_column=dataset_config.transcript_text_column,
+            )
+
+        if not is_local_vtt:
+            ds = ds.map(
+                function=partial(
+                    _set_source_language,
+                    language=dataset_config.get("language")
+                    or getattr(config.model, "language", None),
+                )
+            )
+
+        if is_local_vtt:
+            ds = ds.map(
+                function=partial(
+                    decode_vtt_audio, sampling_rate=config.model.sampling_rate
+                )
+            )
+        elif dataset_config.filter_dataset:
             ds = filter_dataset(
                 dataset=ds,
                 audio_column="audio",
@@ -194,13 +356,9 @@ def load_data_for_finetuning(
             column_names=[
                 column
                 for column in ds.column_names or list()
-                if column not in ["audio", "text"]
+                if column not in ["audio", "text", "language"]
             ]
         ).shuffle(seed=config.seed)
-
-        ds = ds.cast_column(
-            column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
-        )
 
         all_datasets.append(ds)  # type: ignore[bad-argument-type]
 
@@ -256,6 +414,7 @@ def load_data_for_finetuning(
         processor=processor,
         num_proc=config.dataset_num_workers,
         language=getattr(config.model, "language", None),
+        language_column="language",
         punctuation=getattr(config.model, "punctuation", True),
     )
 
@@ -546,6 +705,7 @@ def process_dataset(
     num_proc: int | None = None,
     processor: Callable | None = None,
     language: str | None = None,
+    language_column: str | None = None,
     punctuation: bool = True,
 ) -> Data:
     """Process the dataset.
@@ -580,7 +740,11 @@ def process_dataset(
             The processor to use for processing the audio and transcriptions. If `None`,
             then the processor is not used. Defaults to `None`.
         language (optional):
-            The language prompt for a prompt-aware processor. Defaults to `None`.
+            The default language prompt for a prompt-aware processor. Defaults to
+            `None`.
+        language_column (optional):
+            The input column containing a per-example language prompt. Defaults to
+            `None`.
         punctuation (optional):
             Whether to enable punctuation in a prompt-aware processor. Defaults to
             `True`.
@@ -611,6 +775,7 @@ def process_dataset(
         normalise_audio=normalise_audio,
         augment_audio=augment_audio,
         language=language,
+        language_column=language_column,
         punctuation=punctuation,
     )
     if isinstance(dataset, Dataset | DatasetDict):
@@ -638,6 +803,7 @@ def process_example(
     normalise_audio: bool,
     augment_audio: bool,
     language: str | None = None,
+    language_column: str | None = None,
     punctuation: bool = True,
 ) -> dict:
     """Helper function which cleans a single example.
@@ -667,7 +833,11 @@ def process_example(
         augment_audio:
             Whether to augment the audio.
         language (optional):
-            The language prompt for a prompt-aware processor. Defaults to `None`.
+            The default language prompt for a prompt-aware processor. Defaults to
+            `None`.
+        language_column (optional):
+            The input column containing a per-example language prompt. Defaults to
+            `None`.
         punctuation (optional):
             Whether to enable punctuation in a prompt-aware processor. Defaults to
             `True`.
@@ -764,10 +934,13 @@ def process_example(
         return example
 
     # Cohere ASR needs the language prompt and transcript in the same processor call.
-    if language is not None and hasattr(processor, "get_decoder_prompt_ids"):
+    example_language = (
+        example.get(language_column) if language_column is not None else None
+    ) or language
+    if example_language is not None and hasattr(processor, "get_decoder_prompt_ids"):
         processed = processor(
             audio_array,
-            language=language,
+            language=example_language,
             text=example[text_column],
             punctuation=punctuation,
             sampling_rate=sampling_rate,
