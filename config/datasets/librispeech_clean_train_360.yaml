@@ -1,0 +1,9 @@
+librispeech_clean_train_360:
+  id: openslr/librispeech_asr
+  subset: clean
+  train_name: train.360
+  text_column: text
+  audio_column: audio
+  filter_dataset: true
+  language: en
+  revision: null

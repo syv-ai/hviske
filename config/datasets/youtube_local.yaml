@@ -1,4 +1,4 @@
 youtube_local:
   type: local_vtt
   manifest_path: ${oc.env:HOME}/drtv-asr-dataset/data/youtube/youtube-manifest.jsonl
-  language: en
+  language: da

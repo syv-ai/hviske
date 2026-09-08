@@ -6,6 +6,7 @@ import logging
 import multiprocessing as mp
 import os
 import re
+import typing as t
 import warnings
 from functools import partialmethod
 from pathlib import Path
@@ -21,7 +22,8 @@ from datasets import (
     disable_progress_bar,
     enable_progress_bar,
 )
-from huggingface_hub import CommitInfo, upload_folder
+from huggingface_hub import CommitInfo, HfApi, upload_folder
+from huggingface_hub.errors import RepositoryNotFoundError
 from tqdm.auto import tqdm
 from transformers.trainer import Trainer
 
@@ -232,6 +234,167 @@ def interpret_dataset_name(dataset_name: str) -> tuple[str, str | None, str | No
     return dataset_id, dataset_subset, dataset_revision
 
 
+def validate_private_only_config(config: object) -> None:
+    """Reject a contradictory private-publication configuration.
+
+    Args:
+        config:
+            Hydra configuration containing ``private_only`` and ``private``.
+
+    Raises:
+        ValueError:
+            If private-only publication is enabled without private publication.
+    """
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        private_only = bool(getter("private_only", False))
+        private = bool(getter("private", False))
+    else:
+        private_only = bool(getattr(config, "private_only", False))
+        private = bool(getattr(config, "private", False))
+    if private_only and not private:
+        raise ValueError("A private-only run must set private=true")
+
+
+def verify_private_hub_repository(api: HfApi, repo_id: str, token: str | None) -> None:
+    """Verify that a model repository exists and is private.
+
+    Args:
+        api:
+            Authenticated Hugging Face API client.
+        repo_id:
+            Model repository identifier.
+        token:
+            Hugging Face token used for the request.
+
+    Raises:
+        PermissionError:
+            If the repository is public or its visibility is unavailable.
+    """
+    info = api.repo_info(repo_id=repo_id, repo_type="model", token=token or True)
+    if getattr(info, "private", None) is not True:
+        raise PermissionError(
+            f"Private-only publication refuses public repository {repo_id!r}"
+        )
+
+
+def ensure_private_hub_repository(repo_id: str, token: str | None) -> HfApi:
+    """Create a missing private model repository and verify its visibility.
+
+    Args:
+        repo_id:
+            Model repository identifier.
+        token:
+            Hugging Face token used for Hub operations.
+
+    Returns:
+        The authenticated Hugging Face API client.
+
+    """
+    api = HfApi(token=token or True)
+    try:
+        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+    except RepositoryNotFoundError:
+        api.create_repo(
+            repo_id=repo_id,
+            repo_type="model",
+            private=True,
+            exist_ok=True,
+            token=token or True,
+        )
+        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+    return api
+
+
+def publish_model_folder(
+    folder_path: str | Path,
+    repo_id: str,
+    finetuned_from: str,
+    private: bool,
+    model_card_languages: list[str],
+    commit_message: str = "Publish private model",
+) -> CommitInfo:
+    """Publish a model folder after enforcing private-only Hub visibility.
+
+    Args:
+        folder_path:
+            Directory containing the saved model and tokenizer.
+        repo_id:
+            Destination model repository.
+        finetuned_from:
+            Base model identifier for the model card.
+        private:
+            Must be true for this private-only publication path.
+        model_card_languages:
+            Languages to include in the model-card metadata.
+        commit_message (optional):
+            Hub commit message. Defaults to "Publish private model".
+
+    Returns:
+        The model-file upload commit information.
+
+    """
+    validate_private_only_config({"private_only": True, "private": private})
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
+    api = ensure_private_hub_repository(repo_id=repo_id, token=token)
+    commit = upload_folder(
+        repo_id=repo_id,
+        folder_path=folder_path,
+        token=token or True,
+        commit_message=commit_message,
+        allow_patterns=[
+            "*.bin",
+            "*.json",
+            "*.jinja",
+            "*.model",
+            "*.safetensors",
+            "*.txt",
+        ],
+        ignore_patterns=[
+            "_*",
+            "checkpoint-*",
+            "*.arrow",
+            "*.csv",
+            "*.flac",
+            "*.jsonl",
+            "*.log",
+            "*.yaml",
+            "*.yml",
+            "trainer_state.json",
+            "all_results.json",
+            "eval_results.json",
+            "train_results.json",
+            "*.mp3",
+            "*.parquet",
+            "*.wav",
+            "*.vtt",
+            ".hydra/**",
+            "mlruns/**",
+            "runs/**",
+            "wandb/**",
+        ],
+    )
+    language_lines = "\n".join(f"- {language}" for language in model_card_languages)
+    card = (
+        "---\n"
+        f"language:\n{language_lines}\n"
+        "library_name: transformers\n"
+        "pipeline_tag: automatic-speech-recognition\n"
+        f"base_model: {finetuned_from}\n"
+        "---\n"
+    )
+    api.upload_file(
+        path_or_fileobj=card.encode(),
+        path_in_repo="README.md",
+        repo_id=repo_id,
+        repo_type="model",
+        token=token or True,
+        commit_message="Add bilingual model-card metadata",
+    )
+    verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+    return commit
+
+
 def push_model_to_hub(
     trainer: Trainer,
     model_name: str,
@@ -239,8 +402,11 @@ def push_model_to_hub(
     create_pr: bool,
     language: str = "da",
     license: str = "openrail",
-    tasks: list[str] = ["automatic-speech-recognition"],
+    tasks: list[str] | None = None,
     commit_message: str = "Finished finetuning 🎉",
+    private: bool = False,
+    private_only: bool = False,
+    model_card_languages: list[str] | None = None,
 ) -> CommitInfo | None:
     """Upload model and tokenizer to the Hugging Face Hub.
 
@@ -266,15 +432,32 @@ def push_model_to_hub(
             ["automatic-speech-recognition"].
         commit_message (optional):
             Message to commit while pushing. Defaults to "Finished finetuning 🎉".
+        private (optional):
+            Whether the destination repository must be private. Defaults to False.
+        private_only (optional):
+            Whether to refuse all public repositories. Defaults to False.
+        model_card_languages (optional):
+            Language metadata to write to the model card. Defaults to ``language``.
 
     Returns:
         The commit information, or None if the process is not the main process.
+
+    Raises:
+        ValueError:
+            If private-only publication is requested without private=true.
     """
     token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
+    validate_private_only_config({"private_only": private_only, "private": private})
+    repo_id = trainer.hub_model_id or getattr(trainer.args, "hub_model_id", None)
+    if private_only:
+        if repo_id is None:
+            raise ValueError("Private-only publication requires a Hub model ID")
+        ensure_private_hub_repository(repo_id=repo_id, token=token)
 
     # In case the user calls this method with trainer.args.push_to_hub = False
     if trainer.hub_model_id is None:
         trainer.init_hf_repo(token=token)
+        repo_id = trainer.hub_model_id
 
     # Only push from one node
     if not trainer.is_world_process_zero():
@@ -282,22 +465,59 @@ def push_model_to_hub(
 
     trainer.create_model_card(
         model_name=model_name,
-        language=language,
+        language=t.cast(str, model_card_languages or language),
         license=license,
-        tasks=tasks,
+        tasks=tasks or ["automatic-speech-recognition"],
         finetuned_from=finetuned_from,
     )
 
     # Wait for the current upload to be finished.
     trainer._finish_current_push()
-    return upload_folder(
-        repo_id=trainer.hub_model_id or "",
+    commit = upload_folder(
+        repo_id=repo_id or "",
         create_pr=create_pr,
         folder_path=trainer.args.output_dir or ".",
         commit_message=commit_message,
         token=token or True,
-        ignore_patterns=["_*", "checkpoint-*"],
+        allow_patterns=[
+            "README.md",
+            "*.bin",
+            "*.json",
+            "*.jinja",
+            "*.model",
+            "*.safetensors",
+            "*.txt",
+        ],
+        ignore_patterns=[
+            "_*",
+            "checkpoint-*",
+            "*.arrow",
+            "*.audio",
+            "*.csv",
+            "*.flac",
+            "*.jsonl",
+            "*.log",
+            "*.yaml",
+            "*.yml",
+            "trainer_state.json",
+            "all_results.json",
+            "eval_results.json",
+            "train_results.json",
+            "*.mp3",
+            "*.parquet",
+            "*.wav",
+            "*.vtt",
+            ".hydra/**",
+            "mlruns/**",
+            "runs/**",
+            "wandb/**",
+        ],
     )
+    if private_only:
+        verify_private_hub_repository(
+            api=HfApi(token=token or True), repo_id=repo_id or "", token=token
+        )
+    return commit
 
 
 def convert_numeral_to_words(numeral: str, inside_larger_numeral: bool = False) -> str:

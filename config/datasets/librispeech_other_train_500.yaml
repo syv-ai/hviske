@@ -1,0 +1,9 @@
+librispeech_other_train_500:
+  id: openslr/librispeech_asr
+  subset: other
+  train_name: train.500
+  text_column: text
+  audio_column: audio
+  filter_dataset: true
+  language: en
+  revision: null

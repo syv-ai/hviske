@@ -13,7 +13,12 @@ from .data_models import ModelSetup
 from .experiment_tracking import ExTrackingSetup, load_extracking_setup
 from .model_setup import load_model_setup
 from .ngram import train_and_store_ngram_model
-from .utils import block_terminal_output, disable_tqdm, push_model_to_hub
+from .utils import (
+    block_terminal_output,
+    disable_tqdm,
+    push_model_to_hub,
+    validate_private_only_config,
+)
 
 logger = logging.getLogger(__package__)
 
@@ -25,6 +30,7 @@ def finetune(config: DictConfig) -> None:
         config:
             The Hydra configuration object.
     """
+    validate_private_only_config(config=config)
     download_background_noises()
 
     # Note if we're on the main process, if we are running in a distributed setting
@@ -92,4 +98,7 @@ def finetune(config: DictConfig) -> None:
             model_name=config.model_id,
             finetuned_from=config.model.pretrained_model_id,
             create_pr=config.create_pr,
+            private=config.private,
+            private_only=config.get("private_only", False),
+            model_card_languages=config.get("model_card_languages"),
         )
