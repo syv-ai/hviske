@@ -482,7 +482,7 @@ def filter_dataset(
             filtered, DatasetDict | IterableDatasetDict
         )
         for split_name in dataset.keys():
-            dataset[split_name].info.features = filtered[split_name].info.features
+            filtered[split_name].info.features = dataset[split_name].info.features
 
     if isinstance(dataset, Sized) and isinstance(filtered, Sized) and is_main_process:
         num_samples_removed = num_samples_before - len(filtered)

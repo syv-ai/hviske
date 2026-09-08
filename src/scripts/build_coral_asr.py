@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import tarfile
+import typing as t
 from functools import partial
 from itertools import chain
 from pathlib import Path
@@ -534,7 +535,9 @@ def build_conversation_dataset(
             ].squeeze()
 
             transcription = pysubs2.load(conversation_row.transcription_path)
-            audio = AudioSegment.from_file(conversation_row.audio_path)
+            audio = t.cast(
+                AudioSegment, AudioSegment.from_file(conversation_row.audio_path)
+            )
 
             conversation_dir = segment_dir / Path(conversation_row.id_conversation)
             conversation_dir.mkdir(exist_ok=True)
