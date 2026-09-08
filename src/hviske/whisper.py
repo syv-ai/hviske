@@ -14,6 +14,7 @@ from torch.backends.mps import is_available as mps_is_available
 from transformers import (
     AutoConfig,
     AutoModelForSpeechSeq2Seq,
+    GenerationConfig,
     WhisperForConditionalGeneration,
     WhisperProcessor,
 )
@@ -55,11 +56,16 @@ class WhisperModelSetup(ModelSetup):
         self.processor = processor_or_tup
 
         # Whisper tokenizers are misconfigured with a max_length that is too high, but
-        # the correct max_length is stored in the model config, so we'll update it here.
-        hf_config = AutoConfig.from_pretrained(self.config.model.pretrained_model_id)
+        # the correct max_length is stored in the generation config, so update it here.
+        model_id = self.config.model.pretrained_model_id
+        generation_config = GenerationConfig.from_pretrained(model_id)
+        max_length = generation_config.max_length
+        if max_length is None:
+            hf_config = AutoConfig.from_pretrained(model_id)
+            max_length = int(hf_config.max_target_positions)
         self.processor.tokenizer.model_max_length = min(  # type: ignore[attr-defined]
             self.processor.tokenizer.model_max_length,  # type: ignore[attr-defined]
-            hf_config.max_length,
+            max_length,
         )
 
         return self.processor
@@ -217,7 +223,6 @@ class WhisperModelSetup(ModelSetup):
             if self.config.enable_experiment_tracking
             else [],
             ignore_data_skip=self.config.ignore_data_skip,
-            save_safetensors=True,
             predict_with_generate=True,
             generation_max_length=self.config.model.max_length,
             use_cpu=hasattr(sys, "_called_from_test"),

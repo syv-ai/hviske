@@ -50,6 +50,7 @@ class CohereASRTranscriber:
         device: torch.device,
         language: str = "da",
         punctuation: bool = True,
+        max_new_tokens: int = 256,
     ) -> None:
         """Initialise a native Cohere transcriber.
 
@@ -64,12 +65,21 @@ class CohereASRTranscriber:
                 Language code used to construct the decoder prompt. Defaults to ``da``.
             punctuation (optional):
                 Whether punctuation should be enabled. Defaults to ``True``.
+            max_new_tokens (optional):
+                Maximum number of tokens generated per audio input. Defaults to ``256``.
+
+        Raises:
+            ValueError:
+                If ``max_new_tokens`` is less than one.
         """
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least one.")
         self.model = model
         self.processor = processor
-        self.device = device
+        object.__setattr__(self, "_device", device)
         self.language = language
         self.punctuation = punctuation
+        self.max_new_tokens = max_new_tokens
 
     def __call__(
         self, inputs: object, batch_size: int = 1, **kwargs: object
@@ -138,28 +148,40 @@ class CohereASRTranscriber:
                 "All audio inputs in a Cohere batch must share a sampling rate."
             )
         sampling_rate = sampling_rates.pop()
-        processed = self.processor(
-            audio_values,
-            language=self.language,
-            punctuation=self.punctuation,
-            sampling_rate=sampling_rate,
-            return_tensors="pt",
+        process = t.cast(Callable[..., object], self.processor)
+        processed = t.cast(
+            dict[str, object],
+            process(
+                audio_values,
+                language=self.language,
+                punctuation=self.punctuation,
+                sampling_rate=sampling_rate,
+                return_tensors="pt",
+            ),
         )
         chunk_index = t.cast(
             list[tuple[int, int | None]], processed["audio_chunk_index"]
         )
         generation_inputs = {
-            "input_features": processed["input_features"].to(self.device),
-            "attention_mask": processed["attention_mask"].to(self.device),
-            "decoder_input_ids": processed["decoder_input_ids"].to(self.device),
+            "input_features": t.cast(torch.Tensor, processed["input_features"]).to(
+                self._device
+            ),
+            "attention_mask": t.cast(torch.Tensor, processed["attention_mask"]).to(
+                self._device
+            ),
+            "decoder_input_ids": t.cast(
+                torch.Tensor, processed["decoder_input_ids"]
+            ).to(self._device),
         }
         generate = t.cast(Callable[..., object], self.model.generate)
         with torch.no_grad():
-            generated = generate(**generation_inputs)
+            generated = generate(
+                **generation_inputs, max_new_tokens=self.max_new_tokens
+            )
         sequences = (
             generated
             if isinstance(generated, torch.Tensor)
-            else t.cast(torch.Tensor, getattr(t.cast(object, generated), "sequences"))
+            else t.cast(torch.Tensor, getattr(generated, "sequences"))
         )
         decoded = self.processor.decode(
             sequences,
@@ -182,6 +204,7 @@ def load_asr_transcriber(
     device: torch.device,
     language: str = "da",
     punctuation: bool = True,
+    max_new_tokens: int = 256,
 ) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
     """Load a model-aware ASR transcriber.
 
@@ -199,10 +222,18 @@ def load_asr_transcriber(
             Language code for native Cohere prompts. Defaults to ``da``.
         punctuation (optional):
             Whether native Cohere should produce punctuation. Defaults to ``True``.
+        max_new_tokens (optional):
+            Maximum number of tokens generated per audio input. Defaults to ``256``.
 
     Returns:
         A native Cohere adapter or a standard Transformers ASR pipeline.
+
+    Raises:
+        ValueError:
+            If ``max_new_tokens`` is less than one.
     """
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be at least one.")
     if not no_lm:
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
         if getattr(config, "model_type", None) == "cohere_asr":
@@ -219,6 +250,7 @@ def load_asr_transcriber(
                 device=device,
                 language=language,
                 punctuation=punctuation,
+                max_new_tokens=max_new_tokens,
             )
     if no_lm:
         model = Wav2Vec2ForCTC.from_pretrained(model_id)

@@ -51,6 +51,7 @@ def evaluate(config: DictConfig) -> pd.DataFrame:
         no_lm=config.no_lm,
         language=getattr(config, "language", "da"),
         punctuation=getattr(config, "punctuation", True),
+        max_new_tokens=getattr(config, "max_new_tokens", 256),
     )
 
     predictions: list[str] = list()
@@ -130,7 +131,11 @@ def convert_evaluation_dataset_to_df(
 
 
 def load_asr_pipeline(
-    model_id: str, no_lm: bool, language: str = "da", punctuation: bool = True
+    model_id: str,
+    no_lm: bool,
+    language: str = "da",
+    punctuation: bool = True,
+    max_new_tokens: int = 256,
 ) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
     """Load the ASR pipeline.
 
@@ -144,6 +149,8 @@ def load_asr_pipeline(
             Language code for native Cohere prompts. Defaults to ``da``.
         punctuation (optional):
             Whether native Cohere should produce punctuation. Defaults to ``True``.
+        max_new_tokens (optional):
+            Maximum number of tokens generated per audio input. Defaults to ``256``.
 
     Returns:
         The ASR pipeline or native Cohere transcriber.
@@ -160,6 +167,7 @@ def load_asr_pipeline(
             device=device,
             language=language,
             punctuation=punctuation,
+            max_new_tokens=max_new_tokens,
         )
 
     return transcriber

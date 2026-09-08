@@ -170,10 +170,33 @@ def test_native_cohere_loader_dispatches_model_aware_transcriber(
         device=torch.device("cpu"),
         language="sv",
         punctuation=False,
+        max_new_tokens=37,
     )
     assert isinstance(transcriber, CohereASRTranscriber)
     assert transcriber.language == "sv"
     assert transcriber.punctuation is False
+    assert transcriber.max_new_tokens == 37
+
+
+@pytest.mark.parametrize("max_new_tokens", [0, -1])
+def test_native_cohere_transcriber_rejects_invalid_generation_limit(
+    max_new_tokens: int,
+) -> None:
+    """Native Cohere rejects non-positive generation limits."""
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        CohereASRTranscriber(
+            model=t.cast(CohereAsrForConditionalGeneration, object()),
+            processor=t.cast(CohereAsrProcessor, object()),
+            device=torch.device("cpu"),
+            max_new_tokens=max_new_tokens,
+        )
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        load_asr_transcriber(
+            model_id="unused",
+            no_lm=True,
+            device=torch.device("cpu"),
+            max_new_tokens=max_new_tokens,
+        )
 
 
 def test_native_cohere_dispatch_omits_whisper_generation_kwargs() -> None:
@@ -278,6 +301,7 @@ def test_native_cohere_transcriber_builds_prompt_and_reassembles_chunks() -> Non
         model=t.cast(CohereAsrForConditionalGeneration, model),
         processor=t.cast(CohereAsrProcessor, processor),
         device=torch.device("cpu"),
+        max_new_tokens=37,
     )
     outputs = list(
         transcriber(
@@ -294,6 +318,7 @@ def test_native_cohere_transcriber_builds_prompt_and_reassembles_chunks() -> Non
     assert processor.decode_call[1]["audio_chunk_index"] == [(0, 0), (0, 1), (1, None)]
     assert processor.decode_call[1]["language"] == "da"
     assert torch.equal(model.inputs["decoder_input_ids"], torch.tensor([[10, 11]] * 3))
+    assert model.inputs["max_new_tokens"] == 37
 
 
 def test_cohere_trainer_generates_from_prompt_ids() -> None:

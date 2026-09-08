@@ -31,6 +31,7 @@ def add_validations(
     max_cer: float,
     language: str = "da",
     punctuation: bool = True,
+    max_new_tokens: int = 256,
 ) -> Dataset | DatasetDict:
     """Add the ASR validation columns to the dataset.
 
@@ -57,6 +58,8 @@ def add_validations(
             Language code for native Cohere prompts. Defaults to ``da``.
         punctuation (optional):
             Whether native Cohere should produce punctuation. Defaults to ``True``.
+        max_new_tokens (optional):
+            Maximum number of tokens generated per audio input. Defaults to ``256``.
 
     Returns:
         The dataset with the validation columns added.
@@ -106,6 +109,7 @@ def add_validations(
         device=device,
         language=language,
         punctuation=punctuation,
+        max_new_tokens=max_new_tokens,
     )
 
     for split_name, split in processed_dataset.items():

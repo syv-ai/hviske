@@ -3,6 +3,7 @@ model_id: alexandrainst/roest-315m
 sampling_rate: 16_000
 language: da
 punctuation: true
+max_new_tokens: 256
 
 # UI parameters
 title: Røst Speech-to-Text Demo

@@ -94,6 +94,7 @@ def main(config: DictConfig) -> None:
         max_cer=config.validation.max_cer,
         language=getattr(config.validation, "language", "da"),
         punctuation=getattr(config.validation, "punctuation", True),
+        max_new_tokens=getattr(config.validation, "max_new_tokens", 256),
     )
     assert isinstance(read_aloud_dataset, Dataset)
 

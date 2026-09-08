@@ -242,7 +242,6 @@ class Wav2Vec2ModelSetup(ModelSetup):
             if self.config.enable_experiment_tracking
             else [],
             ignore_data_skip=self.config.ignore_data_skip,
-            save_safetensors=True,
             use_cpu=hasattr(sys, "_called_from_test"),
             dataloader_num_workers=self.config.dataloader_num_workers,
             dataloader_drop_last=True,
