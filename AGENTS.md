@@ -1,0 +1,88 @@
+# Hviske
+
+Hviske is a Python codebase for training and evaluating Danish automatic
+speech-recognition models, with dataset and decoder tooling. It exposes the
+`hviske` package.
+
+## Stack
+
+- Python `>=3.11,<3.13`, managed with `uv` and packaged with Hatchling.
+- PyTorch, Hugging Face Datasets and Transformers, Hydra, and Click.
+- Pytest, Ruff, Pyrefly, and pre-commit for quality checks.
+- Optional dependency groups include `kenlm`, `demo`, and `plotting`.
+
+## Layout
+
+- `src/hviske/`: data processing, models, metrics, training, and evaluation.
+- `src/scripts/`: Hydra entry points and dataset, evaluation, and maintenance tools.
+- `config/`: Hydra root configurations and configuration groups.
+- `tests/`: pytest tests and shared fixtures.
+- `notebooks/`: exploratory notebooks and checked-in notebook assets.
+- `.github/workflows/ci.yaml`: pull-request checks run on GitHub Actions.
+
+## Setup and commands
+
+Run commands from the repository root. The documented `src/scripts/...` paths
+assume that launch directory.
+
+```bash
+make install
+source .venv/bin/activate
+make check
+make test
+```
+
+`make install` installs Python 3.11, syncs all extras, creates `.env`, installs
+pre-commit, and runs `pre-commit autoupdate`. It also updates `uv` when `uv` is
+already installed. These steps can change `.pre-commit-config.yaml` and global
+tooling; inspect `git diff` afterwards.
+
+For dependencies without project bootstrap, run:
+
+```bash
+uv sync --python 3.11 --all-extras
+```
+
+Hydra entry points accept `key=value` overrides. Common examples are:
+
+```bash
+uv run python src/scripts/finetune_asr_model.py model=wav2vec2-small
+uv run python src/scripts/evaluate_model.py model_id=ORG/MODEL
+uv run python src/scripts/run_asr_demo.py
+uv run python src/scripts/train_ngram_decoder.py model=wav2vec2-small
+```
+
+Hydra `config_path` values such as `../../config` are relative to the declaring
+script, not the launch CWD. CWD-relative inputs, outputs, and caches, including
+the evaluation CSV and `.hviske-cache`, follow the launch CWD.
+
+## Testing and quality
+
+The full test suite uses real Hugging Face datasets and short training runs.
+Install FFmpeg and authenticate with Hugging Face using `HF_TOKEN`,
+`HUGGINGFACE_HUB_TOKEN`, or an existing `hf auth login` session. Tests also
+need network access and enough storage for model and dataset caches.
+
+`make check` runs all pre-commit hooks. Ruff's configured hooks use `--fix` and
+`--unsafe-fixes`, so they can rewrite files; inspect `git diff` after the run.
+`make test` runs pytest and then `readme-cov`; the latter can rewrite `README.md`.
+Run a focused test with, for example, `uv run pytest tests/test_package.py`.
+
+Ruff uses 88-character lines, double quotes, import sorting, type annotations,
+and Google-style docstrings. Keep Python changes compatible with Python 3.11.
+Use Conventional Commit subjects such as `feat:`, `fix:`, or `docs:`.
+
+## Configuration, outputs, and gotchas
+
+- Preserve the `hviske` namespace; do not reintroduce `coral` imports or paths.
+- Multi-GPU fine-tuning must use `accelerate launch`.
+- `make` creates and includes a root `.env`; never inspect, paste, or commit it.
+- Evaluation calls `evaluate()` first, then attempts cache cleanup, then writes a
+  CSV only when `store_results=true`. Its current singular `model--...` glob
+  ordinarily misses Hugging Face's `models--...` cache directories.
+- N-gram training may run `sudo apt-get` when `apt-get` is present. It downloads
+  and compiles KenLM under `cache_dir`, or `~/.cache` when that is unset.
+- Training and evaluation can create caches, Hydra outputs, result files, and
+  tracking directories. Do not commit generated artifacts.
+- CI runs only for non-draft pull requests targeting `main`, uses Python 3.11 on
+  Ubuntu, and checks out `main` rather than the pull request ref.
