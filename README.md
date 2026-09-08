@@ -1,14 +1,13 @@
-# CoRal
+# Hviske
 
-Danish ASR and TTS datasets and models, as part of the [CoRal
+Hviske is a Danish ASR and TTS software project associated with the [CoRal
 project](https://alexandra.dk/coral/), funded by the [Innovation
 Fund](https://innovationsfonden.dk/).
 
 ______________________________________________________________________
-[![Documentation](https://img.shields.io/badge/docs-passing-green)](https://alexandrainst.github.io/coral/coral.html)
-[![License](https://img.shields.io/github/license/CoRal-project/coral)](https://github.com/CoRal-project/coral/blob/main/LICENSE)
-[![LastCommit](https://img.shields.io/github/last-commit/CoRal-project/coral)](https://github.com/CoRal-project/coral/commits/main)
-[![Code Coverage](https://img.shields.io/badge/Coverage-57%25-orange.svg)](https://github.com/CoRal-project/coral/tree/main/tests)
+[![License](https://img.shields.io/github/license/syv-ai/hviske)](https://github.com/syv-ai/hviske/blob/main/LICENSE)
+[![LastCommit](https://img.shields.io/github/last-commit/syv-ai/hviske)](https://github.com/syv-ai/hviske/commits/main)
+[![Code Coverage](https://img.shields.io/badge/Coverage-57%25-orange.svg)](https://github.com/syv-ai/hviske/tree/main/tests)
 
 
 Author and maintainer:

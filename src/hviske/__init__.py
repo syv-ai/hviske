@@ -1,4 +1,4 @@
-"""The CoRal project.
+"""The Hviske project.
 
 .. include:: ../../README.md
 """

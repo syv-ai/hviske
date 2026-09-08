@@ -20,14 +20,14 @@ import torch
 from dotenv import load_dotenv
 from omegaconf import DictConfig
 
-from coral.finetune import finetune
+from hviske.finetune import finetune
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s ⋅ %(name)s ⋅ %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("coral_finetuning")
+logger = logging.getLogger("hviske_finetuning")
 
 
 load_dotenv()

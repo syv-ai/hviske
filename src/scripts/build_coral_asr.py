@@ -26,8 +26,8 @@ from pydub import AudioSegment
 from requests import HTTPError
 from tqdm.auto import tqdm
 
-from coral.utils import no_datasets_progress_bars
-from coral.validation import add_validations
+from hviske.utils import no_datasets_progress_bars
+from hviske.validation import add_validations
 
 logging.basicConfig(
     level=logging.INFO,

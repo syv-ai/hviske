@@ -6,7 +6,7 @@ import os
 from omegaconf import DictConfig
 from transformers.trainer_callback import EarlyStoppingCallback
 
-from coral.data import download_background_noises
+from hviske.data import download_background_noises
 
 from .data import load_data_for_finetuning
 from .data_models import ModelSetup

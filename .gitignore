@@ -100,8 +100,8 @@ outputs/
 multirun/
 
 # Documentation
-docs/coral_models/
-docs/coral_models.html
+docs/hviske_models/
+docs/hviske_models.html
 docs/index.html
 docs/search.json
 
@@ -128,8 +128,8 @@ CoRal_public.db
 # Todo document
 todo.md
 
-# Coral cache
-.coral-cache/
+# Hviske cache
+.hviske-cache/
 
 # Background noises
 background-noises/

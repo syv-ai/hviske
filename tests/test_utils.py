@@ -6,7 +6,7 @@ import datasets.utils.logging as ds_logging
 import pytest
 import transformers.utils.logging as hf_logging
 
-from coral.utils import (
+from hviske.utils import (
     block_terminal_output,
     convert_numeral_to_words,
     transformers_output_ignored,

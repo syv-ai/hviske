@@ -12,8 +12,8 @@ from transformers.pipelines.automatic_speech_recognition import (
 )
 from transformers.pipelines.base import KeyDataset
 
-from coral.data import DEFAULT_CONVERSION_DICT, process_example
-from coral.utils import transformers_output_ignored
+from hviske.data import DEFAULT_CONVERSION_DICT, process_example
+from hviske.utils import transformers_output_ignored
 
 from .data import filter_dataset, process_dataset
 from .metrics import cer, wer

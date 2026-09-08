@@ -1,1 +1,1 @@
-"""Tests for the CoRal project."""
+"""Tests for the Hviske project."""

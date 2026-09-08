@@ -12,9 +12,9 @@ from datasets import Dataset, DatasetDict, load_dataset
 from omegaconf import DictConfig
 from requests import HTTPError
 
-from coral.data import filter_dataset
-from coral.utils import interpret_dataset_name
-from coral.validation import add_validations
+from hviske.data import filter_dataset
+from hviske.utils import interpret_dataset_name
+from hviske.validation import add_validations
 
 logging.basicConfig(
     level=logging.INFO,

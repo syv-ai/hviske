@@ -13,7 +13,7 @@ import hydra
 from dotenv import load_dotenv
 from omegaconf import DictConfig
 
-from coral.evaluate import evaluate
+from hviske.evaluate import evaluate
 
 load_dotenv()
 
@@ -23,7 +23,7 @@ logging.basicConfig(
     format="%(asctime)s ⋅ %(name)s ⋅ %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("coral_evaluation")
+logger = logging.getLogger("hviske_evaluation")
 
 
 @hydra.main(config_path="../../config", config_name="evaluation", version_base=None)

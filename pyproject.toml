@@ -1,7 +1,7 @@
 [project]
-name = "coral"
+name = "hviske"
 version = "0.0.0"
-description = "Danish ASR and TTS models associated with the CoRal project."
+description = "Hviske provides Danish ASR and TTS models associated with the CoRal project."
 readme = "README.md"
 authors = [
     {name = "Dan Saattrup Smart", email = "dan.smart@alexandra.dk"},
@@ -49,8 +49,8 @@ plotting = [
 ]
 
 [project.urls]
-Repository = "https://github.com/CoRal-project/coral"
-Issues = "https://github.com/CoRal-project/coral/issues"
+Repository = "https://github.com/syv-ai/hviske"
+Issues = "https://github.com/syv-ai/hviske/issues"
 
 [project.license]
 file = "LICENSE"
@@ -146,7 +146,7 @@ addopts = [
     '--durations=10',
     '--color=yes',
     '--doctest-modules',
-    '--cov=src/coral',
+    '--cov=src/hviske',
     '-vvv',
 ]
 xfail_strict = true
@@ -162,7 +162,7 @@ filterwarnings = [
 log_cli_level = "info"
 testpaths = [
     "tests",
-    "src/coral",
+    "src/hviske",
 ]
 
 [tool.pyrefly]
