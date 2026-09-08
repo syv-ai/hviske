@@ -2,6 +2,7 @@
 
 from omegaconf import DictConfig
 
+from .cohere import CohereModelSetup
 from .data_models import ModelSetup
 from .wav2vec2 import Wav2Vec2ModelSetup
 from .whisper import WhisperModelSetup
@@ -27,5 +28,7 @@ def load_model_setup(config: DictConfig) -> ModelSetup:
             return Wav2Vec2ModelSetup(config=config)
         case "whisper":
             return WhisperModelSetup(config=config)
+        case "cohere":
+            return CohereModelSetup(config=config)
         case _:
             raise ValueError(f"Unsupported model type: {model_type!r}")

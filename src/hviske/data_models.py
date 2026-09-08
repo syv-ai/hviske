@@ -7,6 +7,7 @@ from typing import Type, TypeAlias
 
 from omegaconf import DictConfig
 from transformers import (
+    CohereAsrProcessor,
     PreTrainedModel,
     Wav2Vec2Processor,
     Wav2Vec2ProcessorWithLM,
@@ -17,7 +18,9 @@ from transformers.trainer import Trainer
 from transformers.trainer_utils import EvalPrediction
 from transformers.training_args import TrainingArguments
 
-Processor: TypeAlias = Wav2Vec2Processor | Wav2Vec2ProcessorWithLM | WhisperProcessor
+Processor: TypeAlias = (
+    Wav2Vec2Processor | Wav2Vec2ProcessorWithLM | WhisperProcessor | CohereAsrProcessor
+)
 
 
 @dataclass

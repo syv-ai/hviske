@@ -43,6 +43,13 @@ Here are some of the more important available keys:
   - `whisper-medium`
   - `whisper-large`
   - `whisper-large-turbo`
+  - `cohere`
+
+  The `cohere` config fine-tunes `CohereLabs/cohere-transcribe-03-2026` with a
+  Danish language and punctuation prompt at 16 kHz. The official Cohere checkpoint
+  is gated on Hugging Face and requires accepted access and authentication. Native
+  Transformers 5.5 loading is used without remote code; Danish fine-tuned
+  checkpoints such as `syvai/hviske-v5.3` are also supported.
 - `datasets`: The datasets to finetune the models on. Can be a single dataset or an
   array of datasets (written like [dataset1,dataset2,...]). Supports the following
   values:

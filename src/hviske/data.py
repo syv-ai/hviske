@@ -255,6 +255,8 @@ def load_data_for_finetuning(
         augment_audio=True,
         processor=processor,
         num_proc=config.dataset_num_workers,
+        language=getattr(config.model, "language", None),
+        punctuation=getattr(config.model, "punctuation", True),
     )
 
     data_dict = dict(train=train)
@@ -327,6 +329,8 @@ def load_data_for_finetuning(
             augment_audio=False,
             processor=processor,
             num_proc=config.dataset_num_workers,
+            language=getattr(config.model, "language", None),
+            punctuation=getattr(config.model, "punctuation", True),
         )
         for val in vals
     ]
@@ -541,6 +545,8 @@ def process_dataset(
     augment_audio: bool,
     num_proc: int | None = None,
     processor: Callable | None = None,
+    language: str | None = None,
+    punctuation: bool = True,
 ) -> Data:
     """Process the dataset.
 
@@ -573,6 +579,11 @@ def process_dataset(
         processor (optional):
             The processor to use for processing the audio and transcriptions. If `None`,
             then the processor is not used. Defaults to `None`.
+        language (optional):
+            The language prompt for a prompt-aware processor. Defaults to `None`.
+        punctuation (optional):
+            Whether to enable punctuation in a prompt-aware processor. Defaults to
+            `True`.
 
     Returns:
         The cleaned dataset.
@@ -599,6 +610,8 @@ def process_dataset(
         processor=processor,
         normalise_audio=normalise_audio,
         augment_audio=augment_audio,
+        language=language,
+        punctuation=punctuation,
     )
     if isinstance(dataset, Dataset | DatasetDict):
         mapped = dataset.map(
@@ -624,6 +637,8 @@ def process_example(
     processor: Callable | None,
     normalise_audio: bool,
     augment_audio: bool,
+    language: str | None = None,
+    punctuation: bool = True,
 ) -> dict:
     """Helper function which cleans a single example.
 
@@ -651,6 +666,11 @@ def process_example(
             Whether to normalise the audio.
         augment_audio:
             Whether to augment the audio.
+        language (optional):
+            The language prompt for a prompt-aware processor. Defaults to `None`.
+        punctuation (optional):
+            Whether to enable punctuation in a prompt-aware processor. Defaults to
+            `True`.
 
     Returns:
         The cleaned example.
@@ -743,7 +763,24 @@ def process_example(
         example[audio_column]["array"] = audio_array
         return example
 
-    # Process the audio
+    # Cohere ASR needs the language prompt and transcript in the same processor call.
+    if language is not None and hasattr(processor, "get_decoder_prompt_ids"):
+        processed = processor(
+            audio_array,
+            language=language,
+            text=example[text_column],
+            punctuation=punctuation,
+            sampling_rate=sampling_rate,
+        )
+        example["input_features"] = processed["input_features"][0]
+        example["attention_mask"] = processed["attention_mask"][0]
+        example["decoder_input_ids"] = processed["decoder_input_ids"][0]
+        example["labels"] = processed["labels"][0]
+        example["input_length"] = len(example["labels"])
+        example["num_seconds"] = len(example["attention_mask"]) / 100
+        return example
+
+    # Process the audio for Whisper and Wav2Vec2.
     processed = processor(audio_array, sampling_rate=sampling_rate)
     audio_feature_name = (
         "input_values" if "input_values" in processed else "input_features"

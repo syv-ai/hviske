@@ -1,0 +1,18 @@
+# The official Cohere checkpoint is gated on the Hugging Face Hub.
+name: cohere
+type: cohere
+pretrained_model_id: CohereLabs/cohere-transcribe-03-2026
+freeze_feature_encoder: false
+
+# Data hyperparameters
+lower_case: false
+characters_to_keep: null
+language: da
+punctuation: true
+
+# Cohere expects 128-bin features at 16 kHz.
+sampling_rate: 16_000
+max_length: 256
+
+# Model-specific optimisation hyperparameters
+learning_rate: 1.0e-5
