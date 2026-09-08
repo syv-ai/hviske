@@ -1,0 +1,4 @@
+drtv_local:
+  type: local_vtt
+  manifest_path: ${oc.env:HOME}/drtv-asr-dataset/data/drtv/drtv-manifest.jsonl
+  language: da

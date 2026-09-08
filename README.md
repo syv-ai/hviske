@@ -60,6 +60,8 @@ Here are some of the more important available keys:
   - `ftspeech`
   - `nota`
   - `nst`
+  - `p1` (streaming audio plus configurable transcript Hub join)
+  - `drtv_local` and `youtube_local` (local WAV/VTT manifests)
 - `dataset_probabilities`: In case you are finetuning on several datasets, you need to
   specify the probability of sampling each one. This is an array of probabilities that
   need to sum to 1. If not set, the datasets are sampled uniformly.
@@ -78,6 +80,30 @@ Here are some of the more important available keys:
   running out of GPU memory.
 - `model.learning_rate`, `total_batch_size`, `max_steps`, `warmup_steps`: Training
   parameters that you can tweak, although it shouldn't really be needed.
+
+Dataset entries may set `language` to override the model-level Cohere prompt for
+that source. A Hub audio source can be joined to a compact transcript Hub dataset
+without downloading the audio by setting `transcript_dataset_id`,
+`transcript_subset`, `transcript_split`, `audio_join_column`,
+`transcript_join_column`, and `transcript_text_column`; optional `revision` and
+`transcript_revision` pin each side independently. The audio side remains streaming,
+while the transcript side is indexed in memory. Column names are deliberately
+configuration fields because private transcript schemas must be verified before use.
+The supplied `p1` config reads its three join names from `P1_AUDIO_JOIN_COLUMN`,
+`P1_TRANSCRIPT_JOIN_COLUMN`, and `P1_TRANSCRIPT_TEXT_COLUMN` environment variables.
+
+For local WAV/VTT data, first build a manifest without copying audio:
+
+```bash
+uv run python src/scripts/build_vtt_manifest.py \
+  --source-dir "$HOME/drtv-asr-dataset/data/drtv" \
+  --output "$HOME/drtv-asr-dataset/data/drtv/drtv-manifest.jsonl" \
+  --language da
+```
+
+Use `config/datasets/drtv_local.yaml` or `youtube_local.yaml` as the dataset
+configuration. Training seeks and reads only each cue from the original WAV when it
+is consumed; the manifest stores paths, offsets, text, IDs, durations, and language.
 
 See all the finetuning options in the `config/asr_finetuning.yaml` file.
 
