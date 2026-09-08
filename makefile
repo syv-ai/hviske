@@ -32,12 +32,12 @@ help:
 	@grep -E '^[0-9a-zA-Z_-]+:.*?## .*$$' makefile | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 install: ## Install dependencies
-	@echo "Installing the 'CoRal' project..."
+	@echo "Installing the 'Hviske' project..."
 	@$(MAKE) --quiet install-uv
 	@$(MAKE) --quiet install-dependencies
 	@$(MAKE) --quiet setup-environment-variables
 	@$(MAKE) --quiet install-pre-commit
-	@echo "Installed the 'CoRal' project! You can now activate your virtual environment with 'source .venv/bin/activate'."
+	@echo "Installed the 'Hviske' project! You can now activate your virtual environment with 'source .venv/bin/activate'."
 	@echo "Note that this is a 'uv' project. Use 'uv add <package>' to install new dependencies and 'uv remove <package>' to remove them."
 
 install-uv:

@@ -7,7 +7,7 @@ import pytest
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from omegaconf import DictConfig
 
-from coral.data import load_data_for_finetuning, process_dataset, process_example
+from hviske.data import load_data_for_finetuning, process_dataset, process_example
 
 
 class TestLoadDataForFinetuning:

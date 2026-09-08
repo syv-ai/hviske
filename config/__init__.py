@@ -1,1 +1,1 @@
-"""Configuration files for the CoRal project."""
+"""Configuration files for the Hviske project."""

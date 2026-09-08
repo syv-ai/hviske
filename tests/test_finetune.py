@@ -2,7 +2,7 @@
 
 from omegaconf import DictConfig
 
-from coral.finetune import finetune
+from hviske.finetune import finetune
 
 
 def test_finetune(finetuning_config: DictConfig) -> None:

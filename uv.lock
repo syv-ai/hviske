@@ -381,112 +381,6 @@ wheels = [
 ]
 
 [[package]]
-name = "coral"
-version = "0.0.0"
-source = { editable = "." }
-dependencies = [
-    { name = "accelerate" },
-    { name = "click" },
-    { name = "datasets" },
-    { name = "deepspeed" },
-    { name = "hydra-core" },
-    { name = "jiwer" },
-    { name = "joblib" },
-    { name = "librosa" },
-    { name = "mlflow" },
-    { name = "openpyxl" },
-    { name = "progress" },
-    { name = "pycountry" },
-    { name = "pyctcdecode" },
-    { name = "pydub" },
-    { name = "pysubs2" },
-    { name = "python-dotenv" },
-    { name = "requests" },
-    { name = "soundfile" },
-    { name = "torch-audiomentations" },
-    { name = "torchaudio" },
-    { name = "transformers" },
-    { name = "wandb" },
-]
-
-[package.optional-dependencies]
-demo = [
-    { name = "gradio" },
-    { name = "punctfix" },
-    { name = "samplerate" },
-]
-kenlm = [
-    { name = "kenlm" },
-]
-plotting = [
-    { name = "matplotlib" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "click" },
-    { name = "coverage" },
-    { name = "lxml" },
-    { name = "nbstripout" },
-    { name = "pip" },
-    { name = "pre-commit" },
-    { name = "pyrefly" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "readme-coverage-badger" },
-    { name = "ruff" },
-    { name = "setuptools" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", specifier = ">=1.9.0" },
-    { name = "click", specifier = ">=8.2.1" },
-    { name = "datasets", specifier = ">=3.6.0,<4.0.0" },
-    { name = "deepspeed", specifier = ">=0.17.4" },
-    { name = "gradio", marker = "extra == 'demo'", specifier = ">=5.31.0" },
-    { name = "hydra-core", specifier = ">=1.1.1" },
-    { name = "jiwer", specifier = ">=4.0.0" },
-    { name = "joblib", specifier = ">=1.5.1" },
-    { name = "kenlm", marker = "extra == 'kenlm'", url = "https://github.com/kpu/kenlm/archive/master.zip" },
-    { name = "librosa", specifier = ">=0.11.0" },
-    { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.9.2" },
-    { name = "mlflow", specifier = ">=3.1.4" },
-    { name = "openpyxl", specifier = ">=3.1.5" },
-    { name = "progress", specifier = ">=1.6.1" },
-    { name = "punctfix", marker = "extra == 'demo'", specifier = ">=0.11.1" },
-    { name = "pycountry", specifier = ">=24.6.1" },
-    { name = "pyctcdecode", specifier = ">=0.5.0" },
-    { name = "pydub", specifier = ">=0.25.1" },
-    { name = "pysubs2", specifier = ">=1.8.0" },
-    { name = "python-dotenv", specifier = ">=1.2.2" },
-    { name = "requests", specifier = ">=2.32.4" },
-    { name = "samplerate", marker = "extra == 'demo'", specifier = ">=0.2.2" },
-    { name = "soundfile", specifier = ">=0.13.1" },
-    { name = "torch-audiomentations", specifier = ">=0.12.0" },
-    { name = "torchaudio", specifier = ">=2.6.0,<2.7.0" },
-    { name = "transformers", specifier = ">=5.5.0" },
-    { name = "wandb", specifier = ">=0.23.1" },
-]
-provides-extras = ["kenlm", "demo", "plotting"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "click", specifier = ">=8.1.7" },
-    { name = "coverage", specifier = ">=5.5" },
-    { name = "lxml", specifier = ">=6.1.0" },
-    { name = "nbstripout", specifier = ">=0.7.1" },
-    { name = "pip", specifier = ">=26.1.2" },
-    { name = "pre-commit", specifier = ">=3.8.0" },
-    { name = "pyrefly", specifier = ">=0.45.0" },
-    { name = "pytest", specifier = ">=9.0.3" },
-    { name = "pytest-cov", specifier = ">=5.0.0" },
-    { name = "readme-coverage-badger", specifier = ">=0.1.2" },
-    { name = "ruff", specifier = ">=0.7.1" },
-    { name = "setuptools", specifier = ">=83.0.0" },
-]
-
-[[package]]
 name = "coverage"
 version = "7.13.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1112,6 +1006,112 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/44/40/68d9b286b125d9318ae95c8f8b206e8672e7244b0eea61ebb4a88037638c/huggingface_hub-1.9.1.tar.gz", hash = "sha256:442af372207cc24dcb089caf507fcd7dbc1217c11d6059a06f6b90afe64e8bd2", size = 750355, upload-time = "2026-04-07T13:47:59.167Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3d/af/10a89c54937dccf6c10792770f362d96dd67aedfde108e6e1fd7a0836789/huggingface_hub-1.9.1-py3-none-any.whl", hash = "sha256:8dae771b969b318203727a6c6c5209d25e661f6f0dd010fc09cc4a12cf81c657", size = 637356, upload-time = "2026-04-07T13:47:57.239Z" },
+]
+
+[[package]]
+name = "hviske"
+version = "0.0.0"
+source = { editable = "." }
+dependencies = [
+    { name = "accelerate" },
+    { name = "click" },
+    { name = "datasets" },
+    { name = "deepspeed" },
+    { name = "hydra-core" },
+    { name = "jiwer" },
+    { name = "joblib" },
+    { name = "librosa" },
+    { name = "mlflow" },
+    { name = "openpyxl" },
+    { name = "progress" },
+    { name = "pycountry" },
+    { name = "pyctcdecode" },
+    { name = "pydub" },
+    { name = "pysubs2" },
+    { name = "python-dotenv" },
+    { name = "requests" },
+    { name = "soundfile" },
+    { name = "torch-audiomentations" },
+    { name = "torchaudio" },
+    { name = "transformers" },
+    { name = "wandb" },
+]
+
+[package.optional-dependencies]
+demo = [
+    { name = "gradio" },
+    { name = "punctfix" },
+    { name = "samplerate" },
+]
+kenlm = [
+    { name = "kenlm" },
+]
+plotting = [
+    { name = "matplotlib" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "click" },
+    { name = "coverage" },
+    { name = "lxml" },
+    { name = "nbstripout" },
+    { name = "pip" },
+    { name = "pre-commit" },
+    { name = "pyrefly" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "readme-coverage-badger" },
+    { name = "ruff" },
+    { name = "setuptools" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", specifier = ">=1.9.0" },
+    { name = "click", specifier = ">=8.2.1" },
+    { name = "datasets", specifier = ">=3.6.0,<4.0.0" },
+    { name = "deepspeed", specifier = ">=0.17.4" },
+    { name = "gradio", marker = "extra == 'demo'", specifier = ">=5.31.0" },
+    { name = "hydra-core", specifier = ">=1.1.1" },
+    { name = "jiwer", specifier = ">=4.0.0" },
+    { name = "joblib", specifier = ">=1.5.1" },
+    { name = "kenlm", marker = "extra == 'kenlm'", url = "https://github.com/kpu/kenlm/archive/master.zip" },
+    { name = "librosa", specifier = ">=0.11.0" },
+    { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.9.2" },
+    { name = "mlflow", specifier = ">=3.1.4" },
+    { name = "openpyxl", specifier = ">=3.1.5" },
+    { name = "progress", specifier = ">=1.6.1" },
+    { name = "punctfix", marker = "extra == 'demo'", specifier = ">=0.11.1" },
+    { name = "pycountry", specifier = ">=24.6.1" },
+    { name = "pyctcdecode", specifier = ">=0.5.0" },
+    { name = "pydub", specifier = ">=0.25.1" },
+    { name = "pysubs2", specifier = ">=1.8.0" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "requests", specifier = ">=2.32.4" },
+    { name = "samplerate", marker = "extra == 'demo'", specifier = ">=0.2.2" },
+    { name = "soundfile", specifier = ">=0.13.1" },
+    { name = "torch-audiomentations", specifier = ">=0.12.0" },
+    { name = "torchaudio", specifier = ">=2.6.0,<2.7.0" },
+    { name = "transformers", specifier = ">=5.5.0" },
+    { name = "wandb", specifier = ">=0.23.1" },
+]
+provides-extras = ["kenlm", "demo", "plotting"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "click", specifier = ">=8.1.7" },
+    { name = "coverage", specifier = ">=5.5" },
+    { name = "lxml", specifier = ">=6.1.0" },
+    { name = "nbstripout", specifier = ">=0.7.1" },
+    { name = "pip", specifier = ">=26.1.2" },
+    { name = "pre-commit", specifier = ">=3.8.0" },
+    { name = "pyrefly", specifier = ">=0.45.0" },
+    { name = "pytest", specifier = ">=9.0.3" },
+    { name = "pytest-cov", specifier = ">=5.0.0" },
+    { name = "readme-coverage-badger", specifier = ">=0.1.2" },
+    { name = "ruff", specifier = ">=0.7.1" },
+    { name = "setuptools", specifier = ">=83.0.0" },
 ]
 
 [[package]]
