@@ -4,10 +4,10 @@ version = "0.0.0"
 description = "Hviske provides Danish ASR and TTS models associated with the CoRal project."
 readme = "README.md"
 authors = [
-    {name = "Dan Saattrup Smart", email = "dan.smart@alexandra.dk"},
+    {name = "Dan Saattrup Smart", email = "dan@syv.ai"},
 ]
 maintainers = [
-    {name = "Dan Saattrup Smart", email = "dan.smart@alexandra.dk"},
+    {name = "Dan Saattrup Smart", email = "dan@syv.ai"},
 ]
 requires-python = ">=3.11,<3.13"
 dependencies = [

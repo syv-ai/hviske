@@ -1,9 +1,5 @@
 """Get the speaker IDs for the CoRal test and validation splits.
 
-Developers:
-    - Oliver Kinch (oliver.kinch@alexandra.dk)
-    - Dan Saattrup Nielsen (dan.nielsen@alexandra.dk)
-
 Usage:
     python src/scripts/get_coral_split_ids.py [key=value] [key=value] ...
 """

@@ -47,7 +47,7 @@ dataset_probabilities: null
 model_id: ${model.name}-${now:%Y-%m-%d}
 models_dir: models
 model_dir: ${models_dir}/${model_id}
-hub_organisation: alexandrainst
+hub_organisation: syv-ai
 push_to_hub: false
 create_pr: false
 private: false

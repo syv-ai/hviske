@@ -1,8 +1,6 @@
 # Hviske
 
-Hviske is a Danish ASR and TTS software project associated with the [CoRal
-project](https://alexandra.dk/coral/), funded by the [Innovation
-Fund](https://innovationsfonden.dk/).
+Hviske is a Danish ASR model and codebase, forked from the [CoRal repo](https://github.com/alexandrainst/coral).
 
 ______________________________________________________________________
 [![License](https://img.shields.io/github/license/syv-ai/hviske)](https://github.com/syv-ai/hviske/blob/main/LICENSE)
@@ -12,7 +10,7 @@ ______________________________________________________________________
 
 Author and maintainer:
 
-- Dan Saattrup Smart (dan.smart@alexandra.dk)
+- Dan Saattrup Smart (dan@syv.dk)
 
 
 ## Installation
