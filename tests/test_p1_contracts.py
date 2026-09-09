@@ -1,0 +1,145 @@
+"""Tests for the deterministic Phase 1A P1 contracts."""
+
+import json
+
+import pytest
+
+from hviske.p1_contracts import (
+    CanonicalIdentityManifest,
+    CTCContract,
+    LedgerState,
+    ModelContract,
+    NormalisationContract,
+    OutputEncodingContract,
+    RepositoryRevision,
+    SegmentationContract,
+    SourceCoordinates,
+    VADContract,
+    canonical_json,
+    pipeline_config_sha256,
+    segment_id,
+    valid_ledger_transition,
+)
+
+AUDIO_REVISION = "449b9c2294026df6d0d37538f279fdec03f565ff"
+TRANSCRIPT_REVISION = "41132579816d86e889635f84f30511279f026359"
+VAD_REVISION = "867c2aa692646a1f1de3e94a15c9dd9f614c0acb"
+VAD_MODEL = "5c6988d663950a93a5f0d6c38c2fe024653ec552b"
+CTC_REVISION = "69bd9b53b7b82ad926d35e7b280f957ed299a7db"
+CTC_MODEL_REVISION = "cc62398a83d2eb071f789dfaea019a9ff3211c6c"
+ANOMALY_REVISION = "973afd24965f72e36ca33b3055d56a652f456b4d"
+
+
+def test_canonical_json_normalises_unicode_and_preserves_numbers() -> None:
+    """Canonical JSON is compact, sorted, NFC, and type-preserving."""
+    first = canonical_json({"z": "e\u0301", "integer": 1, "float": 1.0})
+    second = canonical_json({"float": 1.0, "integer": 1, "z": "é"})
+
+    assert first == second
+    assert first == '{"float":1.0,"integer":1,"z":"é"}'
+    assert json.loads(first)["integer"] == 1
+    assert isinstance(json.loads(first)["float"], float)
+
+
+def test_canonical_json_rejects_non_finite_floats() -> None:
+    """Non-finite values cannot create ambiguous pipeline identities."""
+    with pytest.raises((TypeError, ValueError)):
+        canonical_json({"score": float("nan")})
+
+
+def test_identity_and_segment_ids_are_deterministic() -> None:
+    """The manifest and segment identities are stable and framed by JSON."""
+    manifest = make_manifest()
+    digest = pipeline_config_sha256(manifest)
+
+    assert digest == pipeline_config_sha256(manifest.model_copy())
+    assert segment_id(
+        pipeline_config_sha256=digest,
+        source_file_id="programme-1",
+        source_start_ms=100,
+        source_end_ms=2100,
+        text="Hej, verden!",
+    ) == segment_id(
+        pipeline_config_sha256=digest,
+        source_file_id="programme-1",
+        source_start_ms=100,
+        source_end_ms=2100,
+        text="Hej, verden!",
+    )
+    assert digest != pipeline_config_sha256(
+        manifest.model_copy(update={"pipeline_version": "p1-segmentation-2"})
+    )
+
+
+def make_manifest() -> CanonicalIdentityManifest:
+    """Build the pinned Phase 1A identity fixture.
+
+    Returns:
+        A complete immutable identity manifest.
+    """
+    return CanonicalIdentityManifest(
+        schema_version="p1-segments-v1",
+        pipeline_version="p1-segmentation-1a",
+        source=SourceCoordinates(
+            audio=RepositoryRevision(repository="syvai/p1", revision=AUDIO_REVISION),
+            transcripts=RepositoryRevision(
+                repository="syvai/p1-transcripts", revision=TRANSCRIPT_REVISION
+            ),
+        ),
+        vad=VADContract(
+            name="silero-vad",
+            repository=RepositoryRevision(
+                repository="snakers4/silero-vad", revision=VAD_REVISION
+            ),
+            model_blob=VAD_MODEL,
+            license="MIT",
+        ),
+        ctc=CTCContract(
+            source_commit=CTC_REVISION,
+            sdist_sha256=(
+                "19d383ea5f22438ebb1699d72b22078b63f351a33fa50bedb19c14077ba6a116"
+            ),
+            license="Apache-2.0",
+            model=ModelContract(
+                repository=RepositoryRevision(
+                    repository="NbAiLab/wav2vec2-large-danish-npsc-nst",
+                    revision=CTC_MODEL_REVISION,
+                ),
+                license="Apache-2.0",
+            ),
+        ),
+        anomaly_model=ModelContract(
+            repository=RepositoryRevision(
+                repository="openai/whisper-small", revision=ANOMALY_REVISION
+            ),
+            license="Apache-2.0",
+        ),
+        normalisation=NormalisationContract(version="p1-text-normalisation-1"),
+        segmentation=SegmentationContract(
+            minimum_duration_ms=1000,
+            target_minimum_duration_ms=2000,
+            target_maximum_duration_ms=8000,
+            maximum_duration_ms=9999,
+            maximum_drift_ms=500,
+            minimum_alignment_score=0.0,
+            minimum_vad_speech_ratio=0.0,
+        ),
+        output=OutputEncodingContract(),
+    )
+
+
+def test_ledger_transition_contract() -> None:
+    """Ledger transitions follow the restart-safe state machine."""
+    assert valid_ledger_transition(LedgerState.DISCOVERED, LedgerState.PROCESSING)
+    assert valid_ledger_transition(LedgerState.PROCESSING, LedgerState.RETRYABLE)
+    assert valid_ledger_transition(LedgerState.COMMITTED, LedgerState.VERIFIED)
+    assert not valid_ledger_transition(LedgerState.VERIFIED, LedgerState.PROCESSING)
+    assert not valid_ledger_transition(LedgerState.PURGED, LedgerState.PROCESSING)
+
+
+def test_revisions_reject_mutable_or_incomplete_coordinates() -> None:
+    """Branches and abbreviated SHAs cannot enter the identity manifest."""
+    with pytest.raises(ValueError, match="complete 40-character"):
+        RepositoryRevision(repository="syvai/p1", revision="main")
+    with pytest.raises(ValueError, match="complete 40-character"):
+        RepositoryRevision(repository="syvai/p1", revision=AUDIO_REVISION[:-1])

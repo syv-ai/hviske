@@ -559,12 +559,49 @@ wheels = [
 ]
 
 [[package]]
+name = "ctc-segmentation"
+version = "1.7.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cython" },
+    { name = "numpy" },
+    { name = "setuptools" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f4/ed/78dd82e0b022ed4cb047188c0b8cead62fa0c27700737fd34e3263d83882/ctc_segmentation-1.7.4.tar.gz", hash = "sha256:19d383ea5f22438ebb1699d72b22078b63f351a33fa50bedb19c14077ba6a116", size = 73584, upload-time = "2022-10-11T19:25:00.575Z" }
+
+[[package]]
 name = "cycler"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a9/95/a3dbbb5028f35eafb79008e7522a75244477d2838f38cbb722248dabc2a8/cycler-0.12.1.tar.gz", hash = "sha256:88bb128f02ba341da8ef447245a9e138fae777f6a23943da4540077d3601eb1c", size = 7615, upload-time = "2023-10-07T05:32:18.335Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl", hash = "sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30", size = 8321, upload-time = "2023-10-07T05:32:16.783Z" },
+]
+
+[[package]]
+name = "cython"
+version = "3.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a9/d8/4981ef716ad0e3ff0d3ef383aefc6b03c4a88dee33b272bf8e0d833001ca/cython-3.3.0.tar.gz", hash = "sha256:eed0d93fbca7087f143b42c34b05a825849bdf17f101572c2105acfa49aa88b8", size = 3727515, upload-time = "2026-08-22T05:16:39.493Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/67/dffaf12b7203f7e936d98b967e065c50a7883f152c51ded44ed8762128f4/cython-3.3.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:ec09dbf73ff4f7be2b339b995fadae9c4bb517bbbed7ec11d6fe99c2092b48fd", size = 3134644, upload-time = "2026-08-22T05:16:59.112Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/f2/9dc6a3bad9c9d11bf31903321553820a661ce00319a57c4181bf0dcb87f4/cython-3.3.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:11e437f086affee8051cec4bb531be3edb646ab66e325154aa6849377f365033", size = 3346108, upload-time = "2026-08-22T05:17:01.082Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/9b/dd726d11b2aff24f0c3fa68ce9e3934097a058aca471a8cc9888aeae5471/cython-3.3.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e6035b5231a9316edc19d6415f4296fd1d0370e2a165a714b3edc167b9ca00e1", size = 3479260, upload-time = "2026-08-22T05:17:03.476Z" },
+    { url = "https://files.pythonhosted.org/packages/43/55/7408773fdadb2b3434501109696533555ba89f233366519c661372c69098/cython-3.3.0-cp311-cp311-win_amd64.whl", hash = "sha256:8566ea804cfc265f5e9dda71d1b716aa24ee4c3423a5da4b28a248a78c33e3f9", size = 2862883, upload-time = "2026-08-22T05:17:06.008Z" },
+    { url = "https://files.pythonhosted.org/packages/da/0f/95bad838a80ac52c9e982dad00bd9a0b2bad57fb4c688e5f53ac3ef65ff0/cython-3.3.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:03bc5333932f5dda3ba9315298ecdd21daa1b58410bb1f8ce04c78ec8337130a", size = 3143472, upload-time = "2026-08-22T05:17:07.956Z" },
+    { url = "https://files.pythonhosted.org/packages/91/8b/53d4a84de853b39940a0e35a6a2a9ed5f54cb05468daee95bc0fd1c2a178/cython-3.3.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7e321ae700995a16dc3055ada06ffb8d61e1a7434e5d0e811547a45ac1015ebd", size = 3258974, upload-time = "2026-08-22T05:17:09.908Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/4e/6b1c5a4e6bbe1726104de007aa2fdf01a3e2e386b4ec93c7be5f5085d53f/cython-3.3.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:428fafed98ea26927000a287b4dfc9ef07339f56656a5329a34eaa593f79a4f8", size = 3412225, upload-time = "2026-08-22T05:17:12.281Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/9b/cd724d91c500116769bdb853450a2197ba3d640dbbe3b02fc54ebdfdbd1b/cython-3.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:333449cc0350baedee5a6af27929eac8a71eac4ec59333c45ff476b33c6c660d", size = 2872123, upload-time = "2026-08-22T05:17:14.322Z" },
+    { url = "https://files.pythonhosted.org/packages/14/59/bc1a84b434cb5bebb0cd6f50da8f239d35a5c141b20fdeafc2817fd87778/cython-3.3.0-cp39-abi3-macosx_10_9_x86_64.whl", hash = "sha256:e0d2713d2b292c826bc21dc8732bd9e47628103aa3764180c881e04b3fef95dc", size = 3063660, upload-time = "2026-08-22T05:17:40.923Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/6d/542e32908fb421d88354f327ed6450e14240f9825d25393065bc65f4723f/cython-3.3.0-cp39-abi3-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:169e56fd411f4cd5bba51c82f8239421d547a846099db2b261e4aed48ba9f51f", size = 3358395, upload-time = "2026-08-22T05:17:43.036Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/7c/ddaf197bc65b581e1891657940bc4f7cb1f740e822115e828920b3a119ce/cython-3.3.0-cp39-abi3-manylinux2014_armv7l.manylinux_2_17_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:29f38ebafdf23e3da2516f40c4d065da38bfe002181bf93e2b8cf1262449aba6", size = 3041760, upload-time = "2026-08-22T05:17:44.907Z" },
+    { url = "https://files.pythonhosted.org/packages/19/a7/ae5ec3e34d43da846ed4c425734752d83aae0dae49feb929f09c90fc9afa/cython-3.3.0-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:75c4ae8a6d3a5ccf3cdaba8ab32e6a8d0cd38e3a476aa7ac12df8f8171a8d570", size = 3156152, upload-time = "2026-08-22T05:17:46.884Z" },
+    { url = "https://files.pythonhosted.org/packages/31/44/c60b601fc43f0b08e9d6f14b94e0dd02eb0ca8d60f46e242ace7191ac1be/cython-3.3.0-cp39-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:b94fb5613b9fe34c27d13ec9972dc0dcd2a2155db2902e93921cadc162610a38", size = 3046690, upload-time = "2026-08-22T05:17:48.731Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/9e/d735c26ed907563d3365534006acb263651c2d3b87fee804f7a483dd1714/cython-3.3.0-cp39-abi3-musllinux_1_2_i686.whl", hash = "sha256:c4558ba85849ab65dc57e10fd0efb13fabd9d3c09981a2566e18dec7cf47586a", size = 3373534, upload-time = "2026-08-22T05:17:50.7Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/e8/aa7b4f3a28d6e8117c76e2cf78a0df7a503486cdf7243c5b53200c9533a1/cython-3.3.0-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:311a016369adfd1e0015c4f9819168fc0e518451d7efb4435c30d65a3a26d52b", size = 3265110, upload-time = "2026-08-22T05:17:52.577Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/66/37892a8999d6bbd3f92d691a9701cb720c8ddd6171e16f5148eee6e8cb7f/cython-3.3.0-cp39-abi3-win32.whl", hash = "sha256:90869072e50b7c8904fe1dd7810321ae901fd5637a6eec6646ed9c57f9eb1081", size = 2587733, upload-time = "2026-08-22T05:17:54.547Z" },
+    { url = "https://files.pythonhosted.org/packages/19/a2/5f4d305cbd4489d21570e5491ad5c483c478cdab032853e2125c280e3bd5/cython-3.3.0-cp39-abi3-win_arm64.whl", hash = "sha256:dce56c26d388f00a19426371b6926bf2f77c5c03b71d5273e4556c68be98c2dd", size = 2608078, upload-time = "2026-08-22T05:17:56.386Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/77/67b0b24e45073a699610e50f00c18474ff9b09ea29ecc95083bdf5e60acd/cython-3.3.0-py3-none-any.whl", hash = "sha256:9b24b5c8cd536946b62086fcafee6d5509d3f549f72d553d2336af87ffbe0da1", size = 1349151, upload-time = "2026-08-22T05:16:36.741Z" },
 ]
 
 [[package]]
@@ -1151,6 +1188,7 @@ source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "click" },
+    { name = "ctc-segmentation" },
     { name = "datasets" },
     { name = "deepspeed" },
     { name = "hydra-core" },
@@ -1162,6 +1200,7 @@ dependencies = [
     { name = "progress" },
     { name = "pycountry" },
     { name = "pyctcdecode" },
+    { name = "pydantic" },
     { name = "pydub" },
     { name = "pysubs2" },
     { name = "python-dotenv", version = "1.2.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1169,6 +1208,7 @@ dependencies = [
     { name = "requests" },
     { name = "safetensors" },
     { name = "sentencepiece" },
+    { name = "silero-vad" },
     { name = "soundfile" },
     { name = "torch-audiomentations" },
     { name = "torchaudio" },
@@ -1213,6 +1253,7 @@ quality = [
 requires-dist = [
     { name = "accelerate", specifier = ">=1.9.0" },
     { name = "click", specifier = ">=8.2.1" },
+    { name = "ctc-segmentation", specifier = "==1.7.4" },
     { name = "datasets", specifier = ">=3.6.0,<4.0.0" },
     { name = "deepspeed", specifier = ">=0.17.4" },
     { name = "gradio", marker = "extra == 'demo'", specifier = ">=5.31.0" },
@@ -1228,6 +1269,7 @@ requires-dist = [
     { name = "punctfix", marker = "extra == 'demo'", specifier = ">=0.11.1" },
     { name = "pycountry", specifier = ">=24.6.1" },
     { name = "pyctcdecode", specifier = ">=0.5.0" },
+    { name = "pydantic", specifier = ">=2.0" },
     { name = "pydub", specifier = ">=0.25.1" },
     { name = "pysubs2", specifier = ">=1.8.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
@@ -1235,6 +1277,7 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.7.0" },
     { name = "samplerate", marker = "extra == 'demo'", specifier = ">=0.2.2" },
     { name = "sentencepiece", specifier = ">=0.2.2" },
+    { name = "silero-vad", specifier = ">=6.2.1" },
     { name = "soundfile", specifier = ">=0.13.1" },
     { name = "torch-audiomentations", specifier = ">=0.12.0" },
     { name = "torchaudio", specifier = ">=2.6.0,<2.7.0" },
@@ -3275,6 +3318,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/58/15/8b3609fd3830ef7b27b655beb4b4e9c62313a4e8da8c676e142cc210d58e/shellingham-1.5.4.tar.gz", hash = "sha256:8dbca0739d487e5bd35ab3ca4b36e11c4078f3a234bfce294b0a0291363404de", size = 10310, upload-time = "2023-10-24T04:13:40.426Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e0/f9/0595336914c5619e5f28a1fb793285925a8cd4b432c9da0a987836c7f822/shellingham-1.5.4-py2.py3-none-any.whl", hash = "sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686", size = 9755, upload-time = "2023-10-24T04:13:38.866Z" },
+]
+
+[[package]]
+name = "silero-vad"
+version = "6.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+    { name = "torch" },
+    { name = "torchaudio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/32/d3/e31f526482782764aa4f70e20fd4545cf2e4a81a60b6fb0f089f6d107991/silero_vad-6.2.1.tar.gz", hash = "sha256:b23062b0e39fad17b1266fc23c1e7b4290219dbe82ce08510889e32f681f4b3b", size = 28913811, upload-time = "2026-02-24T08:41:59.329Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0b/2b/48566f29a8b53d856ceb1994f209122749b3fda0a733a07e82047257de7a/silero_vad-6.2.1-py3-none-any.whl", hash = "sha256:09de93c4d874bb19c53e62a47dd38be5f163cedad2b5599583231f2a84ef79cb", size = 9146242, upload-time = "2026-02-24T08:41:56.955Z" },
 ]
 
 [[package]]
