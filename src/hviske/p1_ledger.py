@@ -1,0 +1,1304 @@
+"""Crash-safe metadata ledger for the Phase 1 P1 segmentation pipeline.
+
+The ledger deliberately stores identities, counters and checksums, never source
+content.  Paths in the database are publication-relative paths; local scratch
+paths are supplied to reconciliation calls and are not persisted.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import cast
+
+from .p1_contracts import (
+    BatchEvidence,
+    ContractModel,
+    LedgerState,
+    RejectionCategory,
+    ShardEvidence,
+    valid_ledger_transition,
+)
+
+_SCHEMA_VERSION = 1
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_FORBIDDEN_KEYS = {
+    "access_token",
+    "api_key",
+    "audio_bytes",
+    "auth",
+    "credential",
+    "credentials",
+    "full_transcript",
+    "hf_token",
+    "password",
+    "secret",
+    "text",
+    "text_corpus",
+    "token",
+    "transcript",
+    "transcript_text",
+    "waveform",
+}
+_FORBIDDEN_PATH_PARTS = {".cache", "cache", "scratch", "tmp"}
+
+
+@dataclass(frozen=True)
+class BatchRecord:
+    """Metadata and durable evidence for one bounded publication batch."""
+
+    batch_id: str
+    state: LedgerState
+    pipeline_digest: str
+    commit_id: str | None
+    attempts: int
+    programme_count: int
+    row_count: int
+    rejection_counts: dict[str, int]
+    duration_ms: int | None
+    verification_time: str | None
+    purge_time: str | None
+    publication_artifact_purged_at: str | None
+    publication_artifact_purge_evidence: dict[str, object]
+    remote_checked_at: str | None
+    remote_present: bool | None
+    last_error: str | None
+
+
+class LedgerError(RuntimeError):
+    """Base class for ledger errors."""
+
+
+class EvidenceError(LedgerError):
+    """Raised when evidence would violate the metadata-only ledger contract."""
+
+
+class InvalidTransition(LedgerError):
+    """Raised when a requested state transition is not allowed."""
+
+
+@dataclass(frozen=True)
+class ProgrammeRecord:
+    """Metadata and durable evidence for one source programme."""
+
+    programme_id: str
+    source_file_id: str
+    state: LedgerState
+    source_revisions: dict[str, object]
+    pipeline_digest: str
+    attempts: int
+    accepted_count: int
+    rejected_count: int
+    source_duration_ms: int | None
+    processed_duration_ms: int | None
+    commit_id: str | None
+    rejection_counts: dict[str, int]
+    source_temp_purged_at: str | None
+    source_temp_purge_evidence: dict[str, object]
+    verification_time: str | None
+    purge_time: str | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class ShardRecord:
+    """Metadata and checksum evidence for one local or published shard."""
+
+    shard_id: str
+    programme_id: str | None
+    batch_id: str | None
+    state: LedgerState
+    path: str
+    byte_size: int
+    row_count: int
+    sha256: str
+    verification_time: str | None
+    purge_time: str | None
+
+
+class Ledger:
+    """SQLite-backed, restart-safe ledger.
+
+    Args:
+        path:
+            SQLite database path.  ``":memory:"`` is useful for tests.
+        reset_processing:
+            Reset processing rows when opening the database.  This is enabled by
+            default because a new connection represents a restarted worker.
+    """
+
+    def __init__(self, path: str | Path, *, reset_processing: bool = True) -> None:
+        """Open or create a durable ledger.
+
+        Args:
+            path:
+                SQLite database path.
+            reset_processing (optional):
+                Whether to reset processing rows on open. Defaults to True.
+        """
+        self.path = Path(path) if str(path) != ":memory:" else Path(":memory:")
+        database = str(path)
+        self._connection = sqlite3.connect(database, isolation_level=None, timeout=30)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 30000")
+        if database != ":memory:":
+            self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("PRAGMA synchronous = FULL")
+        self._migrate()
+        if reset_processing:
+            self.reset_abandoned_processing()
+
+    def __enter__(self) -> Ledger:
+        """Return this ledger for a context-managed session."""
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: object | None,
+    ) -> None:
+        """Close the ledger after leaving a context-managed session."""
+        self.close()
+
+    def close(self) -> None:
+        """Close the database connection."""
+        self._connection.close()
+
+    def discover_programme(
+        self,
+        programme_id: str,
+        *,
+        source_file_id: str,
+        source_revisions: ContractModel | Mapping[str, object],
+        pipeline_digest: str,
+        source_duration_ms: int | None = None,
+    ) -> ProgrammeRecord:
+        """Alias for :meth:`register_programme` used by discovery workers.
+
+        Returns:
+            The resulting programme record.
+        """
+        return self.register_programme(
+            programme_id,
+            source_file_id=source_file_id,
+            source_revisions=source_revisions,
+            pipeline_digest=pipeline_digest,
+            source_duration_ms=source_duration_ms,
+        )
+
+    def register_programme(
+        self,
+        programme_id: str,
+        *,
+        source_file_id: str,
+        source_revisions: ContractModel | Mapping[str, object],
+        pipeline_digest: str,
+        source_duration_ms: int | None = None,
+    ) -> ProgrammeRecord:
+        """Register a discovered programme idempotently.
+
+        Source revisions are serialised as contract metadata. Transcript and
+        audio payloads are rejected before SQLite is touched.
+
+        Returns:
+            The resulting programme record.
+
+        Raises:
+            EvidenceError:
+                If identity or metadata is invalid.
+        """
+        self._validate_identifier(programme_id, "programme_id")
+        self._validate_identifier(source_file_id, "source_file_id")
+        self._validate_digest(pipeline_digest, "pipeline_digest")
+        self._validate_nonnegative(source_duration_ms, "source_duration_ms")
+        revisions = self._metadata_json(source_revisions)
+        now = self._now()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM programmes WHERE programme_id = ?", (programme_id,)
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO programmes (
+                        programme_id, source_file_id, state, source_revisions,
+                        pipeline_digest, source_duration_ms, discovered_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        programme_id,
+                        source_file_id,
+                        LedgerState.DISCOVERED.value,
+                        revisions,
+                        pipeline_digest,
+                        source_duration_ms,
+                        now,
+                        now,
+                    ),
+                )
+            elif (
+                existing["source_file_id"] != source_file_id
+                or existing["source_revisions"] != revisions
+                or existing["pipeline_digest"] != pipeline_digest
+            ):
+                raise EvidenceError("programme identity differs from the ledger")
+        return self.programme(programme_id)
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run a caller-supplied group of writes as one durable transaction.
+
+        Yields:
+            The active SQLite connection.
+        """
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._connection
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+            self._sync_database()
+
+    def purge_programme(
+        self, programme_id: str, *, evidence: Mapping[str, object] | None = None
+    ) -> ProgrammeRecord:
+        """Record source-temporary deletion and finish a programme.
+
+        Returns:
+            The resulting programme record.
+        """
+        self.mark_source_temps_purged(programme_id, evidence=evidence)
+        return self.transition_programme(programme_id, LedgerState.PURGED)
+
+    def mark_source_temps_purged(
+        self, programme_id: str, *, evidence: Mapping[str, object] | None = None
+    ) -> ProgrammeRecord:
+        """Record deletion of source/alignment temporary data, without paths.
+
+        Returns:
+            The resulting programme record.
+
+        Raises:
+            InvalidTransition:
+                If local shards are not yet recoverable.
+        """
+        safe_evidence = self._metadata_json(evidence or {})
+        now = self._now()
+        with self.transaction() as connection:
+            programme = self._require_row(
+                connection, "programmes", "programme_id", programme_id
+            )
+            if programme["state"] not in {
+                LedgerState.SHARDED.value,
+                LedgerState.COMMITTED.value,
+                LedgerState.VERIFIED.value,
+                LedgerState.PURGED.value,
+            }:
+                raise InvalidTransition("source temporaries require recoverable shards")
+            connection.execute(
+                """UPDATE programmes SET source_temp_purged_at = ?,
+                source_temp_purge_evidence = ?, updated_at = ?
+                WHERE programme_id = ?""",
+                (now, safe_evidence, now, programme_id),
+            )
+        return self.programme(programme_id)
+
+    def transition_programme(
+        self,
+        programme_id: str,
+        target: LedgerState,
+        *,
+        evidence: Mapping[str, object] | None = None,
+        **fields: object,
+    ) -> ProgrammeRecord:
+        """Atomically transition a programme and persist its evidence.
+
+        Returns:
+            The resulting programme record.
+        """
+        combined = self._fields_from_evidence(evidence, fields)
+        return cast(
+            ProgrammeRecord,
+            self._transition(
+                table="programmes",
+                identifier_column="programme_id",
+                identifier=programme_id,
+                target=target,
+                evidence=evidence,
+                fields=combined,
+            ),
+        )
+
+    def register_shard(
+        self,
+        shard_id: str,
+        *,
+        path: str,
+        sha256: str,
+        byte_size: int,
+        row_count: int,
+        programme_id: str | None = None,
+        batch_id: str | None = None,
+        state: LedgerState = LedgerState.SHARDED,
+    ) -> ShardRecord:
+        """Register a complete shard using only publication-relative metadata.
+
+        Returns:
+            The resulting shard record.
+
+        Raises:
+            EvidenceError:
+                If the path, digest, or evidence is unsafe.
+        """
+        self._validate_identifier(shard_id, "shard_id")
+        safe_path = self._publication_path(path)
+        self._validate_digest(sha256, "sha256")
+        self._validate_nonnegative(byte_size, "byte_size")
+        self._validate_nonnegative(row_count, "row_count")
+        if state not in {LedgerState.DISCOVERED, LedgerState.SHARDED}:
+            raise EvidenceError("new shards must be discovered or sharded")
+        with self.transaction() as connection:
+            if programme_id is not None:
+                self._require_row(
+                    connection, "programmes", "programme_id", programme_id
+                )
+            if batch_id is not None:
+                self._require_row(connection, "batches", "batch_id", batch_id)
+            existing = connection.execute(
+                "SELECT * FROM shards WHERE shard_id = ?", (shard_id,)
+            ).fetchone()
+            values = (
+                programme_id,
+                batch_id,
+                state.value,
+                safe_path,
+                byte_size,
+                row_count,
+                sha256,
+            )
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO shards (
+                        shard_id, programme_id, batch_id, state, path, byte_size,
+                        row_count, sha256, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (shard_id, *values, self._now(), self._now()),
+                )
+            elif (
+                tuple(
+                    existing[key]
+                    for key in ("path", "byte_size", "row_count", "sha256")
+                )
+                != values[3:]
+            ):
+                if existing["state"] in {
+                    LedgerState.VERIFIED.value,
+                    LedgerState.PURGED.value,
+                }:
+                    raise EvidenceError("a verified shard path is immutable")
+                raise EvidenceError("shard evidence differs from the ledger")
+        return self.shard(shard_id)
+
+    def reject_programme(
+        self,
+        programme_id: str,
+        *,
+        reason: RejectionCategory | str,
+        accepted_count: int = 0,
+        rejected_count: int = 1,
+    ) -> ProgrammeRecord:
+        """Permanently reject a programme with a counted reason.
+
+        Returns:
+            The resulting programme record.
+        """
+        category = self._rejection_category(reason)
+        return self.transition_programme(
+            programme_id,
+            LedgerState.REJECTED,
+            rejection_counts={category: rejected_count},
+            accepted_count=accepted_count,
+            rejected_count=rejected_count,
+            last_error=category,
+        )
+
+    @property
+    def schema_version(self) -> int:
+        """Expose the current on-disk schema version."""
+        return int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+
+    def start_processing(self, programme_id: str) -> ProgrammeRecord:
+        """Move a programme to processing and increment its attempt count.
+
+        Returns:
+            The resulting programme record.
+        """
+        return self.transition_programme(programme_id, LedgerState.PROCESSING)
+
+    record_shard = register_shard
+    create_shard = register_shard
+
+    def register_batch(
+        self, batch_id: str, *, pipeline_digest: str, duration_ms: int | None = None
+    ) -> BatchRecord:
+        """Register an empty bounded publication batch idempotently.
+
+        Returns:
+            The resulting batch record.
+
+        Raises:
+            EvidenceError:
+                If the batch identity is invalid.
+        """
+        self._validate_identifier(batch_id, "batch_id")
+        self._validate_digest(pipeline_digest, "pipeline_digest")
+        self._validate_nonnegative(duration_ms, "duration_ms")
+        now = self._now()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO batches (
+                        batch_id, state, pipeline_digest, duration_ms, created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        batch_id,
+                        LedgerState.DISCOVERED.value,
+                        pipeline_digest,
+                        duration_ms,
+                        now,
+                        now,
+                    ),
+                )
+            elif existing["pipeline_digest"] != pipeline_digest:
+                raise EvidenceError("batch pipeline digest differs from the ledger")
+        return self.batch(batch_id)
+
+    def transition_shard(
+        self,
+        shard_id: str,
+        target: LedgerState,
+        *,
+        evidence: Mapping[str, object] | None = None,
+        **fields: object,
+    ) -> ShardRecord:
+        """Atomically transition a shard.
+
+        Returns:
+            The resulting shard record.
+        """
+        combined = self._fields_from_evidence(evidence, fields)
+        return cast(
+            ShardRecord,
+            self._transition(
+                table="shards",
+                identifier_column="shard_id",
+                identifier=shard_id,
+                target=target,
+                evidence=evidence,
+                fields=combined,
+            ),
+        )
+
+    create_batch = register_batch
+
+    def attach_shard(self, batch_id: str, shard_id: str) -> BatchRecord:
+        """Attach a registered shard and refresh batch counts atomically.
+
+        Returns:
+            The resulting batch record.
+
+        Raises:
+            EvidenceError:
+                If the shard belongs to another pipeline or batch.
+            InvalidTransition:
+                If the batch has already been committed.
+        """
+        with self.transaction() as connection:
+            batch = self._require_row(connection, "batches", "batch_id", batch_id)
+            shard = self._require_row(connection, "shards", "shard_id", shard_id)
+            if shard["programme_id"] is not None:
+                programme = self._require_row(
+                    connection, "programmes", "programme_id", shard["programme_id"]
+                )
+                if programme["pipeline_digest"] != batch["pipeline_digest"]:
+                    raise EvidenceError(
+                        "shard programme uses a different pipeline digest"
+                    )
+            if batch["state"] not in {
+                LedgerState.DISCOVERED.value,
+                LedgerState.PROCESSING.value,
+                LedgerState.SHARDED.value,
+            }:
+                raise InvalidTransition("shards cannot be attached after commit")
+            if shard["batch_id"] not in (None, batch_id):
+                raise EvidenceError("shard already belongs to another batch")
+            connection.execute(
+                "UPDATE shards SET batch_id = ?, updated_at = ? WHERE shard_id = ?",
+                (batch_id, self._now(), shard_id),
+            )
+            self._refresh_batch_counts(connection, batch_id)
+        return self.batch(batch_id)
+
+    def purge_batch(
+        self, batch_id: str, *, evidence: Mapping[str, object] | None = None
+    ) -> BatchRecord:
+        """Record verified publication deletion and finish a batch.
+
+        Returns:
+            The resulting batch record.
+        """
+        self.mark_publication_artifacts_purged(batch_id, evidence=evidence)
+        return self.transition_batch(batch_id, LedgerState.PURGED)
+
+    def mark_publication_artifacts_purged(
+        self, batch_id: str, *, evidence: Mapping[str, object] | None = None
+    ) -> BatchRecord:
+        """Record deletion of local publication artefacts separately from sources.
+
+        Returns:
+            The resulting batch record.
+
+        Raises:
+            InvalidTransition:
+                If remote verification has not completed.
+        """
+        now = self._now()
+        with self.transaction() as connection:
+            batch = self._require_row(connection, "batches", "batch_id", batch_id)
+            if batch["state"] != LedgerState.VERIFIED.value:
+                raise InvalidTransition(
+                    "publication artefacts require remote verification"
+                )
+            safe_evidence = (
+                batch["publication_artifact_purge_evidence"]
+                if evidence is None
+                else self._metadata_json(evidence)
+            )
+            connection.execute(
+                """UPDATE batches SET publication_artifact_purged_at = ?,
+                publication_artifact_purge_evidence = ?, updated_at = ?
+                WHERE batch_id = ?""",
+                (now, safe_evidence, now, batch_id),
+            )
+        return self.batch(batch_id)
+
+    def transition_batch(
+        self,
+        batch_id: str,
+        target: LedgerState,
+        *,
+        evidence: Mapping[str, object] | None = None,
+        commit_id: str | None = None,
+        **fields: object,
+    ) -> BatchRecord:
+        """Atomically transition a batch and persist publication evidence.
+
+        Returns:
+            The resulting batch record.
+        """
+        combined = self._fields_from_evidence(evidence, fields)
+        if commit_id is not None:
+            self._validate_commit(commit_id)
+            combined["commit_id"] = commit_id
+        return cast(
+            BatchRecord,
+            self._transition(
+                table="batches",
+                identifier_column="batch_id",
+                identifier=batch_id,
+                target=target,
+                evidence=evidence,
+                fields=combined,
+            ),
+        )
+
+    def reconcile_committed_batch(
+        self, batch_id: str, remote_commit_exists: object
+    ) -> bool:
+        """Ask a remote store whether a committed batch already exists.
+
+        The hook receives ``(commit_id, publication_paths)`` and must return a
+        boolean. A missing commit makes the batch retryable; a present commit is
+        left committed for the normal verification step.
+
+        Returns:
+            Whether the immutable remote commit exists.
+
+        Raises:
+            InvalidTransition:
+                If the batch is not committed.
+            TypeError:
+                If the hook is not callable.
+        """
+        if not callable(remote_commit_exists):
+            raise TypeError("remote_commit_exists must be callable")
+        record = self.batch(batch_id)
+        if record.state != LedgerState.COMMITTED or record.commit_id is None:
+            raise InvalidTransition("only committed batches have remote reconciliation")
+        paths = tuple(shard.path for shard in self.shards(batch_id))
+        hook = cast(Callable[[str, tuple[str, ...]], bool], remote_commit_exists)
+        present = bool(hook(record.commit_id, paths))
+        now = self._now()
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE batches SET remote_checked_at = ?, remote_present = ?,
+                updated_at = ? WHERE batch_id = ?""",
+                (now, int(present), now, batch_id),
+            )
+        if not present:
+            self.transition_batch(
+                batch_id,
+                LedgerState.RETRYABLE,
+                last_error="remote commit was not found",
+            )
+        return present
+
+    reconcile_remote = reconcile_committed_batch
+
+    def reconcile_local_shard(self, shard_id: str, local_path: str | Path) -> bool:
+        """Return whether a local shard exactly matches its durable digest.
+
+        Returns:
+            True only for a regular, non-symlink file with matching size and digest.
+        """
+        shard = self.shard(shard_id)
+        candidate = Path(local_path)
+        if not candidate.is_file() or candidate.is_symlink():
+            return False
+        digest = hashlib.sha256()
+        size = 0
+        with candidate.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+        return size == shard.byte_size and digest.hexdigest() == shard.sha256
+
+    local_shard_matches = reconcile_local_shard
+
+    def programme(self, programme_id: str) -> ProgrammeRecord:
+        """Return one programme record."""
+        row = self._fetch("programmes", "programme_id", programme_id)
+        return self._programme_record(row)
+
+    def reset_abandoned_processing(self) -> int:
+        """Reset all processing rows, as a newly opened ledger is a restart.
+
+        Returns:
+            The number of rows reset.
+        """
+        now = self._now()
+        with self.transaction() as connection:
+            total = 0
+            for table in ("programmes", "batches"):
+                cursor = connection.execute(
+                    f"""UPDATE {table} SET state = ?, last_error = ?,
+                    processing_started_at = NULL, updated_at = ?
+                    WHERE state = ?""",
+                    (
+                        LedgerState.RETRYABLE.value,
+                        "abandoned processing reset",
+                        now,
+                        LedgerState.PROCESSING.value,
+                    ),
+                )
+                total += cursor.rowcount
+            cursor = connection.execute(
+                """UPDATE shards SET state = ?, last_error = ?, updated_at = ?
+                WHERE state = ?""",
+                (
+                    LedgerState.RETRYABLE.value,
+                    "abandoned processing reset",
+                    now,
+                    LedgerState.PROCESSING.value,
+                ),
+            )
+            total += cursor.rowcount
+        return total
+
+    get_programme = programme
+
+    def shard(self, shard_id: str) -> ShardRecord:
+        """Return one shard record."""
+        row = self._fetch("shards", "shard_id", shard_id)
+        return self._shard_record(row)
+
+    get_shard = shard
+
+    def batch(self, batch_id: str) -> BatchRecord:
+        """Return one batch record."""
+        row = self._fetch("batches", "batch_id", batch_id)
+        return self._batch_record(row)
+
+    get_batch = batch
+
+    @staticmethod
+    def _fields_from_evidence(
+        evidence: Mapping[str, object] | None, fields: Mapping[str, object]
+    ) -> dict[str, object]:
+        combined = dict(fields)
+        if evidence is not None:
+            for key in (
+                "accepted_count",
+                "rejected_count",
+                "source_duration_ms",
+                "processed_duration_ms",
+                "duration_ms",
+                "rejection_counts",
+                "commit_id",
+                "last_error",
+            ):
+                if key in evidence and key not in combined:
+                    combined[key] = evidence[key]
+        return combined
+
+    def _migrate(self) -> None:
+        with self.transaction() as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > _SCHEMA_VERSION:
+                raise LedgerError("ledger schema is newer than this package")
+            if version < 1:
+                connection.execute(
+                    """CREATE TABLE programmes (
+                        programme_id TEXT PRIMARY KEY,
+                        source_file_id TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        source_revisions TEXT NOT NULL,
+                        pipeline_digest TEXT NOT NULL,
+                        commit_id TEXT,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        accepted_count INTEGER NOT NULL DEFAULT 0,
+                        rejected_count INTEGER NOT NULL DEFAULT 0,
+                        source_duration_ms INTEGER,
+                        processed_duration_ms INTEGER,
+                        rejection_counts TEXT NOT NULL DEFAULT '{}',
+                        processing_started_at TEXT,
+                        discovered_at TEXT NOT NULL,
+                        verification_time TEXT,
+                        purge_time TEXT,
+                        source_temp_purged_at TEXT,
+                        source_temp_purge_evidence TEXT NOT NULL DEFAULT '{}',
+                        last_evidence TEXT NOT NULL DEFAULT '{}',
+                        last_error TEXT,
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    """CREATE TABLE batches (
+                        batch_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        pipeline_digest TEXT NOT NULL,
+                        commit_id TEXT,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        programme_count INTEGER NOT NULL DEFAULT 0,
+                        row_count INTEGER NOT NULL DEFAULT 0,
+                        rejection_counts TEXT NOT NULL DEFAULT '{}',
+                        duration_ms INTEGER,
+                        processing_started_at TEXT,
+                        verification_time TEXT,
+                        purge_time TEXT,
+                        publication_artifact_purged_at TEXT,
+                        publication_artifact_purge_evidence TEXT NOT NULL DEFAULT '{}',
+                        remote_checked_at TEXT,
+                        remote_present INTEGER,
+                        last_evidence TEXT NOT NULL DEFAULT '{}',
+                        last_error TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    """CREATE TABLE shards (
+                        shard_id TEXT PRIMARY KEY,
+                        programme_id TEXT REFERENCES programmes(programme_id),
+                        batch_id TEXT REFERENCES batches(batch_id),
+                        state TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        byte_size INTEGER NOT NULL,
+                        row_count INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        verification_time TEXT,
+                        purge_time TEXT,
+                        last_evidence TEXT NOT NULL DEFAULT '{}',
+                        last_error TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    "CREATE INDEX shards_batch ON shards(batch_id, shard_id)"
+                )
+                connection.execute("CREATE INDEX programmes_state ON programmes(state)")
+                connection.execute("CREATE INDEX batches_state ON batches(state)")
+                connection.execute("PRAGMA user_version = 1")
+
+    @staticmethod
+    def _publication_path(value: str) -> str:
+        if not isinstance(value, str) or not value or "\\" in value:
+            raise EvidenceError("shard paths must be non-empty POSIX relative paths")
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise EvidenceError("shard paths must be publication-relative")
+        if any(part.lower() in _FORBIDDEN_PATH_PARTS for part in path.parts):
+            raise EvidenceError("machine or cache paths are not allowed")
+        return path.as_posix()
+
+    def _refresh_batch_counts(
+        self, connection: sqlite3.Connection, batch_id: str
+    ) -> None:
+        row = connection.execute(
+            """SELECT COUNT(DISTINCT programme_id), COALESCE(SUM(row_count), 0)
+            FROM shards WHERE batch_id = ?""",
+            (batch_id,),
+        ).fetchone()
+        connection.execute(
+            """UPDATE batches SET programme_count = ?, row_count = ?, updated_at = ?
+            WHERE batch_id = ?""",
+            (row[0], row[1], self._now(), batch_id),
+        )
+
+    @staticmethod
+    def _now() -> str:
+        return dt.datetime.now(dt.UTC).isoformat(timespec="microseconds")
+
+    def _sync_database(self) -> None:
+        if self.path == Path(":memory:"):
+            return
+        for filename in (self.path, Path(f"{self.path}-wal")):
+            try:
+                descriptor = os.open(filename, os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def _transition(
+        self,
+        *,
+        table: str,
+        identifier_column: str,
+        identifier: str,
+        target: LedgerState,
+        evidence: Mapping[str, object] | None,
+        fields: Mapping[str, object],
+    ) -> ProgrammeRecord | ShardRecord | BatchRecord:
+        safe_evidence = self._metadata_json(evidence or {})
+        now = self._now()
+        with self.transaction() as connection:
+            row = self._require_row(connection, table, identifier_column, identifier)
+            current = LedgerState(row["state"])
+            if current == target:
+                return self._record_for_table(table, row)
+            if not valid_ledger_transition(current, target):
+                raise InvalidTransition(
+                    f"{current.value} -> {target.value} is not allowed"
+                )
+            updates: dict[str, object] = {"state": target.value, "updated_at": now}
+            if table == "programmes":
+                updates.update(
+                    self._programme_updates(target, row, fields, safe_evidence, now)
+                )
+            elif table == "shards":
+                updates.update(self._shard_updates(target, fields, safe_evidence, now))
+            else:
+                updates.update(
+                    self._batch_updates(target, row, fields, safe_evidence, now)
+                )
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            connection.execute(
+                f"UPDATE {table} SET {assignments} WHERE {identifier_column} = ?",
+                (*updates.values(), identifier),
+            )
+        return self._record_for_table(
+            table, self._fetch(table, identifier_column, identifier)
+        )
+
+    def _batch_updates(
+        self,
+        target: LedgerState,
+        row: sqlite3.Row,
+        fields: Mapping[str, object],
+        evidence: str,
+        now: str,
+    ) -> dict[str, object]:
+        updates = self._common_updates(
+            fields,
+            evidence,
+            allowed_keys={"duration_ms", "rejection_counts", "commit_id", "last_error"},
+        )
+        if target in {LedgerState.COMMITTED, LedgerState.VERIFIED, LedgerState.PURGED}:
+            attached = self._connection.execute(
+                "SELECT COUNT(*) FROM shards WHERE batch_id = ?", (row["batch_id"],)
+            ).fetchone()[0]
+            if attached == 0:
+                raise EvidenceError("committed batches require at least one shard")
+            commit_id = fields.get("commit_id", row["commit_id"])
+            if not isinstance(commit_id, str) or not _COMMIT_RE.fullmatch(commit_id):
+                raise EvidenceError("committed batches require a complete commit SHA")
+        if target == LedgerState.PROCESSING:
+            updates["attempts"] = int(row["attempts"]) + 1
+            updates["processing_started_at"] = now
+        if target == LedgerState.RETRYABLE:
+            updates["commit_id"] = None
+        if target == LedgerState.COMMITTED:
+            updates["remote_checked_at"] = None
+            updates["remote_present"] = None
+        if target == LedgerState.VERIFIED:
+            updates["verification_time"] = now
+        if target == LedgerState.PURGED:
+            updates["purge_time"] = now
+        return updates
+
+    @staticmethod
+    def _common_updates(
+        fields: Mapping[str, object], evidence: str, *, allowed_keys: set[str]
+    ) -> dict[str, object]:
+        allowed = {
+            "accepted_count": "accepted_count",
+            "rejected_count": "rejected_count",
+            "source_duration_ms": "source_duration_ms",
+            "processed_duration_ms": "processed_duration_ms",
+            "duration_ms": "duration_ms",
+            "rejection_counts": "rejection_counts",
+            "commit_id": "commit_id",
+            "last_error": "last_error",
+        }
+        updates: dict[str, object] = {"last_evidence": evidence}
+        for key, column in allowed.items():
+            if key not in allowed_keys or key not in fields:
+                continue
+            value = fields[key]
+            if (
+                key.endswith("_count")
+                or key.endswith("_duration_ms")
+                or key == "duration_ms"
+            ):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise EvidenceError(f"{key} must be a non-negative integer")
+            if key == "rejection_counts":
+                value = Ledger._rejection_counts(value)
+            if key == "commit_id":
+                Ledger._validate_commit(cast(str, value))
+            if key == "last_error" and value is not None and not isinstance(value, str):
+                raise EvidenceError("last_error must be text")
+            updates[column] = value
+        return updates
+
+    @staticmethod
+    def _rejection_counts(value: object) -> str:
+        if not isinstance(value, Mapping):
+            raise EvidenceError("rejection_counts must be a mapping")
+        counts: dict[str, int] = {}
+        for key, count in value.items():
+            if not isinstance(key, (str, RejectionCategory)):
+                raise EvidenceError("rejection categories must be strings")
+            category = Ledger._rejection_category(
+                key.value if isinstance(key, RejectionCategory) else key
+            )
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise EvidenceError("rejection counts must be non-negative integers")
+            counts[category] = count
+        return json.dumps(counts, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _rejection_category(value: RejectionCategory | str) -> str:
+        try:
+            return RejectionCategory(value).value
+        except ValueError as error:
+            raise EvidenceError(f"unknown rejection category: {value!r}") from error
+
+    @staticmethod
+    def _validate_commit(value: object) -> None:
+        if not isinstance(value, str) or not _COMMIT_RE.fullmatch(value):
+            raise EvidenceError("commit_id must be a complete 40-character commit SHA")
+
+    def _fetch(self, table: str, column: str, value: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            f"SELECT * FROM {table} WHERE {column} = ?", (value,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown {table[:-1]} {value!r}")
+        return row
+
+    @staticmethod
+    def _metadata_json(value: object) -> str:
+        if isinstance(value, ContractModel):
+            serialisable = Ledger._metadata_value(value.model_dump(mode="json"))
+        elif isinstance(value, Mapping):
+            serialisable = Ledger._metadata_value(value)
+        elif value is None:
+            serialisable = {}
+        else:
+            raise EvidenceError("evidence must be a mapping or contract")
+        Ledger._validate_metadata(serialisable)
+        try:
+            return json.dumps(serialisable, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as error:
+            raise EvidenceError("evidence is not JSON metadata") from error
+
+    @staticmethod
+    def _metadata_value(value: object) -> object:
+        if isinstance(value, ContractModel):
+            return Ledger._metadata_value(value.model_dump(mode="json"))
+        if isinstance(value, Mapping):
+            converted: dict[str, object] = {}
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise EvidenceError("metadata keys must be strings")
+                converted[key] = Ledger._metadata_value(child)
+            return converted
+        if isinstance(value, (list, tuple)):
+            return [Ledger._metadata_value(child) for child in value]
+        return value
+
+    @staticmethod
+    def _validate_metadata(value: object, key: str = "") -> None:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raise EvidenceError("audio or binary payloads are not allowed")
+        if isinstance(value, Mapping):
+            for raw_key, child in value.items():
+                if not isinstance(raw_key, str):
+                    raise EvidenceError("metadata keys must be strings")
+                normalised = raw_key.lower().replace("-", "_")
+                if normalised in _FORBIDDEN_KEYS:
+                    raise EvidenceError(f"metadata field {raw_key!r} is not permitted")
+                Ledger._validate_metadata(child, normalised)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                Ledger._validate_metadata(child, key)
+        elif isinstance(value, str):
+            lowered = value.lower()
+            if "bearer " in lowered or re.search(r"\bhf_[a-z0-9]{20,}\b", lowered):
+                raise EvidenceError("credentials are not allowed in metadata")
+            if (
+                key == "path"
+                or key.endswith(("_path", "_dir", "_file"))
+                or "cache" in key
+                or "scratch" in key
+            ) and Ledger._looks_like_local_path(value):
+                raise EvidenceError("machine or cache paths are not allowed")
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise EvidenceError("metadata numbers must be finite")
+        elif value is not None and not isinstance(value, (bool, int, float)):
+            raise EvidenceError("metadata must contain JSON-compatible values")
+
+    @staticmethod
+    def _looks_like_local_path(value: str) -> bool:
+        path = Path(value)
+        return path.is_absolute() or any(
+            part.lower() in _FORBIDDEN_PATH_PARTS for part in path.parts
+        )
+
+    def _programme_updates(
+        self,
+        target: LedgerState,
+        row: sqlite3.Row,
+        fields: Mapping[str, object],
+        evidence: str,
+        now: str,
+    ) -> dict[str, object]:
+        updates = self._common_updates(
+            fields,
+            evidence,
+            allowed_keys={
+                "accepted_count",
+                "rejected_count",
+                "source_duration_ms",
+                "processed_duration_ms",
+                "rejection_counts",
+                "commit_id",
+                "last_error",
+            },
+        )
+        if target in {LedgerState.COMMITTED, LedgerState.VERIFIED, LedgerState.PURGED}:
+            commit_id = fields.get("commit_id", row["commit_id"])
+            if not isinstance(commit_id, str) or not _COMMIT_RE.fullmatch(commit_id):
+                raise EvidenceError(
+                    "committed programmes require a complete commit SHA"
+                )
+        if target == LedgerState.PROCESSING:
+            updates["attempts"] = int(row["attempts"]) + 1
+            updates["processing_started_at"] = now
+        if target == LedgerState.RETRYABLE:
+            updates["commit_id"] = None
+        if target == LedgerState.VERIFIED:
+            updates["verification_time"] = now
+        if target == LedgerState.PURGED:
+            updates["purge_time"] = now
+        return updates
+
+    def _record_for_table(
+        self, table: str, row: sqlite3.Row
+    ) -> ProgrammeRecord | ShardRecord | BatchRecord:
+        if table == "programmes":
+            return self._programme_record(row)
+        if table == "shards":
+            return self._shard_record(row)
+        return self._batch_record(row)
+
+    @staticmethod
+    def _batch_record(row: sqlite3.Row) -> BatchRecord:
+        return BatchRecord(
+            batch_id=row["batch_id"],
+            state=LedgerState(row["state"]),
+            pipeline_digest=row["pipeline_digest"],
+            commit_id=row["commit_id"],
+            attempts=row["attempts"],
+            programme_count=row["programme_count"],
+            row_count=row["row_count"],
+            rejection_counts=json.loads(row["rejection_counts"]),
+            duration_ms=row["duration_ms"],
+            verification_time=row["verification_time"],
+            purge_time=row["purge_time"],
+            publication_artifact_purged_at=row["publication_artifact_purged_at"],
+            publication_artifact_purge_evidence=json.loads(
+                row["publication_artifact_purge_evidence"]
+            ),
+            remote_checked_at=row["remote_checked_at"],
+            remote_present=None
+            if row["remote_present"] is None
+            else bool(row["remote_present"]),
+            last_error=row["last_error"],
+        )
+
+    @staticmethod
+    def _programme_record(row: sqlite3.Row) -> ProgrammeRecord:
+        return ProgrammeRecord(
+            programme_id=row["programme_id"],
+            source_file_id=row["source_file_id"],
+            state=LedgerState(row["state"]),
+            source_revisions=json.loads(row["source_revisions"]),
+            pipeline_digest=row["pipeline_digest"],
+            attempts=row["attempts"],
+            accepted_count=row["accepted_count"],
+            rejected_count=row["rejected_count"],
+            source_duration_ms=row["source_duration_ms"],
+            processed_duration_ms=row["processed_duration_ms"],
+            commit_id=row["commit_id"],
+            rejection_counts=json.loads(row["rejection_counts"]),
+            source_temp_purged_at=row["source_temp_purged_at"],
+            source_temp_purge_evidence=json.loads(row["source_temp_purge_evidence"]),
+            verification_time=row["verification_time"],
+            purge_time=row["purge_time"],
+            last_error=row["last_error"],
+        )
+
+    @staticmethod
+    def _shard_record(row: sqlite3.Row) -> ShardRecord:
+        return ShardRecord(
+            shard_id=row["shard_id"],
+            programme_id=row["programme_id"],
+            batch_id=row["batch_id"],
+            state=LedgerState(row["state"]),
+            path=row["path"],
+            byte_size=row["byte_size"],
+            row_count=row["row_count"],
+            sha256=row["sha256"],
+            verification_time=row["verification_time"],
+            purge_time=row["purge_time"],
+        )
+
+    @staticmethod
+    def _require_row(
+        connection: sqlite3.Connection, table: str, column: str, value: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            f"SELECT * FROM {table} WHERE {column} = ?", (value,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown {table[:-1]} {value!r}")
+        return row
+
+    def _shard_updates(
+        self, target: LedgerState, fields: Mapping[str, object], evidence: str, now: str
+    ) -> dict[str, object]:
+        updates = self._common_updates(fields, evidence, allowed_keys={"last_error"})
+        if target == LedgerState.VERIFIED:
+            updates["verification_time"] = now
+        if target == LedgerState.PURGED:
+            updates["purge_time"] = now
+        return updates
+
+    @staticmethod
+    def _validate_digest(value: object, name: str) -> None:
+        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+            raise EvidenceError(f"{name} must be lowercase SHA-256 hex")
+
+    @staticmethod
+    def _validate_identifier(value: object, name: str) -> None:
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise EvidenceError(f"{name} must be a non-empty identifier")
+        if name.endswith("_file_id") and Ledger._looks_like_local_path(value):
+            raise EvidenceError("machine or cache paths are not allowed")
+        Ledger._validate_metadata({name: value})
+
+    @staticmethod
+    def _validate_nonnegative(value: object, name: str) -> None:
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise EvidenceError(f"{name} must be a non-negative integer")
+
+    def batch_evidence(self, batch_id: str) -> BatchEvidence:
+        """Build the serialisable contract evidence for a batch.
+
+        Returns:
+            Metadata validated by the Phase 1A batch contract.
+        """
+        batch = self.batch(batch_id)
+        return BatchEvidence(
+            batch_id=batch.batch_id,
+            state=batch.state,
+            shards=tuple(
+                ShardEvidence(
+                    path=shard.path,
+                    byte_size=shard.byte_size,
+                    row_count=shard.row_count,
+                    sha256=shard.sha256,
+                )
+                for shard in self.shards(batch_id)
+            ),
+            commit_id=batch.commit_id,
+            programme_count=batch.programme_count,
+            row_count=batch.row_count,
+            rejection_counts={
+                RejectionCategory(key): value
+                for key, value in batch.rejection_counts.items()
+            },
+        )
+
+    def shards(self, batch_id: str) -> tuple[ShardRecord, ...]:
+        """Return all shards attached to a batch in deterministic order."""
+        rows = self._connection.execute(
+            "SELECT * FROM shards WHERE batch_id = ? ORDER BY shard_id", (batch_id,)
+        ).fetchall()
+        return tuple(self._shard_record(row) for row in rows)
+
+
+__all__ = [
+    "BatchRecord",
+    "EvidenceError",
+    "InvalidTransition",
+    "Ledger",
+    "LedgerError",
+    "ProgrammeRecord",
+    "ShardRecord",
+]
