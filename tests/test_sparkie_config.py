@@ -8,6 +8,9 @@ from hydra import compose
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import InterpolationResolutionError
 
+import hviske.utils as utils
+from scripts.publish_private_model import training_sources_from_config
+
 TRAINING_NAMES = [
     "p1",
     "drtv_local",
@@ -251,6 +254,32 @@ def test_sparkie_evaluation_and_exclusions(monkeypatch: pytest.MonkeyPatch) -> N
     assert not Path("config/datasets/fleurs_en_us.yaml").exists()
 
 
+def test_sparkie_model_card_contains_safe_complete_provenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The generated card contains all source metadata but no local paths."""
+    config = _preset(monkeypatch)
+    sources = training_sources_from_config(config=config)
+    card_path = tmp_path / "README.md"
+    utils._stage_model_card(
+        destination=card_path,
+        finetuned_from=str(config.model.pretrained_model_id),
+        model_card_languages=list(config.model_card_languages),
+        training_dataset_ids=list(config.training_dataset_ids),
+        training_sources=sources,
+        evaluation_status="Pilot reviewed.",
+        reviewed_model_card=None,
+    )
+    card = card_path.read_text(encoding="utf-8")
+    for source in sources:
+        assert all(str(source[key]) in card for key in source)
+    assert str(tmp_path) not in card
+    assert str(config.datasets.drtv_local.manifest_path) not in card
+    assert "license: openrail" in card
+    assert "base_model: CohereLabs/cohere-transcribe-03-2026" in card
+    assert "Pilot reviewed." in card
+
+
 def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     """Training stays local and publication metadata names every Hub source."""
     config = _preset(monkeypatch)
@@ -260,6 +289,7 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     assert config.private is True
     assert config.private_only is True
     assert config.save_total_limit == 3
+    assert config.max_validation_samples_per_dataset == 1000
     assert list(config.model_card_languages) == ["da", "en"]
     assert list(config.training_dataset_ids) == [
         "syvai/p1",
@@ -274,6 +304,32 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
         "facebook/voxpopuli",
         "openslr/librispeech_asr",
     ]
+
+
+def test_sparkie_publication_provenance_is_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publication provenance covers Hub and local sources without paths."""
+    config = _preset(monkeypatch)
+    sources = training_sources_from_config(config=config)
+    source_ids = {str(source["id"]) for source in sources}
+    assert set(config.training_dataset_ids).issubset(source_ids)
+    assert {"local_vtt:drtv_local", "local_vtt:youtube_local"}.issubset(source_ids)
+    assert all(
+        all(
+            key in source
+            for key in ("subset", "split", "revision", "probability", "language")
+        )
+        for source in sources
+    )
+    assert all(
+        "/" not in str(source["revision"])
+        for source in sources
+        if source["id"].startswith("local_vtt:")
+    )
+    assert {
+        source["probability"] for source in sources if source["id"] == "syvai/p1"
+    } == {0.08}
 
 
 def test_sparkie_training_order_and_probabilities(

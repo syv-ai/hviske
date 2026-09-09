@@ -8,10 +8,12 @@ import os
 import typing as t
 from pathlib import Path
 
-from datasets import load_dataset
+from datasets import Dataset, IterableDataset, load_dataset
 from huggingface_hub import HfApi
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
+
+from hviske.data import _load_transcript_dataset, join_audio_and_transcripts
 
 logger = logging.getLogger("hviske_data_preflight")
 
@@ -51,16 +53,47 @@ def _preflight_hub_source(
         cache_dir=cache_dir,
         trust_remote_code=source_config.get("trust_remote_code", False),
     )
-    row = _first_row(dataset=dataset, source_name=source_name)
-    required_columns = [str(source_config.audio_column)]
-    if source_config.get("transcript_dataset_id") is None:
-        required_columns.append(str(source_config.text_column))
+    has_transcript_join = source_config.get("transcript_dataset_id") is not None
+    if has_transcript_join:
+        transcript = _load_transcript_dataset(
+            dataset_id=str(source_config.transcript_dataset_id),
+            subset=source_config.get("transcript_subset"),
+            split=str(source_config.get("transcript_split", "train")),
+            revision=str(source_config.transcript_revision),
+            cache_dir=cache_dir,
+            trust_remote_code=source_config.get("transcript_trust_remote_code", False),
+            dataset_loader=dataset_loader,
+        )
+        if not isinstance(dataset, Dataset | IterableDataset):
+            raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
+        dataset = join_audio_and_transcripts(
+            audio_dataset=dataset,
+            transcript_dataset=transcript,
+            audio_join_column=str(source_config.audio_join_column),
+            transcript_join_column=str(source_config.transcript_join_column),
+            transcript_text_column=str(source_config.transcript_text_column),
+        )
+        row = _first_row(dataset=dataset, source_name=f"joined {source_name}")
+        _require_columns(
+            row=row,
+            required_columns=[str(source_config.audio_column), "text"],
+            source_name=f"joined {source_name}",
+        )
     else:
-        required_columns.append(str(source_config.audio_join_column))
-    _require_columns(
-        row=row, required_columns=required_columns, source_name=source_name
-    )
-    logger.info("Validated one streamed row from %s", source_name)
+        row = _first_row(dataset=dataset, source_name=source_name)
+        _require_columns(
+            row=row,
+            required_columns=[
+                str(source_config.audio_column),
+                str(source_config.text_column),
+            ],
+            source_name=source_name,
+        )
+    text_column = "text" if has_transcript_join else str(source_config.text_column)
+    text = row[text_column]
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"Configured text is empty in the first {source_name} row")
+    logger.info("Validated one joined/streamed row from %s", source_name)
 
 
 def _first_row(dataset: object, source_name: str) -> dict[str, object]:
@@ -123,36 +156,6 @@ def _preflight_local_manifest(source_name: str, manifest_path: Path) -> None:
     logger.info("Validated one metadata row from %s", source_name)
 
 
-def _preflight_transcript_source(
-    source_name: str,
-    source_config: DictConfig,
-    dataset_loader: DatasetLoader,
-    cache_dir: str | None,
-    token: str | None,
-) -> None:
-    transcript_name = f"{source_name} transcripts"
-    dataset = dataset_loader(
-        path=source_config.transcript_dataset_id,
-        name=source_config.get("transcript_subset"),
-        split=source_config.get("transcript_split", "train"),
-        revision=source_config.transcript_revision,
-        token=token or True,
-        streaming=True,
-        cache_dir=cache_dir,
-        trust_remote_code=source_config.get("transcript_trust_remote_code", False),
-    )
-    row = _first_row(dataset=dataset, source_name=transcript_name)
-    _require_columns(
-        row=row,
-        required_columns=[
-            str(source_config.transcript_join_column),
-            str(source_config.transcript_text_column),
-        ],
-        source_name=transcript_name,
-    )
-    logger.info("Validated one streamed row from %s", transcript_name)
-
-
 class HubApi(t.Protocol):
     """Hub operations needed by the data preflight."""
 
@@ -202,14 +205,6 @@ def preflight_finetuning_data(
                 cache_dir=config.get("cache_dir"),
                 token=token,
             )
-            if source_config.get("transcript_dataset_id") is not None:
-                _preflight_transcript_source(
-                    source_name=str(source_name),
-                    source_config=source_config,
-                    dataset_loader=dataset_loader,
-                    cache_dir=config.get("cache_dir"),
-                    token=token,
-                )
 
     for index, source_config in enumerate(config.evaluation_datasets):
         _preflight_hub_source(

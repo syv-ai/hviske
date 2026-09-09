@@ -2,6 +2,7 @@
 
 import collections.abc as c
 import contextlib
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -62,6 +63,16 @@ _MODEL_ARTEFACT_NAMES = frozenset(
 )
 _SHARDED_MODEL_ARTEFACT = re.compile(
     r"(?:model|pytorch_model)-\d{5}-of-\d{5}\.(?:bin|safetensors)\Z"
+)
+_TOKENIZER_FILES = frozenset(
+    {
+        "tokenizer.json",
+        "tokenizer.model",
+        "vocab.json",
+        "vocab.txt",
+        "spiece.model",
+        "sentencepiece.bpe.model",
+    }
 )
 
 
@@ -149,9 +160,9 @@ class no_datasets_progress_bars:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
+        _exc_type: type[BaseException] | None,
+        _exc_val: BaseException | None,
+        _exc_tb: TracebackType | None,
     ) -> None:
         """Re-enable the progress bar."""
         enable_progress_bar()
@@ -430,6 +441,8 @@ def publish_model_folder(
     commit_message: str = "Publish private model",
     training_dataset_ids: list[str] | None = None,
     evaluation_status: str = "Not evaluated.",
+    training_sources: list[dict[str, object]] | None = None,
+    reviewed_model_card: Path | None = None,
 ) -> CommitInfo:
     """Publish a model folder through one private Hub commit.
 
@@ -450,11 +463,25 @@ def publish_model_folder(
             Exact Hub dataset identifiers used for training.
         evaluation_status (optional):
             Short evaluation-status statement for the model card.
+        training_sources (optional):
+            Structured source provenance for the model card.
+        reviewed_model_card (optional):
+            A reviewed README to use instead of the generated card.
 
     Returns:
         The model-file upload commit information.
+
+    Raises:
+        ValueError:
+            If the package or structured provenance is incomplete.
     """
     validate_private_only_config({"private_only": True, "private": private})
+    if not training_sources:
+        raise ValueError("Structured training-source provenance is required")
+    _validate_training_sources(
+        training_sources=training_sources,
+        training_dataset_ids=training_dataset_ids or [],
+    )
     token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
     api = ensure_private_hub_repository(repo_id=repo_id, token=token)
     languages = list(model_card_languages)
@@ -464,12 +491,14 @@ def publish_model_folder(
     with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
         staging_path = Path(staging_dir)
         _copy_model_artefacts(source=Path(folder_path), destination=staging_path)
-        _write_model_card(
+        _stage_model_card(
             destination=staging_path / "README.md",
             finetuned_from=finetuned_from,
             model_card_languages=languages,
             training_dataset_ids=training_dataset_ids or [],
+            training_sources=training_sources,
             evaluation_status=evaluation_status,
+            reviewed_model_card=reviewed_model_card,
         )
         verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
         commit = upload_folder(
@@ -483,14 +512,15 @@ def publish_model_folder(
 
 
 def _copy_model_artefacts(source: Path, destination: Path) -> None:
-    """Copy only recognised regular files from a model output directory.
+    """Copy a complete, reloadable Cohere package using the strict allowlist.
 
     Raises:
         ValueError:
-            If the source is not a directory.
+            If the source is not a complete Cohere package.
     """
     if not source.is_dir():
         raise ValueError(f"Model output directory does not exist: {source}")
+    _validate_model_package(source=source)
     for candidate in source.iterdir():
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -500,38 +530,164 @@ def _copy_model_artefacts(source: Path, destination: Path) -> None:
         shutil.copy2(candidate, destination / candidate.name)
 
 
-def _write_model_card(
+def _validate_model_package(source: Path) -> None:
+    """Check that a saved Cohere model has all reload-critical files.
+
+    Raises:
+        ValueError:
+            If a required package file or weight set is missing or malformed.
+    """
+    required = {
+        "config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "tokenizer_config.json",
+    }
+    missing = [name for name in required if not _regular_file(source / name)]
+    if missing:
+        raise ValueError("Cohere package is missing: " + ", ".join(sorted(missing)))
+    try:
+        config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Cohere config.json is not valid JSON") from error
+    if not isinstance(config, dict):
+        raise ValueError("Cohere config.json must contain an object")
+    if not any(_regular_file(source / name) for name in _TOKENIZER_FILES):
+        raise ValueError("Cohere package is missing tokenizer vocabulary/model files")
+    if _regular_file(source / "model.safetensors") or _regular_file(
+        source / "pytorch_model.bin"
+    ):
+        return
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = source / index_name
+        if not _regular_file(index_path):
+            continue
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Malformed sharded weight index: {index_name}") from error
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if (
+            not isinstance(weight_map, dict)
+            or not weight_map
+            or not all(
+                isinstance(name, str)
+                and _SHARDED_MODEL_ARTEFACT.fullmatch(name)
+                and _regular_file(source / name)
+                for name in weight_map.values()
+            )
+        ):
+            raise ValueError(f"Incomplete sharded weight index: {index_name}")
+        return
+    raise ValueError(
+        "Cohere package needs model.safetensors, pytorch_model.bin, or a complete "
+        "sharded weight index"
+    )
+
+
+def _regular_file(path: Path) -> bool:
+    """Return whether a path is a regular, non-symlink file."""
+    return path.is_file() and not path.is_symlink()
+
+
+def _stage_model_card(
     destination: Path,
     finetuned_from: str,
     model_card_languages: list[str],
     training_dataset_ids: list[str],
+    training_sources: list[dict[str, object]],
     evaluation_status: str,
+    reviewed_model_card: Path | None,
 ) -> None:
-    """Write the publication model card without machine-local information."""
-    language_lines = "\n".join(f"- {language}" for language in model_card_languages)
+    """Stage a generated or reviewed card, never arbitrary source files.
+
+    Raises:
+        ValueError:
+            If a reviewed card is not a safe, complete provenance record.
+    """
+    if reviewed_model_card is not None:
+        if not _regular_file(reviewed_model_card):
+            raise ValueError("Reviewed model card must be a regular file")
+        card = reviewed_model_card.read_text(encoding="utf-8")
+        forbidden = ("manifest_path", "source_wav_path", "HF_TOKEN", "HUGGINGFACE")
+        required_markers = ("license: openrail", "base_model:", "private", "internal")
+        if (
+            any(
+                str(value) not in card
+                for source in training_sources
+                for value in source.values()
+            )
+            or any(marker not in card for marker in required_markers)
+            or any(marker in card for marker in forbidden)
+            or re.search(r"(?:^|\s)/(?:Users|home|private|tmp|var)/", card)
+        ):
+            raise ValueError(
+                "Reviewed model card does not contain safe complete provenance"
+            )
+        destination.write_text(card, encoding="utf-8")
+        return
+    source_lines = "\n".join(
+        "- "
+        + "; ".join(
+            f"{key}: {source[key]}"
+            for key in (
+                "id",
+                "source",
+                "subset",
+                "split",
+                "revision",
+                "probability",
+                "language",
+            )
+        )
+        for source in training_sources
+    )
     dataset_lines = "\n".join(f"- {dataset_id}" for dataset_id in training_dataset_ids)
-    if not dataset_lines:
-        dataset_lines = "- Not supplied by the caller."
+    language_lines = "\n".join(f"- {language}" for language in model_card_languages)
     destination.write_text(
         "---\n"
-        f"language:\n{language_lines}\n"
-        "license: openrail\n"
-        "library_name: transformers\n"
+        f"language:\n{language_lines}\nlicense: openrail\nlibrary_name: transformers\n"
         "pipeline_tag: automatic-speech-recognition\n"
-        f"base_model: {finetuned_from}\n"
-        "datasets:\n"
-        f"{dataset_lines}\n"
-        "---\n\n"
+        f"base_model: {finetuned_from}\ndatasets:\n{dataset_lines}\n---\n\n"
         "# Private internal Danish-English ASR checkpoint\n\n"
-        "This is a private internal Danish-English automatic speech recognition "
-        "checkpoint. It is intended for internal research, evaluation and testing "
-        "only, not for public distribution or production use.\n\n"
-        "## Training datasets\n\n"
-        f"{dataset_lines}\n\n"
-        "## Evaluation status\n\n"
-        f"{evaluation_status}\n",
+        "This private Cohere checkpoint is for internal research, evaluation and "
+        "testing only. It is not for public distribution or production use.\n\n"
+        "## Training-source provenance\n\n"
+        f"{source_lines}\n\n## Evaluation status\n\n{evaluation_status}\n",
         encoding="utf-8",
     )
+
+
+def _validate_training_sources(
+    training_sources: list[dict[str, object]], training_dataset_ids: list[str]
+) -> None:
+    """Validate source provenance before it can enter a model card.
+
+    Raises:
+        ValueError:
+            If a configured dataset is missing or metadata is incomplete.
+    """
+    ids = {str(source.get("id")) for source in training_sources}
+    missing = sorted(set(training_dataset_ids) - ids)
+    if missing:
+        raise ValueError("Model-card provenance misses datasets: " + ", ".join(missing))
+    required = {
+        "id",
+        "source",
+        "subset",
+        "split",
+        "revision",
+        "probability",
+        "language",
+    }
+    for source in training_sources:
+        if not required.issubset(source) or any(
+            source.get(key) is None or not str(source.get(key)).strip()
+            for key in required
+        ):
+            raise ValueError("Each training source needs complete structured metadata")
+        if any(key in source for key in ("path", "manifest_path")):
+            raise ValueError("Local paths are not permitted in model-card provenance")
 
 
 def ensure_private_hub_repository(repo_id: str, token: str | None) -> HfApi:
@@ -718,6 +874,37 @@ def push_model_to_hub(
     return commit
 
 
+def _write_model_card(
+    destination: Path,
+    finetuned_from: str,
+    model_card_languages: list[str],
+    training_dataset_ids: list[str],
+    evaluation_status: str,
+) -> None:
+    """Write a backwards-compatible minimal card for trainer publication."""
+    sources: list[dict[str, object]] = [
+        {
+            "id": dataset_id,
+            "source": dataset_id,
+            "subset": "unspecified",
+            "split": "unspecified",
+            "revision": "unspecified",
+            "probability": "unspecified",
+            "language": "da/en",
+        }
+        for dataset_id in training_dataset_ids
+    ]
+    _stage_model_card(
+        destination=destination,
+        finetuned_from=finetuned_from,
+        model_card_languages=model_card_languages,
+        training_dataset_ids=training_dataset_ids,
+        training_sources=sources,
+        evaluation_status=evaluation_status,
+        reviewed_model_card=None,
+    )
+
+
 class transformers_output_ignored:
     """Context manager to block terminal output."""
 
@@ -727,9 +914,9 @@ class transformers_output_ignored:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
+        _exc_type: type[BaseException] | None,
+        _exc_val: BaseException | None,
+        _exc_tb: TracebackType | None,
     ) -> None:
         """Exit the context manager."""
         hf_logging.set_verbosity_info()

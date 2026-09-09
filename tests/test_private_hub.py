@@ -76,6 +76,58 @@ def test_private_only_refuses_private_false() -> None:
         utils.validate_private_only_config({"private_only": True, "private": False})
 
 
+def test_publication_accepts_valid_cohere_package(tmp_path: Path) -> None:
+    """A complete Cohere package passes the reloadability gate."""
+    _minimal_cohere_package(tmp_path)
+    utils._validate_model_package(tmp_path)
+
+
+def _minimal_cohere_package(
+    folder: Path, *, weights: bool = True, processor: bool = True
+) -> None:
+    """Create the smallest package accepted by the Cohere publication gate."""
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    if processor:
+        for name in (
+            "preprocessor_config.json",
+            "processor_config.json",
+            "tokenizer_config.json",
+            "tokenizer.json",
+        ):
+            (folder / name).write_text("{}", encoding="utf-8")
+    if weights:
+        (folder / "model.safetensors").write_bytes(b"weights")
+
+
+def test_publication_rejects_empty_or_card_only_package(tmp_path: Path) -> None:
+    """A README or empty output cannot be uploaded as a model."""
+    (tmp_path / "README.md").write_text("card", encoding="utf-8")
+    with pytest.raises(ValueError, match="Cohere package is missing"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_malformed_sharded_index(tmp_path: Path) -> None:
+    """A broken sharded index cannot masquerade as a complete weight set."""
+    _minimal_cohere_package(tmp_path, weights=False)
+    (tmp_path / "model.safetensors.index.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="Incomplete sharded"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_missing_processor(tmp_path: Path) -> None:
+    """A weight file without Cohere processor essentials is incomplete."""
+    _minimal_cohere_package(tmp_path, processor=False)
+    with pytest.raises(ValueError, match="preprocessor_config"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_missing_weights(tmp_path: Path) -> None:
+    """Processor metadata alone is not a reloadable model."""
+    _minimal_cohere_package(tmp_path, weights=False)
+    with pytest.raises(ValueError, match="needs model"):
+        utils._validate_model_package(tmp_path)
+
+
 def test_publish_fails_if_visibility_changes_after_upload(
     monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -88,6 +140,7 @@ def test_publish_fails_if_visibility_changes_after_upload(
         return SimpleNamespace()
 
     monkeypatch.setattr(utils, "upload_folder", upload)
+    _populate_model_output(tmp_path)
     with pytest.raises(PermissionError, match="public repository"):
         utils.publish_model_folder(
             folder_path=tmp_path,
@@ -95,7 +148,58 @@ def test_publish_fails_if_visibility_changes_after_upload(
             finetuned_from="org/base-model",
             private=True,
             model_card_languages=["da", "en"],
+            training_dataset_ids=["org/dataset"],
+            training_sources=[_source("org/dataset")],
         )
+
+
+def _populate_model_output(folder: Path) -> None:
+    """Create allowed and forbidden files in a trainer output directory."""
+    for name in (
+        "config.json",
+        "preprocessor_config.json",
+        "model.safetensors",
+        "model-00001-of-00002.safetensors",
+        "model.safetensors.index.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+        "processor_config.json",
+        "chat_template.jinja",
+    ):
+        (folder / name).write_text("model", encoding="utf-8")
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    for name in (
+        "arbitrary.json",
+        "manifest.jsonl",
+        "recording.wav",
+        "trainer_state.json",
+        "metrics.csv",
+        "run.log",
+    ):
+        (folder / name).write_text("forbidden", encoding="utf-8")
+    (folder / "checkpoint-100").mkdir()
+    (folder / "checkpoint-100" / "model.safetensors").write_text(
+        "forbidden", encoding="utf-8"
+    )
+    (folder / "wandb").mkdir()
+    (folder / "wandb" / "run.json").write_text("forbidden", encoding="utf-8")
+    (folder / "nested").mkdir()
+    (folder / "nested" / "config.json").write_text("forbidden", encoding="utf-8")
+    (folder / "symlink.safetensors").symlink_to(folder / "model.safetensors")
+
+
+def _source(dataset_id: str) -> dict[str, object]:
+    """Return complete provenance metadata for publication tests."""
+    return {
+        "id": dataset_id,
+        "source": dataset_id,
+        "subset": "none",
+        "split": "train",
+        "revision": "sha256-test",
+        "probability": 1.0,
+        "language": "da",
+    }
 
 
 def test_publish_stages_exact_top_level_allowlist(
@@ -127,6 +231,7 @@ def test_publish_stages_exact_top_level_allowlist(
         private=True,
         model_card_languages=["da", "en"],
         training_dataset_ids=["CoRal-project/coral-v3"],
+        training_sources=[_source("CoRal-project/coral-v3")],
         evaluation_status="Evaluation ran during training.",
     )
 
@@ -135,6 +240,7 @@ def test_publish_stages_exact_top_level_allowlist(
         {
             "README.md",
             "config.json",
+            "preprocessor_config.json",
             "model.safetensors",
             "model-00001-of-00002.safetensors",
             "model.safetensors.index.json",
@@ -150,40 +256,6 @@ def test_publish_stages_exact_top_level_allowlist(
     assert "Private internal Danish-English ASR checkpoint" in staged_card[0]
     assert str(tmp_path) not in staged_card[0]
     assert api.info_calls == 3
-
-
-def _populate_model_output(folder: Path) -> None:
-    """Create allowed and forbidden files in a trainer output directory."""
-    for name in (
-        "config.json",
-        "model.safetensors",
-        "model-00001-of-00002.safetensors",
-        "model.safetensors.index.json",
-        "tokenizer_config.json",
-        "vocab.json",
-        "merges.txt",
-        "processor_config.json",
-        "chat_template.jinja",
-    ):
-        (folder / name).write_text("model", encoding="utf-8")
-    for name in (
-        "arbitrary.json",
-        "manifest.jsonl",
-        "recording.wav",
-        "trainer_state.json",
-        "metrics.csv",
-        "run.log",
-    ):
-        (folder / name).write_text("forbidden", encoding="utf-8")
-    (folder / "checkpoint-100").mkdir()
-    (folder / "checkpoint-100" / "model.safetensors").write_text(
-        "forbidden", encoding="utf-8"
-    )
-    (folder / "wandb").mkdir()
-    (folder / "wandb" / "run.json").write_text("forbidden", encoding="utf-8")
-    (folder / "nested").mkdir()
-    (folder / "nested" / "config.json").write_text("forbidden", encoding="utf-8")
-    (folder / "symlink.safetensors").symlink_to(folder / "model.safetensors")
 
 
 def test_push_stages_once_and_disables_trainer_push(

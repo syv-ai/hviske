@@ -5,13 +5,14 @@ import json
 from pathlib import Path
 
 import pytest
+from datasets import Dataset
 from omegaconf import OmegaConf
 
 from scripts.preflight_finetuning_data import preflight_finetuning_data
 
 
 def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
-    """Hub streams and local manifests remain bounded to their first row."""
+    """Audio and validation stay bounded while transcripts are fully indexed."""
     audio_path = tmp_path / "audio.wav"
     audio_path.touch()
     manifest_path = tmp_path / "manifest.jsonl"
@@ -67,17 +68,15 @@ def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
             ],
         }
     )
-    datasets: list[CountingDataset] = []
     calls: list[dict[str, object]] = []
 
-    def fake_loader(**kwargs: object) -> CountingDataset:
+    def fake_loader(**kwargs: object) -> Dataset:
         calls.append(kwargs)
-        rows: list[dict[str, object]]
         path = kwargs["path"]
         if path == "org/audio":
             rows = [
-                {"audio": object(), "recording_id": "one"},
-                {"audio": object(), "recording_id": "two"},
+                {"audio": [0.0], "recording_id": "one"},
+                {"audio": [0.0], "recording_id": "two"},
             ]
         elif path == "org/transcripts":
             rows = [
@@ -86,41 +85,23 @@ def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
             ]
         else:
             rows = [
-                {"audio": object(), "text": "hello"},
-                {"audio": object(), "text": "world"},
+                {"audio": [0.0], "text": "hello"},
+                {"audio": [0.0], "text": "world"},
             ]
-        dataset = CountingDataset(rows=rows)
-        datasets.append(dataset)
-        return dataset
+        return Dataset.from_list(rows)
 
     api = FakeHubApi()
     preflight_finetuning_data(config=config, dataset_loader=fake_loader, hub_api=api)
 
     assert api.model_ids == ["org/gated-model"]
-    assert len(datasets) == 3
-    assert all(dataset.consumed == 1 for dataset in datasets)
-    assert all(call["streaming"] is True for call in calls)
+    assert len(calls) == 3
+    assert [call["streaming"] for call in calls] == [True, False, True]
     assert all(call["trust_remote_code"] is False for call in calls)
     assert [call["revision"] for call in calls] == [
         "audio-sha",
         "transcript-sha",
         "evaluation-sha",
     ]
-
-
-class CountingDataset:
-    """Iterable that records how many rows a caller consumes."""
-
-    def __init__(self, rows: list[dict[str, object]]) -> None:
-        """Store rows without exposing a length-based materialisation path."""
-        self.rows = rows
-        self.consumed = 0
-
-    def __iter__(self) -> c.Iterator[dict[str, object]]:
-        """Yield rows while recording consumption."""
-        for row in self.rows:
-            self.consumed += 1
-            yield row
 
 
 class FakeHubApi:
@@ -176,3 +157,18 @@ def test_preflight_rejects_missing_schema_without_consuming_a_second_row() -> No
         )
 
     assert dataset.consumed == 1
+
+
+class CountingDataset:
+    """Iterable that records how many rows a caller consumes."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        """Store rows without exposing a length-based materialisation path."""
+        self.rows = rows
+        self.consumed = 0
+
+    def __iter__(self) -> c.Iterator[dict[str, object]]:
+        """Yield rows while recording consumption."""
+        for row in self.rows:
+            self.consumed += 1
+            yield row
