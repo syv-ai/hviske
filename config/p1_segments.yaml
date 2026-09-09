@@ -17,7 +17,7 @@ vad:
   repository:
     repository: snakers4/silero-vad
     revision: 867c2aa692646a1f1de3e94a15c9dd9f614c0acb
-  model_blob: 5c6988d663950a93a5f0d6c38c2fe024653ec552b
+  model_blob: 5c6988d663950a93a5f0d6c38c2fe024653ec552
   license: MIT
 
 ctc:
