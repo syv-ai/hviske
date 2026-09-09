@@ -1,5 +1,6 @@
 """Focused tests for the Olmix calibration matrix and launcher."""
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from omegaconf import OmegaConf
 
 from src.scripts.run_olmix_benchmark import (
     ANCHORS,
-    CHECKPOINTS,
+    EVALUATION_STEPS,
     MODELS,
     _make_run_id,
     build_command,
@@ -34,8 +35,8 @@ SOURCE_ORDER = [
 ]
 
 
-def test_hviske_v5_tiny_model_config_is_native_and_trainable() -> None:
-    """Expose the trainable native Cohere checkpoint with Danish prompts."""
+def test_hviske_v5_tiny_model_config_uses_pinned_remote_code() -> None:
+    """Expose the trainable remote Cohere checkpoint with a pinned revision."""
     config = compose(
         config_name="asr_finetuning",
         overrides=["model=hviske-v5-tiny", "enable_experiment_tracking=false"],
@@ -43,6 +44,8 @@ def test_hviske_v5_tiny_model_config_is_native_and_trainable() -> None:
 
     assert config.model.type == "cohere"
     assert config.model.pretrained_model_id == "syvai/hviske-v5-tiny"
+    assert config.model.revision == "361051e8ed732798d68fcd5d5ec64fd4e39da40b"
+    assert config.model.trust_remote_code is True
     assert config.model.freeze_feature_encoder is False
     assert config.model.sampling_rate == 16_000
     assert config.model.language == "da"
@@ -79,9 +82,9 @@ def test_launcher_command_uses_non_uniform_schedule_and_safe_overrides() -> None
 
 
 def test_matrix_model_and_anchor_sets_are_explicit() -> None:
-    """Keep the six serial matrix cells and requested checkpoints explicit."""
+    """Keep the six serial matrix cells and evaluation steps explicit."""
     assert MODELS == ("whisper-xxsmall", "hviske-v5-tiny")
-    assert CHECKPOINTS == (250, 500, 1000, 2000, 3000)
+    assert EVALUATION_STEPS == (250, 500, 1000, 2000, 3000)
     assert len(MODELS) * len(ANCHORS) == 6
 
 
@@ -94,9 +97,10 @@ def test_olmix_anchor_composition_preserves_sources_and_language_totals(
 
     assert list(config.datasets) == SOURCE_ORDER
     assert len(config.dataset_probabilities) == len(SOURCE_ORDER)
-    assert sum(config.dataset_probabilities) == pytest.approx(1.0)
-    assert sum(config.dataset_probabilities[:9]) == pytest.approx(0.60)
-    assert sum(config.dataset_probabilities[9:]) == pytest.approx(0.40)
+    probabilities = [Decimal(str(value)) for value in config.dataset_probabilities]
+    assert sum(probabilities) == Decimal("1.00")
+    assert sum(probabilities[:9]) == Decimal("0.60")
+    assert sum(probabilities[9:]) == Decimal("0.40")
     assert all(probability > 0 for probability in config.dataset_probabilities)
 
 

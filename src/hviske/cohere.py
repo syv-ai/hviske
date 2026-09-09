@@ -15,6 +15,8 @@ from omegaconf import DictConfig
 from torch.backends.mps import is_available as mps_is_available
 from transformers import (
     AutoConfig,
+    AutoModelForSpeechSeq2Seq,
+    AutoProcessor,
     CohereAsrForConditionalGeneration,
     Wav2Vec2ForCTC,
     Wav2Vec2Processor,
@@ -33,7 +35,10 @@ from transformers.training_args import OptimizerNames, TrainingArguments
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 
 from .compute_metrics import compute_error_rate_metrics
-from .data_collators import DataCollatorCohereWithPadding
+from .data_collators import (
+    DataCollatorCohereWithPadding,
+    DataCollatorSpeechSeq2SeqWithPadding,
+)
 from .data_models import ModelSetup, PreTrainedModelData
 from .utils import transformers_output_ignored
 
@@ -100,7 +105,7 @@ class CohereAsrProcessor(TransformersCohereAsrProcessor):
 
 
 class CohereModelSetup(ModelSetup):
-    """Model setup for native Transformers Cohere ASR models."""
+    """Model setup for native and remote-code Cohere ASR models."""
 
     def __init__(self, config: DictConfig) -> None:
         """Initialise the model setup.
@@ -117,90 +122,186 @@ class CohereModelSetup(ModelSetup):
         """Return the error-rate metric function."""
         return partial(compute_error_rate_metrics, processor=self.processor)
 
-    def load_data_collator(self) -> DataCollatorCohereWithPadding:
-        """Return the Cohere prompt-aware data collator."""
+    def load_data_collator(
+        self,
+    ) -> DataCollatorCohereWithPadding | DataCollatorSpeechSeq2SeqWithPadding:
+        """Return the data collator for the selected Cohere implementation."""
+        if self._uses_remote_code():
+            return DataCollatorSpeechSeq2SeqWithPadding(
+                processor=self.processor,
+                sample_rate=self.config.model.sampling_rate,
+                max_seconds_per_example=self.config.max_seconds_per_example,
+                padding=self.config.padding,
+            )
         return DataCollatorCohereWithPadding(
             processor=self.processor,
             padding=self.config.padding,
             max_length=self.config.model.max_length,
         )
 
+    def _uses_remote_code(self) -> bool:
+        return bool(self.config.model.get("trust_remote_code", False))
+
     def load_model(self) -> CohereAsrForConditionalGeneration:
-        """Load the native Cohere ASR model.
+        """Load the configured Cohere ASR model.
 
         Returns:
-            The native Cohere model.
+            The loaded Cohere model.
+
+        Raises:
+            TypeError:
+                If remote code does not expose the required model capabilities.
         """
-        with transformers_output_ignored():
-            model = CohereAsrForConditionalGeneration.from_pretrained(
-                self.config.model.pretrained_model_id,
-                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-                trust_remote_code=False,
-            )
-        if self.config.model.freeze_feature_encoder:
-            encoder = model.model.encoder
-            for parameter in encoder.parameters():
-                parameter.requires_grad = False
+        if self._uses_remote_code():
+            with transformers_output_ignored():
+                model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                    self.config.model.pretrained_model_id, **self._pretrained_kwargs()
+                )
+            if not all(
+                callable(getattr(model, name, None))
+                for name in ("forward", "generate", "save_pretrained")
+            ):
+                raise TypeError(
+                    "The remote Cohere model must support forward, generate and "
+                    "save_pretrained."
+                )
+            if self.config.model.freeze_feature_encoder:
+                self._freeze_encoder(model)
+        else:
+            with transformers_output_ignored():
+                model = CohereAsrForConditionalGeneration.from_pretrained(
+                    self.config.model.pretrained_model_id,
+                    token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+                    trust_remote_code=False,
+                )
+            if self.config.model.freeze_feature_encoder:
+                encoder = model.model.encoder
+                for parameter in encoder.parameters():
+                    parameter.requires_grad = False
 
         # Gradient checkpointing and the decoder cache are incompatible.
         model.config.use_cache = False
-        return model
+        return t.cast(CohereAsrForConditionalGeneration, model)
+
+    @staticmethod
+    def _freeze_encoder(model: object) -> None:
+        get_encoder = getattr(model, "get_encoder", None)
+        encoder = None
+        if callable(get_encoder):
+            try:
+                encoder = get_encoder()
+            except (AttributeError, NotImplementedError):
+                encoder = None
+        if encoder is None:
+            encoder = getattr(model, "encoder", None)
+        if encoder is None:
+            model_body = getattr(model, "model", None)
+            encoder = getattr(model_body, "encoder", None)
+        parameters = getattr(encoder, "parameters", None)
+        if not callable(parameters):
+            raise TypeError("The remote Cohere model has no accessible encoder.")
+        for parameter in parameters():
+            parameter.requires_grad = False
+
+    def _pretrained_kwargs(self) -> dict[str, str | bool]:
+        kwargs: dict[str, str | bool] = {
+            "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+            "trust_remote_code": self._uses_remote_code(),
+        }
+        revision = self.config.model.get("revision")
+        if revision is not None:
+            kwargs["revision"] = str(revision)
+        return kwargs
 
     def load_processor(self) -> CohereAsrProcessor:
-        """Load the native processor without remote Python code.
+        """Load the configured Cohere processor.
 
         Returns:
             The checkpoint processor.
 
         Raises:
             TypeError:
-                If the checkpoint is not a native Cohere processor.
+                If the checkpoint does not expose the required processing API.
         """
-        processor = CohereAsrProcessor.from_pretrained(
-            self.config.model.pretrained_model_id,
-            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-            trust_remote_code=False,
-        )
-        if not isinstance(processor, CohereAsrProcessor):
-            raise TypeError(
-                "The checkpoint did not load as a native Cohere ASR processor."
+        if self._uses_remote_code():
+            processor = AutoProcessor.from_pretrained(
+                self.config.model.pretrained_model_id, **self._pretrained_kwargs()
             )
-        self.processor = processor
-        return processor
+            self._validate_remote_processor(processor)
+        else:
+            processor = CohereAsrProcessor.from_pretrained(
+                self.config.model.pretrained_model_id,
+                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+                trust_remote_code=False,
+            )
+            if not isinstance(processor, CohereAsrProcessor):
+                raise TypeError(
+                    "The checkpoint did not load as a native Cohere ASR processor."
+                )
+        self.processor = t.cast(CohereAsrProcessor, processor)
+        return self.processor
+
+    @staticmethod
+    def _validate_remote_processor(processor: object) -> None:
+        required = ("feature_extractor", "tokenizer", "batch_decode")
+        missing = [name for name in required if not hasattr(processor, name)]
+        if not callable(processor):
+            missing.append("__call__")
+        if missing:
+            raise TypeError(
+                "The remote Cohere processor is missing required capabilities: "
+                + ", ".join(missing)
+            )
 
     def load_saved(self) -> PreTrainedModelData:
-        """Load a saved native Cohere model and its processing objects.
+        """Load a saved Cohere model and its processing objects.
 
         Returns:
             The saved model, processor, collator and metric function.
 
         Raises:
             TypeError:
-                If the saved checkpoint contains non-native model objects.
+                If the saved checkpoint does not expose the required API.
         """
         if Path(self.config.model_dir).exists():
             model_path = self.config.model_dir
         else:
             model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
 
-        processor = CohereAsrProcessor.from_pretrained(
-            model_path,
-            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-            trust_remote_code=False,
-        )
-        model = CohereAsrForConditionalGeneration.from_pretrained(
-            model_path,
-            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-            trust_remote_code=False,
-        )
-        if not isinstance(processor, CohereAsrProcessor):
-            raise TypeError(
-                "The saved checkpoint did not contain a native Cohere processor."
+        if self._uses_remote_code():
+            processor = AutoProcessor.from_pretrained(
+                model_path, **self._pretrained_kwargs()
             )
-        if not isinstance(model, CohereAsrForConditionalGeneration):
-            raise TypeError(
-                "The saved checkpoint did not contain a native Cohere model."
+            self._validate_remote_processor(processor)
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_path, **self._pretrained_kwargs()
             )
+            if not all(
+                callable(getattr(model, name, None))
+                for name in ("forward", "generate", "save_pretrained")
+            ):
+                raise TypeError(
+                    "The saved remote Cohere model has an incomplete model API."
+                )
+        else:
+            processor = CohereAsrProcessor.from_pretrained(
+                model_path,
+                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+                trust_remote_code=False,
+            )
+            model = CohereAsrForConditionalGeneration.from_pretrained(
+                model_path,
+                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+                trust_remote_code=False,
+            )
+            if not isinstance(processor, CohereAsrProcessor):
+                raise TypeError(
+                    "The saved checkpoint did not contain a native Cohere processor."
+                )
+            if not isinstance(model, CohereAsrForConditionalGeneration):
+                raise TypeError(
+                    "The saved checkpoint did not contain a native Cohere model."
+                )
         return PreTrainedModelData(
             processor=processor,
             model=model,
@@ -213,8 +314,8 @@ class CohereModelSetup(ModelSetup):
         )
 
     def load_trainer_class(self) -> Type[Trainer]:
-        """Return the Cohere evaluation trainer."""
-        return CohereSeq2SeqTrainer
+        """Return the trainer for the selected Cohere implementation."""
+        return Seq2SeqTrainer if self._uses_remote_code() else CohereSeq2SeqTrainer
 
     def load_training_arguments(self) -> TrainingArguments:
         """Build the common training configuration for Cohere.

@@ -148,17 +148,21 @@ The Olmix benchmark is local-only and serial. It compares the two model configs
 `whisper-xxsmall` (`openai/whisper-tiny`) and `hviske-v5-tiny`
 (`syvai/hviske-v5-tiny`) against the production, read-speech-heavy, and
 spontaneous/conversational-heavy anchors. The anchors preserve the 16-source order,
-60/40 Danish/English split, and non-zero representation of every source. The
-launcher writes one unique directory per job containing `metadata.json`, `run.log`,
-and the model output. It records the commit, command, timings, and parsed evaluation
-metrics; no credentials are written.
+60/40 Danish/English split, and non-zero representation of every source. The launcher
+writes one unique directory per job containing `metadata.json`, `run.log`,
+the step-tagged `evaluation_metrics.jsonl`, and the final model output. It records the
+commit, immutable model revision, command, timings, and evaluation metrics; no
+credentials are written.
 
-Run these commands inside the training container. The first command is deliberately
-credential-free: use the container's existing Hugging Face login rather than putting
-a token in an environment variable, command, or file.
+Run these commands inside the externally supplied training container. This repository
+does not build or configure that image: provide the project checkout, model/cache and
+background-noise mounts, plus the usual runtime environment (including GPU access and
+an existing Hugging Face login) according to the deployment. The first command is
+credential-free: use that existing login rather than putting a token in an environment
+variable, command, or file.
 
 ```bash
-docker exec -it hviske-sparkie bash
+docker exec -it <hviske-container> bash
 cd /workspace/hviske
 uv sync --python 3.11 --all-extras
 uv run python src/scripts/finetune_asr_model.py \
@@ -166,13 +170,12 @@ uv run python src/scripts/finetune_asr_model.py \
 uv run pytest tests/test_olmix_benchmark.py -q
 ```
 
-Run both two-step model smokes in a detached tmux session and inspect their logs:
+Run both two-step model smokes in an interactive tmux session and inspect their logs:
 
 ```bash
-tmux new-session -d -s olmix-smoke \
-  'cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
+tmux new-session -s olmix-smoke \
+  'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
    --smoke --output-root runs/olmix'
-tmux attach -t olmix-smoke
 ```
 
 After both smokes succeed, run the six jobs serially with `--skip-smoke`. If the
@@ -182,10 +185,9 @@ before the matrix. Each full job uses
 500, 1,000, 2,000, and 3,000, and disables Hub publication and experiment tracking.
 
 ```bash
-tmux new-session -d -s olmix-matrix \
-  'cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
+tmux new-session -s olmix-matrix \
+  'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
    --matrix --skip-smoke --output-root runs/olmix'
-tmux attach -t olmix-matrix
 tmux capture-pane -pt olmix-matrix:0 -S -200
 ```
 
@@ -193,16 +195,17 @@ For one selected calibration job, use the same launcher with `--model` and
 `--anchor`, for example:
 
 ```bash
-tmux new-session -d -s olmix-read \
-  'cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
+tmux new-session -s olmix-read \
+  'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
    --model hviske-v5-tiny --anchor olmix_read_speech_heavy \
    --output-root runs/olmix'
 ```
 
-The requested checkpoints are non-uniform, so `eval_steps` alone cannot express
+The requested evaluation steps are non-uniform, so `eval_steps` alone cannot express
 this schedule. The launcher passes the schedule through `evaluation_steps`; the
-training callback suppresses evaluations at all other steps while retaining the
-existing Trainer/Hydra entry point.
+training callback suppresses evaluations at all other steps and writes exact
+step-tagged records to `evaluation_metrics.jsonl`. These are evaluation steps, not
+retained checkpoints: only the final step is saved and one final checkpoint is kept.
 
 ## Explicit private publication
 

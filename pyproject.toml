@@ -29,6 +29,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "requests>=2.32.4",
     "safetensors>=0.7.0",
+    "sentencepiece>=0.2.2",
     "soundfile>=0.13.1",
     "torch-audiomentations>=0.12.0",
     "torchaudio>=2.6.0,<2.7.0",  # Upper bound for compatibility with audiomentations

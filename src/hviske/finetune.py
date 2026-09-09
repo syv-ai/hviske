@@ -1,7 +1,9 @@
 """Finetuning ASR models."""
 
+import json
 import logging
 import os
+from pathlib import Path
 
 from omegaconf import DictConfig
 from transformers.trainer_callback import (
@@ -74,7 +76,8 @@ def finetune(config: DictConfig) -> None:
     if evaluation_steps:
         callbacks.append(
             EvaluationScheduleCallback(
-                evaluation_steps=[int(step) for step in evaluation_steps]
+                evaluation_steps=[int(step) for step in evaluation_steps],
+                metrics_path=config.get("evaluation_metrics_path"),
             )
         )
     if eval_dataset is not None and config.early_stopping:
@@ -137,14 +140,43 @@ def finetune(config: DictConfig) -> None:
 class EvaluationScheduleCallback(TrainerCallback):
     """Restrict step-based evaluation to a finite, non-uniform schedule."""
 
-    def __init__(self, evaluation_steps: list[int]) -> None:
+    def __init__(
+        self, evaluation_steps: list[int], metrics_path: str | Path | None = None
+    ) -> None:
         """Initialise the callback with the permitted trainer steps.
 
         Args:
             evaluation_steps:
                 Global steps at which validation should run.
+            metrics_path (optional):
+                JSONL destination for step-tagged metrics. Defaults to ``None``.
         """
         self.evaluation_steps = set(evaluation_steps)
+        self.metrics_path = Path(metrics_path) if metrics_path is not None else None
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs: dict[str, float | int | bool] | None = None,
+        **kwargs: object,
+    ) -> None:
+        """Write machine-readable metrics with the Trainer's global step."""
+        del args, control, kwargs
+        if self.metrics_path is None or not logs:
+            return
+        metrics = {
+            key: value
+            for key, value in logs.items()
+            if key.startswith("eval_") or key in {"loss", "learning_rate"}
+        }
+        if not metrics:
+            return
+        self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {"step": state.global_step, **metrics}
+        with self.metrics_path.open("a", encoding="utf-8") as metrics_file:
+            metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
 
     def on_step_end(
         self,
