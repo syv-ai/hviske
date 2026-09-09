@@ -19,6 +19,7 @@ from datasets import (
 
 from hviske.data import (
     _dataset_cache_identity,
+    _filter_dataset_rows,
     _limit_validation_dataset,
     _set_source_language,
     _standardise_training_dataset,
@@ -136,6 +137,35 @@ def test_dataset_probabilities_reject_invalid_values(
         _validate_dataset_probabilities(
             probabilities=probabilities, dataset_count=dataset_count
         )
+
+
+def test_exact_row_filters_apply_to_streaming_datasets() -> None:
+    """Streaming row filters retain matching rows and explicit features."""
+    features = Features(source=Value("string"), text=Value("string"))
+    dataset = IterableDataset.from_generator(
+        lambda: iter(
+            [
+                {"source": "voxpopuli", "text": "included"},
+                {"source": "ftspeech", "text": "excluded"},
+            ]
+        ),
+        features=features,
+    )
+
+    filtered = _filter_dataset_rows(dataset=dataset, filters={"source": "voxpopuli"})
+
+    assert filtered.features == features
+    assert [row["text"] for row in filtered] == ["included"]
+
+
+def test_exact_row_filters_fail_for_missing_features() -> None:
+    """Row filters reject unknown columns before consuming a stream."""
+    dataset = IterableDataset.from_generator(
+        lambda: iter([]), features=Features(text=Value("string"))
+    )
+
+    with pytest.raises(ValueError, match="missing dataset features: source"):
+        _filter_dataset_rows(dataset=dataset, filters={"source": "voxpopuli"})
 
 
 def test_join_validates_configured_columns() -> None:

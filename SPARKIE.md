@@ -36,18 +36,19 @@ transcript side for the join.
 
 ## Fixed production mix
 
-Do not reorder or rebalance the preset. Its 15 streams are sampled as follows:
+Do not reorder or rebalance the preset. Its 16 streams are sampled as follows:
 
 | Language | Source | Configuration and split | Probability |
 | --- | --- | --- | ---: |
-| Danish | `syvai/p1` + `syvai/p1-transcripts` | `train` joined by the configured key | 0.075 |
-| Danish | local DRTV manifest | `train` | 0.075 |
-| Danish | local YouTube manifest | `train` | 0.075 |
-| Danish | `CoRal-project/coral-v3` | `read_aloud` / `train` | 0.075 |
-| Danish | `CoRal-project/coral-v3` | `conversation` / `train` | 0.075 |
-| Danish | `alexandrainst/ftspeech` | `train` | 0.075 |
-| Danish | `alexandrainst/nota` | `train` | 0.075 |
-| Danish | `alexandrainst/nst-da` | `train` | 0.075 |
+| Danish | `syvai/p1` + `syvai/p1-transcripts` | `train` joined by the configured key | 0.08 |
+| Danish | local DRTV manifest | `train` | 0.10 |
+| Danish | local YouTube manifest | `train` | 0.07 |
+| Danish | `CoRal-project/coral-v3` | `read_aloud` / `train` | 0.04 |
+| Danish | `CoRal-project/coral-v3` | `conversation` / `train` | 0.10 |
+| Danish | `alexandrainst/ftspeech` | `train` | 0.05 |
+| Danish | `alexandrainst/nota` | `train` | 0.05 |
+| Danish | `alexandrainst/nst-da` | `train` | 0.05 |
+| Danish | `syvai/danish-asr-unified` | `default` / `train`, `source=voxpopuli` | 0.06 |
 | English | `MLCommons/peoples_speech` | `clean` / `train` | 0.16 |
 | English | `edinburghcstr/ami` | `sdm` / `train` | 0.04 |
 | English | `edinburghcstr/ami` | `ihm` / `train` | 0.03 |
@@ -56,9 +57,12 @@ Do not reorder or rebalance the preset. Its 15 streams are sampled as follows:
 | English | `openslr/librispeech_asr` | `clean` / `train.360` | 0.025 |
 | English | `openslr/librispeech_asr` | `other` / `train.500` | 0.045 |
 
-The total is 60% Danish and 40% English. FLEURS `en_us` is evaluation-only.
-Common Voice, GigaSpeech, SPGISpeech, older CoRal data, and CoRal TTS are not part of
-this run.
+These are source-sampling probabilities chosen for style and acoustic balance, not
+weights proportional to row count. Large formal or read-aloud corpora are deliberately
+capped. The Danish total is exactly 60% and the English total 40%. FLEURS `en_us` is
+evaluation-only. The unified Danish repository is filtered to `source=voxpopuli`, so its
+ftspeech, CoRal, NST, and Nota rows do not enter through this stream. Common Voice,
+GigaSpeech, SPGISpeech, older CoRal data, and CoRal TTS are not part of this run.
 
 ## Local manifests and bounded preflight
 

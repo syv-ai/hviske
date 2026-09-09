@@ -57,6 +57,7 @@ Here are some of the more important available keys:
   - `ftspeech`
   - `nota`
   - `nst`
+  - `voxpopuli_da` (Danish VoxPopuli rows from `syvai/danish-asr-unified`)
   - `p1` (streaming audio plus configurable transcript Hub join)
   - `peoples_speech_clean` (English People's Speech `clean` training split)
   - `ami_sdm` and `ami_ihm` (English AMI training splits)
@@ -69,7 +70,10 @@ Here are some of the more important available keys:
   English Common Voice is not part of the production mix.
 - `dataset_probabilities`: In case you are finetuning on several datasets, you need to
   specify the probability of sampling each one. This is an array of probabilities that
-  need to sum to 1. If not set, the datasets are sampled uniformly.
+  need to sum to 1. If not set, the datasets are sampled uniformly. Production presets
+  use source-sampling probabilities chosen for style and acoustic balance, not
+  probabilities proportional to row count; large formal or read-aloud corpora are
+  deliberately capped.
 - `model_id`: The model ID of the finetuned model. Defaults to the model type along with
   a timestamp.
 - `push_to_hub`, `hub_organisation` and `private`: Whether to push the finetuned model
@@ -100,7 +104,9 @@ without downloading the audio by setting `transcript_dataset_id`,
 `transcript_trust_remote_code` default to false. The audio side remains streaming,
 while the transcript side is indexed in memory. Column names are deliberately
 configuration fields because private transcript schemas must be verified before use.
-The supplied `p1` config requires `P1_TRANSCRIPT_REVISION`,
+The supplied `voxpopuli_da` config selects only rows whose `source` is exactly
+`voxpopuli`; the unified repository's ftspeech, CoRal, NST, and Nota rows remain
+separately sourced. The supplied `p1` config requires `P1_TRANSCRIPT_REVISION`,
 `P1_AUDIO_JOIN_COLUMN`, `P1_TRANSCRIPT_JOIN_COLUMN`, and
 `P1_TRANSCRIPT_TEXT_COLUMN`.
 

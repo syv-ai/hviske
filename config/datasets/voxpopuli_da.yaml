@@ -1,0 +1,12 @@
+voxpopuli_da:
+  id: syvai/danish-asr-unified
+  subset: default
+  train_name: train
+  text_column: text
+  audio_column: audio
+  filter_dataset: true
+  filters:
+    source: voxpopuli
+  language: da
+  revision: 5a3a49ee981baab6e1e37ddd2c45f9943c27d08f
+  trust_remote_code: false
