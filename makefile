@@ -1,6 +1,6 @@
 # This ensures that we can call `make <target>` even if `<target>` exists as a file or
 # directory.
-.PHONY: docs help
+.PHONY: help install install-pre-commit install-dependencies install-quality-tools check test tree
 
 # Exports all variables defined in the makefile available to scripts
 .EXPORT_ALL_VARIABLES:
@@ -35,6 +35,7 @@ install: ## Install dependencies
 	@echo "Installing the 'Hviske' project..."
 	@$(MAKE) --quiet install-uv
 	@$(MAKE) --quiet install-dependencies
+	@$(MAKE) --quiet install-quality-tools
 	@$(MAKE) --quiet setup-environment-variables
 	@$(MAKE) --quiet install-pre-commit
 	@echo "Installed the 'Hviske' project! You can now activate your virtual environment with 'source .venv/bin/activate'."
@@ -61,6 +62,11 @@ install-dependencies:
 	@uv python install 3.11
 	@uv sync --python 3.11 --all-extras
 
+install-quality-tools:
+	@uv python install 3.12
+	@uv tool install --python 3.12 --force git+https://github.com/saattrupdan/funcsort@v0.1.3
+	@uv tool install --python 3.12 --force 'slopo>=0.5.0'
+
 setup-environment-variables:
 	@uv run python src/scripts/fix_dot_env_file.py
 
@@ -74,7 +80,37 @@ tree:  ## Print directory tree
 	@tree -a --gitignore -I .git .
 
 check:  ## Lint, format, and type-check the code
-	@uv run pre-commit run --all-files
+	@git add . && uv run pre-commit run --all-files
+	@if command -v llama-server >/dev/null 2>&1 && pgrep -x llama-server >/dev/null; then \
+		echo "Running Slopo code duplication detection..."; \
+		export LITELLM_DROP_PARAMS=true; \
+		export OPENAI_API_KEY=$${OPENAI_API_KEY:-sk-no-key}; \
+		if ! INDEX_OUTPUT=$$(uv tool run --python 3.12 --from 'slopo>=0.5.0' slopo index 2>&1); then \
+			echo "❌ Slopo index failed (Python 3.12 tool environment):"; echo "$$INDEX_OUTPUT"; exit 1; \
+		fi; \
+		echo "$$INDEX_OUTPUT" | grep -E "Indexed|unchanged|removed" || true; \
+		if ! EMBED_OUTPUT=$$(uv tool run --python 3.12 --from 'slopo>=0.5.0' slopo embed 2>&1); then \
+			echo "❌ Slopo embed failed (Python 3.12 tool environment):"; echo "$$EMBED_OUTPUT"; exit 1; \
+		fi; \
+		if ! ANALYSIS_OUTPUT=$$(uv tool run --python 3.12 --from 'slopo>=0.5.0' slopo analyze 2>&1); then \
+			echo "❌ Slopo analyse failed (Python 3.12 tool environment):"; echo "$$ANALYSIS_OUTPUT"; exit 1; \
+		fi; \
+		echo "$$ANALYSIS_OUTPUT" | grep -E "Exact copies|Similarity ratio" || true; \
+		DUPLICATE_COUNT=$$(echo "$$ANALYSIS_OUTPUT" | grep "Similarity ratio (including exact copies)" | sed -E 's/.*\(([0-9]+)\/.*/\1/'); \
+		if [ "$$DUPLICATE_COUNT" -gt 0 ] 2>/dev/null; then \
+			RATIO=$$(echo "$$ANALYSIS_OUTPUT" | grep "Similarity ratio (including exact copies)" | sed -E 's/.*: ([0-9.]+%).*/\1/'); \
+			echo ""; \
+			echo "❌ Slopo failed: duplicate code detected"; \
+			printf "   Duplicate units: %s\\n" "$$DUPLICATE_COUNT"; \
+			printf "   Similarity ratio: %s\\n" "$$RATIO"; \
+			echo "   Full report: .slopo/report/index.md"; \
+			echo "   To ignore reviewed duplicates, add their cluster hashes to .slopo/slopo.ignore.txt"; \
+			echo ""; \
+			exit 1; \
+		fi; \
+	else \
+		echo "Slopo skipped (llama.cpp server not running)"; \
+	fi
 
 roest-315m-100k:  ## Train the Røst-315M model
 	@OMP_NUM_THREADS=1 \

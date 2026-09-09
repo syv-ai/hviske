@@ -1,0 +1,10 @@
+librispeech_other_train_500:
+  id: openslr/librispeech_asr
+  subset: other
+  train_name: train.500
+  text_column: text
+  audio_column: audio
+  filter_dataset: true
+  language: en
+  revision: 71cacbfb7e2354c4226d01e70d77d5fca3d04ba1
+  trust_remote_code: false

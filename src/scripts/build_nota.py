@@ -62,6 +62,38 @@ def main(destination_dir: str | Path) -> None:
     )
 
 
+def build_huggingface_dataset(dataset_dir: Path | str) -> DatasetDict:
+    """Builds the HuggingFace dataset.
+
+    Args:
+        dataset_dir:
+            The directory to build the dataset from.
+
+    Returns:
+        The Hugging Face dataset.
+    """
+    dataset_dir = Path(dataset_dir)
+
+    logger.info("Building the HuggingFace dataset...")
+
+    # Build metadata file for the dataset
+    metadata_dict: dict[str, list[str]] = dict(audio=[], text=[])
+    for folder in dataset_dir.iterdir():
+        if not folder.is_dir():
+            continue
+        for text_file in folder.glob("*.txt"):
+            wav_filename = text_file.stem + ".wav"
+            metadata_dict["audio"].append(str(folder / wav_filename))
+            metadata_dict["text"].append(text_file.read_text(encoding="utf-8"))
+    metadata_df = pd.DataFrame(metadata_dict)
+
+    # Build the dataset
+    dataset = Dataset.from_pandas(metadata_df, preserve_index=False)
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+
+    return DatasetDict(dict(train=dataset))
+
+
 def download_nota(destination_dir: Path | str) -> None:
     """Downloads the Nota dataset.
 
@@ -114,38 +146,6 @@ def download_nota(destination_dir: Path | str) -> None:
             with ZipFile(destination_path, "r") as zip_file:
                 zip_file.extractall(path=destination_dir)
             Path(destination_path).unlink()
-
-
-def build_huggingface_dataset(dataset_dir: Path | str) -> DatasetDict:
-    """Builds the HuggingFace dataset.
-
-    Args:
-        dataset_dir:
-            The directory to build the dataset from.
-
-    Returns:
-        The Hugging Face dataset.
-    """
-    dataset_dir = Path(dataset_dir)
-
-    logger.info("Building the HuggingFace dataset...")
-
-    # Build metadata file for the dataset
-    metadata_dict: dict[str, list[str]] = dict(audio=[], text=[])
-    for folder in dataset_dir.iterdir():
-        if not folder.is_dir():
-            continue
-        for text_file in folder.glob("*.txt"):
-            wav_filename = text_file.stem + ".wav"
-            metadata_dict["audio"].append(str(folder / wav_filename))
-            metadata_dict["text"].append(text_file.read_text(encoding="utf-8"))
-    metadata_df = pd.DataFrame(metadata_dict)
-
-    # Build the dataset
-    dataset = Dataset.from_pandas(metadata_df, preserve_index=False)
-    dataset = dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
-
-    return DatasetDict(dict(train=dataset))
 
 
 def stream_download(url: str, destination_path: str | Path) -> None:

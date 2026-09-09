@@ -1,0 +1,145 @@
+# Production bilingual Cohere run for Sparkie. Keep publication as a separate step.
+defaults:
+  - model: cohere
+  - datasets:
+    - p1
+    - drtv_local
+    - youtube_local
+    - coral_read_aloud
+    - coral_conversation
+    - ftspeech
+    - nota
+    - nst
+    - voxpopuli_da
+    - peoples_speech_clean
+    - ami_sdm
+    - ami_ihm
+    - voxpopuli_en
+    - librispeech_clean_train_100
+    - librispeech_clean_train_360
+    - librispeech_other_train_500
+  - experiment_tracking: wandb
+  - override hydra/job_logging: custom
+  - _self_
+
+seed: 4242
+
+evaluation_lower_case: true
+evaluation_characters_to_keep: 'abcdefghijklmnopqrstuvwxyzæøå0123456789éü'
+evaluation_datasets:
+  - id: CoRal-project/coral-v3
+    subset: read_aloud
+    val_name: val
+    text_column: text
+    audio_column: audio
+    language: da
+    revision: 01f7c93c21fc9dec87fe9f7149c79569cc433f08
+    trust_remote_code: false
+  - id: CoRal-project/coral-v3
+    subset: conversation
+    val_name: val
+    text_column: text
+    audio_column: audio
+    language: da
+    revision: 01f7c93c21fc9dec87fe9f7149c79569cc433f08
+    trust_remote_code: false
+  - id: openslr/librispeech_asr
+    subset: clean
+    val_name: validation
+    text_column: text
+    audio_column: audio
+    language: en
+    revision: 71cacbfb7e2354c4226d01e70d77d5fca3d04ba1
+    trust_remote_code: false
+  - id: openslr/librispeech_asr
+    subset: other
+    val_name: validation
+    text_column: text
+    audio_column: audio
+    language: en
+    revision: 71cacbfb7e2354c4226d01e70d77d5fca3d04ba1
+    trust_remote_code: false
+  - id: google/fleurs
+    subset: en_us
+    val_name: validation
+    text_column: raw_transcription
+    audio_column: audio
+    language: en
+    revision: 70bb2e84b976b7e960aa89f1c648e09c59f894dd
+    trust_remote_code: false
+
+max_validation_samples_per_dataset: 1000
+
+min_seconds_per_example: 1.0
+max_seconds_per_example: 10.0
+dataset_num_workers: 4
+dataloader_num_workers: 4
+streaming: true
+cache_dir: null
+padding: longest
+
+# The first nine entries are Danish (60%); the final seven are English (40%).
+dataset_probabilities:
+  - 0.08 # p1
+  - 0.10 # drtv_local
+  - 0.07 # youtube_local
+  - 0.04 # coral_read_aloud
+  - 0.10 # coral_conversation
+  - 0.05 # ftspeech
+  - 0.05 # nota
+  - 0.05 # nst
+  - 0.06 # voxpopuli_da
+  - 0.16 # peoples_speech_clean
+  - 0.04 # ami_sdm
+  - 0.03 # ami_ihm
+  - 0.09 # voxpopuli_en
+  - 0.01 # librispeech_clean_train_100
+  - 0.025 # librispeech_clean_train_360
+  - 0.045 # librispeech_other_train_500
+
+# Exact source metadata for the separate private publication step.
+training_dataset_ids:
+  - syvai/p1
+  - syvai/p1-transcripts
+  - CoRal-project/coral-v3
+  - alexandrainst/ftspeech
+  - alexandrainst/nota
+  - alexandrainst/nst-da
+  - syvai/danish-asr-unified
+  - MLCommons/peoples_speech
+  - edinburghcstr/ami
+  - facebook/voxpopuli
+  - openslr/librispeech_asr
+
+model_id: hviske-v6
+models_dir: models
+model_dir: ${models_dir}/${model_id}
+hub_organisation: syvai
+push_to_hub: false
+create_pr: false
+private: true
+private_only: true
+model_card_languages:
+  - da
+  - en
+fp16_allowed: true
+bf16_allowed: true
+
+resume_from_checkpoint: false
+ignore_data_skip: false
+save_total_limit: 3
+enable_experiment_tracking: false
+
+adam_first_momentum: 0.9
+adam_second_momentum: 0.98
+total_batch_size: 256
+per_device_batch_size: 8
+max_steps: 100_000
+warmup_steps: 1_000
+logging_steps: 100
+eval_steps: 500
+save_steps: 500
+early_stopping: false
+early_stopping_patience: 50
+max_grad_norm: 1.0
+gradient_checkpointing: true

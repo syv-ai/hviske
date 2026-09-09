@@ -5,3 +5,6 @@ ftspeech:
   text_column: sentence
   audio_column: audio
   filter_dataset: true
+  language: da
+  revision: e1b7096db63c7d996a8220b13780a547a88a9af0
+  trust_remote_code: false

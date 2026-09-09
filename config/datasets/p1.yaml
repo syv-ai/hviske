@@ -1,0 +1,19 @@
+p1:
+  id: syvai/p1
+  subset: null
+  train_name: train
+  text_column: text
+  audio_column: audio
+  filter_dataset: true
+  language: da
+  revision: 449b9c2294026df6d0d37538f279fdec03f565ff
+  trust_remote_code: false
+  transcript_dataset_id: syvai/p1-transcripts
+  transcript_subset: null
+  transcript_split: train
+  transcript_revision: ${oc.env:P1_TRANSCRIPT_REVISION}
+  transcript_trust_remote_code: false
+  # The private transcript schema is not assumed. Set these after inspecting it.
+  audio_join_column: ${oc.env:P1_AUDIO_JOIN_COLUMN}
+  transcript_join_column: ${oc.env:P1_TRANSCRIPT_JOIN_COLUMN}
+  transcript_text_column: ${oc.env:P1_TRANSCRIPT_TEXT_COLUMN}

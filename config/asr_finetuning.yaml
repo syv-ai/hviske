@@ -27,6 +27,9 @@ evaluation_datasets:
     text_column: text
     audio_column: audio
 
+# Optional cap applied to each validation dataset before materialisation.
+max_validation_samples_per_dataset: null
+
 # Dataset parameters
 min_seconds_per_example: 1.0
 max_seconds_per_example: 10.0
@@ -51,6 +54,8 @@ hub_organisation: syv-ai
 push_to_hub: false
 create_pr: false
 private: false
+private_only: false
+model_card_languages: null
 fp16_allowed: true
 bf16_allowed: true
 

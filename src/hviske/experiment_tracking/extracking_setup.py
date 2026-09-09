@@ -18,17 +18,17 @@ class ExTrackingSetup(ABC):
         self.config = config
 
     @abstractmethod
-    def run_initialization(self) -> None:
-        """Run the initialization of the experiment tracking setup.
-
-        Returns:
-            True if the initialization was successful, False otherwise.
-        """
-
-    @abstractmethod
     def run_finalization(self) -> None:
         """Run the finalization of the experiment tracking setup.
 
         Returns:
             True if the finalization was successful, False otherwise.
+        """
+
+    @abstractmethod
+    def run_initialization(self) -> None:
+        """Run the initialization of the experiment tracking setup.
+
+        Returns:
+            True if the initialization was successful, False otherwise.
         """

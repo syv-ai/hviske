@@ -1,0 +1,24 @@
+# @package _global_
+# Read-speech anchor: 40% Danish read + 20% Danish conversational and
+# 30% English read + 10% English conversational. Read domains are p1, Coral
+# read-aloud, FTSpeech, Nota, NST, VoxPopuli, and LibriSpeech; DRTV, YouTube,
+# Coral conversation, PeopleSpeech, and AMI form the conversational domains.
+# Within each language/style domain, production proportions are retained so
+# this changes only emphasis.
+dataset_probabilities:
+  - 0.09696969 # p1
+  - 0.07407408 # drtv_local
+  - 0.05185185 # youtube_local
+  - 0.04848485 # coral_read_aloud
+  - 0.07407407 # coral_conversation
+  - 0.06060606 # ftspeech
+  - 0.06060606 # nota
+  - 0.06060606 # nst
+  - 0.07272728 # voxpopuli_da
+  - 0.06956522 # peoples_speech_clean
+  - 0.01739130 # ami_sdm
+  - 0.01304348 # ami_ihm
+  - 0.15882353 # voxpopuli_en
+  - 0.01764706 # librispeech_clean_train_100
+  - 0.04411765 # librispeech_clean_train_360
+  - 0.07941176 # librispeech_other_train_500

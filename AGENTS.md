@@ -8,7 +8,7 @@ speech-recognition models, with dataset and decoder tooling. It exposes the
 
 - Python `>=3.11,<3.13`, managed with `uv` and packaged with Hatchling.
 - PyTorch, Hugging Face Datasets and Transformers, Hydra, and Click.
-- Pytest, Ruff, Pyrefly, and pre-commit for quality checks.
+- Pytest, Ruff, Ty, Vulture, Slopo, and pre-commit for quality checks.
 - Optional dependency groups include `kenlm`, `demo`, and `plotting`.
 
 ## Layout
@@ -17,7 +17,6 @@ speech-recognition models, with dataset and decoder tooling. It exposes the
 - `src/scripts/`: Hydra entry points and dataset, evaluation, and maintenance tools.
 - `config/`: Hydra root configurations and configuration groups.
 - `tests/`: pytest tests and shared fixtures.
-- `notebooks/`: exploratory notebooks and checked-in notebook assets.
 - `.github/workflows/ci.yaml`: pull-request checks run on GitHub Actions.
 
 ## Setup and commands
@@ -31,6 +30,10 @@ source .venv/bin/activate
 make check
 make test
 ```
+
+`make install` keeps the project and test environment on Python 3.11. It also
+provisions Python 3.12 for Funcsort and Slopo, whose commands run through
+explicit `uv tool run --python 3.12` environments.
 
 `make install` installs Python 3.11, syncs all extras, creates `.env`, installs
 pre-commit, and runs `pre-commit autoupdate`. It also updates `uv` when `uv` is
@@ -63,10 +66,14 @@ Install FFmpeg and authenticate with Hugging Face using `HF_TOKEN`,
 `HUGGINGFACE_HUB_TOKEN`, or an existing `hf auth login` session. Tests also
 need network access and enough storage for model and dataset caches.
 
-`make check` runs all pre-commit hooks. Ruff's configured hooks use `--fix` and
-`--unsafe-fixes`, so they can rewrite files; inspect `git diff` after the run.
-`make test` runs pytest and then `readme-cov`; the latter can rewrite `README.md`.
-Run a focused test with, for example, `uv run pytest tests/test_package.py`.
+`make check` stages the working tree, runs all pre-commit hooks, and may rewrite
+and stage files. If a `llama-server` process is already running, it also runs Slopo
+in its explicit Python 3.12 tool environment; index, embed, and analyse failures
+are fatal. When no server is running, it reports the normal conditional skip.
+Ruff's configured hooks use `--fix` and `--unsafe-fixes`, so inspect `git diff` after
+the run. `make test` runs pytest
+and then `readme-cov`; the latter can rewrite `README.md`. Run a focused test with,
+for example, `uv run pytest tests/test_package.py`.
 
 Ruff uses 88-character lines, double quotes, import sorting, type annotations,
 and Google-style docstrings. Keep Python changes compatible with Python 3.11.
@@ -83,6 +90,7 @@ Use Conventional Commit subjects such as `feat:`, `fix:`, or `docs:`.
 - N-gram training may run `sudo apt-get` when `apt-get` is present. It downloads
   and compiles KenLM under `cache_dir`, or `~/.cache` when that is unset.
 - Training and evaluation can create caches, Hydra outputs, result files, and
-  tracking directories. Do not commit generated artifacts.
+  tracking directories. Do not commit generated artifacts. Slopo's database and
+  reports under `.slopo/` are also generated and ignored.
 - CI runs only for non-draft pull requests targeting `main`, uses Python 3.11 on
   Ubuntu, and checks out `main` rather than the pull request ref.

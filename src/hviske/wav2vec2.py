@@ -46,6 +46,54 @@ class Wav2Vec2ModelSetup(ModelSetup):
         self.processor: Processor
         self.is_main_process = os.getenv("RANK", "0") == "0"
 
+    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
+        """Return the compute metrics function for the model."""
+        return partial(compute_error_rate_metrics, processor=self.processor)
+
+    def load_data_collator(self) -> DataCollatorCTCWithPadding:
+        """Return the data collator for the model.
+
+        Returns:
+            The data collator.
+        """
+        return DataCollatorCTCWithPadding(
+            processor=self.processor,
+            sample_rate=self.config.model.sampling_rate,
+            max_seconds_per_example=self.config.max_seconds_per_example,
+            padding=self.config.padding,
+        )
+
+    def load_model(self) -> Wav2Vec2ForCTC:
+        """Return the model for the model."""
+        with transformers_output_ignored():
+            model = Wav2Vec2ForCTC.from_pretrained(
+                self.config.model.pretrained_model_id,
+                activation_dropout=self.config.model.activation_dropout,
+                attention_dropout=self.config.model.attention_dropout,
+                hidden_dropout=self.config.model.hidden_dropout,
+                feat_proj_dropout=self.config.model.feat_proj_dropout,
+                final_dropout=self.config.model.final_dropout,
+                apply_spec_augment=True,
+                mask_time_prob=self.config.model.mask_time_prob,
+                mask_time_length=self.config.model.mask_time_length,
+                mask_feature_prob=self.config.model.mask_feature_prob,
+                mask_feature_length=self.config.model.mask_feature_length,
+                layerdrop=self.config.model.layerdrop,
+                ctc_loss_reduction=self.config.model.ctc_loss_reduction,
+                pad_token_id=self.processor.tokenizer.pad_token_id,  # type: ignore[missing-attribute]
+                bos_token_id=self.processor.tokenizer.bos_token_id,  # type: ignore[missing-attribute]
+                eos_token_id=self.processor.tokenizer.eos_token_id,  # type: ignore[missing-attribute]
+                vocab_size=len(self.processor.tokenizer.get_vocab()),  # type: ignore[missing-attribute]
+                ctc_zero_infinity=True,
+            )
+        assert isinstance(model, Wav2Vec2ForCTC)
+
+        if self.config.model.freeze_feature_encoder:
+            for param in model.wav2vec2.parameters():
+                param.requires_grad = False
+
+        return model
+
     def load_processor(self) -> Wav2Vec2Processor:
         """Return the processor for the model.
 
@@ -101,57 +149,63 @@ class Wav2Vec2ModelSetup(ModelSetup):
 
         return self.processor
 
-    def load_model(self) -> Wav2Vec2ForCTC:
-        """Return the model for the model."""
-        with transformers_output_ignored():
-            model = Wav2Vec2ForCTC.from_pretrained(
-                self.config.model.pretrained_model_id,
-                activation_dropout=self.config.model.activation_dropout,
-                attention_dropout=self.config.model.attention_dropout,
-                hidden_dropout=self.config.model.hidden_dropout,
-                feat_proj_dropout=self.config.model.feat_proj_dropout,
-                final_dropout=self.config.model.final_dropout,
-                apply_spec_augment=True,
-                mask_time_prob=self.config.model.mask_time_prob,
-                mask_time_length=self.config.model.mask_time_length,
-                mask_feature_prob=self.config.model.mask_feature_prob,
-                mask_feature_length=self.config.model.mask_feature_length,
-                layerdrop=self.config.model.layerdrop,
-                ctc_loss_reduction=self.config.model.ctc_loss_reduction,
-                pad_token_id=self.processor.tokenizer.pad_token_id,  # type: ignore[missing-attribute]
-                bos_token_id=self.processor.tokenizer.bos_token_id,  # type: ignore[missing-attribute]
-                eos_token_id=self.processor.tokenizer.eos_token_id,  # type: ignore[missing-attribute]
-                vocab_size=len(self.processor.tokenizer.get_vocab()),  # type: ignore[missing-attribute]
-                ctc_zero_infinity=True,
-            )
-        assert isinstance(model, Wav2Vec2ForCTC)
-
-        if self.config.model.freeze_feature_encoder:
-            for param in model.wav2vec2.parameters():
-                param.requires_grad = False
-
-        return model
-
-    def load_data_collator(self) -> DataCollatorCTCWithPadding:
-        """Return the data collator for the model.
+    def load_saved(self) -> PreTrainedModelData:
+        """Return the saved model data for the model.
 
         Returns:
-            The data collator.
+            The model setup.
+
+        Raises:
+            FileNotFoundError:
+                If the model was trained with a language model decoder, but the language
+                model decoder was not found.
         """
-        return DataCollatorCTCWithPadding(
-            processor=self.processor,
+        if Path(self.config.model_dir).exists():
+            model_path = self.config.model_dir
+        else:
+            model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
+
+        processor: Wav2Vec2Processor | Wav2Vec2ProcessorWithLM
+        if self.config.model.decoder is not None:
+            try:
+                processor = Wav2Vec2ProcessorWithLM.from_pretrained(
+                    model_path, token=os.getenv("HUGGINGFACE_HUB_TOKEN", True)
+                )
+            except (FileNotFoundError, ValueError):
+                raise FileNotFoundError(
+                    "The model was trained with a language model decoder, but the "
+                    "language model decoder was not found."
+                )
+        else:
+            processor_or_tup = Wav2Vec2Processor.from_pretrained(
+                model_path, token=os.getenv("HUGGINGFACE_HUB_TOKEN", True)
+            )
+            assert not isinstance(processor_or_tup, tuple)
+            processor = processor_or_tup
+
+        model_or_tup = Wav2Vec2ForCTC.from_pretrained(
+            model_path, token=os.getenv("HUGGINGFACE_HUB_TOKEN", True)
+        )
+        assert isinstance(model_or_tup, Wav2Vec2ForCTC)
+        model = model_or_tup
+
+        data_collator = DataCollatorCTCWithPadding(
+            processor=processor,
             sample_rate=self.config.model.sampling_rate,
             max_seconds_per_example=self.config.max_seconds_per_example,
             padding=self.config.padding,
         )
 
+        return PreTrainedModelData(
+            processor=processor,
+            model=model,
+            data_collator=data_collator,
+            compute_metrics=partial(compute_error_rate_metrics, processor=processor),
+        )
+
     def load_trainer_class(self) -> Type[Trainer]:
         """Return the trainer class for the model."""
         return Trainer
-
-    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
-        """Return the compute metrics function for the model."""
-        return partial(compute_error_rate_metrics, processor=self.processor)
 
     def load_training_arguments(self) -> TrainingArguments:
         """Return the training arguments for the model."""
@@ -221,7 +275,9 @@ class Wav2Vec2ModelSetup(ModelSetup):
             bf16=bf16,
             push_to_hub=False,
             eval_strategy="steps",
-            eval_steps=self.config.eval_steps,
+            eval_steps=(
+                1 if self.config.get("evaluation_steps") else self.config.eval_steps
+            ),
             save_steps=self.config.save_steps,
             save_strategy="no" if self.config.save_total_limit == 0 else "steps",
             logging_steps=self.config.logging_steps,
@@ -248,60 +304,6 @@ class Wav2Vec2ModelSetup(ModelSetup):
             ddp_find_unused_parameters=False,
         )
         return args
-
-    def load_saved(self) -> PreTrainedModelData:
-        """Return the saved model data for the model.
-
-        Returns:
-            The model setup.
-
-        Raises:
-            FileNotFoundError:
-                If the model was trained with a language model decoder, but the language
-                model decoder was not found.
-        """
-        if Path(self.config.model_dir).exists():
-            model_path = self.config.model_dir
-        else:
-            model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
-
-        processor: Wav2Vec2Processor | Wav2Vec2ProcessorWithLM
-        if self.config.model.decoder is not None:
-            try:
-                processor = Wav2Vec2ProcessorWithLM.from_pretrained(
-                    model_path, token=os.getenv("HUGGINGFACE_HUB_TOKEN", True)
-                )
-            except (FileNotFoundError, ValueError):
-                raise FileNotFoundError(
-                    "The model was trained with a language model decoder, but the "
-                    "language model decoder was not found."
-                )
-        else:
-            processor_or_tup = Wav2Vec2Processor.from_pretrained(
-                model_path, token=os.getenv("HUGGINGFACE_HUB_TOKEN", True)
-            )
-            assert not isinstance(processor_or_tup, tuple)
-            processor = processor_or_tup
-
-        model_or_tup = Wav2Vec2ForCTC.from_pretrained(
-            model_path, token=os.getenv("HUGGINGFACE_HUB_TOKEN", True)
-        )
-        assert isinstance(model_or_tup, Wav2Vec2ForCTC)
-        model = model_or_tup
-
-        data_collator = DataCollatorCTCWithPadding(
-            processor=processor,
-            sample_rate=self.config.model.sampling_rate,
-            max_seconds_per_example=self.config.max_seconds_per_example,
-            padding=self.config.padding,
-        )
-
-        return PreTrainedModelData(
-            processor=processor,
-            model=model,
-            data_collator=data_collator,
-            compute_metrics=partial(compute_error_rate_metrics, processor=processor),
-        )
 
 
 def dump_vocabulary(config: DictConfig) -> None:

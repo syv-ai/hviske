@@ -7,19 +7,17 @@ ______________________________________________________________________
 [![LastCommit](https://img.shields.io/github/last-commit/syv-ai/hviske)](https://github.com/syv-ai/hviske/commits/main)
 [![Code Coverage](https://img.shields.io/badge/Coverage-57%25-orange.svg)](https://github.com/syv-ai/hviske/tree/main/tests)
 
-
 Author and maintainer:
 
-- Dan Saattrup Smart (dan@syv.dk)
-
+- Dan Saattrup Smart (<dan@syv.dk>)
 
 ## Installation
 
 1. Run `make install`, which installs `uv` (if it isn't already installed), sets up a
-   virtual environment and all Python dependencies therein.
+   Python 3.11 virtual environment and all project dependencies therein. It also
+   provisions Python 3.12 for the Funcsort and Slopo quality tools.
 2. Run `source .venv/bin/activate` to activate the virtual environment.
 3. Run `make` to see a list of available commands.
-
 
 ## Usage
 
@@ -28,7 +26,7 @@ Author and maintainer:
 You can use the `finetune_asr_model` script to finetune your own ASR model:
 
 ```bash
-python src/scripts/finetune_asr_model.py [key=value]...
+uv run python src/scripts/finetune_asr_model.py [key=value]...
 ```
 
 Here are some of the more important available keys:
@@ -60,15 +58,35 @@ Here are some of the more important available keys:
   - `ftspeech`
   - `nota`
   - `nst`
+  - `voxpopuli_da` (Danish VoxPopuli rows from `syvai/danish-asr-unified`)
+  - `p1` (streaming audio plus configurable transcript Hub join)
+  - `peoples_speech_clean` (English People's Speech `clean` training split)
+  - `ami_sdm` and `ami_ihm` (English AMI training splits)
+  - `voxpopuli_en` (English VoxPopuli training split)
+  - `librispeech_clean_train_100`, `librispeech_clean_train_360`, and
+    `librispeech_other_train_500` (streaming English LibriSpeech)
+  - `drtv_local` and `youtube_local` (local WAV/VTT manifests; both Danish)
+
+  FLEURS `en_us` is evaluation-only in the Sparkie preset and has no training config.
+  English Common Voice is not part of the production mix.
 - `dataset_probabilities`: In case you are finetuning on several datasets, you need to
   specify the probability of sampling each one. This is an array of probabilities that
-  need to sum to 1. If not set, the datasets are sampled uniformly.
+  need to sum to 1. If not set, the datasets are sampled uniformly. Production presets
+  use source-sampling probabilities chosen for style and acoustic balance, not
+  probabilities proportional to row count; large formal or read-aloud corpora are
+  deliberately capped.
 - `model_id`: The model ID of the finetuned model. Defaults to the model type along with
   a timestamp.
 - `push_to_hub`, `hub_organisation` and `private`: Whether to push the finetuned model
   to the Hugging Face Hub, and if so, which organisation to push it to. If `private` is
   set to `True`, the model will be private. The default is not to push the model to the
-  Hub.
+  Hub. `private_only` hard-fails public destinations and verifies Hub visibility before
+  and after upload. The production Sparkie preset keeps publication off during training;
+  use its separate `publish_private_model.py` command after review. Publication stages
+  only a complete reloadable Cohere package and a strict provenance model card. The
+  command resolves the preset automatically, including Hub revisions and source
+  probabilities; local manifest paths are never included. Trainer automatic pushes
+  remain disabled.
 - `enable_experiment_tracking`: Whether training monitoring during training should be
   enabled. Defaults to false. You can also set `experiment_tracking` to either `wandb`
   or `mlflow` to specify which experiment tracking tool to use (`wandb` is used by
@@ -79,8 +97,52 @@ Here are some of the more important available keys:
 - `model.learning_rate`, `total_batch_size`, `max_steps`, `warmup_steps`: Training
   parameters that you can tweak, although it shouldn't really be needed.
 
-See all the finetuning options in the `config/asr_finetuning.yaml` file.
+Dataset entries may set `language` to override the model-level Cohere prompt for
+that source. A Hub audio source can be joined to a compact transcript Hub dataset
+without downloading the audio by setting `transcript_dataset_id`,
+`transcript_subset`, `transcript_split`, `audio_join_column`,
+`transcript_join_column`, and `transcript_text_column`. `revision` and
+`transcript_revision` pin each side independently; `trust_remote_code` and
+`transcript_trust_remote_code` default to false. The audio side remains streaming,
+while the transcript side is indexed in memory. Column names are deliberately
+configuration fields because private transcript schemas must be verified before use.
+The supplied `voxpopuli_da` config selects only rows whose `source` is exactly
+`voxpopuli`; the unified repository's ftspeech, CoRal, NST, and Nota rows remain
+separately sourced. The supplied `p1` config requires `P1_TRANSCRIPT_REVISION`,
+`P1_AUDIO_JOIN_COLUMN`, `P1_TRANSCRIPT_JOIN_COLUMN`, and
+`P1_TRANSCRIPT_TEXT_COLUMN`.
 
+For local WAV/VTT data, first build a manifest without copying audio:
+
+```bash
+uv run python src/scripts/build_vtt_manifest.py \
+  --source-dir "$HOME/drtv-asr-dataset/data/drtv" \
+  --output "$HOME/drtv-asr-dataset/data/drtv/drtv-manifest.jsonl" \
+  --language da
+```
+
+Use `config/datasets/drtv_local.yaml` or `youtube_local.yaml` as the dataset
+configuration. Training seeks and reads only each cue from the original WAV when it
+is consumed; the manifest stores paths, offsets, text, IDs, durations, and language.
+
+The reproducible Sparkie bilingual preset is `config/sparkie_bilingual.yaml`. Resolve
+it with the existing fixed Hydra entry point using `--config-name sparkie_bilingual`,
+then run the bounded data preflight before stopping other Sparkie services:
+
+```bash
+uv run python src/scripts/preflight_finetuning_data.py \
+  --config-name sparkie_bilingual
+```
+
+The production preset caps validation materialisation at 1,000 examples per dataset.
+Use `max_validation_samples_per_dataset=32` for a two-step smoke, `=256` for a pilot,
+and `=1000` for the long run; the smoke must never materialise full validation.
+
+The complete operational procedure, including smoke, pilot, full tmux run, monitoring,
+checkpoint retention, and the separate private publication command, is in
+[`SPARKIE.md`](SPARKIE.md).
+
+See all the finetuning options in the `config/asr_finetuning.yaml` file.
 
 ### Evaluating an Automatic Speech Recognition (ASR) Model
 
@@ -104,13 +166,12 @@ Here are some of the more important available keys:
 
 See all the evaluation options in the `config/evaluation.yaml` file.
 
-
 ## Troubleshooting
 
 If you're on MacOS and get an error saying something along the lines of "fatal error:
 'lzma.h' file not found" then try the following and rerun `make install` afterwards:
 
-```
+```bash
 export CPPFLAGS="-I$(brew --prefix)/include"
 ```
 
@@ -118,6 +179,6 @@ Another MacOS issue can happen if you get something like "fatal error: 'cstddef'
 not found" and/or "fatal error: 'climits' file not found". In this case, first ensure
 that [you have Homebrew installed](https://brew.sh/), after which you run the following:
 
-```
+```bash
 brew install cmake boost zlib eigen
 ```

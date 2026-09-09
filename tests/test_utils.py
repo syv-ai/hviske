@@ -13,6 +13,17 @@ from hviske.utils import (
 )
 
 
+class TestBlockTerminalOutput:
+    """Tests for the `block_terminal_output` function."""
+
+    def test_datasets_logging_level_is_error(self) -> None:
+        """Test that the datasets logging level is set to error."""
+        ds_logging.set_verbosity_warning()
+        assert ds_logging.get_verbosity() == ds_logging.WARNING
+        with output_blocked():
+            assert ds_logging.get_verbosity() == ds_logging.ERROR
+
+
 class output_blocked:
     """Convenience context manager to block terminal output."""
 
@@ -28,25 +39,6 @@ class output_blocked:
     ) -> None:
         """Unblock terminal output."""
         ds_logging.set_verbosity_warning()
-
-
-class TestBlockTerminalOutput:
-    """Tests for the `block_terminal_output` function."""
-
-    def test_datasets_logging_level_is_error(self) -> None:
-        """Test that the datasets logging level is set to error."""
-        ds_logging.set_verbosity_warning()
-        assert ds_logging.get_verbosity() == ds_logging.WARNING
-        with output_blocked():
-            assert ds_logging.get_verbosity() == ds_logging.ERROR
-
-
-def test_transformers_output_ignored() -> None:
-    """Test that the transformers output is ignored."""
-    hf_logging.set_verbosity_info()
-    assert hf_logging.get_verbosity() == hf_logging.INFO
-    with transformers_output_ignored():
-        assert hf_logging.get_verbosity() == hf_logging.ERROR
 
 
 @pytest.mark.parametrize(
@@ -124,3 +116,11 @@ def test_transformers_output_ignored() -> None:
 def test_convert_numeral_to_words(numeral: str, expected: str) -> None:
     """Test that the `convert_numeral_to_words` function works as expected."""
     assert convert_numeral_to_words(numeral=numeral) == expected
+
+
+def test_transformers_output_ignored() -> None:
+    """Test that the transformers output is ignored."""
+    hf_logging.set_verbosity_info()
+    assert hf_logging.get_verbosity() == hf_logging.INFO
+    with transformers_output_ignored():
+        assert hf_logging.get_verbosity() == hf_logging.ERROR

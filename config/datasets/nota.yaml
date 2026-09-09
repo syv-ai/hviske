@@ -5,3 +5,6 @@ nota:
   text_column: text
   audio_column: audio
   filter_dataset: true
+  language: da
+  revision: acd1ad2389426f84fc3cb812c52d3d5dde5c7ce3
+  trust_remote_code: false

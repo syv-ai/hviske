@@ -1,0 +1,10 @@
+voxpopuli_en:
+  id: facebook/voxpopuli
+  subset: en
+  train_name: train
+  text_column: normalized_text
+  audio_column: audio
+  filter_dataset: true
+  language: en
+  revision: 42f01879c780b4a2e90ec0b4f616c2ece526e4f1
+  trust_remote_code: false
