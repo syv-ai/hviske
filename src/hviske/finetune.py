@@ -4,7 +4,13 @@ import logging
 import os
 
 from omegaconf import DictConfig
-from transformers.trainer_callback import EarlyStoppingCallback
+from transformers.trainer_callback import (
+    EarlyStoppingCallback,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
+)
+from transformers.training_args import TrainingArguments
 
 from hviske.data import download_background_noises
 
@@ -63,6 +69,21 @@ def finetune(config: DictConfig) -> None:
     if eval_dataset is None and is_main_process:
         logger.info("No validation set found. Disabling early stopping.")
 
+    callbacks: list[TrainerCallback] = []
+    evaluation_steps = config.get("evaluation_steps")
+    if evaluation_steps:
+        callbacks.append(
+            EvaluationScheduleCallback(
+                evaluation_steps=[int(step) for step in evaluation_steps]
+            )
+        )
+    if eval_dataset is not None and config.early_stopping:
+        callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=config.early_stopping_patience
+            )
+        )
+
     trainer = model_setup.load_trainer_class()(
         model=model,
         data_collator=model_setup.load_data_collator(),
@@ -71,13 +92,7 @@ def finetune(config: DictConfig) -> None:
         train_dataset=dataset["train"],
         eval_dataset=eval_dataset,
         processing_class=getattr(processor, "tokenizer"),
-        callbacks=[
-            EarlyStoppingCallback(
-                early_stopping_patience=config.early_stopping_patience
-            )
-        ]
-        if eval_dataset is not None and config.early_stopping
-        else None,
+        callbacks=callbacks or None,
     )
 
     block_terminal_output()
@@ -117,3 +132,32 @@ def finetune(config: DictConfig) -> None:
                 )
             ),
         )
+
+
+class EvaluationScheduleCallback(TrainerCallback):
+    """Restrict step-based evaluation to a finite, non-uniform schedule."""
+
+    def __init__(self, evaluation_steps: list[int]) -> None:
+        """Initialise the callback with the permitted trainer steps.
+
+        Args:
+            evaluation_steps:
+                Global steps at which validation should run.
+        """
+        self.evaluation_steps = set(evaluation_steps)
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: object,
+    ) -> TrainerControl:
+        """Evaluate only at the configured global steps.
+
+        Returns:
+            The updated trainer control object.
+        """
+        del args, kwargs
+        control.should_evaluate = state.global_step in self.evaluation_steps
+        return control

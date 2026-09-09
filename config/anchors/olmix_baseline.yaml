@@ -1,0 +1,21 @@
+# @package _global_
+# Olmix control: exactly the production Sparkie bilingual mix.
+# Keep this vector identical to sparkie_bilingual.yaml so model effects are
+# separable from data-selection effects.
+dataset_probabilities:
+  - 0.08 # p1
+  - 0.10 # drtv_local
+  - 0.07 # youtube_local
+  - 0.04 # coral_read_aloud
+  - 0.10 # coral_conversation
+  - 0.05 # ftspeech
+  - 0.05 # nota
+  - 0.05 # nst
+  - 0.06 # voxpopuli_da
+  - 0.16 # peoples_speech_clean
+  - 0.04 # ami_sdm
+  - 0.03 # ami_ihm
+  - 0.09 # voxpopuli_en
+  - 0.01 # librispeech_clean_train_100
+  - 0.025 # librispeech_clean_train_360
+  - 0.045 # librispeech_other_train_500
