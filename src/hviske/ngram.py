@@ -39,6 +39,35 @@ def train_and_store_ngram_model(config: DictConfig) -> None:
     compress_ngram_model(kenlm_build_dir=kenlm_build_dir, config=config)
 
 
+def compress_ngram_model(kenlm_build_dir: Path, config: DictConfig) -> None:
+    """Compress the n-gram language model.
+
+    Args:
+        kenlm_build_dir:
+            Path to the `kenlm` build directory.
+        config:
+            Hydra configuration dictionary.
+    """
+    logger.info("Compressing n-gram language model...")
+
+    compressed_ngram_path = (
+        Path(config.model_dir)
+        / "language_model"
+        / f"{config.model.decoder_num_ngrams}gram.arpa"
+    )
+    subprocess.run(
+        [
+            str(kenlm_build_dir / "bin" / "build_binary"),
+            str(compressed_ngram_path),
+            str(compressed_ngram_path.with_suffix(".bin")),
+        ]
+    )
+
+    # Remove the uncompressed ngram model, as we only need the compressed version
+    if compressed_ngram_path.exists():
+        compressed_ngram_path.unlink()
+
+
 def download_and_compile_kenlm(config: DictConfig) -> Path:
     """Download and compile the `kenlm` library.
 
@@ -91,6 +120,45 @@ def download_and_compile_kenlm(config: DictConfig) -> Path:
         subprocess.run(["make", "-j", "2"], cwd=str(kenlm_build_dir))
 
     return kenlm_build_dir
+
+
+def store_ngram_model(ngram_model_path: Path, config: DictConfig) -> None:
+    """Stores the n-gram language model in the model directory.
+
+    Args:
+        ngram_model_path:
+            Path to the n-gram language model.
+        config:
+            Hydra configuration dictionary.
+    """
+    logger.info("Storing n-gram language model...")
+
+    processor = Wav2Vec2Processor.from_pretrained(config.model_dir)
+
+    # Extract the vocabulary, which will be used to build the CTC decoder
+    vocab_dict: dict[str, int] = processor.tokenizer.get_vocab()  # type: ignore[missing-attribute]
+    sorted_vocab_list = sorted(vocab_dict.items(), key=lambda item: item[1])
+    sorted_vocab_dict = {k.lower(): v for k, v in sorted_vocab_list}
+
+    # Build the processor with LM included
+    decoder = build_ctcdecoder(
+        labels=list(sorted_vocab_dict.keys()), kenlm_model_path=str(ngram_model_path)
+    )
+    processor_with_lm = Wav2Vec2ProcessorWithLM(
+        feature_extractor=processor.feature_extractor,  # type: ignore[missing-attribute]
+        tokenizer=processor.tokenizer,  # type: ignore[missing-attribute]
+        decoder=decoder,
+    )
+
+    # Store the processor with LM, where any existing ngram model is removed
+    if Path(config.model_dir, "language_model").exists():
+        shutil.rmtree(Path(config.model_dir) / "language_model")
+    processor_with_lm.save_pretrained(config.model_dir)
+
+    # Remove the ngram model again, as the `save_pretrained` method also saves the ngram
+    # model
+    if ngram_model_path.exists():
+        ngram_model_path.unlink()
 
 
 def train_ngram_model(kenlm_build_dir: Path, config: DictConfig) -> Path:
@@ -317,71 +385,3 @@ def get_sentence_corpus_path(config: DictConfig) -> Path:
         text_file.flush()
 
     return sentence_path
-
-
-def store_ngram_model(ngram_model_path: Path, config: DictConfig) -> None:
-    """Stores the n-gram language model in the model directory.
-
-    Args:
-        ngram_model_path:
-            Path to the n-gram language model.
-        config:
-            Hydra configuration dictionary.
-    """
-    logger.info("Storing n-gram language model...")
-
-    processor = Wav2Vec2Processor.from_pretrained(config.model_dir)
-
-    # Extract the vocabulary, which will be used to build the CTC decoder
-    vocab_dict: dict[str, int] = processor.tokenizer.get_vocab()  # type: ignore[missing-attribute]
-    sorted_vocab_list = sorted(vocab_dict.items(), key=lambda item: item[1])
-    sorted_vocab_dict = {k.lower(): v for k, v in sorted_vocab_list}
-
-    # Build the processor with LM included
-    decoder = build_ctcdecoder(
-        labels=list(sorted_vocab_dict.keys()), kenlm_model_path=str(ngram_model_path)
-    )
-    processor_with_lm = Wav2Vec2ProcessorWithLM(
-        feature_extractor=processor.feature_extractor,  # type: ignore[missing-attribute]
-        tokenizer=processor.tokenizer,  # type: ignore[missing-attribute]
-        decoder=decoder,
-    )
-
-    # Store the processor with LM, where any existing ngram model is removed
-    if Path(config.model_dir, "language_model").exists():
-        shutil.rmtree(Path(config.model_dir) / "language_model")
-    processor_with_lm.save_pretrained(config.model_dir)
-
-    # Remove the ngram model again, as the `save_pretrained` method also saves the ngram
-    # model
-    if ngram_model_path.exists():
-        ngram_model_path.unlink()
-
-
-def compress_ngram_model(kenlm_build_dir: Path, config: DictConfig) -> None:
-    """Compress the n-gram language model.
-
-    Args:
-        kenlm_build_dir:
-            Path to the `kenlm` build directory.
-        config:
-            Hydra configuration dictionary.
-    """
-    logger.info("Compressing n-gram language model...")
-
-    compressed_ngram_path = (
-        Path(config.model_dir)
-        / "language_model"
-        / f"{config.model.decoder_num_ngrams}gram.arpa"
-    )
-    subprocess.run(
-        [
-            str(kenlm_build_dir / "bin" / "build_binary"),
-            str(compressed_ngram_path),
-            str(compressed_ngram_path.with_suffix(".bin")),
-        ]
-    )
-
-    # Remove the uncompressed ngram model, as we only need the compressed version
-    if compressed_ngram_path.exists():
-        compressed_ngram_path.unlink()

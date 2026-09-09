@@ -68,11 +68,19 @@ dev = [
     "lxml>=6.1.0",
     "pip>=26.1.2",
     "setuptools>=83.0.0",
-    "pyrefly>=0.45.0",
+    "ty>=0.0.40",
+    "vulture>=2.16",
+    "slopo>=0.5.0; python_version >= '3.12'",
 ]
 
 [tool.uv.sources]
 kenlm = { url = "https://github.com/kpu/kenlm/archive/master.zip" }
+
+[tool.uv]
+# Slopo currently declares NumPy 2.5, while pyctcdecode (used by the n-gram
+# decoder) declares NumPy <2. Keep the supported project NumPy line until
+# pyctcdecode publishes a compatible release; Slopo's array API works with it.
+override-dependencies = ["numpy>=1.26.0,<2.0.0"]
 
 [tool.ruff]
 target-version = "py311"
@@ -82,6 +90,7 @@ exclude = [
     ".pytest_cache",
     ".ruff_cache",
     ".venv",
+    "vulture_whitelist.py",
 ]
 extend-include = [
     "*.ipynb",
@@ -134,11 +143,18 @@ split-on-trailing-comma = false
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
-[tool.pyrefly.errors]
-missing-import = false
-missing-attribute = false
-not-iterable = false
-no-matching-overload = false
+[tool.ty.src]
+exclude = ["vulture_whitelist.py"]
+
+[tool.ty.rules]
+unresolved-import = "ignore"
+unresolved-attribute = "ignore"
+unsupported-operator = "ignore"
+no-matching-overload = "ignore"
+
+[tool.vulture]
+paths = ["src", "tests", "vulture_whitelist.py"]
+min_confidence = 80
 
 [tool.pytest.ini_options]
 minversion = "7.0"
@@ -164,9 +180,6 @@ testpaths = [
     "tests",
     "src/hviske",
 ]
-
-[tool.pyrefly]
-site-package-path = [".venv/lib/python3.11/site-packages"]
 
 [build-system]
 requires = ["hatchling"]

@@ -55,10 +55,7 @@ class TestProcessDataset:
             normalise_audio=True,
             augment_audio=False,
         )
-        processed_samples = {
-            sample["text"]  # pyrefly: ignore[bad-index]
-            for sample in processed_dataset
-        }
+        processed_samples = {sample["text"] for sample in processed_dataset}
         expected_samples = {
             "min fortræffelige lille nattergal!",
             "jeg venter grumme meget af den",

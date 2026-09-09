@@ -48,7 +48,7 @@ METRIC_NAMES = dict(cer="Character error rate", wer="Word error rate")
 def main(
     evaluation_file: tuple[Path, ...],
     metric: str,
-    model_focus: tuple[str],
+    model_focus: tuple[str, ...],
     title: str | None,
 ) -> None:
     """Creates a plot comparing the performance of different models on a dataset.

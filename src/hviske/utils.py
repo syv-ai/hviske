@@ -82,56 +82,6 @@ def block_terminal_output() -> None:
     os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 
 
-class transformers_output_ignored:
-    """Context manager to block terminal output."""
-
-    def __enter__(self) -> None:
-        """Enter the context manager."""
-        hf_logging.set_verbosity_error()
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> None:
-        """Exit the context manager."""
-        hf_logging.set_verbosity_info()
-
-
-@contextlib.contextmanager
-def monkeypatched(
-    obj: object, name: str, patch: c.Callable
-) -> c.Generator[None, None, None]:
-    """Temporarily monkeypatch.
-
-    Args:
-        obj:
-            The object to monkeypatch.
-        name:
-            The name of the attribute to monkeypatch.
-        patch:
-            The patch to apply.
-    """
-    old_attr = getattr(obj, name)
-    setattr(obj, name, patch(old_attr))
-    try:
-        yield
-    finally:
-        setattr(obj, name, old_attr)
-
-
-@contextlib.contextmanager
-def disable_tqdm() -> c.Generator[None, None, None]:
-    """Context manager to disable tqdm."""
-
-    def _patch(old_init: c.Callable[..., None]) -> partialmethod:
-        return partialmethod(old_init, disable=True)
-
-    with monkeypatched(tqdm_package.std.tqdm, "__init__", _patch):
-        yield
-
-
 def convert_iterable_dataset_to_dataset(
     iterable_dataset: IterableDataset,
     split_name: str = "train",
@@ -205,362 +155,6 @@ class no_datasets_progress_bars:
     ) -> None:
         """Re-enable the progress bar."""
         enable_progress_bar()
-
-
-def interpret_dataset_name(dataset_name: str) -> tuple[str, str | None, str | None]:
-    """Interpret the dataset name.
-
-    This extracts the dataset ID, dataset subset and dataset revision from the dataset
-    name.
-
-    Args:
-        dataset_name:
-            The name of the dataset.
-
-    Returns:
-        A triple (dataset_id, dataset_subset, dataset_revision) where:
-            dataset_id:
-                The ID of the dataset.
-            dataset_subset:
-                The subset of the dataset, which can be None if the default subset
-                should be used.
-            dataset_revision:
-                The revision of the dataset, which can be None if the newest revision
-                should be used.
-    """
-    if ":" in dataset_name and "::" not in dataset_name:
-        dataset_name = dataset_name.replace(":", "::")
-
-    assert dataset_name.count("@") <= 1, (
-        "You cannot include more than one '@' in the dataset name"
-    )
-    assert dataset_name.count("::") <= 1, (
-        "You cannot include more than one ':' in the dataset name"
-    )
-
-    dataset_id = dataset_name
-    dataset_subset = None
-    dataset_revision = None
-
-    if "@" in dataset_name:
-        dataset_id_and_dataset_subset, dataset_revision_and_dataset_subset = (
-            dataset_name.split("@")
-        )
-        if "::" in dataset_id_and_dataset_subset:
-            dataset_id, dataset_subset = dataset_id_and_dataset_subset.split("::")
-        else:
-            dataset_id = dataset_id_and_dataset_subset
-            dataset_subset = None
-        if "::" in dataset_revision_and_dataset_subset:
-            dataset_id, dataset_subset = dataset_revision_and_dataset_subset.split("::")
-        else:
-            dataset_revision = dataset_revision_and_dataset_subset
-
-    if "::" in dataset_name:
-        dataset_id, dataset_subset = dataset_name.split("::")
-        if "@" in dataset_subset:
-            dataset_subset, dataset_revision = dataset_subset.split("@")
-        else:
-            dataset_revision = None
-
-    return dataset_id, dataset_subset, dataset_revision
-
-
-def validate_private_only_config(config: object) -> None:
-    """Reject a contradictory private-publication configuration.
-
-    Args:
-        config:
-            Hydra configuration containing ``private_only`` and ``private``.
-
-    Raises:
-        ValueError:
-            If private-only publication is enabled without private publication.
-    """
-    getter = getattr(config, "get", None)
-    if callable(getter):
-        private_only = bool(getter("private_only", False))
-        private = bool(getter("private", False))
-    else:
-        private_only = bool(getattr(config, "private_only", False))
-        private = bool(getattr(config, "private", False))
-    if private_only and not private:
-        raise ValueError("A private-only run must set private=true")
-
-
-def verify_private_hub_repository(api: HfApi, repo_id: str, token: str | None) -> None:
-    """Verify that a model repository exists and is private.
-
-    Args:
-        api:
-            Authenticated Hugging Face API client.
-        repo_id:
-            Model repository identifier.
-        token:
-            Hugging Face token used for the request.
-
-    Raises:
-        PermissionError:
-            If the repository is public or its visibility is unavailable.
-    """
-    info = api.repo_info(repo_id=repo_id, repo_type="model", token=token or True)
-    if getattr(info, "private", None) is not True:
-        raise PermissionError(
-            f"Private-only publication refuses public repository {repo_id!r}"
-        )
-
-
-def ensure_private_hub_repository(repo_id: str, token: str | None) -> HfApi:
-    """Create a missing private model repository and verify its visibility.
-
-    Args:
-        repo_id:
-            Model repository identifier.
-        token:
-            Hugging Face token used for Hub operations.
-
-    Returns:
-        The authenticated Hugging Face API client.
-
-    """
-    api = HfApi(token=token or True)
-    try:
-        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
-    except RepositoryNotFoundError:
-        api.create_repo(
-            repo_id=repo_id,
-            repo_type="model",
-            private=True,
-            exist_ok=True,
-            token=token or True,
-        )
-        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
-    return api
-
-
-def publish_model_folder(
-    folder_path: str | Path,
-    repo_id: str,
-    finetuned_from: str,
-    private: bool,
-    model_card_languages: list[str],
-    commit_message: str = "Publish private model",
-    training_dataset_ids: list[str] | None = None,
-    evaluation_status: str = "Not evaluated.",
-) -> CommitInfo:
-    """Publish a model folder through one private Hub commit.
-
-    Args:
-        folder_path:
-            Directory containing the saved model and tokenizer.
-        repo_id:
-            Destination model repository.
-        finetuned_from:
-            Base model identifier for the model card.
-        private:
-            Must be true for this private-only publication path.
-        model_card_languages:
-            Languages to include in the model-card metadata.
-        commit_message (optional):
-            Hub commit message. Defaults to "Publish private model".
-        training_dataset_ids (optional):
-            Exact Hub dataset identifiers used for training.
-        evaluation_status (optional):
-            Short evaluation-status statement for the model card.
-
-    Returns:
-        The model-file upload commit information.
-    """
-    validate_private_only_config({"private_only": True, "private": private})
-    token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
-    api = ensure_private_hub_repository(repo_id=repo_id, token=token)
-    languages = list(model_card_languages)
-    for required_language in ("da", "en"):
-        if required_language not in languages:
-            languages.append(required_language)
-    with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
-        staging_path = Path(staging_dir)
-        _copy_model_artefacts(source=Path(folder_path), destination=staging_path)
-        _write_model_card(
-            destination=staging_path / "README.md",
-            finetuned_from=finetuned_from,
-            model_card_languages=languages,
-            training_dataset_ids=training_dataset_ids or [],
-            evaluation_status=evaluation_status,
-        )
-        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
-        commit = upload_folder(
-            repo_id=repo_id,
-            folder_path=staging_path,
-            token=token or True,
-            commit_message=commit_message,
-        )
-        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
-    return commit
-
-
-def push_model_to_hub(
-    trainer: Trainer,
-    model_name: str,
-    finetuned_from: str,
-    create_pr: bool,
-    language: str = "da",
-    license: str = "openrail",
-    tasks: list[str] | None = None,
-    commit_message: str = "Finished finetuning 🎉",
-    private: bool = False,
-    private_only: bool = False,
-    model_card_languages: list[str] | None = None,
-    training_dataset_ids: list[str] | None = None,
-    evaluation_status: str = "Not evaluated.",
-) -> CommitInfo | None:
-    """Upload a filtered model artefact set to the Hugging Face Hub.
-
-    The upload is staged in a temporary directory so trainer output, datasets and
-    experiment-tracking artefacts cannot become part of the Hub commit.
-
-    Args:
-        trainer:
-            The Trainer object containing the model and tokenizer to upload.
-        model_name:
-            The name of the model.
-        finetuned_from:
-            The ID of the model that was finetuned.
-        create_pr:
-            Whether to create a pull request.
-        language (optional):
-            Retained for API compatibility. The model card is bilingual.
-        license (optional):
-            Must be ``openrail`` for this publication path.
-        tasks (optional):
-            Retained for API compatibility; this path publishes ASR models.
-        commit_message (optional):
-            Message to commit while pushing. Defaults to "Finished finetuning 🎉".
-        private (optional):
-            Whether the destination repository must be private. Defaults to False.
-        private_only (optional):
-            Whether to refuse all public repositories. Defaults to False.
-        model_card_languages (optional):
-            Additional model-card language metadata. Danish and English are always
-            included.
-        training_dataset_ids (optional):
-            Exact Hub dataset identifiers used for training.
-        evaluation_status (optional):
-            Short evaluation-status statement for the model card.
-
-    Returns:
-        The commit information, or None if the process is not the main process.
-
-    Raises:
-        ValueError:
-            If private-only publication is requested without private=true, or if a
-            licence other than openrail is requested.
-    """
-    del language, tasks, model_name
-    if license.lower() != "openrail":
-        raise ValueError("Private ASR publication requires the openrail licence")
-    token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
-    validate_private_only_config({"private_only": private_only, "private": private})
-    repo_id = trainer.hub_model_id or getattr(trainer.args, "hub_model_id", None)
-    api: HfApi | None = None
-    requires_private = private or private_only
-    if requires_private:
-        if repo_id is None:
-            raise ValueError("Private publication requires a Hub model ID")
-        api = ensure_private_hub_repository(repo_id=repo_id, token=token)
-
-    # Trainer's own asynchronous pushes must never publish this output directory.
-    trainer.args.push_to_hub = False
-    if trainer.hub_model_id is None:
-        trainer.init_hf_repo(token=token)
-        repo_id = trainer.hub_model_id
-
-    if not trainer.is_world_process_zero():
-        return None
-    trainer._finish_current_push()
-
-    languages = list(model_card_languages or ["da", "en"])
-    for required_language in ("da", "en"):
-        if required_language not in languages:
-            languages.append(required_language)
-    with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
-        staging_path = Path(staging_dir)
-        _copy_model_artefacts(
-            source=Path(trainer.args.output_dir or "."), destination=staging_path
-        )
-        _write_model_card(
-            destination=staging_path / "README.md",
-            finetuned_from=finetuned_from,
-            model_card_languages=languages,
-            training_dataset_ids=training_dataset_ids or [],
-            evaluation_status=evaluation_status,
-        )
-        if requires_private:
-            assert api is not None
-            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
-        commit = upload_folder(
-            repo_id=repo_id or "",
-            create_pr=create_pr,
-            folder_path=staging_path,
-            commit_message=commit_message,
-            token=token or True,
-        )
-        if requires_private:
-            assert api is not None
-            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
-    return commit
-
-
-def _copy_model_artefacts(source: Path, destination: Path) -> None:
-    """Copy only recognised regular files from a model output directory.
-
-    Raises:
-        ValueError:
-            If the source is not a directory.
-    """
-    if not source.is_dir():
-        raise ValueError(f"Model output directory does not exist: {source}")
-    for candidate in source.iterdir():
-        if candidate.is_symlink() or not candidate.is_file():
-            continue
-        is_sharded = _SHARDED_MODEL_ARTEFACT.fullmatch(candidate.name) is not None
-        if candidate.name not in _MODEL_ARTEFACT_NAMES and not is_sharded:
-            continue
-        shutil.copy2(candidate, destination / candidate.name)
-
-
-def _write_model_card(
-    destination: Path,
-    finetuned_from: str,
-    model_card_languages: list[str],
-    training_dataset_ids: list[str],
-    evaluation_status: str,
-) -> None:
-    """Write the publication model card without machine-local information."""
-    language_lines = "\n".join(f"- {language}" for language in model_card_languages)
-    dataset_lines = "\n".join(f"- {dataset_id}" for dataset_id in training_dataset_ids)
-    if not dataset_lines:
-        dataset_lines = "- Not supplied by the caller."
-    destination.write_text(
-        "---\n"
-        f"language:\n{language_lines}\n"
-        "license: openrail\n"
-        "library_name: transformers\n"
-        "pipeline_tag: automatic-speech-recognition\n"
-        f"base_model: {finetuned_from}\n"
-        "datasets:\n"
-        f"{dataset_lines}\n"
-        "---\n\n"
-        "# Private internal Danish-English ASR checkpoint\n\n"
-        "This is a private internal Danish-English automatic speech recognition "
-        "checkpoint. It is intended for internal research, evaluation and testing "
-        "only, not for public distribution or production use.\n\n"
-        "## Training datasets\n\n"
-        f"{dataset_lines}\n\n"
-        "## Evaluation status\n\n"
-        f"{evaluation_status}\n",
-        encoding="utf-8",
-    )
 
 
 def convert_numeral_to_words(numeral: str, inside_larger_numeral: bool = False) -> str:
@@ -733,3 +327,409 @@ def convert_numeral_to_words(numeral: str, inside_larger_numeral: bool = False) 
             return numeral
 
     return re.sub(r" +", " ", result).strip()
+
+
+@contextlib.contextmanager
+def disable_tqdm() -> c.Generator[None, None, None]:
+    """Context manager to disable tqdm."""
+
+    def _patch(old_init: c.Callable[..., None]) -> partialmethod:
+        return partialmethod(old_init, disable=True)
+
+    with monkeypatched(tqdm_package.std.tqdm, "__init__", _patch):
+        yield
+
+
+@contextlib.contextmanager
+def monkeypatched(
+    obj: object, name: str, patch: c.Callable
+) -> c.Generator[None, None, None]:
+    """Temporarily monkeypatch.
+
+    Args:
+        obj:
+            The object to monkeypatch.
+        name:
+            The name of the attribute to monkeypatch.
+        patch:
+            The patch to apply.
+    """
+    old_attr = getattr(obj, name)
+    setattr(obj, name, patch(old_attr))
+    try:
+        yield
+    finally:
+        setattr(obj, name, old_attr)
+
+
+def interpret_dataset_name(dataset_name: str) -> tuple[str, str | None, str | None]:
+    """Interpret the dataset name.
+
+    This extracts the dataset ID, dataset subset and dataset revision from the dataset
+    name.
+
+    Args:
+        dataset_name:
+            The name of the dataset.
+
+    Returns:
+        A triple (dataset_id, dataset_subset, dataset_revision) where:
+            dataset_id:
+                The ID of the dataset.
+            dataset_subset:
+                The subset of the dataset, which can be None if the default subset
+                should be used.
+            dataset_revision:
+                The revision of the dataset, which can be None if the newest revision
+                should be used.
+    """
+    if ":" in dataset_name and "::" not in dataset_name:
+        dataset_name = dataset_name.replace(":", "::")
+
+    assert dataset_name.count("@") <= 1, (
+        "You cannot include more than one '@' in the dataset name"
+    )
+    assert dataset_name.count("::") <= 1, (
+        "You cannot include more than one ':' in the dataset name"
+    )
+
+    dataset_id = dataset_name
+    dataset_subset = None
+    dataset_revision = None
+
+    if "@" in dataset_name:
+        dataset_id_and_dataset_subset, dataset_revision_and_dataset_subset = (
+            dataset_name.split("@")
+        )
+        if "::" in dataset_id_and_dataset_subset:
+            dataset_id, dataset_subset = dataset_id_and_dataset_subset.split("::")
+        else:
+            dataset_id = dataset_id_and_dataset_subset
+            dataset_subset = None
+        if "::" in dataset_revision_and_dataset_subset:
+            dataset_id, dataset_subset = dataset_revision_and_dataset_subset.split("::")
+        else:
+            dataset_revision = dataset_revision_and_dataset_subset
+
+    if "::" in dataset_name:
+        dataset_id, dataset_subset = dataset_name.split("::")
+        if "@" in dataset_subset:
+            dataset_subset, dataset_revision = dataset_subset.split("@")
+        else:
+            dataset_revision = None
+
+    return dataset_id, dataset_subset, dataset_revision
+
+
+def publish_model_folder(
+    folder_path: str | Path,
+    repo_id: str,
+    finetuned_from: str,
+    private: bool,
+    model_card_languages: list[str],
+    commit_message: str = "Publish private model",
+    training_dataset_ids: list[str] | None = None,
+    evaluation_status: str = "Not evaluated.",
+) -> CommitInfo:
+    """Publish a model folder through one private Hub commit.
+
+    Args:
+        folder_path:
+            Directory containing the saved model and tokenizer.
+        repo_id:
+            Destination model repository.
+        finetuned_from:
+            Base model identifier for the model card.
+        private:
+            Must be true for this private-only publication path.
+        model_card_languages:
+            Languages to include in the model-card metadata.
+        commit_message (optional):
+            Hub commit message. Defaults to "Publish private model".
+        training_dataset_ids (optional):
+            Exact Hub dataset identifiers used for training.
+        evaluation_status (optional):
+            Short evaluation-status statement for the model card.
+
+    Returns:
+        The model-file upload commit information.
+    """
+    validate_private_only_config({"private_only": True, "private": private})
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
+    api = ensure_private_hub_repository(repo_id=repo_id, token=token)
+    languages = list(model_card_languages)
+    for required_language in ("da", "en"):
+        if required_language not in languages:
+            languages.append(required_language)
+    with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
+        staging_path = Path(staging_dir)
+        _copy_model_artefacts(source=Path(folder_path), destination=staging_path)
+        _write_model_card(
+            destination=staging_path / "README.md",
+            finetuned_from=finetuned_from,
+            model_card_languages=languages,
+            training_dataset_ids=training_dataset_ids or [],
+            evaluation_status=evaluation_status,
+        )
+        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+        commit = upload_folder(
+            repo_id=repo_id,
+            folder_path=staging_path,
+            token=token or True,
+            commit_message=commit_message,
+        )
+        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+    return commit
+
+
+def _copy_model_artefacts(source: Path, destination: Path) -> None:
+    """Copy only recognised regular files from a model output directory.
+
+    Raises:
+        ValueError:
+            If the source is not a directory.
+    """
+    if not source.is_dir():
+        raise ValueError(f"Model output directory does not exist: {source}")
+    for candidate in source.iterdir():
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        is_sharded = _SHARDED_MODEL_ARTEFACT.fullmatch(candidate.name) is not None
+        if candidate.name not in _MODEL_ARTEFACT_NAMES and not is_sharded:
+            continue
+        shutil.copy2(candidate, destination / candidate.name)
+
+
+def _write_model_card(
+    destination: Path,
+    finetuned_from: str,
+    model_card_languages: list[str],
+    training_dataset_ids: list[str],
+    evaluation_status: str,
+) -> None:
+    """Write the publication model card without machine-local information."""
+    language_lines = "\n".join(f"- {language}" for language in model_card_languages)
+    dataset_lines = "\n".join(f"- {dataset_id}" for dataset_id in training_dataset_ids)
+    if not dataset_lines:
+        dataset_lines = "- Not supplied by the caller."
+    destination.write_text(
+        "---\n"
+        f"language:\n{language_lines}\n"
+        "license: openrail\n"
+        "library_name: transformers\n"
+        "pipeline_tag: automatic-speech-recognition\n"
+        f"base_model: {finetuned_from}\n"
+        "datasets:\n"
+        f"{dataset_lines}\n"
+        "---\n\n"
+        "# Private internal Danish-English ASR checkpoint\n\n"
+        "This is a private internal Danish-English automatic speech recognition "
+        "checkpoint. It is intended for internal research, evaluation and testing "
+        "only, not for public distribution or production use.\n\n"
+        "## Training datasets\n\n"
+        f"{dataset_lines}\n\n"
+        "## Evaluation status\n\n"
+        f"{evaluation_status}\n",
+        encoding="utf-8",
+    )
+
+
+def ensure_private_hub_repository(repo_id: str, token: str | None) -> HfApi:
+    """Create a missing private model repository and verify its visibility.
+
+    Args:
+        repo_id:
+            Model repository identifier.
+        token:
+            Hugging Face token used for Hub operations.
+
+    Returns:
+        The authenticated Hugging Face API client.
+
+    """
+    api = HfApi(token=token or True)
+    try:
+        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+    except RepositoryNotFoundError:
+        api.create_repo(
+            repo_id=repo_id,
+            repo_type="model",
+            private=True,
+            exist_ok=True,
+            token=token or True,
+        )
+        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+    return api
+
+
+def verify_private_hub_repository(api: HfApi, repo_id: str, token: str | None) -> None:
+    """Verify that a model repository exists and is private.
+
+    Args:
+        api:
+            Authenticated Hugging Face API client.
+        repo_id:
+            Model repository identifier.
+        token:
+            Hugging Face token used for the request.
+
+    Raises:
+        PermissionError:
+            If the repository is public or its visibility is unavailable.
+    """
+    info = api.repo_info(repo_id=repo_id, repo_type="model", token=token or True)
+    if getattr(info, "private", None) is not True:
+        raise PermissionError(
+            f"Private-only publication refuses public repository {repo_id!r}"
+        )
+
+
+def validate_private_only_config(config: object) -> None:
+    """Reject a contradictory private-publication configuration.
+
+    Args:
+        config:
+            Hydra configuration containing ``private_only`` and ``private``.
+
+    Raises:
+        ValueError:
+            If private-only publication is enabled without private publication.
+    """
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        private_only = bool(getter("private_only", False))
+        private = bool(getter("private", False))
+    else:
+        private_only = bool(getattr(config, "private_only", False))
+        private = bool(getattr(config, "private", False))
+    if private_only and not private:
+        raise ValueError("A private-only run must set private=true")
+
+
+def push_model_to_hub(
+    trainer: Trainer,
+    model_name: str,
+    finetuned_from: str,
+    create_pr: bool,
+    language: str = "da",
+    license: str = "openrail",
+    tasks: list[str] | None = None,
+    commit_message: str = "Finished finetuning 🎉",
+    private: bool = False,
+    private_only: bool = False,
+    model_card_languages: list[str] | None = None,
+    training_dataset_ids: list[str] | None = None,
+    evaluation_status: str = "Not evaluated.",
+) -> CommitInfo | None:
+    """Upload a filtered model artefact set to the Hugging Face Hub.
+
+    The upload is staged in a temporary directory so trainer output, datasets and
+    experiment-tracking artefacts cannot become part of the Hub commit.
+
+    Args:
+        trainer:
+            The Trainer object containing the model and tokenizer to upload.
+        model_name:
+            The name of the model.
+        finetuned_from:
+            The ID of the model that was finetuned.
+        create_pr:
+            Whether to create a pull request.
+        language (optional):
+            Retained for API compatibility. The model card is bilingual.
+        license (optional):
+            Must be ``openrail`` for this publication path.
+        tasks (optional):
+            Retained for API compatibility; this path publishes ASR models.
+        commit_message (optional):
+            Message to commit while pushing. Defaults to "Finished finetuning 🎉".
+        private (optional):
+            Whether the destination repository must be private. Defaults to False.
+        private_only (optional):
+            Whether to refuse all public repositories. Defaults to False.
+        model_card_languages (optional):
+            Additional model-card language metadata. Danish and English are always
+            included.
+        training_dataset_ids (optional):
+            Exact Hub dataset identifiers used for training.
+        evaluation_status (optional):
+            Short evaluation-status statement for the model card.
+
+    Returns:
+        The commit information, or None if the process is not the main process.
+
+    Raises:
+        ValueError:
+            If private-only publication is requested without private=true, or if a
+            licence other than openrail is requested.
+    """
+    del language, tasks, model_name
+    if license.lower() != "openrail":
+        raise ValueError("Private ASR publication requires the openrail licence")
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
+    validate_private_only_config({"private_only": private_only, "private": private})
+    repo_id = trainer.hub_model_id or getattr(trainer.args, "hub_model_id", None)
+    api: HfApi | None = None
+    requires_private = private or private_only
+    if requires_private:
+        if repo_id is None:
+            raise ValueError("Private publication requires a Hub model ID")
+        api = ensure_private_hub_repository(repo_id=repo_id, token=token)
+
+    # Trainer's own asynchronous pushes must never publish this output directory.
+    trainer.args.push_to_hub = False
+    if trainer.hub_model_id is None:
+        trainer.init_hf_repo(token=token)
+        repo_id = trainer.hub_model_id
+
+    if not trainer.is_world_process_zero():
+        return None
+    trainer._finish_current_push()
+
+    languages = list(model_card_languages or ["da", "en"])
+    for required_language in ("da", "en"):
+        if required_language not in languages:
+            languages.append(required_language)
+    with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
+        staging_path = Path(staging_dir)
+        _copy_model_artefacts(
+            source=Path(trainer.args.output_dir or "."), destination=staging_path
+        )
+        _write_model_card(
+            destination=staging_path / "README.md",
+            finetuned_from=finetuned_from,
+            model_card_languages=languages,
+            training_dataset_ids=training_dataset_ids or [],
+            evaluation_status=evaluation_status,
+        )
+        if requires_private:
+            assert api is not None
+            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
+        commit = upload_folder(
+            repo_id=repo_id or "",
+            create_pr=create_pr,
+            folder_path=staging_path,
+            commit_message=commit_message,
+            token=token or True,
+        )
+        if requires_private:
+            assert api is not None
+            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
+    return commit
+
+
+class transformers_output_ignored:
+    """Context manager to block terminal output."""
+
+    def __enter__(self) -> None:
+        """Enter the context manager."""
+        hf_logging.set_verbosity_error()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the context manager."""
+        hf_logging.set_verbosity_info()

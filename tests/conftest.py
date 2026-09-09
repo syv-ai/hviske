@@ -18,14 +18,26 @@ load_dotenv()
 initialize(config_path="../config", version_base=None)
 
 
-def pytest_configure() -> None:
-    """Set a global flag when `pytest` is being run."""
-    setattr(sys, "_called_from_test", True)
+@pytest.fixture(scope="session")
+def dataset(finetuning_config: DictConfig) -> Generator[Dataset, None, None]:
+    """Load the dataset for testing.
 
-
-def pytest_unconfigure() -> None:
-    """Unset the global flag when `pytest` is finished."""
-    delattr(sys, "_called_from_test")
+    Yields:
+        The dataset for testing.
+    """
+    dataset_config = list(finetuning_config.datasets.values())[0]
+    dataset = load_dataset(
+        path=dataset_config.id,
+        name=dataset_config.subset,
+        split=dataset_config.train_name,
+        token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+    )
+    assert isinstance(dataset, Dataset)
+    if dataset_config.text_column != "text":
+        dataset = dataset.rename_column(dataset_config.text_column, "text")
+    if dataset_config.audio_column != "audio":
+        dataset = dataset.rename_column(dataset_config.audio_column, "audio")
+    yield dataset
 
 
 @pytest.fixture(
@@ -63,23 +75,11 @@ def finetuning_config(
     )
 
 
-@pytest.fixture(scope="session")
-def dataset(finetuning_config: DictConfig) -> Generator[Dataset, None, None]:
-    """Load the dataset for testing.
+def pytest_configure() -> None:
+    """Set a global flag when `pytest` is being run."""
+    setattr(sys, "_called_from_test", True)
 
-    Yields:
-        The dataset for testing.
-    """
-    dataset_config = list(finetuning_config.datasets.values())[0]
-    dataset = load_dataset(
-        path=dataset_config.id,
-        name=dataset_config.subset,
-        split=dataset_config.train_name,
-        token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-    )
-    assert isinstance(dataset, Dataset)
-    if dataset_config.text_column != "text":
-        dataset = dataset.rename_column(dataset_config.text_column, "text")
-    if dataset_config.audio_column != "audio":
-        dataset = dataset.rename_column(dataset_config.audio_column, "audio")
-    yield dataset
+
+def pytest_unconfigure() -> None:
+    """Unset the global flag when `pytest` is finished."""
+    delattr(sys, "_called_from_test")

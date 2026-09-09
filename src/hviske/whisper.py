@@ -47,28 +47,22 @@ class WhisperModelSetup(ModelSetup):
         self.processor: WhisperProcessor
         self.is_main_process = os.getenv("RANK", "0") == "0"
 
-    def load_processor(self) -> WhisperProcessor:
-        """Return the processor for the model."""
-        processor_or_tup = WhisperProcessor.from_pretrained(
-            self.config.model.pretrained_model_id, language="Danish", task="transcribe"
-        )
-        assert isinstance(processor_or_tup, WhisperProcessor)
-        self.processor = processor_or_tup
+    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
+        """Return the function used to compute metrics during training."""
+        return partial(compute_error_rate_metrics, processor=self.processor)
 
-        # Whisper tokenizers are misconfigured with a max_length that is too high, but
-        # the correct max_length is stored in the generation config, so update it here.
-        model_id = self.config.model.pretrained_model_id
-        generation_config = GenerationConfig.from_pretrained(model_id)
-        max_length = generation_config.max_length
-        if max_length is None:
-            hf_config = AutoConfig.from_pretrained(model_id)
-            max_length = int(hf_config.max_target_positions)
-        self.processor.tokenizer.model_max_length = min(  # type: ignore[attr-defined]
-            self.processor.tokenizer.model_max_length,  # type: ignore[attr-defined]
-            max_length,
-        )
+    def load_data_collator(self) -> DataCollatorSpeechSeq2SeqWithPadding:
+        """Return the data collator for the model.
 
-        return self.processor
+        Returns:
+            The data collator.
+        """
+        return DataCollatorSpeechSeq2SeqWithPadding(
+            processor=self.processor,
+            sample_rate=self.config.model.sampling_rate,
+            max_seconds_per_example=self.config.max_seconds_per_example,
+            padding=self.config.padding,
+        )
 
     def load_model(self) -> WhisperForConditionalGeneration:
         """Return the model for the setup."""
@@ -114,26 +108,67 @@ class WhisperModelSetup(ModelSetup):
 
         return model
 
-    def load_data_collator(self) -> DataCollatorSpeechSeq2SeqWithPadding:
-        """Return the data collator for the model.
+    def load_processor(self) -> WhisperProcessor:
+        """Return the processor for the model."""
+        processor_or_tup = WhisperProcessor.from_pretrained(
+            self.config.model.pretrained_model_id, language="Danish", task="transcribe"
+        )
+        assert isinstance(processor_or_tup, WhisperProcessor)
+        self.processor = processor_or_tup
+
+        # Whisper tokenizers are misconfigured with a max_length that is too high, but
+        # the correct max_length is stored in the generation config, so update it here.
+        model_id = self.config.model.pretrained_model_id
+        generation_config = GenerationConfig.from_pretrained(model_id)
+        max_length = generation_config.max_length
+        if max_length is None:
+            hf_config = AutoConfig.from_pretrained(model_id)
+            max_length = int(hf_config.max_target_positions)
+        self.processor.tokenizer.model_max_length = min(  # type: ignore[attr-defined]
+            self.processor.tokenizer.model_max_length,  # type: ignore[attr-defined]
+            max_length,
+        )
+
+        return self.processor
+
+    def load_saved(self) -> PreTrainedModelData:
+        """Load the model setup.
 
         Returns:
-            The data collator.
+            The model setup.
         """
-        return DataCollatorSpeechSeq2SeqWithPadding(
-            processor=self.processor,
+        if Path(self.config.model_dir).exists():
+            model_path = self.config.model_dir
+        else:
+            model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
+
+        processor: Processor
+        processor_or_tup = WhisperProcessor.from_pretrained(model_path, token=True)
+        assert isinstance(processor_or_tup, WhisperProcessor)
+        processor = processor_or_tup
+
+        model_or_tup = WhisperForConditionalGeneration.from_pretrained(
+            model_path, token=True
+        )
+        assert isinstance(model_or_tup, WhisperForConditionalGeneration)
+        model = model_or_tup
+
+        data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+            processor=processor,
             sample_rate=self.config.model.sampling_rate,
             max_seconds_per_example=self.config.max_seconds_per_example,
             padding=self.config.padding,
+        )
+        return PreTrainedModelData(
+            processor=processor,
+            model=model,
+            data_collator=data_collator,
+            compute_metrics=partial(compute_error_rate_metrics, processor=processor),
         )
 
     def load_trainer_class(self) -> Type[Trainer]:
         """Return the trainer class used to train the model."""
         return Seq2SeqTrainer
-
-    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
-        """Return the function used to compute metrics during training."""
-        return partial(compute_error_rate_metrics, processor=self.processor)
 
     def load_training_arguments(self) -> TrainingArguments:
         """Return the training arguments for the model."""
@@ -235,38 +270,3 @@ class WhisperModelSetup(ModelSetup):
             ).to_dict(),
         )
         return args
-
-    def load_saved(self) -> PreTrainedModelData:
-        """Load the model setup.
-
-        Returns:
-            The model setup.
-        """
-        if Path(self.config.model_dir).exists():
-            model_path = self.config.model_dir
-        else:
-            model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
-
-        processor: Processor
-        processor_or_tup = WhisperProcessor.from_pretrained(model_path, token=True)
-        assert isinstance(processor_or_tup, WhisperProcessor)
-        processor = processor_or_tup
-
-        model_or_tup = WhisperForConditionalGeneration.from_pretrained(
-            model_path, token=True
-        )
-        assert isinstance(model_or_tup, WhisperForConditionalGeneration)
-        model = model_or_tup
-
-        data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-            processor=processor,
-            sample_rate=self.config.model.sampling_rate,
-            max_seconds_per_example=self.config.max_seconds_per_example,
-            padding=self.config.padding,
-        )
-        return PreTrainedModelData(
-            processor=processor,
-            model=model,
-            data_collator=data_collator,
-            compute_metrics=partial(compute_error_rate_metrics, processor=processor),
-        )

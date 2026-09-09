@@ -10,42 +10,6 @@ from omegaconf import OmegaConf
 from scripts.preflight_finetuning_data import preflight_finetuning_data
 
 
-class CountingDataset:
-    """Iterable that records how many rows a caller consumes."""
-
-    def __init__(self, rows: list[dict[str, object]]) -> None:
-        """Store rows without exposing a length-based materialisation path."""
-        self.rows = rows
-        self.consumed = 0
-
-    def __iter__(self) -> c.Iterator[dict[str, object]]:
-        """Yield rows while recording consumption."""
-        for row in self.rows:
-            self.consumed += 1
-            yield row
-
-
-class FakeHubApi:
-    """Record authentication and model-access checks."""
-
-    def __init__(self) -> None:
-        """Initialise an empty model access log."""
-        self.model_ids: list[str] = []
-
-    def whoami(self) -> dict[str, object]:
-        """Return a test identity."""
-        return {"name": "tester"}
-
-    def model_info(self, repo_id: str) -> object:
-        """Record the model repository checked by the preflight.
-
-        Returns:
-            Placeholder model metadata.
-        """
-        self.model_ids.append(repo_id)
-        return object()
-
-
 def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
     """Hub streams and local manifests remain bounded to their first row."""
     audio_path = tmp_path / "audio.wav"
@@ -142,6 +106,42 @@ def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
         "transcript-sha",
         "evaluation-sha",
     ]
+
+
+class CountingDataset:
+    """Iterable that records how many rows a caller consumes."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        """Store rows without exposing a length-based materialisation path."""
+        self.rows = rows
+        self.consumed = 0
+
+    def __iter__(self) -> c.Iterator[dict[str, object]]:
+        """Yield rows while recording consumption."""
+        for row in self.rows:
+            self.consumed += 1
+            yield row
+
+
+class FakeHubApi:
+    """Record authentication and model-access checks."""
+
+    def __init__(self) -> None:
+        """Initialise an empty model access log."""
+        self.model_ids: list[str] = []
+
+    def model_info(self, repo_id: str) -> object:
+        """Record the model repository checked by the preflight.
+
+        Returns:
+            Placeholder model metadata.
+        """
+        self.model_ids.append(repo_id)
+        return object()
+
+    def whoami(self) -> dict[str, object]:
+        """Return a test identity."""
+        return {"name": "tester"}
 
 
 def test_preflight_rejects_missing_schema_without_consuming_a_second_row() -> None:

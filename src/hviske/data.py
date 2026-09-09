@@ -46,6 +46,111 @@ from .utils import (
 logger = logging.getLogger(__package__)
 
 
+def _dataset_cache_identity(
+    dataset_id: str,
+    subset: str | None,
+    split: str,
+    revision: str | None,
+    purpose: str,
+    max_samples: int | None = None,
+) -> str:
+    """Build a stable cache identity for one dataset materialisation.
+
+    Args:
+        dataset_id:
+            Dataset repository or local identifier.
+        subset:
+            Dataset subset, if any.
+        split:
+            Dataset split.
+        revision:
+            Dataset revision, if any.
+        purpose:
+            Cache purpose, such as validation or evaluation.
+        max_samples (optional):
+            Materialisation limit, if one is applied.
+
+    Returns:
+        A filesystem-safe dataset identifier containing a canonical hash.
+    """
+    identity = json.dumps(
+        {
+            "dataset_id": dataset_id,
+            "max_samples": max_samples,
+            "purpose": purpose,
+            "revision": revision,
+            "split": split,
+            "subset": subset,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"{dataset_id.replace('/', '--')}-{digest}"
+
+
+def _limit_validation_dataset(
+    dataset: IterableDataset, max_samples: int | None
+) -> IterableDataset:
+    """Apply a validation sample limit while the dataset is still iterable.
+
+    Args:
+        dataset:
+            Validation examples to limit.
+        max_samples:
+            Maximum number of examples, or ``None`` for no limit.
+
+    Returns:
+        The limited iterable dataset.
+    """
+    if max_samples is None:
+        return dataset
+    return dataset.take(max_samples)
+
+
+def _load_transcript_dataset(
+    dataset_id: str,
+    subset: str | None,
+    split: str,
+    revision: str | None,
+    cache_dir: str | None,
+    trust_remote_code: bool = False,
+) -> Dataset:
+    """Load the compact transcript side without streaming.
+
+    Returns:
+        A non-streaming transcript dataset.
+
+    Raises:
+        ValueError:
+            If the Hub returns a streaming or otherwise unsupported dataset.
+    """
+    kwargs: dict[str, Any] = {
+        "path": dataset_id,
+        "name": subset,
+        "split": split,
+        "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+        "streaming": False,
+        "cache_dir": cache_dir,
+        "trust_remote_code": trust_remote_code,
+    }
+    if revision is not None:
+        kwargs["revision"] = revision
+    with no_datasets_progress_bars():
+        dataset = load_dataset(**kwargs)
+    if not isinstance(dataset, Dataset):
+        raise ValueError("The transcript dataset must be a non-streaming Dataset")
+    return dataset
+
+
+def _set_source_language(
+    example: dict[str, Any], language: str | None
+) -> dict[str, Any]:
+    example["language"] = language
+    return example
+
+
 def _validate_dataset_probabilities(
     probabilities: Iterable[object], dataset_count: int
 ) -> list[float]:
@@ -96,69 +201,6 @@ def _validate_dataset_probabilities(
     if not math.isclose(total, 1.0, rel_tol=0, abs_tol=1e-8):
         raise ValueError(f"Dataset probabilities must sum to 1, but sum to {total}")
     return validated
-
-
-def _limit_validation_dataset(
-    dataset: IterableDataset, max_samples: int | None
-) -> IterableDataset:
-    """Apply a validation sample limit while the dataset is still iterable.
-
-    Args:
-        dataset:
-            Validation examples to limit.
-        max_samples:
-            Maximum number of examples, or ``None`` for no limit.
-
-    Returns:
-        The limited iterable dataset.
-    """
-    if max_samples is None:
-        return dataset
-    return dataset.take(max_samples)
-
-
-def _dataset_cache_identity(
-    dataset_id: str,
-    subset: str | None,
-    split: str,
-    revision: str | None,
-    purpose: str,
-    max_samples: int | None = None,
-) -> str:
-    """Build a stable cache identity for one dataset materialisation.
-
-    Args:
-        dataset_id:
-            Dataset repository or local identifier.
-        subset:
-            Dataset subset, if any.
-        split:
-            Dataset split.
-        revision:
-            Dataset revision, if any.
-        purpose:
-            Cache purpose, such as validation or evaluation.
-        max_samples (optional):
-            Materialisation limit, if one is applied.
-
-    Returns:
-        A filesystem-safe dataset identifier containing a canonical hash.
-    """
-    identity = json.dumps(
-        {
-            "dataset_id": dataset_id,
-            "max_samples": max_samples,
-            "purpose": purpose,
-            "revision": revision,
-            "split": split,
-            "subset": subset,
-        },
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    return f"{dataset_id.replace('/', '--')}-{digest}"
 
 
 def join_audio_and_transcripts(
@@ -222,41 +264,6 @@ def join_audio_and_transcripts(
     return t.cast(Dataset | IterableDataset, audio_dataset.map(add_transcript))
 
 
-def _load_transcript_dataset(
-    dataset_id: str,
-    subset: str | None,
-    split: str,
-    revision: str | None,
-    cache_dir: str | None,
-    trust_remote_code: bool = False,
-) -> Dataset:
-    """Load the compact transcript side without streaming.
-
-    Returns:
-        A non-streaming transcript dataset.
-
-    Raises:
-        ValueError:
-            If the Hub returns a streaming or otherwise unsupported dataset.
-    """
-    kwargs: dict[str, Any] = {
-        "path": dataset_id,
-        "name": subset,
-        "split": split,
-        "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-        "streaming": False,
-        "cache_dir": cache_dir,
-        "trust_remote_code": trust_remote_code,
-    }
-    if revision is not None:
-        kwargs["revision"] = revision
-    with no_datasets_progress_bars():
-        dataset = load_dataset(**kwargs)
-    if not isinstance(dataset, Dataset):
-        raise ValueError("The transcript dataset must be a non-streaming Dataset")
-    return dataset
-
-
 def _require_columns(
     dataset: Dataset | IterableDataset, columns: list[str], dataset_name: str
 ) -> None:
@@ -264,13 +271,6 @@ def _require_columns(
     missing = sorted(set(columns) - available)
     if missing:
         raise ValueError(f"Missing {dataset_name} dataset columns: {missing}")
-
-
-def _set_source_language(
-    example: dict[str, Any], language: str | None
-) -> dict[str, Any]:
-    example["language"] = language
-    return example
 
 
 # Dictionary that contains characters to be converted (from the key to the value). Some
@@ -321,6 +321,48 @@ DEFAULT_CONVERSION_DICT = {
 FILLER_WORDS_PATTERN = re.compile(
     pattern=r"\b(eh+m*|øh+m*|h+m+|m+h+)\b", flags=re.IGNORECASE
 )
+
+
+def filter_example(
+    sample: dict[str, Any],
+    audio_column: str,
+    text_column: str,
+    min_seconds_per_example: int | float,
+    max_seconds_per_example: int,
+) -> bool:
+    """Filter samples based on the validation status.
+
+    Args:
+        sample:
+            The sample to filter.
+        audio_column:
+            The name of the column containing the audio.
+        text_column:
+            The name of the column containing the transcriptions.
+        min_seconds_per_example:
+            The minimum number of seconds that an example can have.
+        max_seconds_per_example:
+            The maximum number of seconds that an example can
+
+    Returns:
+        Whether the sample should be kept.
+    """
+    # Filtering based on audio
+    audio = sample[audio_column]
+    if audio["array"].shape[0] <= audio["sampling_rate"] * min_seconds_per_example:
+        return False
+    if audio["array"].shape[0] >= audio["sampling_rate"] * max_seconds_per_example:
+        return False
+
+    # Filtering based on text
+    if len(sample[text_column].strip()) == 0:
+        return False
+
+    # Filtering based on validation
+    if "validated" in sample and sample["validated"] == "rejected":
+        return False
+
+    return True
 
 
 def load_data_for_finetuning(
@@ -650,6 +692,186 @@ def load_data_for_finetuning(
     return dataset
 
 
+def filter_dataset(
+    dataset: Data,
+    audio_column: str,
+    text_column: str,
+    min_seconds_per_example: int | float,
+    max_seconds_per_example: int,
+    is_main_process: bool,
+    num_proc: int | None = None,
+) -> Data:
+    """Filter the dataset.
+
+    Note that this removes samples from the dataset.
+
+    Args:
+        dataset:
+            The dataset to filter.
+        audio_column:
+            The name of the column containing the audio.
+        text_column:
+            The name of the column containing the transcriptions.
+        min_seconds_per_example:
+            The minimum number of seconds that an example can have.
+        max_seconds_per_example:
+            The maximum number of seconds that an example can have.
+        is_main_process:
+            Whether the current process is the main process.
+        num_proc (optional):
+            The number of processes to use for filtering the dataset. If `None`, then
+            no multiprocessing is used. Defaults to `None`.
+
+    Returns:
+        The filtered dataset.
+
+    Raises:
+        ValueError:
+            If the filtered dataset type is unsupported.
+    """
+    num_samples_before = len(dataset) if isinstance(dataset, Sized) else 0
+
+    filter_fn = partial(
+        filter_example,
+        text_column=text_column,
+        audio_column=audio_column,
+        min_seconds_per_example=min_seconds_per_example,
+        max_seconds_per_example=max_seconds_per_example,
+    )
+    if isinstance(dataset, Dataset | DatasetDict):
+        filtered = t.cast(Dataset | DatasetDict, dataset).filter(
+            function=filter_fn,
+            num_proc=num_proc,
+            desc="Filtering dataset",
+            keep_in_memory=True,
+        )
+    else:
+        filtered = t.cast(IterableDataset | IterableDatasetDict, dataset).filter(
+            function=filter_fn
+        )
+
+    # Add info back in the filtered dataset, as it gets removed after calling `filter`
+    if isinstance(dataset, Dataset | IterableDataset) and isinstance(
+        filtered, Dataset | IterableDataset
+    ):
+        filtered.info.features = dataset.info.features
+    else:
+        if not (
+            isinstance(dataset, DatasetDict | IterableDatasetDict)
+            and isinstance(filtered, DatasetDict | IterableDatasetDict)
+        ):
+            raise ValueError(f"Unsupported filtered dataset type: {type(filtered)}")
+        for split_name in dataset.keys():
+            filtered[split_name].info.features = dataset[split_name].info.features
+
+    if isinstance(dataset, Sized) and isinstance(filtered, Sized) and is_main_process:
+        num_samples_removed = num_samples_before - len(filtered)
+        logger.info(f"Removed {num_samples_removed:,} samples from the dataset")
+
+    return t.cast(Data, filtered)
+
+
+def process_dataset(
+    dataset: Data,
+    lower_case: bool,
+    characters_to_keep: Iterable[str] | None,
+    text_column: str,
+    remove_input_dataset_columns: bool,
+    audio_column: str | None,
+    convert_numerals: bool,
+    normalise_audio: bool,
+    augment_audio: bool,
+    num_proc: int | None = None,
+    processor: Callable | None = None,
+    language: str | None = None,
+    language_column: str | None = None,
+    punctuation: bool = True,
+) -> Data:
+    """Process the dataset.
+
+    Note that this does not remove any samples from the dataset.
+
+    Args:
+        dataset:
+            The dataset to be cleaned.
+        lower_case:
+            Whether to make the text lower case.
+        characters_to_keep:
+            All the characters that should be kept in the transcriptions. Can be None if
+            all characters should be kept.
+        text_column:
+            The name of the column containing the text.
+        remove_input_dataset_columns:
+            Whether to remove all input dataset columns from the output dataset.
+        audio_column:
+            The name of the column containing the audio. Can be `None` if the dataset
+            does not have an audio column.
+        convert_numerals:
+            Whether to convert numerals to words.
+        normalise_audio:
+            Whether to normalise the audio.
+        augment_audio:
+            Whether to augment the audio.
+        num_proc (optional):
+            The number of processes to use for processing the dataset. If `None`, then
+            no multiprocessing is used. Defaults to `None`.
+        processor (optional):
+            The processor to use for processing the audio and transcriptions. If `None`,
+            then the processor is not used. Defaults to `None`.
+        language (optional):
+            The default language prompt for a prompt-aware processor. Defaults to
+            `None`.
+        language_column (optional):
+            The input column containing a per-example language prompt. Defaults to
+            `None`.
+        punctuation (optional):
+            Whether to enable punctuation in a prompt-aware processor. Defaults to
+            `True`.
+
+    Returns:
+        The cleaned dataset.
+
+    Raises:
+        ValueError:
+            If the dataset type is not supported.
+    """
+    if isinstance(dataset, Dataset) or isinstance(dataset, IterableDataset):
+        column_names = t.cast(Dataset | IterableDataset, dataset).column_names
+    elif isinstance(dataset, DatasetDict) or isinstance(dataset, IterableDatasetDict):
+        column_names = dataset["train"].column_names
+    else:
+        raise ValueError(f"Unsupported dataset type: {type(dataset)}")
+
+    map_fn = partial(
+        process_example,
+        characters_to_keep=characters_to_keep,
+        conversion_dict=DEFAULT_CONVERSION_DICT,
+        text_column=text_column,
+        audio_column=audio_column,
+        lower_case=lower_case,
+        convert_numerals=convert_numerals,
+        processor=processor,
+        normalise_audio=normalise_audio,
+        augment_audio=augment_audio,
+        language=language,
+        language_column=language_column,
+        punctuation=punctuation,
+    )
+    if isinstance(dataset, Dataset | DatasetDict):
+        mapped = t.cast(Dataset | DatasetDict, dataset).map(
+            function=map_fn,
+            num_proc=num_proc,
+            desc="Processing dataset",
+            remove_columns=column_names if remove_input_dataset_columns else None,
+        )
+    else:
+        mapped = t.cast(IterableDataset | IterableDatasetDict, dataset).map(
+            function=map_fn, remove_columns=column_names
+        )
+
+    return t.cast(Data, mapped)
+
+
 def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
     """Load the evaluation dataset.
 
@@ -739,224 +961,6 @@ def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
         dataset.save_to_disk(dataset_path=eval_dataset_path)
 
     return dataset
-
-
-def filter_dataset(
-    dataset: Data,
-    audio_column: str,
-    text_column: str,
-    min_seconds_per_example: int | float,
-    max_seconds_per_example: int,
-    is_main_process: bool,
-    num_proc: int | None = None,
-) -> Data:
-    """Filter the dataset.
-
-    Note that this removes samples from the dataset.
-
-    Args:
-        dataset:
-            The dataset to filter.
-        audio_column:
-            The name of the column containing the audio.
-        text_column:
-            The name of the column containing the transcriptions.
-        min_seconds_per_example:
-            The minimum number of seconds that an example can have.
-        max_seconds_per_example:
-            The maximum number of seconds that an example can have.
-        is_main_process:
-            Whether the current process is the main process.
-        num_proc (optional):
-            The number of processes to use for filtering the dataset. If `None`, then
-            no multiprocessing is used. Defaults to `None`.
-
-    Returns:
-        The filtered dataset.
-
-    Raises:
-        ValueError:
-            If the filtered dataset type is unsupported.
-    """
-    num_samples_before = len(dataset) if isinstance(dataset, Sized) else 0
-
-    filter_fn = partial(
-        filter_example,
-        text_column=text_column,
-        audio_column=audio_column,
-        min_seconds_per_example=min_seconds_per_example,
-        max_seconds_per_example=max_seconds_per_example,
-    )
-    if isinstance(dataset, Dataset | DatasetDict):
-        filtered = dataset.filter(
-            function=filter_fn,
-            num_proc=num_proc,
-            desc="Filtering dataset",
-            keep_in_memory=True,
-        )
-    else:
-        filtered = dataset.filter(function=filter_fn)
-
-    # Add info back in the filtered dataset, as it gets removed after calling `filter`
-    if isinstance(dataset, Dataset | IterableDataset) and isinstance(
-        filtered, Dataset | IterableDataset
-    ):
-        filtered.info.features = dataset.info.features
-    else:
-        if not (
-            isinstance(dataset, DatasetDict | IterableDatasetDict)
-            and isinstance(filtered, DatasetDict | IterableDatasetDict)
-        ):
-            raise ValueError(f"Unsupported filtered dataset type: {type(filtered)}")
-        for split_name in dataset.keys():
-            filtered[split_name].info.features = dataset[split_name].info.features
-
-    if isinstance(dataset, Sized) and isinstance(filtered, Sized) and is_main_process:
-        num_samples_removed = num_samples_before - len(filtered)
-        logger.info(f"Removed {num_samples_removed:,} samples from the dataset")
-
-    return filtered  # type: ignore[bad-return]
-
-
-def filter_example(
-    sample: dict[str, Any],
-    audio_column: str,
-    text_column: str,
-    min_seconds_per_example: int | float,
-    max_seconds_per_example: int,
-) -> bool:
-    """Filter samples based on the validation status.
-
-    Args:
-        sample:
-            The sample to filter.
-        audio_column:
-            The name of the column containing the audio.
-        text_column:
-            The name of the column containing the transcriptions.
-        min_seconds_per_example:
-            The minimum number of seconds that an example can have.
-        max_seconds_per_example:
-            The maximum number of seconds that an example can
-
-    Returns:
-        Whether the sample should be kept.
-    """
-    # Filtering based on audio
-    audio = sample[audio_column]
-    if audio["array"].shape[0] <= audio["sampling_rate"] * min_seconds_per_example:
-        return False
-    if audio["array"].shape[0] >= audio["sampling_rate"] * max_seconds_per_example:
-        return False
-
-    # Filtering based on text
-    if len(sample[text_column].strip()) == 0:
-        return False
-
-    # Filtering based on validation
-    if "validated" in sample and sample["validated"] == "rejected":
-        return False
-
-    return True
-
-
-def process_dataset(
-    dataset: Data,
-    lower_case: bool,
-    characters_to_keep: Iterable[str] | None,
-    text_column: str,
-    remove_input_dataset_columns: bool,
-    audio_column: str | None,
-    convert_numerals: bool,
-    normalise_audio: bool,
-    augment_audio: bool,
-    num_proc: int | None = None,
-    processor: Callable | None = None,
-    language: str | None = None,
-    language_column: str | None = None,
-    punctuation: bool = True,
-) -> Data:
-    """Process the dataset.
-
-    Note that this does not remove any samples from the dataset.
-
-    Args:
-        dataset:
-            The dataset to be cleaned.
-        lower_case:
-            Whether to make the text lower case.
-        characters_to_keep:
-            All the characters that should be kept in the transcriptions. Can be None if
-            all characters should be kept.
-        text_column:
-            The name of the column containing the text.
-        remove_input_dataset_columns:
-            Whether to remove all input dataset columns from the output dataset.
-        audio_column:
-            The name of the column containing the audio. Can be `None` if the dataset
-            does not have an audio column.
-        convert_numerals:
-            Whether to convert numerals to words.
-        normalise_audio:
-            Whether to normalise the audio.
-        augment_audio:
-            Whether to augment the audio.
-        num_proc (optional):
-            The number of processes to use for processing the dataset. If `None`, then
-            no multiprocessing is used. Defaults to `None`.
-        processor (optional):
-            The processor to use for processing the audio and transcriptions. If `None`,
-            then the processor is not used. Defaults to `None`.
-        language (optional):
-            The default language prompt for a prompt-aware processor. Defaults to
-            `None`.
-        language_column (optional):
-            The input column containing a per-example language prompt. Defaults to
-            `None`.
-        punctuation (optional):
-            Whether to enable punctuation in a prompt-aware processor. Defaults to
-            `True`.
-
-    Returns:
-        The cleaned dataset.
-
-    Raises:
-        ValueError:
-            If the dataset type is not supported.
-    """
-    if isinstance(dataset, Dataset) or isinstance(dataset, IterableDataset):
-        column_names = dataset.column_names
-    elif isinstance(dataset, DatasetDict) or isinstance(dataset, IterableDatasetDict):
-        column_names = dataset["train"].column_names
-    else:
-        raise ValueError(f"Unsupported dataset type: {type(dataset)}")
-
-    map_fn = partial(
-        process_example,
-        characters_to_keep=characters_to_keep,
-        conversion_dict=DEFAULT_CONVERSION_DICT,
-        text_column=text_column,
-        audio_column=audio_column,
-        lower_case=lower_case,
-        convert_numerals=convert_numerals,
-        processor=processor,
-        normalise_audio=normalise_audio,
-        augment_audio=augment_audio,
-        language=language,
-        language_column=language_column,
-        punctuation=punctuation,
-    )
-    if isinstance(dataset, Dataset | DatasetDict):
-        mapped = dataset.map(
-            function=map_fn,
-            num_proc=num_proc,
-            desc="Processing dataset",
-            remove_columns=column_names if remove_input_dataset_columns else None,
-        )
-    else:
-        mapped = dataset.map(function=map_fn, remove_columns=column_names)
-
-    return mapped  # type: ignore[bad-return]
 
 
 def process_example(

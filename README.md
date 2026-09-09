@@ -7,11 +7,9 @@ ______________________________________________________________________
 [![LastCommit](https://img.shields.io/github/last-commit/syv-ai/hviske)](https://github.com/syv-ai/hviske/commits/main)
 [![Code Coverage](https://img.shields.io/badge/Coverage-57%25-orange.svg)](https://github.com/syv-ai/hviske/tree/main/tests)
 
-
 Author and maintainer:
 
-- Dan Saattrup Smart (dan@syv.dk)
-
+- Dan Saattrup Smart (<dan@syv.dk>)
 
 ## Installation
 
@@ -19,7 +17,6 @@ Author and maintainer:
    virtual environment and all Python dependencies therein.
 2. Run `source .venv/bin/activate` to activate the virtual environment.
 3. Run `make` to see a list of available commands.
-
 
 ## Usage
 
@@ -131,10 +128,9 @@ uv run python src/scripts/preflight_finetuning_data.py \
 
 The complete operational procedure, including smoke, pilot, full tmux run, monitoring,
 checkpoint retention, and the separate private publication command, is in
-[`docs/sparkie-bilingual-runbook.md`](docs/sparkie-bilingual-runbook.md).
+[`SPARKIE.md`](SPARKIE.md).
 
 See all the finetuning options in the `config/asr_finetuning.yaml` file.
-
 
 ### Evaluating an Automatic Speech Recognition (ASR) Model
 
@@ -158,13 +154,12 @@ Here are some of the more important available keys:
 
 See all the evaluation options in the `config/evaluation.yaml` file.
 
-
 ## Troubleshooting
 
 If you're on MacOS and get an error saying something along the lines of "fatal error:
 'lzma.h' file not found" then try the following and rerun `make install` afterwards:
 
-```
+```bash
 export CPPFLAGS="-I$(brew --prefix)/include"
 ```
 
@@ -172,6 +167,6 @@ Another MacOS issue can happen if you get something like "fatal error: 'cstddef'
 not found" and/or "fatal error: 'climits' file not found". In this case, first ensure
 that [you have Homebrew installed](https://brew.sh/), after which you run the following:
 
-```
+```bash
 brew install cmake boost zlib eigen
 ```

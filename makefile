@@ -1,6 +1,6 @@
 # This ensures that we can call `make <target>` even if `<target>` exists as a file or
 # directory.
-.PHONY: docs help
+.PHONY: help install install-pre-commit install-dependencies check test tree
 
 # Exports all variables defined in the makefile available to scripts
 .EXPORT_ALL_VARIABLES:
@@ -74,7 +74,30 @@ tree:  ## Print directory tree
 	@tree -a --gitignore -I .git .
 
 check:  ## Lint, format, and type-check the code
-	@uv run pre-commit run --all-files
+	@git add . && uv run pre-commit run --all-files
+	@if command -v llama-server >/dev/null 2>&1 && pgrep -x llama-server >/dev/null; then \
+		echo "Running Slopo code duplication detection..."; \
+		export LITELLM_DROP_PARAMS=true; \
+		export OPENAI_API_KEY=$${OPENAI_API_KEY:-sk-no-key}; \
+		uv run slopo index 2>&1 | grep -E "Indexed|unchanged|removed" || true; \
+		uv run slopo embed 2>&1 || true; \
+		ANALYSIS_OUTPUT=$$(uv run slopo analyze 2>&1); \
+		echo "$$ANALYSIS_OUTPUT" | grep -E "Exact copies|Similarity ratio" || true; \
+		DUPLICATE_COUNT=$$(echo "$$ANALYSIS_OUTPUT" | grep "Similarity ratio (including exact copies)" | sed -E 's/.*\(([0-9]+)\/.*/\1/'); \
+		if [ "$$DUPLICATE_COUNT" -gt 0 ] 2>/dev/null; then \
+			RATIO=$$(echo "$$ANALYSIS_OUTPUT" | grep "Similarity ratio (including exact copies)" | sed -E 's/.*: ([0-9.]+%).*/\1/'); \
+			echo ""; \
+			echo "❌ Slopo failed: duplicate code detected"; \
+			printf "   Duplicate units: %s\\n" "$$DUPLICATE_COUNT"; \
+			printf "   Similarity ratio: %s\\n" "$$RATIO"; \
+			echo "   Full report: .slopo/report/index.md"; \
+			echo "   To ignore reviewed duplicates, add their cluster hashes to .slopo/slopo.ignore.txt"; \
+			echo ""; \
+			exit 1; \
+		fi; \
+	else \
+		echo "Slopo skipped (llama.cpp server not running)"; \
+	fi
 
 roest-315m-100k:  ## Train the Røst-315M model
 	@OMP_NUM_THREADS=1 \

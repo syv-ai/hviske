@@ -125,205 +125,9 @@ def main(config: DictConfig) -> None:
     )
 
 
-##########################################
-# Building the read-aloud subset #####
-##########################################
-
-
-def build_read_aloud_dataset(
-    metadata_database_path: Path, audio_dir: Path, additional_logging: bool = False
-) -> Dataset:
-    """Build the CoRal read-aloud dataset.
-
-    Args:
-        metadata_database_path:
-            Path to the SQLite database containing the metadata.
-        audio_dir:
-            Path to the directory containing the audio files.
-        additional_logging:
-            Flag to turn on additional logging useful for debugging
-
-    Returns:
-        The CoRal read-aloud dataset.
-    """
-    # Get the number of samples in the SQLite database. We don't do any merges here to
-    # save some time. That means that the count will be an upper bound rather than a
-    # precise number of samples, but we deal with that when we actually fetch the data
-    count_query = "SELECT COUNT(*) FROM Recordings;"
-    with sqlite3.connect(database=metadata_database_path) as connection:
-        cursor = connection.cursor()
-        cursor.execute(count_query)
-        num_metadata_samples = cursor.fetchone()[0]
-    logger.info(f"There are {num_metadata_samples:,} samples in the SQLite database.")
-
-    # Set up which features to fetch from the SQLite database. We exclude the ID
-    # features since they need to be handled separately
-    non_id_features = [
-        # "datetime_start",
-        # "datetime_end",
-        "text",
-        "location",
-        "location_roomdim",
-        "noise_level",
-        "noise_type",
-        "source_url",
-        "age",
-        "gender",
-        "dialect",
-        # "language_native",
-        # "language_spoken",
-        "country_birth",
-        # "zipcode_birth",
-        # "zip_school",
-        "education",
-        "occupation",
-        "validated",
-    ]
-    non_id_features_str = ",\n".join(non_id_features)
-
-    selection_query = f"""
-        SELECT
-            Recordings.id_recording,
-            Sentences.id_sentence,
-            Speakers.id_speaker,
-            Recordings.id_validator,
-            {non_id_features_str}
-        FROM
-            Recordings
-            INNER JOIN Sentences ON Recordings.id_sentence = Sentences.id_sentence
-            INNER JOIN Speakers ON Recordings.id_speaker = Speakers.id_speaker
-    """
-
-    # Open the database connection and fetch the data
-    logger.info("Fetching the metadata from the SQLite database...")
-    with sqlite3.connect(database=metadata_database_path) as connection:
-        cursor = connection.cursor()
-        cursor.execute(selection_query)
-        rows = list(map(list, cursor.fetchall()))
-
-    recording_ids: list[str] = [row[0] for row in rows]
-    logger.info(f"Got {len(recording_ids)} recording ids")
-
-    if num_metadata_samples != len(rows):
-        logger.info(
-            f"Expected to get all {num_metadata_samples} samples but got {len(rows)} "
-            f"which means {num_metadata_samples - len(rows)} are missing"
-        )
-        if additional_logging:
-            with sqlite3.connect(database=metadata_database_path) as conn:
-                cursor = conn.execute("SELECT id_recording FROM Recordings")
-                all_ids = [row[0] for row in list(map(list, cursor.fetchall()))]
-                logger.info(
-                    "The missing rows are "
-                    f"{set(all_ids).difference(set(recording_ids))}"
-                )
-
-    # Get a list of all the audio file paths. We need this since the audio files lie in
-    # subdirectories of the main audio directory
-    audio_subdirs = list(audio_dir.iterdir())
-    with Parallel(n_jobs=mp.cpu_count(), backend="threading") as parallel:
-        all_audio_path_lists = parallel(
-            delayed(list_audio_files)(subdir)
-            for subdir in tqdm(audio_subdirs, desc="Collecting audio file paths")
-        )
-
-    all_audio_paths_list = list(
-        chain.from_iterable(all_audio_path_lists)  # pyrefly: ignore[bad-argument-type]
-    )
-    all_audio_paths = {path.stem: path for path in all_audio_paths_list}
-    logger.info(f"Got {len(all_audio_paths)} audio paths")
-
-    # Match the audio files to the metadata, to ensure that there is a 1-to-1
-    # correspondence between them
-    logger.info("Matching the audio files to the metadata...")
-    matched_audio_paths = [
-        all_audio_paths.get(recording_id) for recording_id in recording_ids
-    ]
-    if len(recording_ids) != len(all_audio_paths):
-        matching_audio_paths = [
-            path for path in matched_audio_paths if path is not None
-        ]
-        ids_with_missing_paths = [
-            id_ for id_, path in zip(recording_ids, matched_audio_paths) if path is None
-        ]
-        logger.info(f"Got {len(matching_audio_paths)} matched audio paths")
-        logger.info(f"Got {len(ids_with_missing_paths)} missing audio paths")
-        if additional_logging:
-            logger.info(f"The missing paths are {ids_with_missing_paths}")
-        if len(matching_audio_paths) != len(all_audio_paths):
-            logger.info(
-                f"Found {len(all_audio_paths)} audio paths but could only match "
-                f"{len(matching_audio_paths)} of them to rows which means there are "
-                f"{len(all_audio_paths) - len(matching_audio_paths)} too many audio "
-                "paths"
-            )
-            if additional_logging:
-                additional_paths = set(all_audio_paths.values()).difference(
-                    set(matching_audio_paths)
-                )
-                logger.info(f"The additional paths are {additional_paths}")
-
-    rows = [
-        row + [str(audio_path)]
-        for row, audio_path in zip(rows, matched_audio_paths)
-        if audio_path is not None
-    ]
-    logger.info(f"Got {len(rows)} matched rows")
-
-    # Build the dataset from the metadata and the audio files. This embeds all the audio
-    # files into the dataset as parquet files
-    dataset = Dataset.from_dict(
-        mapping={
-            "id_recording": [row[0] for row in rows],
-            "id_sentence": [row[1] for row in rows],
-            "id_speaker": [row[2] for row in rows],
-            "id_validator": [row[3] for row in rows],
-            **{
-                feature: [row[i] for row in rows]
-                for i, feature in enumerate(non_id_features, start=4)
-            },
-            "audio": [row[-1] for row in rows],
-        }
-    )
-    dataset = dataset.cast_column("audio", Audio())
-    return dataset
-
-
-def list_audio_files(
-    audio_dir: Path, max_attempts: int = 10, extensions: list[str] = ["wav"]
-) -> list[Path]:
-    """List all the audio files in the given directory.
-
-    Args:
-        audio_dir:
-            The directory containing the audio files.
-        max_attempts (optional):
-            The maximum number of attempts to list the audio files. Defaults to 10.
-        extensions (optional):
-            A list of extensions to consider when listing the audio files. Defaults to
-            ["wav"].
-
-    Returns:
-        A list of paths to the audio files.
-
-    Raises:
-        OSError:
-            If the audio files cannot be listed.
-    """
-    for _ in range(max_attempts):
-        try:
-            return [file for ext in extensions for file in audio_dir.glob(f"*.{ext}")]
-        except OSError:
-            sleep(1)
-    else:
-        raise OSError(f"Failed to list the audio files in {audio_dir!r}.")
-
-
 ############################################
 # Building the conversation subset #####
 ############################################
-
-
 def build_conversation_dataset(
     metadata_database_path: Path,
     audio_dir: Path,
@@ -508,9 +312,11 @@ def build_conversation_dataset(
     logger.info(f"There are {transcription_lines_count:,} transcribed lines")
 
     processed_conversation_rows = pd.DataFrame(
-        columns=list(conversation_rows.columns)  # pyrefly: ignore[bad-argument-type]
-        + list(speaker_rows.columns)
-        + ["id_segment", "text", "audio"]
+        columns=pd.Index(
+            list(conversation_rows.columns)
+            + list(speaker_rows.columns)
+            + ["id_segment", "text", "audio"]
+        )
     )
     processed_conversation_rows = processed_conversation_rows.drop(
         columns=[
@@ -600,11 +406,245 @@ def build_conversation_dataset(
     return dataset
 
 
+def list_audio_files(
+    audio_dir: Path, max_attempts: int = 10, extensions: list[str] = ["wav"]
+) -> list[Path]:
+    """List all the audio files in the given directory.
+
+    Args:
+        audio_dir:
+            The directory containing the audio files.
+        max_attempts (optional):
+            The maximum number of attempts to list the audio files. Defaults to 10.
+        extensions (optional):
+            A list of extensions to consider when listing the audio files. Defaults to
+            ["wav"].
+
+    Returns:
+        A list of paths to the audio files.
+
+    Raises:
+        OSError:
+            If the audio files cannot be listed.
+    """
+    for _ in range(max_attempts):
+        try:
+            return [file for ext in extensions for file in audio_dir.glob(f"*.{ext}")]
+        except OSError:
+            sleep(1)
+    else:
+        raise OSError(f"Failed to list the audio files in {audio_dir!r}.")
+
+
+##########################################
+# Building the read-aloud subset #####
+##########################################
+def build_read_aloud_dataset(
+    metadata_database_path: Path, audio_dir: Path, additional_logging: bool = False
+) -> Dataset:
+    """Build the CoRal read-aloud dataset.
+
+    Args:
+        metadata_database_path:
+            Path to the SQLite database containing the metadata.
+        audio_dir:
+            Path to the directory containing the audio files.
+        additional_logging:
+            Flag to turn on additional logging useful for debugging
+
+    Returns:
+        The CoRal read-aloud dataset.
+    """
+    # Get the number of samples in the SQLite database. We don't do any merges here to
+    # save some time. That means that the count will be an upper bound rather than a
+    # precise number of samples, but we deal with that when we actually fetch the data
+    count_query = "SELECT COUNT(*) FROM Recordings;"
+    with sqlite3.connect(database=metadata_database_path) as connection:
+        cursor = connection.cursor()
+        cursor.execute(count_query)
+        num_metadata_samples = cursor.fetchone()[0]
+    logger.info(f"There are {num_metadata_samples:,} samples in the SQLite database.")
+
+    # Set up which features to fetch from the SQLite database. We exclude the ID
+    # features since they need to be handled separately
+    non_id_features = [
+        # "datetime_start",
+        # "datetime_end",
+        "text",
+        "location",
+        "location_roomdim",
+        "noise_level",
+        "noise_type",
+        "source_url",
+        "age",
+        "gender",
+        "dialect",
+        # "language_native",
+        # "language_spoken",
+        "country_birth",
+        # "zipcode_birth",
+        # "zip_school",
+        "education",
+        "occupation",
+        "validated",
+    ]
+    non_id_features_str = ",\n".join(non_id_features)
+
+    selection_query = f"""
+        SELECT
+            Recordings.id_recording,
+            Sentences.id_sentence,
+            Speakers.id_speaker,
+            Recordings.id_validator,
+            {non_id_features_str}
+        FROM
+            Recordings
+            INNER JOIN Sentences ON Recordings.id_sentence = Sentences.id_sentence
+            INNER JOIN Speakers ON Recordings.id_speaker = Speakers.id_speaker
+    """
+
+    # Open the database connection and fetch the data
+    logger.info("Fetching the metadata from the SQLite database...")
+    with sqlite3.connect(database=metadata_database_path) as connection:
+        cursor = connection.cursor()
+        cursor.execute(selection_query)
+        rows = list(map(list, cursor.fetchall()))
+
+    recording_ids: list[str] = [row[0] for row in rows]
+    logger.info(f"Got {len(recording_ids)} recording ids")
+
+    if num_metadata_samples != len(rows):
+        logger.info(
+            f"Expected to get all {num_metadata_samples} samples but got {len(rows)} "
+            f"which means {num_metadata_samples - len(rows)} are missing"
+        )
+        if additional_logging:
+            with sqlite3.connect(database=metadata_database_path) as conn:
+                cursor = conn.execute("SELECT id_recording FROM Recordings")
+                all_ids = [row[0] for row in list(map(list, cursor.fetchall()))]
+                logger.info(
+                    "The missing rows are "
+                    f"{set(all_ids).difference(set(recording_ids))}"
+                )
+
+    # Get a list of all the audio file paths. We need this since the audio files lie in
+    # subdirectories of the main audio directory
+    audio_subdirs = list(audio_dir.iterdir())
+    with Parallel(n_jobs=mp.cpu_count(), backend="threading") as parallel:
+        all_audio_path_lists = parallel(
+            delayed(list_audio_files)(subdir)
+            for subdir in tqdm(audio_subdirs, desc="Collecting audio file paths")
+        )
+
+    all_audio_paths_list = list(chain.from_iterable(all_audio_path_lists))
+    all_audio_paths = {path.stem: path for path in all_audio_paths_list}
+    logger.info(f"Got {len(all_audio_paths)} audio paths")
+
+    # Match the audio files to the metadata, to ensure that there is a 1-to-1
+    # correspondence between them
+    logger.info("Matching the audio files to the metadata...")
+    matched_audio_paths = [
+        all_audio_paths.get(recording_id) for recording_id in recording_ids
+    ]
+    if len(recording_ids) != len(all_audio_paths):
+        matching_audio_paths = [
+            path for path in matched_audio_paths if path is not None
+        ]
+        ids_with_missing_paths = [
+            id_ for id_, path in zip(recording_ids, matched_audio_paths) if path is None
+        ]
+        logger.info(f"Got {len(matching_audio_paths)} matched audio paths")
+        logger.info(f"Got {len(ids_with_missing_paths)} missing audio paths")
+        if additional_logging:
+            logger.info(f"The missing paths are {ids_with_missing_paths}")
+        if len(matching_audio_paths) != len(all_audio_paths):
+            logger.info(
+                f"Found {len(all_audio_paths)} audio paths but could only match "
+                f"{len(matching_audio_paths)} of them to rows which means there are "
+                f"{len(all_audio_paths) - len(matching_audio_paths)} too many audio "
+                "paths"
+            )
+            if additional_logging:
+                additional_paths = set(all_audio_paths.values()).difference(
+                    set(matching_audio_paths)
+                )
+                logger.info(f"The additional paths are {additional_paths}")
+
+    rows = [
+        row + [str(audio_path)]
+        for row, audio_path in zip(rows, matched_audio_paths)
+        if audio_path is not None
+    ]
+    logger.info(f"Got {len(rows)} matched rows")
+
+    # Build the dataset from the metadata and the audio files. This embeds all the audio
+    # files into the dataset as parquet files
+    dataset = Dataset.from_dict(
+        mapping={
+            "id_recording": [row[0] for row in rows],
+            "id_sentence": [row[1] for row in rows],
+            "id_speaker": [row[2] for row in rows],
+            "id_validator": [row[3] for row in rows],
+            **{
+                feature: [row[i] for row in rows]
+                for i, feature in enumerate(non_id_features, start=4)
+            },
+            "audio": [row[-1] for row in rows],
+        }
+    )
+    dataset = dataset.cast_column("audio", Audio())
+    return dataset
+
+
+#############################
+# Utility functions #####
+#############################
+def copy_audio_directory_to_cwd(audio_dir: Path) -> Path:
+    """Copy audio files to the current working directory.
+
+    Args:
+        audio_dir:
+            The directory containing the audio files.
+
+    Returns:
+        The new directory containing the audio files.
+    """
+    new_audio_dir = Path.cwd() / audio_dir.name
+    new_audio_dir.mkdir(exist_ok=True)
+
+    # Get list of subdirectories of the audio directory, or abort of none exist
+    audio_subdirs = [path for path in audio_dir.iterdir() if path.is_dir()]
+    if not audio_subdirs:
+        return new_audio_dir
+
+    # Compress all subdirectories that are not already compressed
+    with Parallel(n_jobs=mp.cpu_count(), backend="threading") as parallel:
+        parallel(
+            delayed(function=compress_dir)(directory=subdir)
+            for subdir in tqdm(
+                iterable=audio_subdirs,
+                desc="Compressing audio files on the source disk",
+            )
+        )
+
+    # Decompress all the compressed audio files in the current working directory
+    with Parallel(n_jobs=mp.cpu_count(), backend="threading") as parallel:
+        parallel(
+            delayed(function=decompress_file)(
+                file=compressed_subdir, destination_dir=new_audio_dir
+            )
+            for compressed_subdir in tqdm(
+                iterable=list(audio_dir.glob("*.tar.xz")),
+                desc="Copying the compressed files and decompressing them",
+            )
+        )
+
+    return new_audio_dir
+
+
 #####################################
 # Splitting of the datasets #####
 #####################################
-
-
 def split_dataset(
     dataset: Dataset, test_speakers: list[str], val_speakers: list[str]
 ) -> DatasetDict | None:
@@ -654,69 +694,9 @@ def split_dataset(
     return DatasetDict(splits)
 
 
-def examples_belong_to_train(
-    examples: dict[str, list], test_speakers: list[str], val_speakers: list[str]
-) -> list[bool]:
-    """Check if each example belongs to the training set.
-
-    Args:
-        examples:
-            A batch of examples.
-        test_speakers:
-            A list of speakers in the test set.
-        val_speakers:
-            A list of speakers in the validation set.
-
-    Returns:
-        A list of booleans indicating whether each example belongs to the training
-        set.
-    """
-    return [
-        speaker_id not in test_speakers + val_speakers
-        for speaker_id in examples["id_speaker"]
-    ]
-
-
-def examples_belong_to_val(
-    examples: dict[str, list], val_speakers: list[str]
-) -> list[bool]:
-    """Check if each example belongs to the validation set.
-
-    Args:
-        examples:
-            A batch of examples.
-        val_speakers:
-            A list of speakers in the validation set.
-
-    Returns:
-        A list of booleans indicating whether each example belongs to the validation
-        set.
-    """
-    return [speaker_id in val_speakers for speaker_id in examples["id_speaker"]]
-
-
-def examples_belong_to_test(
-    examples: dict[str, list], test_speakers: list[str]
-) -> list[bool]:
-    """Check if each example belongs to the test set.
-
-    Args:
-        examples:
-            A batch of examples.
-        test_speakers:
-            A list of speakers in the test set.
-
-    Returns:
-        A list of booleans indicating whether each example belongs to the test set.
-    """
-    return [speaker_id in test_speakers for speaker_id in examples["id_speaker"]]
-
-
 #####################################
 # Uploading of the datasets #####
 #####################################
-
-
 def upload_dataset(
     read_aloud_dataset: DatasetDict | None,
     conversation_dataset: DatasetDict | None,
@@ -771,52 +751,21 @@ def upload_dataset(
             logger.error("Failed to upload the conversation dataset.")
 
 
-#############################
-# Utility functions #####
-#############################
+class CorruptedCompressedFile(Exception):
+    """Exception raised when a compressed file is corrupted."""
 
+    def __init__(self, file: Path) -> None:
+        """Initialise the exception.
 
-def copy_audio_directory_to_cwd(audio_dir: Path) -> Path:
-    """Copy audio files to the current working directory.
-
-    Args:
-        audio_dir:
-            The directory containing the audio files.
-
-    Returns:
-        The new directory containing the audio files.
-    """
-    new_audio_dir = Path.cwd() / audio_dir.name
-    new_audio_dir.mkdir(exist_ok=True)
-
-    # Get list of subdirectories of the audio directory, or abort of none exist
-    audio_subdirs = [path for path in audio_dir.iterdir() if path.is_dir()]
-    if not audio_subdirs:
-        return new_audio_dir
-
-    # Compress all subdirectories that are not already compressed
-    with Parallel(n_jobs=mp.cpu_count(), backend="threading") as parallel:
-        parallel(
-            delayed(function=compress_dir)(directory=subdir)
-            for subdir in tqdm(
-                iterable=audio_subdirs,
-                desc="Compressing audio files on the source disk",
-            )
+        Args:
+            file:
+                The corrupted file.
+        """
+        self.file = file
+        self.message = (
+            f"Failed to decompress the file {self.file}, as it appears to be corrupted."
         )
-
-    # Decompress all the compressed audio files in the current working directory
-    with Parallel(n_jobs=mp.cpu_count(), backend="threading") as parallel:
-        parallel(
-            delayed(function=decompress_file)(
-                file=compressed_subdir, destination_dir=new_audio_dir
-            )
-            for compressed_subdir in tqdm(
-                iterable=list(audio_dir.glob("*.tar.xz")),
-                desc="Copying the compressed files and decompressing them",
-            )
-        )
-
-    return new_audio_dir
+        super().__init__(self.message)
 
 
 def compress_dir(directory: Path) -> Path:
@@ -877,21 +826,62 @@ def remove_suffixes(path: Path) -> Path:
     return path
 
 
-class CorruptedCompressedFile(Exception):
-    """Exception raised when a compressed file is corrupted."""
+def examples_belong_to_test(
+    examples: dict[str, list], test_speakers: list[str]
+) -> list[bool]:
+    """Check if each example belongs to the test set.
 
-    def __init__(self, file: Path) -> None:
-        """Initialise the exception.
+    Args:
+        examples:
+            A batch of examples.
+        test_speakers:
+            A list of speakers in the test set.
 
-        Args:
-            file:
-                The corrupted file.
-        """
-        self.file = file
-        self.message = (
-            f"Failed to decompress the file {self.file}, as it appears to be corrupted."
-        )
-        super().__init__(self.message)
+    Returns:
+        A list of booleans indicating whether each example belongs to the test set.
+    """
+    return [speaker_id in test_speakers for speaker_id in examples["id_speaker"]]
+
+
+def examples_belong_to_train(
+    examples: dict[str, list], test_speakers: list[str], val_speakers: list[str]
+) -> list[bool]:
+    """Check if each example belongs to the training set.
+
+    Args:
+        examples:
+            A batch of examples.
+        test_speakers:
+            A list of speakers in the test set.
+        val_speakers:
+            A list of speakers in the validation set.
+
+    Returns:
+        A list of booleans indicating whether each example belongs to the training
+        set.
+    """
+    return [
+        speaker_id not in test_speakers + val_speakers
+        for speaker_id in examples["id_speaker"]
+    ]
+
+
+def examples_belong_to_val(
+    examples: dict[str, list], val_speakers: list[str]
+) -> list[bool]:
+    """Check if each example belongs to the validation set.
+
+    Args:
+        examples:
+            A batch of examples.
+        val_speakers:
+            A list of speakers in the validation set.
+
+    Returns:
+        A list of booleans indicating whether each example belongs to the validation
+        set.
+    """
+    return [speaker_id in val_speakers for speaker_id in examples["id_speaker"]]
 
 
 if __name__ == "__main__":

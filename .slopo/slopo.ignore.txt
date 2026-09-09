@@ -1,0 +1,13 @@
+# Reviewed Slopo exceptions for Hviske.
+# These are intentional duplication: model setup implementations share stable
+# interfaces, collators implement parallel ASR contracts, and dataset builders
+# are standalone download recipes. Re-review hashes after refactors.
+
+a4c1bdebda37  # shared load_compute_metrics interface implementations
+958682d721a1  # shared training-argument construction across model families
+81208b2e4349  # parallel CTC and seq2seq collator implementations
+8c0e607cca5d  # standalone dataset download helpers
+
+effa5d00231d  # standalone dataset build entry points
+362a7b07ca39  # model-specific data-collator factory interfaces
+ed5cea4180a5  # model-specific saved-model loading interfaces
