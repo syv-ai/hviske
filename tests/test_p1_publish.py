@@ -1,0 +1,358 @@
+"""Focused tests for private, verified P1 publication."""
+
+from __future__ import annotations
+
+import collections.abc as c
+import hashlib
+import tempfile
+import typing as t
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from huggingface_hub.utils import RepositoryNotFoundError
+
+from hviske.p1_publish import (
+    AllowListError,
+    LocalShard,
+    PrivacyError,
+    PublicationError,
+    UploadOperation,
+    VerificationError,
+    build_dataset_card,
+    initialise_private_dataset,
+    publish_batch,
+    validate_staging_directory,
+)
+
+
+def test_batch_verifies_every_path_and_streams_every_shard(tmp_path: Path) -> None:
+    """Every shard is checked remotely and opened in streaming mode."""
+    first = tmp_path / "one.parquet"
+    second = tmp_path / "two.parquet"
+    first.write_bytes(b"first shard")
+    second.write_bytes(b"second shard")
+    hub = MemoryHub()
+    samples: list[str] = []
+
+    def validate(dataset: object, path: str) -> None:
+        """Decode the fake sample and record the shard path."""
+        next(iter(t.cast(c.Iterable[object], dataset)))
+        samples.append(path)
+
+    evidence = publish_batch(
+        hub,
+        "org/p1",
+        "batch-001",
+        [
+            LocalShard(first, "shards/one.parquet", 3),
+            LocalShard(second, "shards/two.parquet", 4),
+        ],
+        validator=validate,
+    )
+
+    assert evidence.commit_id == "a" * 40
+    assert evidence.row_count == 7
+    assert samples == ["shards/one.parquet", "shards/two.parquet"]
+    assert hub.streamed == [
+        "shards/one.parquet",
+        "shards/two.parquet",
+        "batch-manifest.json",
+    ]
+    assert hub.loaded == [("shards/one.parquet", True), ("shards/two.parquet", True)]
+    assert first.exists() and second.exists()
+
+
+@dataclass
+class MemoryHub:
+    """Small in-memory Hub fake that records every operation."""
+
+    private: object = True
+    commit_id: str = "a" * 40
+    expose_digest: bool = False
+    flip_public: bool = False
+    decode_empty: bool = False
+    missing: bool = False
+    corrupt_stream: bool = False
+
+    def __post_init__(self) -> None:
+        """Initialise the fake's mutable repository state."""
+        self.files: dict[str, bytes] = {}
+        self.commits: list[tuple[str, ...]] = []
+        self.privacy_checks = 0
+        self.streamed: list[str] = []
+        self.loaded: list[tuple[str, bool]] = []
+        self.created = False
+
+    def create_commit(
+        self,
+        repo_id: str,
+        operations: c.Iterable[UploadOperation],
+        *,
+        repo_type: str,
+        commit_message: str,
+        parent_commit: str | None = None,
+    ) -> object:
+        """Copy uploaded operation bytes into the fake repository.
+
+        Returns:
+            Fake commit metadata.
+        """
+        operations = tuple(operations)
+        self.commits.append(tuple(operation.path_in_repo for operation in operations))
+        for operation in operations:
+            self.files[operation.path_in_repo] = operation.path.read_bytes()
+        if self.flip_public:
+            self.private = False
+        return SimpleNamespace(commit_id=self.commit_id)
+
+    def create_repo(
+        self, repo_id: str, *, repo_type: str, private: bool, exist_ok: bool
+    ) -> object:
+        """Create the fake repository with the requested visibility.
+
+        Returns:
+            Fake repository metadata.
+        """
+        self.private = private
+        self.created = True
+        return SimpleNamespace(private=private)
+
+    def get_paths_info(
+        self, repo_id: str, paths: list[str], *, repo_type: str, revision: str
+    ) -> list[object]:
+        """Return size and optionally content-digest metadata."""
+        result = []
+        for path in paths:
+            content = self.files[path]
+            attrs: dict[str, object] = {"path": path, "size": len(content)}
+            if self.expose_digest:
+                attrs["sha256"] = hashlib.sha256(content).hexdigest()
+            result.append(SimpleNamespace(**attrs))
+        return result
+
+    def load_dataset(
+        self, repo_id: str, *, shard_path: str, revision: str, streaming: bool
+    ) -> object:
+        """Return a one-row streaming dataset."""
+        self.loaded.append((shard_path, streaming))
+        if self.decode_empty:
+            return iter(())
+        return iter(({"audio": {"array": [0.0]}, "text": "hej"},))
+
+    def repo_info(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> object:
+        """Return the current fake visibility.
+
+        Raises:
+            RepositoryNotFoundError:
+                If this fake is configured as an uncreated repository.
+        """
+        self.privacy_checks += 1
+        if self.missing and not self.created:
+            raise RepositoryNotFoundError(
+                "missing",
+                response=httpx.Response(
+                    status_code=404, request=httpx.Request("GET", "https://hub.test")
+                ),
+            )
+        return SimpleNamespace(private=self.private)
+
+    def stream_file(
+        self, repo_id: str, path: str, *, repo_type: str, revision: str
+    ) -> list[bytes]:
+        """Return the remote object in multiple chunks."""
+        self.streamed.append(path)
+        if self.corrupt_stream and path == "one.parquet":
+            return [b"remote corruption"]
+        content = self.files[path]
+        return [content[:1], content[1:]]
+
+
+def test_card_contains_required_terms_and_no_credentials() -> None:
+    """Cards contain the required private-use statement and reject tokens."""
+    card = make_card()
+    assert "No public redistribution grant" in card
+    assert all(section in card for section in ("Source provenance", "Field schema"))
+    with pytest.raises(PublicationError):
+        initialise_private_dataset(
+            MemoryHub(), "org/p1", card="token=hf_" + "x" * 20, token="hf_" + "x" * 20
+        )
+
+
+def make_card() -> str:
+    """Build representative card metadata for tests.
+
+    Returns:
+        A safe dataset card.
+    """
+    return build_dataset_card(
+        source_provenance="Pinned source programmes",
+        permitted_use="Internal ASR research",
+        private_access_terms="Access is limited to the project organisation",
+        alignment_method="VAD followed by CTC alignment",
+        field_schema="audio, text and deterministic metadata",
+        known_limitations="Danish speech only",
+        rejection_policy="Reject undecodable or poorly aligned material",
+        source_revisions="dataset@" + "a" * 40,
+        model_revisions="ctc@" + "b" * 40,
+    )
+
+
+def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
+    """A batch that would reach 100 Hub operations is refused."""
+    shards = []
+    for index in range(99):
+        path = tmp_path / f"{index}.parquet"
+        path.write_bytes(b"x")
+        shards.append(LocalShard(path, f"{index}.parquet", 1))
+    with pytest.raises(AllowListError):
+        publish_batch(MemoryHub(), "org/p1", "batch", shards)
+
+
+def test_digest_failure_retains_local_artefacts(tmp_path: Path) -> None:
+    """A digest mismatch never invokes a purge."""
+    path = tmp_path / "one.parquet"
+    path.write_bytes(b"local")
+    hub = MemoryHub(corrupt_stream=True)
+    with pytest.raises(VerificationError):
+        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+    assert path.exists()
+    assert (tmp_path / "batch-manifest.json").exists()
+
+
+def test_exposed_digest_avoids_remote_download() -> None:
+    """An exposed SHA-256 avoids retaining or streaming a remote object."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "one.parquet"
+        path.write_bytes(b"data")
+        hub = MemoryHub(expose_digest=True)
+        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+        assert not hub.streamed
+
+
+def test_initialisation_commits_card_and_attributes_privately() -> None:
+    """Initialisation uploads only the card and Git attributes privately."""
+    hub = MemoryHub()
+    commit = initialise_private_dataset(hub, "org/p1", card=make_card())
+    assert commit == "a" * 40
+    assert hub.commits == [("README.md", ".gitattributes")]
+    assert "*.parquet" in hub.files[".gitattributes"].decode()
+    assert hub.privacy_checks >= 3
+
+
+def test_invalid_commit_is_not_accepted(tmp_path: Path) -> None:
+    """Branches and abbreviated commit identifiers cannot be captured."""
+    path = tmp_path / "one.parquet"
+    path.write_bytes(b"data")
+    hub = MemoryHub(commit_id="main")
+    with pytest.raises(VerificationError):
+        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+    assert path.exists()
+
+
+def test_missing_repository_is_created_private_before_initialisation() -> None:
+    """A missing repository is created private and checked before its card commit."""
+    hub = MemoryHub(missing=True)
+    commit = initialise_private_dataset(hub, "org/p1", card=make_card())
+    assert commit == "a" * 40
+    assert hub.created
+    assert hub.commits == [("README.md", ".gitattributes")]
+
+
+def test_post_commit_privacy_failure_stops_before_verification(tmp_path: Path) -> None:
+    """A visibility incident stops before path or dataset verification."""
+    path = tmp_path / "one.parquet"
+    path.write_bytes(b"local")
+    hub = MemoryHub(flip_public=True)
+    with pytest.raises(PrivacyError):
+        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+    assert not hub.loaded
+
+
+def test_public_or_unknown_visibility_aborts_before_commit() -> None:
+    """Public, unknown, and malformed visibility never receive a commit."""
+    for visibility in (False, None, "private"):
+        hub = MemoryHub(private=visibility)
+        with pytest.raises(PrivacyError):
+            initialise_private_dataset(hub, "org/p1", card=make_card())
+        assert not hub.commits
+
+
+def test_purge_requires_and_follows_durable_verification(tmp_path: Path) -> None:
+    """Purging is impossible before, and happens after, durable recording."""
+    path = tmp_path / "one.parquet"
+    path.write_bytes(b"data")
+    events: list[str] = []
+    with pytest.raises(PublicationError):
+        publish_batch(
+            MemoryHub(),
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            purge_callback=lambda paths: events.append("purge"),
+        )
+    assert path.exists()
+
+    def purge(paths: tuple[Path, ...]) -> None:
+        """Remove every artefact supplied by the publisher."""
+        events.append("purge")
+        for candidate in paths:
+            candidate.unlink()
+
+    evidence = publish_batch(
+        MemoryHub(),
+        "org/p1",
+        "batch",
+        [LocalShard(path, "one.parquet", 1)],
+        durable_verification=lambda _: events.append("durable"),
+        purge_callback=purge,
+    )
+    assert evidence.state.value == "purged"
+    assert events[-2:] == ["durable", "purge"]
+    assert not path.exists()
+
+
+def test_stream_decode_failure_retains_the_pending_batch(tmp_path: Path) -> None:
+    """An empty streaming shard cannot trigger local purging."""
+    path = tmp_path / "one.parquet"
+    path.write_bytes(b"local")
+    hub = MemoryHub(decode_empty=True)
+    purged = False
+
+    def purge(paths: tuple[Path, ...]) -> None:
+        """Record an unexpected purge attempt."""
+        nonlocal purged
+        purged = True
+
+    with pytest.raises(VerificationError):
+        publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            durable_verification=lambda evidence: None,
+            purge_callback=purge,
+        )
+    assert path.exists()
+    assert not purged
+
+
+def test_symlinks_and_unexpected_staging_entries_are_rejected(tmp_path: Path) -> None:
+    """Symlinks and files outside the explicit staging allow-list are rejected."""
+    real = tmp_path / "real.parquet"
+    real.write_bytes(b"data")
+    link = tmp_path / "link.parquet"
+    link.symlink_to(real)
+    with pytest.raises(AllowListError):
+        publish_batch(
+            MemoryHub(), "org/p1", "batch", [LocalShard(link, "link.parquet", 1)]
+        )
+
+    unexpected = tmp_path / "unexpected.txt"
+    unexpected.write_text("no")
+    with pytest.raises(AllowListError):
+        validate_staging_directory(tmp_path, [Path("real.parquet")])
