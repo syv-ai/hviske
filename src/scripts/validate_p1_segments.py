@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import typing as t
 from pathlib import Path
 
+import numpy as np
 import pyarrow.parquet as pq
+import soundfile as sf
 
 from hviske.p1_publish import HfApiAdapter
+from hviske.p1_source import HfP1Source, SourceShard
 from hviske.p1_validation import (
     ClipRetriever,
     MetadataLedger,
     PinnedHubClipRetriever,
+    SourceClipRetriever,
     build_quality_report,
     create_blinded_audit_manifest,
     export_clip_for_review,
@@ -119,11 +124,6 @@ def _run_review(args: argparse.Namespace) -> None:
             "choose exactly one of --decision (playing review) or --export-audio "
             "(non-playing review)"
         )
-    if args.audio_root is None and (args.hub_repo is None or args.hub_revision is None):
-        raise SystemExit(
-            "--review-id requires --hub-repo and --hub-revision "
-            "(or an explicit --audio-root for offline smoke tests)"
-        )
     raw_manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     if not isinstance(raw_manifest, list):
         raise ValueError("audit manifest must be a JSON list")
@@ -137,13 +137,25 @@ def _run_review(args: argparse.Namespace) -> None:
     )
     if entry is None:
         raise ValueError(f"unknown audit_id: {args.review_id}")
+    if (
+        args.audio_root is None
+        and isinstance(entry, dict)
+        and isinstance(entry.get("parquet_path"), str)
+        and (args.hub_repo is None or args.hub_revision is None)
+    ):
+        raise SystemExit(
+            "remote audit reviews require --hub-repo and --hub-revision "
+            "(or an explicit --audio-root for offline smoke tests)"
+        )
     retriever: ClipRetriever
     if args.audio_root is not None:
         retriever = LocalClipRetriever(args.audio_root)
-    else:
+    elif isinstance(entry, dict) and isinstance(entry.get("parquet_path"), str):
         retriever = PinnedHubClipRetriever(
             HfApiAdapter(), repository=args.hub_repo, revision=args.hub_revision
         )
+    else:
+        retriever = SourceClipRetriever(_source_clip_callback)
     candidate = t.cast(dict[str, object], entry)
     if args.export_audio is not None:
         destination = export_clip_for_review(
@@ -232,6 +244,59 @@ def _write_json(path: Path, value: object) -> None:
         json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     logger.info("Wrote %s", path)
+
+
+def _source_clip_callback(entry: t.Mapping[str, object]) -> bytes:
+    """Retrieve and encode exactly one rejected source interval.
+
+    Returns:
+        A temporary-review FLAC payload.
+
+    Raises:
+        FileNotFoundError:
+            If the source file identifier is absent from the pinned source.
+        ValueError:
+            If the source locator or decoded payload is invalid.
+    """
+    repository = entry.get("source_repository")
+    revision = entry.get("source_revision")
+    file_id = entry.get("source_file_id")
+    start = entry.get("source_start_ms")
+    end = entry.get("source_end_ms")
+    if not isinstance(repository, str) or not isinstance(revision, str):
+        raise ValueError("source audit entry has an incomplete source locator")
+    if not isinstance(file_id, str):
+        raise ValueError("source audit entry has no source file identifier")
+    if not isinstance(start, int) or not isinstance(end, int):
+        raise ValueError("source audit entry has an incomplete interval")
+    source = HfP1Source(audio_repository=repository)
+    for raw in source.list_audio_shards(revision=revision):
+        raw_path = raw.get("path")
+        raw_size = raw.get("size")
+        if not isinstance(raw_path, str) or not isinstance(raw_size, int):
+            raise ValueError("source shard metadata is invalid")
+        shard = SourceShard(
+            path=raw_path,
+            byte_size=raw_size,
+            revision=revision,
+            oid=t.cast(str | None, raw.get("oid")),
+        )
+        for pointer in source.iter_programme_pointers(shard=shard):
+            if pointer.file_id != file_id:
+                continue
+            audio = source.fetch_audio(pointer=pointer)
+            if not isinstance(audio.value, np.ndarray):
+                raise ValueError("source audio did not decode to samples")
+            first = max(0, start * audio.sampling_rate // 1000)
+            last = min(audio.value.shape[0], end * audio.sampling_rate // 1000)
+            if last <= first:
+                raise ValueError("source interval is empty")
+            output = io.BytesIO()
+            sf.write(
+                output, audio.value[first:last], audio.sampling_rate, format="FLAC"
+            )
+            return output.getvalue()
+    raise FileNotFoundError(f"source file_id not found: {file_id}")
 
 
 if __name__ == "__main__":

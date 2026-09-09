@@ -13,15 +13,18 @@ from types import SimpleNamespace
 
 import httpx
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
+from huggingface_hub import HfFileSystem
 from huggingface_hub.utils import RepositoryNotFoundError
 
 from hviske.p1_contracts import LedgerState, OutputRow, ShardEvidence
 from hviske.p1_ledger import Ledger
 from hviske.p1_publish import (
     AllowListError,
+    HfApiAdapter,
     LocalShard,
     PrivacyError,
     PublicationError,
@@ -69,7 +72,7 @@ def test_batch_verifies_every_path_and_streams_every_shard(tmp_path: Path) -> No
     assert hub.streamed == [
         "shards/one.parquet",
         "shards/two.parquet",
-        "batch-manifest.json",
+        "manifests/batch-001.json",
     ]
     assert hub.loaded == [("shards/one.parquet", True), ("shards/two.parquet", True)]
     assert first.exists() and second.exists()
@@ -266,7 +269,7 @@ def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> 
             "org/p1",
             "batch",
             ledger=ledger,
-            manifest_path=tmp_path / "batch-manifest.json",
+            manifest_path=tmp_path / "manifests" / "batch-001.json",
         )
         assert verified.state is LedgerState.VERIFIED
         assert ledger.batch("batch").state is LedgerState.VERIFIED
@@ -280,7 +283,7 @@ def test_digest_failure_retains_local_artefacts(tmp_path: Path) -> None:
     with pytest.raises(VerificationError):
         publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
     assert path.exists()
-    assert (tmp_path / "batch-manifest.json").exists()
+    assert (tmp_path / "manifests" / "batch.json").exists()
 
 
 def test_exposed_digest_avoids_remote_download() -> None:
@@ -291,6 +294,25 @@ def test_exposed_digest_avoids_remote_download() -> None:
         hub = MemoryHub(expose_digest=True)
         publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
         assert not hub.streamed
+
+
+def test_hf_digest_stream_uses_explicit_dataset_namespace() -> None:
+    """The filesystem adapter never ambiguously addresses a model repository."""
+    adapter = object.__new__(HfApiAdapter)
+    paths: list[str] = []
+
+    class Filesystem:
+        def open(self, path: str, **_: object) -> io.BytesIO:
+            paths.append(path)
+            return io.BytesIO(b"payload")
+
+    adapter._filesystem = t.cast(HfFileSystem, Filesystem())
+    assert list(
+        adapter.stream_file(
+            "org/p1", "shards/one.parquet", repo_type="dataset", revision="a" * 40
+        )
+    ) == [b"payload"]
+    assert paths == ["datasets/org/p1/shards/one.parquet"]
 
 
 def test_initialisation_commits_card_and_attributes_privately() -> None:
@@ -350,6 +372,15 @@ def test_local_validation_enforces_exact_schema_audio_and_duration(
     pq.write_table(_rows_table([row.model_copy(update={"duration_ms": 9})]), broken)
     with pytest.raises(VerificationError, match="duration"):
         validate_local_shard(broken)
+    second_row = _rows_table([row, row])
+    duration_column = second_row.column_names.index("duration_ms")
+    second_row = second_row.set_column(
+        duration_column, "duration_ms", pa.array([10, 9], type=pa.int32())
+    )
+    multi_row = tmp_path / "multi-row.parquet"
+    pq.write_table(second_row, multi_row)
+    with pytest.raises(VerificationError, match="duration"):
+        validate_local_shard(multi_row, expected_row_count=2)
 
 
 def test_missing_repository_is_created_private_before_initialisation() -> None:

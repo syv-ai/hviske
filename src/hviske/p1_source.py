@@ -401,7 +401,9 @@ class HfP1Source:
             yield pq.ParquetFile(local)
             return
         filesystem = self._filesystem()
-        handle = filesystem.open(f"{repository}/{path}", "rb", revision=revision)
+        handle = filesystem.open(
+            f"datasets/{repository}/{path}", "rb", revision=revision
+        )
         try:
             yield pq.ParquetFile(handle)
         finally:
@@ -974,20 +976,20 @@ def parse_audio_row(
     audio = row.get("audio")
     if not isinstance(audio, c.Mapping):
         raise InvalidSourceRecord(f"audio row {file_id} has no audio mapping")
-    rate = audio.get("sampling_rate", row.get("sampling_rate", default_sampling_rate))
-    if (
-        isinstance(rate, bool)
-        or not isinstance(rate, numbers.Integral)
-        or int(rate) <= 0
-    ):
-        raise InvalidSourceRecord(f"audio row {file_id} has an invalid sampling rate")
+    declared_rate = audio.get(
+        "sampling_rate", row.get("sampling_rate", default_sampling_rate)
+    )
     declared_channels = audio.get("channels", row.get("channels", default_channels))
-    if declared_channels is not None and (
-        isinstance(declared_channels, bool)
-        or not isinstance(declared_channels, numbers.Integral)
-        or int(declared_channels) <= 0
+    for name, value in (
+        ("sampling rate", declared_rate),
+        ("channel", declared_channels),
     ):
-        raise InvalidSourceRecord(f"audio row {file_id} has invalid channel metadata")
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, numbers.Integral)
+            or int(value) <= 0
+        ):
+            raise InvalidSourceRecord(f"audio row {file_id} has an invalid {name}")
     value = audio.get("array", audio.get("bytes", audio.get("path")))
     if value is None or not isinstance(
         value, (bytes, str, Path, np.ndarray, list, tuple)
@@ -1002,11 +1004,11 @@ def parse_audio_row(
             raise InvalidSourceRecord(
                 f"audio row {file_id} contains invalid FLAC"
             ) from exc
-        if decoded_rate != int(rate):
+        actual_channels = int(decoded.shape[1])
+        if declared_rate is not None and decoded_rate != int(declared_rate):
             raise InvalidSourceRecord(
                 f"audio row {file_id} rate metadata does not match FLAC"
             )
-        actual_channels = int(decoded.shape[1])
         if declared_channels is not None and actual_channels != int(declared_channels):
             raise InvalidSourceRecord(
                 f"audio row {file_id} channel metadata does not match FLAC"
@@ -1014,9 +1016,12 @@ def parse_audio_row(
         return ParsedAudio(
             file_id=file_id,
             value=np.asarray(decoded, dtype=np.float32),
-            sampling_rate=int(rate),
+            sampling_rate=int(decoded_rate),
             channels=actual_channels,
         )
+    if declared_rate is None:
+        raise InvalidSourceRecord(f"audio row {file_id} has no sampling rate")
+    rate = int(declared_rate)
     if isinstance(value, (list, tuple)):
         value = np.asarray(value)
     if isinstance(value, np.ndarray):

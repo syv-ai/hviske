@@ -646,6 +646,11 @@ def _native_candidates(
                     and isinstance(value, (str, int, float, bool, type(None)))
                 }
                 safe["id"] = file_id
+                for key, value in getattr(pointer, "metadata", ()):
+                    try:
+                        safe.setdefault(key, json.loads(value))
+                    except (TypeError, ValueError):
+                        continue
                 yield file_id, safe, (shard, pointer)
 
     if programme_limit is None:
@@ -910,66 +915,15 @@ def _publish_native_pending(
 ) -> None:
     """Publish a ledger-allocated batch and add locators after immutable commit."""
     del pending_ids
-    evidence = publish_pending(
+    publish_pending(
         hub=hub,
         settings=settings,
         ledger=ledger,
         batch_id=batch_id,
         pending=pending,
         pending_ids=(),
+        audit_rows=audit_rows,
     )
-    if audit_rows and evidence.commit_id is not None:
-        _record_audit_candidates(
-            rows=audit_rows,
-            path=settings.scratch_root / "audit-candidates.jsonl",
-            repository=settings.target_private_repo,
-            revision=evidence.commit_id,
-            remote_paths=tuple(record.path for record in ledger.shards(batch_id)),
-            row_counts=tuple(record.row_count for record in ledger.shards(batch_id)),
-        )
-
-
-def _record_audit_candidates(
-    *,
-    rows: c.Sequence[object],
-    path: Path,
-    repository: str,
-    revision: str,
-    remote_paths: tuple[str, ...],
-    row_counts: tuple[int, ...],
-) -> None:
-    """Persist bounded blinded audit metadata with committed row locators."""
-    from hviske.p1_validation import create_blinded_audit_manifest
-
-    candidates: list[dict[str, object]] = []
-    row_index = 0
-    for shard_path, shard_rows in zip(remote_paths, row_counts):
-        for offset, row in enumerate(rows[row_index : row_index + shard_rows]):
-            candidates.append(
-                {
-                    "status": "accepted",
-                    "segment_id": getattr(row, "segment_id"),
-                    "source_file_id": getattr(row, "source_file_id"),
-                    "source_start_ms": getattr(row, "source_start_ms"),
-                    "source_end_ms": getattr(row, "source_end_ms"),
-                    "duration_ms": getattr(row, "duration_ms"),
-                    "repository": repository,
-                    "revision": revision,
-                    "parquet_path": shard_path,
-                    "row_locator": offset,
-                }
-            )
-            row_index += 1
-    if not candidates:
-        return
-    selected = create_blinded_audit_manifest(
-        candidates, accepted_quota=min(200, len(candidates)), seed="p1"
-    )
-    with path.open("a", encoding="utf-8") as stream:
-        for candidate in selected:
-            stream.write(json.dumps(candidate, sort_keys=True) + "\\n")
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 def publish_pending(
@@ -980,6 +934,7 @@ def publish_pending(
     batch_id: str,
     pending: c.Sequence[object],
     pending_ids: c.Sequence[str],
+    audit_rows: c.Sequence[object] = (),
 ) -> object:
     """Publish a complete ledger batch through the shared verified publisher.
 
@@ -993,8 +948,6 @@ def publish_pending(
     from hviske.p1_publish import HubClient, LocalShard, publish_batch
 
     shards = t.cast(c.Sequence[LocalShard], pending)
-    if not shards:
-        raise ValueError("publication batch has no local shards")
     try:
         record = ledger.batch(batch_id)
     except KeyError:
@@ -1006,6 +959,31 @@ def publish_pending(
             ledger.attach_shard(batch_id, shard_id)
         ledger.transition_batch(batch_id, _state("sharded"))
         record = ledger.batch(batch_id)
+    if record.state in {_state("verified"), _state("purged")}:
+        from hviske.p1_publish import HubClient, verify_batch
+
+        evidence = verify_batch(
+            t.cast(HubClient, hub),
+            settings.target_private_repo,
+            batch_id,
+            ledger=ledger,
+        )
+        if ledger.batch(batch_id).state is _state("verified"):
+            paths = tuple(
+                Path(item.local_path)
+                for item in ledger.shards(batch_id)
+                if item.local_path is not None
+            )
+            for path in paths:
+                if path.is_file() and not path.is_symlink():
+                    path.unlink()
+            ledger.purge_batch(
+                batch_id, evidence={"deleted": True, "kind": "publication-artifact"}
+            )
+        ledger.finalise_batch_children(batch_id)
+        return evidence.model_copy(update={"state": _state("purged")})
+    if not shards:
+        raise ValueError("publication batch has no local shards")
     programme_ids = tuple(
         sorted(
             {
@@ -1021,6 +999,22 @@ def publish_pending(
             if path.is_file() and not path.is_symlink():
                 path.unlink()
 
+    def durable_verification(evidence: object) -> None:
+        if audit_rows:
+            commit_id = getattr(evidence, "commit_id", None)
+            if not isinstance(commit_id, str):
+                raise ValueError("verified publication has no commit for audit records")
+            _record_audit_candidates(
+                rows=audit_rows,
+                path=settings.scratch_root / "audit-candidates.jsonl",
+                repository=settings.target_private_repo,
+                revision=commit_id,
+                remote_paths=tuple(record.path for record in ledger.shards(batch_id)),
+                row_counts=tuple(
+                    record.row_count for record in ledger.shards(batch_id)
+                ),
+            )
+
     evidence = publish_batch(
         t.cast(HubClient, hub),
         settings.target_private_repo,
@@ -1033,8 +1027,10 @@ def publish_pending(
         },
         staging_dir=Path(shards[0].path).parent,
         ledger=ledger,
+        durable_verification=durable_verification if audit_rows else None,
         purge_callback=purge,
     )
+    ledger.finalise_batch_children(batch_id)
     for programme_id in programme_ids:
         programme = ledger.programme(programme_id)
         if programme.state is _state("sharded"):
@@ -1049,6 +1045,57 @@ def publish_pending(
             if ledger.programme(programme_id).state is _state("verified"):
                 ledger.transition_programme(programme_id, _state("purged"))
     return evidence
+
+
+def _record_audit_candidates(
+    *,
+    rows: c.Sequence[object],
+    path: Path,
+    repository: str,
+    revision: str,
+    remote_paths: tuple[str, ...],
+    row_counts: tuple[int, ...],
+) -> None:
+    """Persist bounded blinded audit metadata with committed row locators.
+
+    Raises:
+        TypeError:
+            If an audit row is neither a mapping nor a contract model.
+    """
+    from hviske.p1_validation import create_blinded_audit_manifest
+
+    candidates: list[dict[str, object]] = []
+    row_index = 0
+    for shard_path, shard_rows in zip(remote_paths, row_counts):
+        for offset, row in enumerate(rows[row_index : row_index + shard_rows]):
+            model_dump = getattr(row, "model_dump", None)
+            if callable(model_dump):
+                candidate = t.cast(dict[str, object], model_dump(mode="python"))
+            elif isinstance(row, Mapping):
+                candidate = dict(row)
+            else:
+                raise TypeError("audit rows must be mappings or contract models")
+            candidate.update(
+                {
+                    "status": "accepted",
+                    "repository": repository,
+                    "revision": revision,
+                    "parquet_path": shard_path,
+                    "row_locator": offset,
+                }
+            )
+            candidates.append(candidate)
+            row_index += 1
+    if not candidates:
+        return
+    selected = create_blinded_audit_manifest(
+        candidates, accepted_quota=min(200, len(candidates)), seed="p1"
+    )
+    with path.open("a", encoding="utf-8") as stream:
+        for candidate in selected:
+            stream.write(json.dumps(candidate, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _state(value: str) -> LedgerState:
@@ -1130,25 +1177,24 @@ def _recover_native_batches(
             settings.target_private_repo,
             batch.batch_id,
             ledger=ledger,
-            manifest_path=(paths[0].parent / "batch-manifest.json" if paths else None),
+            manifest_path=(
+                paths[0].parent / "manifests" / f"{batch.batch_id}.json"
+                if paths
+                else None
+            ),
             purge_callback=_unlink_recovered if len(paths) == len(records) else None,
             local_paths=paths,
         )
         recovered_batch = ledger.batch(batch.batch_id)
-        for programme_id in {
-            record.programme_id for record in records if record.programme_id is not None
-        }:
-            programme = ledger.programme(programme_id)
-            if programme.state is _state("sharded"):
-                ledger.transition_programme(
-                    programme_id, _state("committed"), commit_id=batch.commit_id
-                )
-                ledger.transition_programme(programme_id, _state("verified"))
-            if recovered_batch.state is _state("purged"):
-                for shard in ledger.shards(batch.batch_id):
-                    if shard.state is _state("verified"):
-                        ledger.transition_shard(shard.shard_id, _state("purged"))
-                ledger.transition_programme(programme_id, _state("purged"))
+        if recovered_batch.state is _state("verified"):
+            ledger.purge_batch(
+                batch.batch_id,
+                evidence={"deleted": True, "kind": "publication-artifact"},
+            )
+        if ledger.batch(batch.batch_id).state is _state("purged"):
+            ledger.finalise_batch_children(batch.batch_id)
+    for batch in ledger.purged_batches_with_pending_children():
+        ledger.finalise_batch_children(batch.batch_id)
 
 
 def configure_scratch(root: Path) -> Path:
