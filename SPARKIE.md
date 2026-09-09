@@ -30,9 +30,12 @@ export P1_TRANSCRIPT_JOIN_COLUMN=<p1-transcript-key-column>
 export P1_TRANSCRIPT_TEXT_COLUMN=<p1-transcript-text-column>
 ```
 
-All four values are required. The p1 audio side remains streaming; the bounded
-preflight builds the complete compact transcript index and consumes one joined audio
-example, while training uses the same index-plus-streamed-audio join path.
+All four values are required. At revision
+`41132579816d86e889635f84f30511279f026359`, the transcript repository contains
+16,640 rows: 16,638 usable texts, two empty texts, no null keys, and no duplicate
+keys. The P1 audio side remains streaming; the bounded preflight builds the compact
+usable transcript index, filters audio lazily to matching keys, and consumes one
+joined example. Training uses the same partial-index-plus-streamed-audio path.
 
 ## Fixed production mix
 
@@ -83,9 +86,9 @@ uv run python src/scripts/build_vtt_manifest.py \
 Run the preflight while `qwen38-ar` is still serving. It resolves every required
 environment variable, checks Hub authentication and gated model access, validates all
 pinned dataset coordinates and schemas, validates each local manifest and its first
-referenced WAV, and consumes one joined P1 example. It does not prove complete P1 audio
-key coverage without scanning the full 1.9 TB audio stream; the compact transcript index
-is intentionally built in memory. It does not load the ASR model, download background
+referenced WAV, and consumes one joined P1 example. The transcript index is intentionally
+partial and built in memory; unmatched P1 audio rows and empty transcript rows are
+skipped lazily. The preflight does not load the ASR model, download background
 noise, or start training.
 
 ```bash

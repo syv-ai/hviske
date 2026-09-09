@@ -266,8 +266,8 @@ def join_audio_and_transcripts(
     """Join a streaming audio dataset to an indexed transcript dataset.
 
     The audio side is never materialised. The compact transcript side is indexed in
-    memory, then looked up as audio examples are consumed. Missing transcript keys are
-    reported when the corresponding streaming example is read.
+    memory, then the audio stream is filtered lazily to keys with usable transcripts.
+    Empty transcript rows and audio rows without a transcript are skipped.
 
     Args:
         audio_dataset:
@@ -286,7 +286,8 @@ def join_audio_and_transcripts(
 
     Raises:
         ValueError:
-            If a configured column is absent or transcript keys are duplicated.
+            If a configured column is absent, transcript keys are duplicated, or no
+            usable transcripts remain.
     """
     _require_columns(
         dataset=audio_dataset, columns=[audio_join_column], dataset_name="audio"
@@ -297,6 +298,7 @@ def join_audio_and_transcripts(
         dataset_name="transcript",
     )
     transcript_by_key: dict[object, str] = {}
+    seen_transcript_keys: set[object] = set()
     key_type: type[object] | None = None
     for raw_row in transcript_dataset:
         row = t.cast(dict[str, Any], raw_row)
@@ -304,28 +306,34 @@ def join_audio_and_transcripts(
         _validate_join_key(key=key, expected_type=key_type, side="transcript")
         if key_type is None:
             key_type = type(key)
-        if key in transcript_by_key:
+        if key in seen_transcript_keys:
             raise ValueError(f"Duplicate transcript key: {key!r}")
+        seen_transcript_keys.add(key)
         text = row[transcript_text_column]
         if not isinstance(text, str) or not text.strip():
-            raise ValueError(f"Empty transcript for key: {key!r}")
+            continue
         transcript_by_key[key] = text
 
-    def add_transcript(example: dict[str, Any]) -> dict[str, Any]:
+    if not transcript_by_key:
+        raise ValueError("Transcript dataset contains no usable transcripts")
+
+    def has_transcript(example: dict[str, Any]) -> bool:
         key = example[audio_join_column]
         _validate_join_key(key=key, expected_type=key_type, side="audio")
-        if key not in transcript_by_key:
-            raise ValueError(f"No transcript found for audio key: {key!r}")
-        example["text"] = transcript_by_key[key]
+        return key in transcript_by_key
+
+    def add_transcript(example: dict[str, Any]) -> dict[str, Any]:
+        example["text"] = transcript_by_key[example[audio_join_column]]
         return example
 
     if audio_dataset.features is None:
         raise ValueError("Audio dataset must declare features")
     joined_features = audio_dataset.features.copy()
     joined_features["text"] = Value("string")
+    filtered_audio = audio_dataset.filter(has_transcript)
     return t.cast(
         Dataset | IterableDataset,
-        audio_dataset.map(add_transcript, features=joined_features),
+        filtered_audio.map(add_transcript, features=joined_features),
     )
 
 

@@ -191,16 +191,12 @@ def test_join_rejects_duplicate_transcript_keys() -> None:
 
 @pytest.mark.parametrize(
     ("audio_key", "transcript_key", "message"),
-    [
-        ("missing", "present", "No transcript"),
-        ("one", ["one"], "hashable"),
-        (1, "one", "type"),
-    ],
+    [("one", ["one"], "hashable"), (1, "one", "type")],
 )
 def test_join_rejects_invalid_first_audio_key(
     audio_key: object, transcript_key: object, message: str
 ) -> None:
-    """A preflight join rejects mismatches, unhashable keys, and type errors."""
+    """A preflight join rejects unhashable keys and key-type errors."""
     audio = Dataset.from_list([{"key": audio_key}])
     transcripts = Dataset.from_list([{"transcript_key": transcript_key, "words": "Et"}])
     with pytest.raises(ValueError, match=message):
@@ -212,6 +208,23 @@ def test_join_rejects_invalid_first_audio_key(
             transcript_text_column="words",
         )
         next(iter(joined))
+
+
+def test_join_rejects_transcript_index_without_usable_text() -> None:
+    """A transcript index containing only empty text cannot train a model."""
+    audio = IterableDataset.from_generator(
+        lambda: iter([{"key": "one"}]), features=Features(key=Value("string"))
+    )
+    transcripts = Dataset.from_list([{"transcript_key": "one", "words": ""}])
+
+    with pytest.raises(ValueError, match="no usable transcripts"):
+        join_audio_and_transcripts(
+            audio_dataset=audio,
+            transcript_dataset=transcripts,
+            audio_join_column="key",
+            transcript_join_column="transcript_key",
+            transcript_text_column="words",
+        )
 
 
 def test_join_validates_configured_columns() -> None:
@@ -466,13 +479,18 @@ def test_single_language_processor_uses_model_default() -> None:
     assert processor.languages == ["da"]
 
 
-def test_streaming_audio_is_joined_to_indexed_transcripts() -> None:
-    """Joining does not materialise the audio side and fails for missing keys."""
+def test_streaming_audio_is_joined_to_partial_transcript_index() -> None:
+    """Joining lazily skips audio without a usable indexed transcript."""
     audio = IterableDataset.from_generator(
-        lambda: iter([{"key": "one"}, {"key": "two"}]),
+        lambda: iter([{"key": "one"}, {"key": "two"}, {"key": "three"}]),
         features=Features(key=Value("string")),
     )
-    transcripts = Dataset.from_list([{"transcript_key": "one", "words": "Et"}])
+    transcripts = Dataset.from_list(
+        [
+            {"transcript_key": "one", "words": "  "},
+            {"transcript_key": "two", "words": "To"},
+        ]
+    )
     joined = join_audio_and_transcripts(
         audio_dataset=audio,
         transcript_dataset=transcripts,
@@ -481,8 +499,7 @@ def test_streaming_audio_is_joined_to_indexed_transcripts() -> None:
         transcript_text_column="words",
     )
 
-    with pytest.raises(ValueError, match="No transcript"):
-        list(joined)
+    assert list(joined) == [{"key": "two", "text": "To"}]
 
 
 def test_validation_sample_cap_is_applied_before_materialisation() -> None:
