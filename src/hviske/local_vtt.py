@@ -8,7 +8,8 @@ from pathlib import Path
 
 import soundfile as sf
 import torch
-from datasets import Dataset
+import torchaudio.functional
+from datasets import Features, IterableDataset, Value
 
 
 class Cue(t.TypedDict):
@@ -44,30 +45,25 @@ def build_vtt_manifest(
         FileNotFoundError:
             If a WAV file has no matching VTT file.
     """
-    rows: list[dict[str, str | float]] = []
-    for directory in source_directories:
-        for wav_path in sorted(directory.rglob("*.wav")):
-            vtt_path = wav_path.with_suffix(".vtt")
-            if not vtt_path.is_file():
-                raise FileNotFoundError(f"No matching VTT file for {wav_path}")
-            audio_duration = float(sf.info(wav_path).duration)
-            for cue in parse_vtt(vtt_path):
-                if cue["end"] > audio_duration:
-                    raise ValueError(f"Cue extends beyond WAV duration: {vtt_path}")
-                rows.append(
-                    _manifest_row(
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as manifest_file:
+        for directory in source_directories:
+            for wav_path in sorted(directory.rglob("*.wav")):
+                vtt_path = wav_path.with_suffix(".vtt")
+                if not vtt_path.is_file():
+                    raise FileNotFoundError(f"No matching VTT file for {wav_path}")
+                audio_duration = float(sf.info(wav_path).duration)
+                for cue in parse_vtt(vtt_path):
+                    if cue["end"] > audio_duration:
+                        raise ValueError(f"Cue extends beyond WAV duration: {vtt_path}")
+                    row = _manifest_row(
                         wav_path=wav_path,
                         start=cue["start"],
                         end=cue["end"],
                         text=cue["text"],
                         language=language,
                     )
-                )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as manifest_file:
-        for row in rows:
-            manifest_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    manifest_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def parse_vtt(path: Path) -> list[Cue]:
@@ -107,7 +103,7 @@ def parse_vtt(path: Path) -> list[Cue]:
 
 def load_vtt_manifest(
     manifest_path: Path, min_seconds: float, max_seconds: float
-) -> Dataset:
+) -> IterableDataset:
     """Load manifest rows without decoding any audio.
 
     Duration filtering happens while the manifest is read, before a WAV is opened for
@@ -122,22 +118,34 @@ def load_vtt_manifest(
             Exclusive upper duration bound.
 
     Returns:
-        An Arrow dataset containing metadata only.
+        An iterable dataset containing metadata only.
 
-    Raises:
-            ValueError:
-                If a manifest row has an invalid duration.
     """
-    rows: list[dict[str, t.Any]] = []
-    with manifest_path.open(encoding="utf-8") as manifest_file:
-        for line_number, line in enumerate(manifest_file, start=1):
-            row = json.loads(line)
-            duration = float(row["duration"])
-            if min_seconds < duration < max_seconds:
-                rows.append(row)
-            elif duration < 0:
-                raise ValueError(f"Negative duration on manifest line {line_number}")
-    return Dataset.from_list(rows)
+
+    def manifest_rows() -> t.Iterator[dict[str, t.Any]]:
+        with manifest_path.open(encoding="utf-8") as manifest_file:
+            for line_number, line in enumerate(manifest_file, start=1):
+                row = json.loads(line)
+                duration = float(row["duration"])
+                if duration < 0:
+                    raise ValueError(
+                        f"Negative duration on manifest line {line_number}"
+                    )
+                if min_seconds < duration < max_seconds:
+                    yield row
+
+    return IterableDataset.from_generator(
+        generator=manifest_rows,
+        features=Features(
+            source_wav_path=Value("string"),
+            start=Value("float64"),
+            end=Value("float64"),
+            text=Value("string"),
+            id=Value("string"),
+            duration=Value("float64"),
+            language=Value("string"),
+        ),
+    )
 
 
 def decode_vtt_audio(
@@ -167,18 +175,18 @@ def decode_vtt_audio(
         frame_count = round((end - start) * source_rate)
         audio_file.seek(start_frame)
         audio_array = audio_file.read(frames=frame_count, dtype="float32")
-    if audio_array.shape[0] != frame_count:
+    if start < 0 or end < start or audio_array.shape[0] != frame_count:
         raise ValueError(f"Cue is outside source WAV: {path}")
-    if audio_array.ndim == 2:
-        audio_array = audio_array.mean(axis=1)
+
+    waveform = torch.as_tensor(audio_array, dtype=torch.float32)
+    if waveform.ndim == 2:
+        waveform = waveform.mean(dim=1)
+    waveform = waveform.contiguous()
     if source_rate != sampling_rate:
-        audio_array = torch.from_numpy(audio_array).unsqueeze(0).float()
-        audio_array = torch.nn.functional.interpolate(
-            audio_array.unsqueeze(0),
-            size=round(audio_array.shape[-1] * sampling_rate / source_rate),
-            mode="linear",
-            align_corners=False,
-        )[0, 0].numpy()
+        waveform = torchaudio.functional.resample(
+            waveform.unsqueeze(0), orig_freq=source_rate, new_freq=sampling_rate
+        )[0]
+    audio_array = waveform.contiguous().numpy()
     example["audio"] = {"array": audio_array, "sampling_rate": sampling_rate}
     return example
 
