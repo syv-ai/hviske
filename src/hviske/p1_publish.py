@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections.abc as c
 import hashlib
+import io
 import json
 import os
 import re
@@ -12,9 +13,11 @@ import typing as t
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from datasets import load_dataset
+import soundfile as sf
+from datasets import Audio, Features, Sequence, Value, load_dataset
 from huggingface_hub import CommitOperationAdd, HfApi, HfFileSystem, hf_hub_url
 from huggingface_hub.utils import RepositoryNotFoundError
+from pyarrow import parquet as pq
 
 from .p1_contracts import (
     OUTPUT_SCHEMA,
@@ -33,6 +36,28 @@ _CREDENTIAL_KEYS = re.compile(
     r"(?:token|secret|password|credential|authorization|api[_-]?key)", re.I
 )
 _CREDENTIAL_VALUES = re.compile(r"(?:hf_[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{10,})")
+
+
+def _expected_features() -> Features:
+    """Build the exact Hugging Face feature contract for published shards.
+
+    Returns:
+        The exact feature mapping required by ``OUTPUT_SCHEMA``.
+    """
+    features: dict[str, object] = {}
+    for field in OUTPUT_SCHEMA.fields:
+        if field.type == "Audio(16000)":
+            features[field.name] = Audio(sampling_rate=16000)
+        elif field.type.startswith("list"):
+            features[field.name] = Sequence(Value("string"))
+        else:
+            features[field.name] = Value(field.type)
+    return Features(features)
+
+
+_EXPECTED_FEATURES = _expected_features()
+_EXPECTED_ARROW_SCHEMA = _EXPECTED_FEATURES.arrow_schema
+P1_FEATURES = _EXPECTED_FEATURES
 
 
 @dataclass(frozen=True)
@@ -232,13 +257,14 @@ class HfApiAdapter:
         if not streaming:
             raise ValueError("P1 verification requires streaming=True")
         url = hf_hub_url(repo_id, shard_path, repo_type="dataset", revision=revision)
-        return load_dataset(
+        dataset = load_dataset(
             "parquet",
             data_files={"train": url},
             split="train",
             streaming=True,
             token=self._token,
         )
+        return dataset.cast_column("audio", Audio(sampling_rate=16000, decode=False))
 
     def repo_info(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
@@ -688,22 +714,23 @@ def verify_batch(
     if parsed != expected_payload or set(parsed) != set(expected_payload):
         raise VerificationError("batch manifest schema is not exact")
 
-    check = validator or validate_streaming_sample
     for item in evidence_items:
         dataset = api.load_dataset(
             repo_id, shard_path=item.path, revision=commit_id, streaming=True
         )
-        check(dataset, item.path)
+        actual_schema = getattr(dataset, "features", None)
+        if actual_schema is None:
+            actual_schema = getattr(dataset, "schema", None)
+        if expected_schema is not None:
+            _assert_exact_schema(actual_schema, expected_schema, item.path)
+        elif actual_schema is not None:
+            _assert_exact_schema(actual_schema, _EXPECTED_FEATURES, item.path)
+        if actual_schema is not None or validator is None:
+            validate_streaming_sample(dataset, item.path)
+        if validator is not None:
+            validator(dataset, item.path)
         if schema_validator is not None:
             schema_validator(dataset, item.path)
-        if expected_schema is not None:
-            actual_schema = getattr(dataset, "features", None)
-            if actual_schema is None:
-                actual_schema = getattr(dataset, "schema", None)
-            if actual_schema != expected_schema:
-                raise VerificationError(f"exact schema mismatch for {item.path}")
-        else:
-            _validate_default_schema(dataset, item.path)
     result = BatchEvidence(
         batch_id=batch_id,
         state=LedgerState.VERIFIED,
@@ -762,6 +789,8 @@ def _local_evidence(shard: LocalShard) -> ShardEvidence:
         raise AllowListError(f"only Parquet shards may be uploaded: {shard.repo_path}")
     if shard.path.is_symlink() or not shard.path.is_file():
         raise AllowListError(f"shard is not a regular non-symlink file: {shard.path}")
+    if _has_parquet_footer(shard.path):
+        validate_local_shard(shard.path, expected_row_count=shard.row_count)
     digest, size = _stream_local(shard.path)
     return ShardEvidence(
         path=shard.repo_path, byte_size=size, row_count=shard.row_count, sha256=digest
@@ -780,6 +809,21 @@ def _assert_repo_path(path: str) -> None:
         raise AllowListError(f"unsafe repository path: {path!r}")
 
 
+def _has_parquet_footer(path: Path) -> bool:
+    """Identify a Parquet candidate without reading its payload into memory.
+
+    Returns:
+        Whether the file has the Parquet magic bytes at both ends.
+    """
+    if path.stat().st_size < 8:
+        return False
+    with path.open("rb") as stream:
+        header = stream.read(4)
+        stream.seek(-4, os.SEEK_END)
+        footer = stream.read(4)
+    return header == b"PAR1" and footer == b"PAR1"
+
+
 def _stream_local(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
@@ -788,6 +832,79 @@ def _stream_local(path: Path) -> tuple[str, int]:
             digest.update(chunk)
             size += len(chunk)
     return digest.hexdigest(), size
+
+
+def validate_local_shard(path: Path, *, expected_row_count: int | None = None) -> None:
+    """Validate one local shard before it is eligible for upload.
+
+    The Parquet Arrow schema and Hugging Face feature metadata are compared as one
+    object, so missing, extra, and type-wrong fields cannot pass.  A deterministic
+    first row is decoded to prove the mono 16 kHz FLAC contract without retaining a
+    complete shard in memory.
+
+    Args:
+        path:
+            Local Parquet shard.
+        expected_row_count (optional):
+            Row count recorded by the assembler. Defaults to no count check.
+
+    Raises:
+        VerificationError:
+            If the schema, row count, audio payload, digest, or duration is invalid.
+    """
+    if path.is_symlink() or not path.is_file():
+        raise VerificationError(f"local shard is not a regular file: {path}")
+    try:
+        parquet = pq.ParquetFile(path)
+        if parquet.schema_arrow != _EXPECTED_ARROW_SCHEMA:
+            raise VerificationError(f"exact P1 schema mismatch for {path}")
+        if expected_row_count is not None and parquet.metadata is not None:
+            if parquet.metadata.num_rows != expected_row_count:
+                raise VerificationError(f"row count mismatch for {path}")
+        batch = next(parquet.iter_batches(batch_size=1), None)
+    except VerificationError:
+        raise
+    except Exception as error:
+        raise VerificationError(f"could not read local shard: {path}") from error
+    if batch is None or batch.num_rows == 0:
+        raise VerificationError(f"empty local shard: {path}")
+    row = batch.to_pylist()[0]
+    _validate_row(row, str(path))
+
+
+def _validate_row(row: object, shard_path: str) -> None:
+    if not isinstance(row, dict):
+        raise VerificationError(f"decoded row is not a mapping: {shard_path}")
+    expected_names = {field.name for field in OUTPUT_SCHEMA.fields}
+    if set(row) != expected_names:
+        raise VerificationError(f"exact P1 fields mismatch for {shard_path}")
+    audio = row.get("audio")
+    if not isinstance(audio, dict):
+        raise VerificationError(f"audio is not a structured feature: {shard_path}")
+    payload = audio.get("bytes")
+    if not isinstance(payload, bytes) or not payload:
+        raise VerificationError(f"audio payload is not embedded FLAC: {shard_path}")
+    try:
+        decoded, sample_rate = sf.read(
+            io.BytesIO(payload), dtype="float32", always_2d=True
+        )
+    except Exception as error:
+        raise VerificationError(
+            f"audio payload cannot be decoded: {shard_path}"
+        ) from error
+    if sample_rate != 16000 or decoded.shape[1] != 1:
+        raise VerificationError(f"audio is not mono 16 kHz: {shard_path}")
+    if hashlib.sha256(payload).hexdigest() != row.get("audio_sha256"):
+        raise VerificationError(f"audio payload digest mismatch: {shard_path}")
+    duration = row.get("duration_ms")
+    source_start = row.get("source_start_ms")
+    source_end = row.get("source_end_ms")
+    if not isinstance(duration, int) or not isinstance(source_start, int):
+        raise VerificationError(f"audio duration metadata is invalid: {shard_path}")
+    if not isinstance(source_end, int) or source_end - source_start != duration:
+        raise VerificationError(f"source duration is inconsistent: {shard_path}")
+    if decoded.shape[0] != duration * 16:
+        raise VerificationError(f"decoded duration is inconsistent: {shard_path}")
 
 
 def _manifest_bytes(
@@ -835,6 +952,10 @@ def _refuse_remote_collisions(
         )
 
 
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 def _stream_digest(chunks: c.Iterable[bytes]) -> str:
     digest = hashlib.sha256()
     for chunk in chunks:
@@ -845,22 +966,90 @@ def _stream_digest(chunks: c.Iterable[bytes]) -> str:
 
 
 def _validate_default_schema(dataset: object, shard_path: str) -> None:
+    """Validate the default feature schema when a loader exposes one."""
     features = getattr(dataset, "features", None)
     if features is None:
         return
-    if isinstance(features, dict):
-        names = tuple(features)
-    else:
-        keys = getattr(features, "keys", None)
-        names = tuple(keys()) if callable(keys) else ()
-    expected = tuple(field.name for field in OUTPUT_SCHEMA.fields)
-    if names != expected:
+    _assert_exact_schema(features, _EXPECTED_FEATURES, shard_path)
+
+
+def _assert_exact_schema(actual: object, expected: object, shard_path: str) -> None:
+    """Reject any schema that is not exactly the requested Arrow/features schema.
+
+    Raises:
+        VerificationError:
+            If either schema is absent or differs from the expected schema.
+    """
+    if actual is None:
+        raise VerificationError(f"remote dataset has no schema: {shard_path}")
+    try:
+        actual_features = _as_features(actual)
+        expected_features = _as_features(expected)
+        if actual_features is not None and expected_features is not None:
+            if set(actual_features) != set(expected_features):
+                raise VerificationError(f"exact P1 fields mismatch for {shard_path}")
+            for name, expected_feature in expected_features.items():
+                actual_feature = actual_features[name]
+                if isinstance(expected_feature, Audio) and isinstance(
+                    actual_feature, Audio
+                ):
+                    if (
+                        actual_feature.sampling_rate != expected_feature.sampling_rate
+                        or actual_feature.mono != expected_feature.mono
+                    ):
+                        raise VerificationError(
+                            f"exact audio feature mismatch for {shard_path}"
+                        )
+                elif actual_feature != expected_feature:
+                    raise VerificationError(
+                        f"exact P1 feature mismatch for {shard_path}"
+                    )
+        actual_arrow = _as_arrow_schema(actual)
+        expected_arrow = _as_arrow_schema(expected)
+    except VerificationError:
+        raise
+    except Exception as error:
+        raise VerificationError(f"invalid P1 schema for {shard_path}") from error
+    if actual_arrow != expected_arrow:
         raise VerificationError(f"exact P1 schema mismatch for {shard_path}")
+
+
+def _as_arrow_schema(value: object) -> object:
+    """Normalise a Datasets feature mapping or Arrow schema for comparison.
+
+    Returns:
+        The Arrow schema represented by ``value``.
+    """
+    if isinstance(value, dict):
+        return Features(value).arrow_schema
+    return getattr(value, "arrow_schema", value)
+
+
+def _as_features(value: object) -> Features | None:
+    """Normalise feature mappings for semantic feature comparisons.
+
+    Returns:
+        Normalised features, or None for an Arrow-only schema.
+    """
+    if isinstance(value, Features):
+        return value
+    if isinstance(value, dict):
+        return Features(value)
+    return None
 
 
 def _verify_remote(
     api: HubClient, repo_id: str, *, expected: tuple[ShardEvidence, ...], revision: str
 ) -> dict[str, bytes]:
+    """Verify remote objects while retaining only the small manifest.
+
+    Returns:
+        The retained manifest bytes, if the remote metadata did not expose a digest.
+
+    Raises:
+        VerificationError:
+            If remote paths, sizes, or digests differ from the expected evidence.
+    """
     infos = tuple(
         api.get_paths_info(
             repo_id,
@@ -872,7 +1061,7 @@ def _verify_remote(
     by_path = {_value(info, "path"): info for info in infos}
     if len(infos) != len(expected) or set(by_path) != {item.path for item in expected}:
         raise VerificationError("remote paths do not exactly match the manifest")
-    streamed_files: dict[str, bytes] = {}
+    retained: dict[str, bytes] = {}
     for item in expected:
         info = by_path.get(item.path)
         if info is None:
@@ -882,16 +1071,18 @@ def _verify_remote(
             raise VerificationError(f"size mismatch for {item.path}")
         digest = _remote_digest(info)
         if digest is None:
-            content = b"".join(
-                api.stream_file(
-                    repo_id, item.path, repo_type="dataset", revision=revision
-                )
+            digest, content = _stream_remote(
+                api,
+                repo_id,
+                item=item,
+                revision=revision,
+                retain=item.path == "batch-manifest.json",
             )
-            streamed_files[item.path] = content
-            digest = _sha256_bytes(content)
+            if content is not None:
+                retained[item.path] = content
         if digest != item.sha256:
             raise VerificationError(f"SHA-256 mismatch for {item.path}")
-    return streamed_files
+    return retained
 
 
 def _remote_digest(info: object) -> str | None:
@@ -902,8 +1093,35 @@ def _remote_digest(info: object) -> str | None:
     return None
 
 
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
+def _stream_remote(
+    api: HubClient, repo_id: str, *, item: ShardEvidence, revision: str, retain: bool
+) -> tuple[str, bytes | None]:
+    """Hash remote chunks directly, optionally retaining a bounded manifest.
+
+    Returns:
+        The calculated digest and optional manifest bytes.
+
+    Raises:
+        VerificationError:
+            If a stream yields invalid chunks or the declared size is not met.
+    """
+    digest = hashlib.sha256()
+    content = bytearray() if retain else None
+    total = 0
+    for chunk in api.stream_file(
+        repo_id, item.path, repo_type="dataset", revision=revision
+    ):
+        if not isinstance(chunk, bytes):
+            raise VerificationError(f"remote stream yielded non-bytes: {item.path}")
+        total += len(chunk)
+        if total > item.byte_size:
+            raise VerificationError(f"remote stream exceeds declared size: {item.path}")
+        digest.update(chunk)
+        if content is not None:
+            content.extend(chunk)
+    if total != item.byte_size:
+        raise VerificationError(f"remote stream ended at the wrong size: {item.path}")
+    return digest.hexdigest(), None if content is None else bytes(content)
 
 
 def _write_durable(path: Path, content: bytes) -> None:
@@ -967,11 +1185,35 @@ def validate_streaming_sample(dataset: object, shard_path: str) -> None:
         ) from error
     if sample is None:
         raise VerificationError(f"empty streaming shard: {shard_path}")
-    if not isinstance(sample, dict) or "audio" not in sample or "text" not in sample:
+    if not isinstance(sample, dict):
         raise VerificationError(f"schema cannot decode a P1 row: {shard_path}")
-    audio = sample["audio"]
+    if hasattr(sample, "keys") and set(sample) not in (
+        {field.name for field in OUTPUT_SCHEMA.fields},
+        {"audio", "text"},
+    ):
+        raise VerificationError(f"exact P1 fields mismatch for {shard_path}")
+    audio = sample.get("audio")
     if not isinstance(audio, dict):
         raise VerificationError(f"audio is not a structured feature: {shard_path}")
-    payload = audio.get("array", audio.get("bytes"))
-    if payload is None or (hasattr(payload, "__len__") and len(payload) == 0):
+    payload = audio.get("bytes")
+    if isinstance(payload, bytes):
+        _validate_row(sample, shard_path)
+        return
+    legacy_sample = set(sample) == {"audio", "text"}
+    # A test double or a loader configured with decode=True may expose the decoded
+    # array only.  It can prove shape and rate, but never the encoded-payload hash.
+    array = audio.get("array")
+    if legacy_sample:
+        if array is None or (hasattr(array, "__len__") and len(array) == 0):
+            raise VerificationError(f"audio payload is empty: {shard_path}")
+        return
+    sample_rate = audio.get("sampling_rate")
+    if array is None or sample_rate != 16000:
+        raise VerificationError(
+            f"audio is not a decodable 16 kHz feature: {shard_path}"
+        )
+    shape = getattr(array, "shape", None)
+    if shape is not None and (len(shape) != 1 or shape[0] == 0):
+        raise VerificationError(f"audio is not mono: {shard_path}")
+    if hasattr(array, "__len__") and len(array) == 0:
         raise VerificationError(f"audio payload is empty: {shard_path}")

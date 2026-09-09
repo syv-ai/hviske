@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from hviske.p1_contracts import LedgerState, RejectionCategory
-from hviske.p1_ledger import EvidenceError, InvalidTransition, Ledger
+from hviske.p1_ledger import EvidenceError, InvalidTransition, Ledger, ShardAllocation
 
 DIGEST = "a" * 64
 COMMIT = "b" * 40
@@ -17,6 +17,50 @@ REVISIONS = {
     "audio": {"repository": "syvai/p1-audio", "revision": "c" * 40},
     "transcripts": {"repository": "syvai/p1-transcripts", "revision": "d" * 40},
 }
+
+
+def test_atomic_batch_allocation_persists_local_identity_before_sharding(
+    tmp_path: Path,
+) -> None:
+    """Batch attachment and programme sharding commit as one transaction."""
+    local = tmp_path / "part.parquet"
+    local.write_bytes(b"durable shard")
+    digest = hashlib.sha256(local.read_bytes()).hexdigest()
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        add_programme(ledger)
+        batch, shards = ledger.allocate_batch_with_shards(
+            "programme-1",
+            [
+                ShardAllocation(
+                    local_path=local,
+                    remote_path="data/part.parquet",
+                    sha256=digest,
+                    byte_size=local.stat().st_size,
+                    row_count=2,
+                )
+            ],
+        )
+        assert batch.state is LedgerState.SHARDED
+        assert ledger.programme("programme-1").state is LedgerState.SHARDED
+        assert shards[0].batch_id == batch.batch_id
+        assert shards[0].local_path == str(local.resolve())
+        assert ledger.unattached_local_shards() == ()
+        alternate = tmp_path / "elsewhere" / local.name
+        alternate.parent.mkdir()
+        alternate.write_bytes(local.read_bytes())
+        assert not ledger.reconcile_local_shard(shards[0].shard_id, alternate)
+        assert ledger.reconcile_local_shard(shards[0].shard_id)
+
+
+def add_programme(ledger: Ledger, programme_id: str = "programme-1") -> None:
+    """Add the standard metadata-only programme fixture."""
+    ledger.register_programme(
+        programme_id,
+        source_file_id=f"source-{programme_id}",
+        source_revisions=REVISIONS,
+        pipeline_digest=DIGEST,
+        source_duration_ms=12_000,
+    )
 
 
 def test_batch_shard_state_machine_and_separate_publication_purge(
@@ -56,17 +100,6 @@ def add_batch(ledger: Ledger, batch_id: str = "batch-1") -> None:
         programme_id="programme-1",
     )
     ledger.attach_shard(batch_id, "shard-1")
-
-
-def add_programme(ledger: Ledger, programme_id: str = "programme-1") -> None:
-    """Add the standard metadata-only programme fixture."""
-    ledger.register_programme(
-        programme_id,
-        source_file_id=f"source-{programme_id}",
-        source_revisions=REVISIONS,
-        pipeline_digest=DIGEST,
-        source_duration_ms=12_000,
-    )
 
 
 def test_local_reconciliation_requires_exact_digest_and_regular_file(
@@ -186,6 +219,26 @@ def test_remote_reconciliation_avoids_reupload_or_marks_retryable(
         ledger.transition_batch("batch-2", LedgerState.COMMITTED, commit_id=COMMIT)
         assert not ledger.reconcile_remote("batch-2", lambda _commit, _paths: False)
         assert ledger.batch("batch-2").state is LedgerState.RETRYABLE
+
+
+def test_restart_enumerates_unattached_local_shards_and_committed_batches(
+    tmp_path: Path,
+) -> None:
+    """Recovery exposes durable local identities without basename matching."""
+    local = tmp_path / "part.parquet"
+    local.write_bytes(b"local shard")
+    digest = hashlib.sha256(local.read_bytes()).hexdigest()
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        shard = ledger.register_shard(
+            "orphan",
+            path="data/orphan.parquet",
+            local_path=local,
+            sha256=digest,
+            byte_size=local.stat().st_size,
+            row_count=1,
+        )
+        assert ledger.unattached_local_shards() == (shard,)
+        assert ledger.recovery_work()[0] == (shard,)
 
 
 def test_restart_resets_abandoned_processing_and_preserves_attempts(

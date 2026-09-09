@@ -1,8 +1,8 @@
 """Crash-safe metadata ledger for the Phase 1 P1 segmentation pipeline.
 
 The ledger deliberately stores identities, counters and checksums, never source
-content.  Paths in the database are publication-relative paths; local scratch
-paths are supplied to reconciliation calls and are not persisted.
+content.  Remote paths are publication-relative; local shard paths are persisted
+only as durable recovery identities.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import math
 import os
 import re
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -125,6 +125,19 @@ class ShardRecord:
     sha256: str
     verification_time: str | None
     purge_time: str | None
+    local_path: str | None = None
+
+
+@dataclass(frozen=True)
+class ShardAllocation:
+    """Local evidence needed for one atomic batch allocation."""
+
+    local_path: str | Path
+    remote_path: str
+    sha256: str
+    byte_size: int
+    row_count: int
+    shard_id: str | None = None
 
 
 class Ledger:
@@ -176,6 +189,182 @@ class Ledger:
     def close(self) -> None:
         """Close the database connection."""
         self._connection.close()
+
+    def allocate_batch_with_shards(
+        self,
+        programme_id: str,
+        shards: Sequence[ShardAllocation | Mapping[str, object] | object],
+        *,
+        batch_id: str | None = None,
+        batch_prefix: str = "batch",
+        shard_prefix: str = "shard",
+        accepted_count: int = 0,
+        rejected_count: int = 0,
+        processed_duration_ms: int | None = None,
+        rejection_counts: Mapping[RejectionCategory | str, int] | None = None,
+    ) -> tuple[BatchRecord, tuple[ShardRecord, ...]]:
+        """Allocate and attach a complete batch in one durable transaction.
+
+        The caller supplies already-fsynced local shards.  Their local path, remote
+        path, size and digest are committed together with the generated identities;
+        only then is the programme allowed to become ``sharded``.  This removes the
+        crash window between a programme transition and shard registration.
+
+        Args:
+            programme_id:
+                Programme whose output is being published.
+            shards:
+                Shard allocations, mappings, or objects exposing ``path``,
+                ``repo_path`` and ``row_count``.  Objects may omit digest and size;
+                those values are computed from the local file.
+            batch_id (optional):
+                Explicit id for retry or recovery.  Defaults to a durable allocation.
+            batch_prefix (optional):
+                Prefix for generated batch IDs. Defaults to ``batch``.
+            shard_prefix (optional):
+                Prefix for generated shard IDs. Defaults to ``shard``.
+            accepted_count (optional):
+                Number of accepted rows. Defaults to 0.
+            rejected_count (optional):
+                Number of rejected rows. Defaults to 0.
+            processed_duration_ms (optional):
+                Processing duration. Defaults to None.
+            rejection_counts (optional):
+                Metadata-only rejection counts. Defaults to an empty mapping.
+
+        Returns:
+            The atomically created batch and its attached shards.
+
+        Raises:
+            EvidenceError:
+                If local evidence is incomplete or inconsistent.
+            InvalidTransition:
+                If the programme cannot become sharded.
+        """
+        if not shards:
+            raise EvidenceError("a publication batch must contain at least one shard")
+        self._validate_identifier(programme_id, "programme_id")
+        self._validate_identifier(batch_prefix, "batch_prefix")
+        self._validate_identifier(shard_prefix, "shard_prefix")
+        self._validate_nonnegative(accepted_count, "accepted_count")
+        self._validate_nonnegative(rejected_count, "rejected_count")
+        self._validate_nonnegative(processed_duration_ms, "processed_duration_ms")
+        safe_rejections = self._rejection_counts(rejection_counts or {})
+        prepared = tuple(self._prepare_allocation(item) for item in shards)
+        remote_paths = [cast(str, item["remote_path"]) for item in prepared]
+        if len(remote_paths) != len(set(remote_paths)):
+            raise EvidenceError("publication paths must be unique")
+        if batch_id is not None:
+            self._validate_identifier(batch_id, "batch_id")
+
+        with self.transaction() as connection:
+            programme = self._require_row(
+                connection, "programmes", "programme_id", programme_id
+            )
+            pipeline_digest = str(programme["pipeline_digest"])
+            if LedgerState(programme["state"]) not in {
+                LedgerState.DISCOVERED,
+                LedgerState.PROCESSING,
+                LedgerState.SHARDED,
+            }:
+                raise InvalidTransition("programme cannot allocate new shards")
+            resolved_batch_id = batch_id or self._next_identifier(
+                connection, kind="batch", prefix=batch_prefix
+            )
+            if (
+                connection.execute(
+                    "SELECT 1 FROM batches WHERE batch_id = ?", (resolved_batch_id,)
+                ).fetchone()
+                is not None
+            ):
+                raise EvidenceError("batch identity already exists")
+            now = self._now()
+            connection.execute(
+                """INSERT INTO batches (
+                    batch_id, state, pipeline_digest, programme_count, row_count,
+                    rejection_counts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    resolved_batch_id,
+                    LedgerState.SHARDED.value,
+                    pipeline_digest,
+                    1,
+                    sum(item["row_count"] for item in prepared),
+                    safe_rejections,
+                    now,
+                    now,
+                ),
+            )
+            records: list[ShardRecord] = []
+            for item in prepared:
+                resolved_shard_id = cast(
+                    str,
+                    item["shard_id"]
+                    or self._next_identifier(
+                        connection, kind="shard", prefix=shard_prefix
+                    ),
+                )
+                self._validate_identifier(resolved_shard_id, "shard_id")
+                connection.execute(
+                    """INSERT INTO shards (
+                        shard_id, programme_id, batch_id, state, path, byte_size,
+                        row_count, sha256, local_path, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        resolved_shard_id,
+                        programme_id,
+                        resolved_batch_id,
+                        LedgerState.SHARDED.value,
+                        item["remote_path"],
+                        item["byte_size"],
+                        item["row_count"],
+                        item["sha256"],
+                        item["local_path"],
+                        now,
+                        now,
+                    ),
+                )
+                records.append(
+                    self._shard_record(
+                        self._require_row(
+                            connection, "shards", "shard_id", resolved_shard_id
+                        )
+                    )
+                )
+            programme_updates = {
+                "state": LedgerState.SHARDED.value,
+                "accepted_count": accepted_count,
+                "rejected_count": rejected_count,
+                "processed_duration_ms": processed_duration_ms,
+                "rejection_counts": safe_rejections,
+                "updated_at": now,
+            }
+            assignments = ", ".join(f"{key} = ?" for key in programme_updates)
+            connection.execute(
+                f"UPDATE programmes SET {assignments} WHERE programme_id = ?",
+                (*programme_updates.values(), programme_id),
+            )
+            batch = self._batch_record(
+                self._require_row(connection, "batches", "batch_id", resolved_batch_id)
+            )
+        return batch, tuple(records)
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run a caller-supplied group of writes as one durable transaction.
+
+        Yields:
+            The active SQLite connection.
+        """
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._connection
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+            self._sync_database()
 
     def discover_programme(
         self,
@@ -255,23 +444,6 @@ class Ledger:
             ):
                 raise EvidenceError("programme identity differs from the ledger")
         return self.programme(programme_id)
-
-    @contextlib.contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Run a caller-supplied group of writes as one durable transaction.
-
-        Yields:
-            The active SQLite connection.
-        """
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._connection
-        except BaseException:
-            self._connection.rollback()
-            raise
-        else:
-            self._connection.commit()
-            self._sync_database()
 
     def purge_programme(
         self, programme_id: str, *, evidence: Mapping[str, object] | None = None
@@ -353,6 +525,7 @@ class Ledger:
         row_count: int,
         programme_id: str | None = None,
         batch_id: str | None = None,
+        local_path: str | Path | None = None,
         state: LedgerState = LedgerState.SHARDED,
     ) -> ShardRecord:
         """Register a complete shard using only publication-relative metadata.
@@ -369,6 +542,7 @@ class Ledger:
         self._validate_digest(sha256, "sha256")
         self._validate_nonnegative(byte_size, "byte_size")
         self._validate_nonnegative(row_count, "row_count")
+        durable_local_path = self._local_path(local_path)
         if state not in {LedgerState.DISCOVERED, LedgerState.SHARDED}:
             raise EvidenceError("new shards must be discovered or sharded")
         with self.transaction() as connection:
@@ -397,19 +571,26 @@ class Ledger:
                 byte_size,
                 row_count,
                 sha256,
+                durable_local_path,
             )
             if existing is None:
                 connection.execute(
                     """INSERT INTO shards (
                         shard_id, programme_id, batch_id, state, path, byte_size,
-                        row_count, sha256, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        row_count, sha256, local_path, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (shard_id, *values, self._now(), self._now()),
                 )
             elif (
                 tuple(
                     existing[key]
-                    for key in ("path", "byte_size", "row_count", "sha256")
+                    for key in (
+                        "path",
+                        "byte_size",
+                        "row_count",
+                        "sha256",
+                        "local_path",
+                    )
                 )
                 != values[3:]
             ):
@@ -420,6 +601,11 @@ class Ledger:
                     raise EvidenceError("a verified shard path is immutable")
                 raise EvidenceError("shard evidence differs from the ledger")
         return self.shard(shard_id)
+
+    prepare_batch = allocate_batch_with_shards
+    allocate_publication_batch = allocate_batch_with_shards
+    register_batch_with_shards = allocate_batch_with_shards
+    allocate_and_attach_shards = allocate_batch_with_shards
 
     def reject_programme(
         self,
@@ -792,14 +978,30 @@ class Ledger:
 
     reconcile_remote = reconcile_committed_batch
 
-    def reconcile_local_shard(self, shard_id: str, local_path: str | Path) -> bool:
-        """Return whether a local shard exactly matches its durable digest.
+    def reconcile_local_shard(
+        self, shard_id: str, local_path: str | Path | None = None
+    ) -> bool:
+        """Return whether the durable local identity still matches its digest.
+
+        When a shard has a persisted local path, a candidate at another path is not
+        interchangeable merely because its basename happens to match.  Older ledger
+        rows without that column remain explicitly addressable by their caller.
 
         Returns:
-            True only for a regular, non-symlink file with matching size and digest.
+            True only for the persisted regular file with matching size and digest.
         """
         shard = self.shard(shard_id)
+        if local_path is None:
+            if shard.local_path is None:
+                return False
+            local_path = shard.local_path
         candidate = Path(local_path)
+        if shard.local_path is not None:
+            try:
+                if candidate.resolve() != Path(shard.local_path).resolve():
+                    return False
+            except OSError:
+                return False
         if not candidate.is_file() or candidate.is_symlink():
             return False
         digest = hashlib.sha256()
@@ -810,7 +1012,97 @@ class Ledger:
                 size += len(block)
         return size == shard.byte_size and digest.hexdigest() == shard.sha256
 
+    def unattached_local_shards(self) -> tuple[ShardRecord, ...]:
+        """Return durable local shards not yet attached to a publication batch.
+
+        These rows are safe recovery candidates because both their local identity
+        and content digest were committed together in SQLite.
+        """
+        rows = self._connection.execute(
+            """SELECT * FROM shards WHERE batch_id IS NULL AND local_path IS NOT NULL
+            AND state IN (?, ?, ?) ORDER BY shard_id""",
+            (
+                LedgerState.DISCOVERED.value,
+                LedgerState.SHARDED.value,
+                LedgerState.RETRYABLE.value,
+            ),
+        ).fetchall()
+        return tuple(self._shard_record(row) for row in rows)
+
+    unattached_shards = unattached_local_shards
+
+    def recoverable_committed_batches(self) -> tuple[BatchRecord, ...]:
+        """Return batches whose remote publication may need restart recovery."""
+        rows = self._connection.execute(
+            """SELECT * FROM batches WHERE state IN (?, ?) ORDER BY batch_id""",
+            (LedgerState.COMMITTED.value, LedgerState.VERIFIED.value),
+        ).fetchall()
+        return tuple(self._batch_record(row) for row in rows)
+
+    committed_for_recovery = recoverable_committed_batches
+
+    def recovery_work(self) -> tuple[tuple[ShardRecord, ...], tuple[BatchRecord, ...]]:
+        """Enumerate unattached local shards and committed batches for restart.
+
+        Returns:
+            Unattached local shard records followed by committed batch records.
+            Both collections contain only durable ledger identities.
+        """
+        return self.unattached_local_shards(), self.recoverable_committed_batches()
+
+    enumerate_recovery = recovery_work
+
     local_shard_matches = reconcile_local_shard
+
+    @staticmethod
+    def _prepare_allocation(item: object) -> dict[str, object]:
+        def value(*names: str) -> object:
+            if isinstance(item, Mapping):
+                for name in names:
+                    if name in item:
+                        return item[name]
+            else:
+                for name in names:
+                    candidate = getattr(item, name, None)
+                    if candidate is not None:
+                        return candidate
+            return None
+
+        local = value("local_path", "path")
+        remote = value("remote_path", "repo_path")
+        row_count = value("row_count")
+        if local is None or remote is None or row_count is None:
+            raise EvidenceError(
+                "shard allocation needs local and remote paths and rows"
+            )
+        local_path = Ledger._local_path(cast(str | Path, local))
+        if local_path is None:
+            raise EvidenceError("shard allocation needs a local path")
+        candidate = Path(local_path)
+        if candidate.is_symlink() or not candidate.is_file():
+            raise EvidenceError("local shard must be a regular non-symlink file")
+        digest = hashlib.sha256()
+        size = 0
+        with candidate.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+        supplied_digest = value("sha256")
+        if supplied_digest is not None and supplied_digest != digest.hexdigest():
+            raise EvidenceError("local shard digest differs from its bytes")
+        supplied_size = value("byte_size", "size")
+        if supplied_size is not None and supplied_size != size:
+            raise EvidenceError("local shard size differs from its bytes")
+        Ledger._validate_nonnegative(row_count, "row_count")
+        safe_remote = Ledger._publication_path(cast(str, remote))
+        return {
+            "local_path": local_path,
+            "remote_path": safe_remote,
+            "sha256": digest.hexdigest(),
+            "byte_size": size,
+            "row_count": cast(int, row_count),
+            "shard_id": value("shard_id"),
+        }
 
     def allocate_sequence(self, kind: str) -> int:
         """Allocate a durable sequence for ``batch`` or ``shard`` work.
@@ -824,32 +1116,46 @@ class Ledger:
         if kind not in {"batch", "shard"}:
             raise ValueError(f"unknown sequence kind: {kind}")
         with self.transaction() as connection:
-            row = connection.execute(
-                f"SELECT next_value FROM {_SEQUENCE_TABLE} WHERE kind = ?", (kind,)
-            ).fetchone()
-            value = 1 if row is None else int(row[0])
-            table = "batches" if kind == "batch" else "shards"
-            identifier = "batch_id" if kind == "batch" else "shard_id"
-            existing = connection.execute(
-                f"SELECT {identifier} FROM {table}"
-            ).fetchall()
-            suffixes = [
-                int(match.group(1))
-                for item in existing
-                if (match := re.search(r"-(\d+)$", str(item[0]))) is not None
-            ]
-            value = max(value, max(suffixes, default=0) + 1)
-            if row is None:
-                connection.execute(
-                    f"INSERT INTO {_SEQUENCE_TABLE} (kind, next_value) VALUES (?, ?)",
-                    (kind, value + 1),
-                )
-            else:
-                connection.execute(
-                    f"UPDATE {_SEQUENCE_TABLE} SET next_value = ? WHERE kind = ?",
-                    (value + 1, kind),
-                )
+            value = self._allocate_sequence_in_transaction(connection, kind)
         return value
+
+    def _allocate_sequence_in_transaction(
+        self, connection: sqlite3.Connection, kind: str
+    ) -> int:
+        identifier = self._next_identifier(
+            connection, kind=kind, prefix="batch" if kind == "batch" else "shard"
+        )
+        return int(identifier.rsplit("-", 1)[1])
+
+    @staticmethod
+    def _next_identifier(
+        connection: sqlite3.Connection, *, kind: str, prefix: str
+    ) -> str:
+        if kind not in {"batch", "shard"}:
+            raise ValueError(f"unknown sequence kind: {kind}")
+        row = connection.execute(
+            f"SELECT next_value FROM {_SEQUENCE_TABLE} WHERE kind = ?", (kind,)
+        ).fetchone()
+        value = 1 if row is None else int(row[0])
+        table = "batches" if kind == "batch" else "shards"
+        identifier = "batch_id" if kind == "batch" else "shard_id"
+        suffixes = [
+            int(match.group(1))
+            for item in connection.execute(f"SELECT {identifier} FROM {table}")
+            if (match := re.search(r"-(\d+)$", str(item[0]))) is not None
+        ]
+        value = max(value, max(suffixes, default=0) + 1)
+        if row is None:
+            connection.execute(
+                f"INSERT INTO {_SEQUENCE_TABLE} (kind, next_value) VALUES (?, ?)",
+                (kind, value + 1),
+            )
+        else:
+            connection.execute(
+                f"UPDATE {_SEQUENCE_TABLE} SET next_value = ? WHERE kind = ?",
+                (value + 1, kind),
+            )
+        return f"{prefix}-{value:08d}"
 
     def committed_batches(self) -> tuple[BatchRecord, ...]:
         """Return committed batches, including ones awaiting verification."""
@@ -994,6 +1300,18 @@ class Ledger:
                     combined[key] = evidence[key]
         return combined
 
+    @staticmethod
+    def _local_path(value: str | Path | None) -> str | None:
+        if value is None:
+            return None
+        candidate = Path(value)
+        if not str(candidate) or "\x00" in str(candidate):
+            raise EvidenceError("local shard paths must be non-empty paths")
+        try:
+            return str(candidate.expanduser().resolve(strict=False))
+        except OSError as error:
+            raise EvidenceError("local shard path cannot be resolved") from error
+
     def _migrate(self) -> None:
         with self.transaction() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -1065,6 +1383,7 @@ class Ledger:
                         byte_size INTEGER NOT NULL,
                         row_count INTEGER NOT NULL,
                         sha256 TEXT NOT NULL,
+                        local_path TEXT,
                         verification_time TEXT,
                         purge_time TEXT,
                         last_evidence TEXT NOT NULL DEFAULT '{}',
@@ -1079,6 +1398,12 @@ class Ledger:
                 connection.execute("CREATE INDEX programmes_state ON programmes(state)")
                 connection.execute("CREATE INDEX batches_state ON batches(state)")
                 connection.execute("PRAGMA user_version = 1")
+            elif version == 1:
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(shards)")
+                }
+                if "local_path" not in columns:
+                    connection.execute("ALTER TABLE shards ADD COLUMN local_path TEXT")
 
     @staticmethod
     def _publication_path(value: str) -> str:
@@ -1453,6 +1778,7 @@ class Ledger:
             sha256=row["sha256"],
             verification_time=row["verification_time"],
             purge_time=row["purge_time"],
+            local_path=row["local_path"],
         )
 
     @staticmethod
