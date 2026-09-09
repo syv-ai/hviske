@@ -25,6 +25,30 @@ from hviske.p1_source import (
 from tests.test_p1_publish import MemoryHub
 
 
+def test_quality_rejection_is_terminal_and_keeps_source_audit_locator(
+    tmp_path: Path,
+) -> None:
+    """A fully decoded but rejected programme is not retried or published."""
+    source = FakeSource()
+    build_config = config(tmp_path, mode="build")
+    build_config.segmentation.minimum_alignment_score = 2.0
+    hub = MemoryHub()
+
+    report = run_pipeline(
+        config=build_config, source=source, hub=hub, ctc=FakeCtc(), vad=FakeVad()
+    )
+
+    with Ledger(
+        tmp_path / "scratch" / "ledger.sqlite", reset_processing=False
+    ) as ledger:
+        assert ledger.programme("p1-programme-1").state.value == "rejected"
+    assert report.rejection_counts["low_alignment_score"] == 1
+    assert not hub.commits
+    manifest = (tmp_path / "scratch" / "audit-candidates.jsonl").read_text()
+    assert '"source_shard_path": "data/audio.parquet"' in manifest
+    assert '"source_row_index": 0' in manifest
+
+
 def test_allocation_failure_never_leaves_programme_sharded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -793,8 +793,7 @@ def _local_evidence(shard: LocalShard) -> ShardEvidence:
         raise AllowListError(f"only Parquet shards may be uploaded: {shard.repo_path}")
     if shard.path.is_symlink() or not shard.path.is_file():
         raise AllowListError(f"shard is not a regular non-symlink file: {shard.path}")
-    if _has_parquet_footer(shard.path):
-        validate_local_shard(shard.path, expected_row_count=shard.row_count)
+    validate_local_shard(shard.path, expected_row_count=shard.row_count)
     digest, size = _stream_local(shard.path)
     return ShardEvidence(
         path=shard.repo_path, byte_size=size, row_count=shard.row_count, sha256=digest

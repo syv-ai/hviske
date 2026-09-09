@@ -9,6 +9,7 @@ from __future__ import annotations
 import collections.abc as c
 import dataclasses
 import gc
+import hashlib
 import importlib
 import itertools
 import json
@@ -33,6 +34,7 @@ from hviske.p1_contracts import (
     RejectionCategory,
     RepositoryRevision,
     SegmentationContract,
+    ShardEvidence,
     SourceCoordinates,
     SourceProgramme,
     VADContract,
@@ -210,11 +212,25 @@ def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)
 
 
-def _unlink_recovered(paths: tuple[Path, ...]) -> None:
-    """Remove only digest-matched shard paths supplied by recovery."""
+def _unlink_recovered(
+    paths: tuple[Path, ...], expected: Mapping[Path, tuple[int, str]] | None = None
+) -> None:
+    """Remove only surviving regular files matching durable recovery evidence."""
     for path in paths:
-        if path.is_file() and not path.is_symlink():
-            path.unlink()
+        if not path.is_file() or path.is_symlink():
+            continue
+        evidence = None if expected is None else expected.get(path)
+        if evidence is not None:
+            size, digest = evidence
+            if path.stat().st_size != size:
+                continue
+            checksum_builder = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    checksum_builder.update(chunk)
+            if checksum_builder.hexdigest() != digest:
+                continue
+        path.unlink()
 
 
 @dataclass(frozen=True)
@@ -490,7 +506,9 @@ def _run_native_pipeline(
     scratch = configure_scratch(settings.scratch_root)
     log = MetadataLog(scratch / "p1-events.jsonl")
     from hviske.p1_source import SourcePlan
+    from hviske.p1_validation import AuditReservoir
 
+    audit_reservoir = AuditReservoir(scratch / "audit-reservoir.json")
     plan = t.cast(
         SourcePlan,
         source.plan(
@@ -558,7 +576,9 @@ def _run_native_pipeline(
             ctc=ctc,
             report=report,
             log=log,
+            audit_reservoir=audit_reservoir,
         )
+    audit_reservoir.finalise(scratch / "audit-candidates.jsonl")
     return report
 
 
@@ -702,6 +722,7 @@ def _process_native_programmes(
     ctc: CTCBackend,
     report: BuildReport,
     log: MetadataLog,
+    audit_reservoir: object | None = None,
 ) -> None:
     """Retrieve, segment, and publish one selected programme at a time.
 
@@ -770,9 +791,19 @@ def _process_native_programmes(
                 vad=vad,
                 sampling_rate=parsed_audio.sampling_rate,
                 channels=parsed_audio.channels,
+                source_locator={
+                    "source_repository": settings.source_audio_repository,
+                    "source_revision": settings.source_audio_revision,
+                    "source_shard_path": shard.path,
+                    "source_row_group": audio_pointer.row_group,
+                    "source_row_index": audio_pointer.row_index,
+                    "source_shard_byte_size": shard.byte_size,
+                },
             )
             report.accepted_segments += len(result.rows)
             report.rejected += len(result.rejections)
+            if audit_reservoir is not None and result.audit_candidates:
+                getattr(audit_reservoir, "add")(result.audit_candidates)
             for _, reason in result.rejections:
                 report.rejection_counts[reason] = (
                     report.rejection_counts.get(reason, 0) + 1
@@ -783,6 +814,31 @@ def _process_native_programmes(
             )
             enforce_scratch_cap(settings)
             if not written.shards:
+                if result.rejections:
+                    reason_counts = {
+                        reason: sum(
+                            1 for _, value in result.rejections if value == reason
+                        )
+                        for _, reason in result.rejections
+                    }
+                    ledger.transition_programme(
+                        programme_id,
+                        _state("rejected"),
+                        rejection_counts=reason_counts,
+                        accepted_count=0,
+                        rejected_count=len(result.rejections),
+                        last_error=next(iter(reason_counts)),
+                    )
+                    purge_source_temporary(getattr(source, "last_temporary", None))
+                    report.processed += 1
+                    log.write(
+                        {
+                            "event": "programme_rejected",
+                            "source_file_id": file_id,
+                            "reason": "quality_gates",
+                        }
+                    )
+                    continue
                 raise ValueError("programme produced no publication shard")
             allocations = tuple(
                 ShardAllocation(
@@ -818,6 +874,7 @@ def _process_native_programmes(
                 pending_ids=tuple(record.shard_id for record in shard_records),
                 batch_id=batch.batch_id,
                 audit_rows=result.rows,
+                audit_reservoir=audit_reservoir,
             )
             report.processed += 1
         except Exception as exc:
@@ -912,6 +969,7 @@ def _publish_native_pending(
     pending_ids: c.Sequence[str],
     batch_id: str,
     audit_rows: c.Sequence[object] = (),
+    audit_reservoir: object | None = None,
 ) -> None:
     """Publish a ledger-allocated batch and add locators after immutable commit."""
     del pending_ids
@@ -923,6 +981,7 @@ def _publish_native_pending(
         pending=pending,
         pending_ids=(),
         audit_rows=audit_rows,
+        audit_reservoir=audit_reservoir,
     )
 
 
@@ -935,6 +994,7 @@ def publish_pending(
     pending: c.Sequence[object],
     pending_ids: c.Sequence[str],
     audit_rows: c.Sequence[object] = (),
+    audit_reservoir: object | None = None,
 ) -> object:
     """Publish a complete ledger batch through the shared verified publisher.
 
@@ -969,14 +1029,12 @@ def publish_pending(
             ledger=ledger,
         )
         if ledger.batch(batch_id).state is _state("verified"):
-            paths = tuple(
-                Path(item.local_path)
+            expected = {
+                Path(item.local_path): (item.byte_size, item.sha256)
                 for item in ledger.shards(batch_id)
                 if item.local_path is not None
-            )
-            for path in paths:
-                if path.is_file() and not path.is_symlink():
-                    path.unlink()
+            }
+            _unlink_recovered(tuple(expected), expected=expected)
             ledger.purge_batch(
                 batch_id, evidence={"deleted": True, "kind": "publication-artifact"}
             )
@@ -1004,9 +1062,9 @@ def publish_pending(
             commit_id = getattr(evidence, "commit_id", None)
             if not isinstance(commit_id, str):
                 raise ValueError("verified publication has no commit for audit records")
-            _record_audit_candidates(
+            candidates = _record_audit_candidates(
                 rows=audit_rows,
-                path=settings.scratch_root / "audit-candidates.jsonl",
+                path=None,
                 repository=settings.target_private_repo,
                 revision=commit_id,
                 remote_paths=tuple(record.path for record in ledger.shards(batch_id)),
@@ -1014,6 +1072,8 @@ def publish_pending(
                     record.row_count for record in ledger.shards(batch_id)
                 ),
             )
+            if audit_reservoir is not None:
+                getattr(audit_reservoir, "add")(candidates)
 
     evidence = publish_batch(
         t.cast(HubClient, hub),
@@ -1050,20 +1110,21 @@ def publish_pending(
 def _record_audit_candidates(
     *,
     rows: c.Sequence[object],
-    path: Path,
+    path: Path | None,
     repository: str,
     revision: str,
     remote_paths: tuple[str, ...],
     row_counts: tuple[int, ...],
-) -> None:
+) -> list[dict[str, object]]:
     """Persist bounded blinded audit metadata with committed row locators.
+
+    Returns:
+        The metadata-only candidates with committed locators.
 
     Raises:
         TypeError:
             If an audit row is neither a mapping nor a contract model.
     """
-    from hviske.p1_validation import create_blinded_audit_manifest
-
     candidates: list[dict[str, object]] = []
     row_index = 0
     for shard_path, shard_rows in zip(remote_paths, row_counts):
@@ -1087,15 +1148,19 @@ def _record_audit_candidates(
             candidates.append(candidate)
             row_index += 1
     if not candidates:
-        return
-    selected = create_blinded_audit_manifest(
-        candidates, accepted_quota=min(200, len(candidates)), seed="p1"
-    )
-    with path.open("a", encoding="utf-8") as stream:
-        for candidate in selected:
-            stream.write(json.dumps(candidate, sort_keys=True) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+        return []
+    if path is not None:
+        from hviske.p1_validation import create_blinded_audit_manifest
+
+        selected = create_blinded_audit_manifest(
+            candidates, accepted_quota=min(200, len(candidates)), rejected_quota=0
+        )
+        with path.open("a", encoding="utf-8") as stream:
+            for candidate in selected:
+                stream.write(json.dumps(candidate, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    return candidates
 
 
 def _state(value: str) -> LedgerState:
@@ -1140,7 +1205,7 @@ def _recover_native_batches(
     remains mandatory even when all local files are present.
     """
     del source
-    from hviske.p1_publish import HubClient, verify_batch
+    from hviske.p1_publish import HubClient, _manifest_bytes, verify_batch
 
     unattached, _ = ledger.recovery_work()
     for record in unattached:
@@ -1149,6 +1214,14 @@ def _recover_native_batches(
             ledger.reconcile_local_shard(record.shard_id, Path(local_path))
 
     for batch, records in ledger.reconstruct_work():
+        manifest_path = next(
+            (
+                Path(record.local_path).parent / "manifests" / f"{batch.batch_id}.json"
+                for record in records
+                if record.local_path is not None
+            ),
+            None,
+        )
         paths = tuple(
             Path(record.local_path)
             for record in records
@@ -1177,14 +1250,37 @@ def _recover_native_batches(
             settings.target_private_repo,
             batch.batch_id,
             ledger=ledger,
-            manifest_path=(
-                paths[0].parent / "manifests" / f"{batch.batch_id}.json"
-                if paths
-                else None
-            ),
-            purge_callback=_unlink_recovered if len(paths) == len(records) else None,
+            manifest_path=manifest_path,
             local_paths=paths,
         )
+        expected_local: dict[Path, tuple[int, str]] = {
+            Path(record.local_path): (record.byte_size, record.sha256)
+            for record in records
+            if record.local_path is not None
+        }
+        if manifest_path is not None:
+            manifest = _manifest_bytes(
+                batch_id=batch.batch_id,
+                shards=tuple(
+                    ShardEvidence(
+                        path=record.path,
+                        byte_size=record.byte_size,
+                        row_count=record.row_count,
+                        sha256=record.sha256,
+                    )
+                    for record in records
+                ),
+                programme_count=batch.programme_count,
+                rejection_counts={
+                    RejectionCategory(key): value
+                    for key, value in batch.rejection_counts.items()
+                },
+            )
+            expected_local[manifest_path] = (
+                len(manifest),
+                hashlib.sha256(manifest).hexdigest(),
+            )
+        _unlink_recovered(tuple(expected_local), expected=expected_local)
         recovered_batch = ledger.batch(batch.batch_id)
         if recovered_batch.state is _state("verified"):
             ledger.purge_batch(

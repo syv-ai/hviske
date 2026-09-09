@@ -96,6 +96,7 @@ class SegmentationResult:
     rows: tuple[OutputRow, ...]
     rejections: tuple[tuple[str, str], ...]
     correction_count: int
+    audit_candidates: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -694,6 +695,7 @@ def segment_programme(
     vad: VADBackend | None = None,
     sampling_rate: int = 16000,
     channels: int | None = None,
+    source_locator: c.Mapping[str, object] | None = None,
 ) -> SegmentationResult:
     """Run bounded proposal, VAD, CTC, correction, filtering, and encoding.
 
@@ -731,15 +733,37 @@ def segment_programme(
     )
     rows: list[OutputRow] = []
     rejections: list[tuple[str, str]] = []
+    audit_candidates: list[dict[str, object]] = []
     identifiers: set[str] = set()
     correction_count = 0
+
+    def reject(proposal: SegmentProposal, reason: str) -> None:
+        rejections.append((proposal.text, reason))
+        candidate: dict[str, object] = {
+            "segment_id": segment_id(
+                pipeline_config_sha256=pipeline_config_sha256,
+                source_file_id=proposal.source_file_id,
+                source_start_ms=proposal.proposal_start_ms,
+                source_end_ms=proposal.proposal_end_ms,
+                text=proposal.text,
+            ),
+            "source_file_id": proposal.source_file_id,
+            "source_start_ms": proposal.proposal_start_ms,
+            "source_end_ms": proposal.proposal_end_ms,
+            "status": "rejected",
+            "rejection_reason": reason,
+        }
+        if source_locator is not None:
+            candidate.update(source_locator)
+        audit_candidates.append(candidate)
+
     for proposal in proposals:
         canonical = normalise_alignment_text(
             words=validated[proposal.word_start_index : proposal.word_end_index],
             contract=normalisation,
         )
         if not canonical.text:
-            rejections.append((proposal.text, RejectionCategory.EMPTY_TEXT.value))
+            reject(proposal, RejectionCategory.EMPTY_TEXT.value)
             continue
         local_audio = values[
             proposal.proposal_start_ms * 16 : proposal.proposal_end_ms * 16
@@ -792,11 +816,9 @@ def segment_programme(
             alignment_word_map=canonical.word_map,
         )
         if decision.row is None:
-            rejections.append((proposal.text, decision.rejection or "rejected"))
+            reject(proposal, decision.rejection or "rejected")
         elif decision.row.segment_id in identifiers:
-            rejections.append(
-                (proposal.text, RejectionCategory.DUPLICATE_SEGMENT_ID.value)
-            )
+            reject(proposal, RejectionCategory.DUPLICATE_SEGMENT_ID.value)
         else:
             identifiers.add(decision.row.segment_id)
             rows.append(decision.row)
@@ -804,6 +826,7 @@ def segment_programme(
         rows=tuple(rows),
         rejections=tuple(rejections),
         correction_count=correction_count,
+        audit_candidates=tuple(audit_candidates),
     )
 
 

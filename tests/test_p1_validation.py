@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from hviske.p1_validation import (
+    AuditReservoir,
     MetadataLedger,
     PinnedHubClipRetriever,
     aggregate_rows,
@@ -139,6 +140,28 @@ def test_blinded_manifest_has_all_quotas_without_labels() -> None:
             for value in strata
         }
         assert prefixes == required_axes
+
+
+def test_corpus_audit_reservoir_is_bounded_and_recoverable(tmp_path: Path) -> None:
+    """One durable reservoir retains every requested status without growing."""
+    path = tmp_path / "reservoir.json"
+    reservoir = AuditReservoir(
+        path, accepted_quota=2, rejected_quota=2, borderline_quota=2, seed="test"
+    )
+    rows = [
+        _row(index, status)
+        for status in ("accepted", "rejected", "borderline")
+        for index in range(10)
+    ]
+    reservoir.add(rows)
+    assert len(reservoir.rows) == 6
+    recovered = AuditReservoir(
+        path, accepted_quota=2, rejected_quota=2, borderline_quota=2, seed="test"
+    )
+    manifest = recovered.finalise(tmp_path / "manifest.jsonl")
+    assert len(manifest) == 6
+    assert {item["source_file_id"] for item in manifest if "source_file_id" in item}
+    assert not (tmp_path / ".reservoir.json.tmp").exists()
 
 
 def test_bounded_reservoir_does_not_retain_audio_or_grow() -> None:
