@@ -1,45 +1,58 @@
-"""Offline integration tests for the bounded P1 build entry point."""
+"""Offline integration tests for the native bounded P1 build entry point."""
 
 from __future__ import annotations
 
 import collections.abc as c
+import io
 from pathlib import Path
 from typing import cast
 
 import numpy as np
+import pytest
+import soundfile as sf
 from omegaconf import DictConfig, OmegaConf
 
+from hviske.p1_ledger import Ledger
+from hviske.p1_pipeline import run_pipeline
 from hviske.p1_segments import AlignmentResult, VADSignal
-from scripts.build_p1_segments import (
-    P1PreflightError,
-    TranscriptIndex,
-    build_transcript_index,
-    run_pipeline,
+from hviske.p1_source import (
+    AudioPointer,
+    ParsedAudio,
+    ParsedTranscript,
+    SourcePlan,
+    SourceShard,
 )
 from tests.test_p1_publish import MemoryHub
 
 
-def test_build_uses_one_worker_and_purges_verified_publication(tmp_path: Path) -> None:
-    """A fake build keeps one programme in flight and purges verified files."""
+def test_allocation_failure_never_leaves_programme_sharded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash before allocation cannot publish a programme without a batch."""
     source = FakeSource()
-    settings = config(tmp_path, mode="build")
-    report = run_pipeline(
-        config=settings, source=source, hub=MemoryHub(), ctc=FakeCtc(), vad=FakeVad()
-    )
 
-    assert source.audio_calls == 1
-    assert report.max_in_flight == 1
-    assert report.processed == 1
-    assert not list((tmp_path / "scratch" / "staging").rglob("*.parquet"))
+    def crash(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("simulated allocation crash")
 
+    monkeypatch.setattr(Ledger, "allocate_batch_with_shards", crash)
     run_pipeline(
-        config=settings, source=source, hub=MemoryHub(), ctc=FakeCtc(), vad=FakeVad()
+        config=config(tmp_path, mode="build"),
+        source=source,
+        hub=MemoryHub(),
+        ctc=FakeCtc(),
+        vad=FakeVad(),
     )
-    assert source.audio_calls == 1
+
+    with Ledger(
+        tmp_path / "scratch" / "ledger.sqlite", reset_processing=False
+    ) as ledger:
+        assert not ledger.pending_batches()
+        assert ledger.programme("p1-programme-1").state.value == "retryable"
 
 
 class FakeCtc:
-    """Model-free aligner used by the build smoke test."""
+    """Model-free aligner used by the production-shaped build smoke test."""
 
     def align(
         self,
@@ -55,58 +68,86 @@ class FakeCtc:
         return AlignmentResult(start_ms, end_ms, 1.0, "fake", ())
 
 
+class FakeIndex:
+    """Pointer index for one immutable transcript row."""
+
+    def get(self, file_id: str) -> object | None:
+        """Return the transcript pointer for the selected programme."""
+        return object() if file_id == "programme-1" else None
+
+
 class FakeSource:
-    """Source fake that records retrieval and exposes deliberately unsorted shards."""
+    """Native source fake that keeps metadata and payload access separate."""
 
     def __init__(self) -> None:
         """Initialise the retrieval counter."""
         self.audio_calls = 0
+        self.plan_calls = 0
 
-    def iter_programmes(
-        self, *, shard: object, index: TranscriptIndex
-    ) -> c.Iterable[object]:
-        """Yield the one source row without touching audio.
-
-        Returns:
-            One metadata row.
-        """
-        return [
-            {
-                "file_id": "programme-1",
-                "duration_ms": 4_000,
-                "words": index.records["programme-1"].row["words"],
-            }
-        ]
-
-    def iter_transcripts(self, *, revision: str) -> c.Iterable[object]:
-        """Return one usable transcript and metadata defects."""
-        return [
-            {
-                "file_id": "programme-1",
-                "transcript_text": "hej verden",
-                "duration_ms": 4_000,
-                "words": [
-                    {"text": "hej", "start_ms": 0, "end_ms": 2_000},
-                    {"text": "verden", "start_ms": 2_000, "end_ms": 4_000},
-                ],
-            },
-            {"file_id": "empty-1", "transcript_text": ""},
-            {"file_id": None, "transcript_text": "missing key"},
-            {"file_id": "programme-1", "transcript_text": "duplicate"},
-        ]
-
-    def list_audio_shards(self, *, revision: str) -> c.Iterable[object]:
-        """Return source metadata in a non-deterministic order."""
-        return [{"path": "b.parquet", "size": 200}, {"path": "a.parquet", "size": 100}]
-
-    def retrieve_audio(self, *, programme: object, shard: object) -> object:
-        """Record retrieval and return a four-second silent clip.
+    def build_transcript_index(
+        self, *, revision: str, path: Path, objects: c.Iterable[object]
+    ) -> FakeIndex:
+        """Build the source-owned pointer index without retaining transcript text.
 
         Returns:
-            A synthetic audio array.
+            A fake pointer index.
         """
+        del revision, path, objects
+        return FakeIndex()
+
+    def fetch_audio(self, *, pointer: AudioPointer) -> ParsedAudio:
+        """Return genuine FLAC bytes through the native source contract."""
         self.audio_calls += 1
-        return np.zeros(64_000, dtype=np.float32)
+        buffer = io.BytesIO()
+        sf.write(buffer, np.zeros((64_000, 1), dtype=np.float32), 16_000, format="FLAC")
+        return ParsedAudio("programme-1", buffer.getvalue(), 16_000, 1)
+
+    def fetch_transcript(self, pointer: object) -> ParsedTranscript:
+        """Fetch the one transcript addressed by its immutable pointer.
+
+        Returns:
+            The parsed transcript.
+        """
+        del pointer
+        from hviske.p1_contracts import SourceWord
+
+        return ParsedTranscript(
+            file_id="programme-1",
+            text="hej verden",
+            words=(
+                SourceWord(text="hej", start_ms=0, end_ms=2_000, speaker_id=None),
+                SourceWord(
+                    text="verden", start_ms=2_000, end_ms=4_000, speaker_id=None
+                ),
+            ),
+        )
+
+    def iter_programme_metadata(self, *, shard: SourceShard) -> c.Iterable[object]:
+        """Yield projected source metadata only.
+
+        Returns:
+            The projected metadata row.
+        """
+        del shard
+        return [{"file_id": "programme-1", "duration_ms": 4_000}]
+
+    def iter_programme_pointers(
+        self, *, shard: SourceShard
+    ) -> c.Iterable[AudioPointer]:
+        """Yield an immutable audio row locator without decoding it."""
+        yield AudioPointer("programme-1", shard, 0, 0)
+
+    def plan(self, *, audio_revision: str, transcript_revision: str) -> SourcePlan:
+        """Return source tree metadata without opening a Parquet row."""
+        self.plan_calls += 1
+        return SourcePlan(
+            audio_repository="audio",
+            transcript_repository="transcripts",
+            audio_revision=audio_revision,
+            transcript_revision=transcript_revision,
+            audio_shards=(SourceShard("data/audio.parquet", 100),),
+            transcript_objects=(("data/transcripts.parquet", 100, None),),
+        )
 
 
 class FakeVad:
@@ -119,16 +160,15 @@ class FakeVad:
             Full-programme speech evidence.
         """
         del sampling_rate
-        return VADSignal(
-            ((0, len(audio) * 1000 // 16_000),), len(audio) * 1000 // 16_000
-        )
+        duration = len(audio) * 1000 // 16_000
+        return VADSignal(((0, duration),), duration)
 
 
 def config(tmp_path: Path, mode: str = "plan") -> DictConfig:
     """Load the pinned config with a test-owned scratch root.
 
     Returns:
-        A resolved Hydra configuration for the test.
+        A Hydra configuration for the test.
     """
     value = OmegaConf.load("config/p1_segments.yaml")
     value.mode = mode
@@ -138,55 +178,67 @@ def config(tmp_path: Path, mode: str = "plan") -> DictConfig:
     return cast(DictConfig, value)
 
 
-def test_plan_has_no_audio_and_records_index_defects(tmp_path: Path) -> None:
-    """Planning performs selection and quotas without invoking the audio loader."""
+def test_build_decodes_flac_and_purges_only_verified_output(tmp_path: Path) -> None:
+    """A native build uses FLAC bytes and purges after publisher verification."""
+    source = FakeSource()
+    report = run_pipeline(
+        config=config(tmp_path, mode="build"),
+        source=source,
+        hub=MemoryHub(),
+        ctc=FakeCtc(),
+        vad=FakeVad(),
+    )
+
+    assert source.audio_calls == 1
+    assert report.max_in_flight == 1
+    assert report.processed == 1
+    assert not list((tmp_path / "scratch" / "staging").rglob("*.parquet"))
+    audit = (tmp_path / "scratch" / "audit-candidates.jsonl").read_text()
+    assert '"parquet_path": "data/train/p1-programme-1-00000.parquet"' in audit
+    assert '"row_locator": 0' in audit
+
+
+def test_plan_dispatches_metadata_only_source_tree_access(tmp_path: Path) -> None:
+    """Planning calls source metadata APIs and never retrieves audio."""
     source = FakeSource()
     report = run_pipeline(config=config(tmp_path), source=source)
 
+    assert source.plan_calls == 1
     assert source.audio_calls == 0
-    assert report.selected_file_ids == ("programme-1",)
+    assert report.selected_file_ids == ()
     assert report.preflight.target["present"] is False
-    events = (tmp_path / "scratch" / "p1-events.jsonl").read_text()
-    assert "empty_text" in events and "duplicate_file_id" in events
-    assert "transcript_text" not in events
 
 
-def test_source_cap_aborts_before_audio(tmp_path: Path) -> None:
-    """A source-object cap fails before a source retrieval can occur.
-
-    Raises:
-        AssertionError:
-            If the cap does not abort the run.
-    """
+def test_verification_failure_retains_local_shard(tmp_path: Path) -> None:
+    """A failed remote verification leaves the ledger batch and bytes recoverable."""
     source = FakeSource()
-    value = config(tmp_path)
-    value.max_source_bytes = 1
-
-    try:
-        run_pipeline(config=value, source=source)
-    except P1PreflightError:
-        pass
-    else:
-        raise AssertionError("source cap did not abort planning")
-    assert source.audio_calls == 0
-
-
-def test_transcript_index_rejects_null_empty_and_duplicate_keys() -> None:
-    """The authenticated metadata index has explicit, deterministic rejections."""
-    index = build_transcript_index(
-        [
-            {"file_id": "ok", "transcript_text": "text"},
-            {"file_id": "", "transcript_text": "text"},
-            {"file_id": "empty", "transcript_text": ""},
-            {"file_id": "ok", "transcript_text": "again"},
-            {"file_id": None, "transcript_text": "text"},
-        ]
+    report = run_pipeline(
+        config=config(tmp_path, mode="build"),
+        source=source,
+        hub=VerifyFailHub(),
+        ctc=FakeCtc(),
+        vad=FakeVad(),
     )
 
-    assert tuple(index.records) == ("ok",)
-    assert [item.reason for item in index.rejections] == [
-        "null_file_id",
-        "empty_text",
-        "duplicate_file_id",
-        "null_file_id",
-    ]
+    assert report.processed == 0
+    assert list((tmp_path / "scratch" / "staging").rglob("*.parquet"))
+    with Ledger(
+        tmp_path / "scratch" / "ledger.sqlite", reset_processing=False
+    ) as ledger:
+        assert ledger.pending_batches()
+
+
+class VerifyFailHub(MemoryHub):
+    """Hub fake that fails during remote digest verification."""
+
+    def stream_file(
+        self, repo_id: str, path: str, *, repo_type: str, revision: str
+    ) -> list[bytes]:
+        """Fail before the publisher is allowed to purge local files.
+
+        Raises:
+            RuntimeError:
+                Always, to simulate a remote verification failure.
+        """
+        del repo_id, path, repo_type, revision
+        raise RuntimeError("simulated verification failure")

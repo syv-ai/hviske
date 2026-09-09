@@ -1035,6 +1035,8 @@ def prepare_source_audio(
         raise ValueError("declared channels do not match audio")
     if actual_channels > 1:
         values = values.mean(axis=1, dtype=np.float32)
+    elif values.ndim == 2:
+        values = values[:, 0]
     if values.size == 0 or not np.isfinite(values).all():
         raise ValueError("audio must be non-empty and finite")
     if sampling_rate != 16000:
