@@ -127,6 +127,8 @@ todo.md
 p1-segmentation/
 p1-events.jsonl
 p1-ledger.sqlite*
+# The configured scratch root may be absolute, but keep local overrides safe too.
+.p1-segmentation/
 
 # Slopo generated database and reports
 .slopo/*.db
