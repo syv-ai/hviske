@@ -45,6 +45,10 @@ from .utils import transformers_output_ignored
 logger = logging.getLogger(__package__)
 
 
+COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
+COHERE_MODEL_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
+
+
 class CohereAsrProcessor(TransformersCohereAsrProcessor):
     """Native Cohere processor with checkpoint-aware language validation.
 
@@ -163,6 +167,7 @@ class CohereModelSetup(ModelSetup):
                     self.config.model.pretrained_model_id,
                     token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
                     trust_remote_code=False,
+                    revision=str(self.config.model.revision),
                 )
             if self.config.model.freeze_feature_encoder:
                 encoder = model.model.encoder
@@ -227,6 +232,7 @@ class CohereModelSetup(ModelSetup):
                 self.config.model.pretrained_model_id,
                 token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
                 trust_remote_code=False,
+                revision=str(self.config.model.revision),
             )
             if not isinstance(processor, CohereAsrProcessor):
                 raise TypeError(
@@ -247,8 +253,17 @@ class CohereModelSetup(ModelSetup):
                 + ", ".join(missing)
             )
 
-    def load_saved(self) -> PreTrainedModelData:
+    def load_saved(
+        self, revision: str | None = None, saved_model_revision: str | None = None
+    ) -> PreTrainedModelData:
         """Load a saved Cohere model and its processing objects.
+
+        Args:
+            revision (optional):
+                Immutable revision of the saved Hub checkpoint.
+            saved_model_revision (optional):
+                Explicit alias for ``revision``. Defaults to the saved-model revision
+                in the configuration when present.
 
         Returns:
             The saved model, processor, collator and metric function.
@@ -256,20 +271,42 @@ class CohereModelSetup(ModelSetup):
         Raises:
             TypeError:
                 If the saved checkpoint does not expose the required API.
+            ValueError:
+                If both saved-checkpoint revision arguments disagree.
         """
-        if Path(self.config.model_dir).exists():
+        if (
+            revision is not None
+            and saved_model_revision is not None
+            and revision != saved_model_revision
+        ):
+            raise ValueError("Saved model revisions must agree")
+        requested_revision = saved_model_revision or revision
+        if requested_revision is None:
+            requested_revision = self.config.get("saved_model_revision")
+        if requested_revision is None:
+            requested_revision = self.config.get("model_revision")
+        if requested_revision is None:
+            requested_revision = self.config.model.get("saved_model_revision")
+
+        local_path = Path(self.config.model_dir).exists()
+        if local_path:
             model_path = self.config.model_dir
         else:
             model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
 
+        pretrained_kwargs: dict[str, str | bool] = {
+            "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+            "trust_remote_code": self._uses_remote_code(),
+        }
+        if not local_path and requested_revision is not None:
+            pretrained_kwargs["revision"] = str(requested_revision)
+
         if self._uses_remote_code():
-            processor = AutoProcessor.from_pretrained(
-                model_path, **self._pretrained_kwargs()
-            )
+            processor = AutoProcessor.from_pretrained(model_path, **pretrained_kwargs)
             self._validate_remote_processor(processor)
             processor = RemoteCohereAsrProcessor(processor=processor)
             model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_path, **self._pretrained_kwargs()
+                model_path, **pretrained_kwargs
             )
             if not all(
                 callable(getattr(model, name, None))
@@ -279,16 +316,27 @@ class CohereModelSetup(ModelSetup):
                     "The saved remote Cohere model has an incomplete model API."
                 )
         else:
-            processor = CohereAsrProcessor.from_pretrained(
-                model_path,
-                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-                trust_remote_code=False,
-            )
-            model = CohereAsrForConditionalGeneration.from_pretrained(
-                model_path,
-                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-                trust_remote_code=False,
-            )
+            token = os.getenv("HUGGINGFACE_HUB_TOKEN", True)
+            if not local_path and requested_revision is not None:
+                processor = CohereAsrProcessor.from_pretrained(
+                    model_path,
+                    token=token,
+                    trust_remote_code=False,
+                    revision=str(requested_revision),
+                )
+                model = CohereAsrForConditionalGeneration.from_pretrained(
+                    model_path,
+                    token=token,
+                    trust_remote_code=False,
+                    revision=str(requested_revision),
+                )
+            else:
+                processor = CohereAsrProcessor.from_pretrained(
+                    model_path, token=token, trust_remote_code=False
+                )
+                model = CohereAsrForConditionalGeneration.from_pretrained(
+                    model_path, token=token, trust_remote_code=False
+                )
             if not isinstance(processor, CohereAsrProcessor):
                 raise TypeError(
                     "The saved checkpoint did not contain a native Cohere processor."
@@ -831,6 +879,7 @@ def load_asr_transcriber(
     language: str = "da",
     punctuation: bool = True,
     max_new_tokens: int = 256,
+    revision: str | None = None,
 ) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
     """Load a model-aware ASR transcriber.
 
@@ -850,6 +899,11 @@ def load_asr_transcriber(
             Whether native Cohere should produce punctuation. Defaults to ``True``.
         max_new_tokens (optional):
             Maximum number of tokens generated per audio input. Defaults to ``256``.
+        revision (optional):
+            Immutable Hub revision for a native Cohere checkpoint. Defaults to the
+            pinned official Cohere checkpoint revision when ``model_id`` is that base
+            checkpoint. Other Hub models are loaded without a revision unless one is
+            explicitly supplied.
 
     Returns:
         A native Cohere adapter or a standard Transformers ASR pipeline.
@@ -861,14 +915,29 @@ def load_asr_transcriber(
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be at least one.")
     if not no_lm:
-        config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        if revision is None and model_id == COHERE_MODEL_ID:
+            revision = COHERE_MODEL_REVISION
+        if revision is None:
+            config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        else:
+            config = AutoConfig.from_pretrained(
+                model_id, trust_remote_code=False, revision=revision
+            )
         if getattr(config, "model_type", None) == "cohere_asr":
-            processor = CohereAsrProcessor.from_pretrained(
-                model_id, trust_remote_code=False
-            )
-            model = CohereAsrForConditionalGeneration.from_pretrained(
-                model_id, trust_remote_code=False
-            )
+            if revision is None:
+                processor = CohereAsrProcessor.from_pretrained(
+                    model_id, trust_remote_code=False
+                )
+                model = CohereAsrForConditionalGeneration.from_pretrained(
+                    model_id, trust_remote_code=False
+                )
+            else:
+                processor = CohereAsrProcessor.from_pretrained(
+                    model_id, trust_remote_code=False, revision=revision
+                )
+                model = CohereAsrForConditionalGeneration.from_pretrained(
+                    model_id, trust_remote_code=False, revision=revision
+                )
             t.cast(Callable[..., object], model.to)(device)
             return CohereASRTranscriber(
                 model=model,

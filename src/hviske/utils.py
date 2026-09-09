@@ -17,6 +17,7 @@ from types import TracebackType
 import datasets.utils.logging as ds_logging
 import tqdm as tqdm_package
 import transformers.utils.logging as hf_logging
+import yaml
 from datasets import (
     Dataset,
     IterableDataset,
@@ -28,6 +29,9 @@ from huggingface_hub import CommitInfo, HfApi, upload_folder
 from huggingface_hub.errors import RepositoryNotFoundError
 from tqdm.auto import tqdm
 from transformers.trainer import Trainer
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
+from yaml.resolver import BaseResolver
 
 logger = logging.getLogger(__package__)
 
@@ -64,16 +68,37 @@ _MODEL_ARTEFACT_NAMES = frozenset(
 _SHARDED_MODEL_ARTEFACT = re.compile(
     r"(?:model|pytorch_model)-\d{5}-of-\d{5}\.(?:bin|safetensors)\Z"
 )
-_TOKENIZER_FILES = frozenset(
-    {
-        "tokenizer.json",
-        "tokenizer.model",
-        "vocab.json",
-        "vocab.txt",
-        "spiece.model",
-        "sentencepiece.bpe.model",
-    }
-)
+_FULL_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader, node: MappingNode, deep: bool = False
+) -> dict[object, object]:
+    """Construct a mapping while rejecting duplicate keys.
+
+    Returns:
+        The constructed mapping.
+
+    Raises:
+        ConstructorError:
+            If the mapping contains a duplicate key.
+    """
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key: {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
 
 
 def block_terminal_output() -> None:
@@ -443,6 +468,7 @@ def publish_model_folder(
     evaluation_status: str = "Not evaluated.",
     training_sources: list[dict[str, object]] | None = None,
     reviewed_model_card: Path | None = None,
+    finetuned_from_revision: str | None = None,
 ) -> CommitInfo:
     """Publish a model folder through one private Hub commit.
 
@@ -467,6 +493,8 @@ def publish_model_folder(
             Structured source provenance for the model card.
         reviewed_model_card (optional):
             A reviewed README to use instead of the generated card.
+        finetuned_from_revision:
+            Immutable revision of the base model. Required for publication.
 
     Returns:
         The model-file upload commit information.
@@ -478,6 +506,9 @@ def publish_model_folder(
     validate_private_only_config({"private_only": True, "private": private})
     if not training_sources:
         raise ValueError("Structured training-source provenance is required")
+    _validate_base_model_metadata(
+        finetuned_from=finetuned_from, finetuned_from_revision=finetuned_from_revision
+    )
     _validate_training_sources(
         training_sources=training_sources,
         training_dataset_ids=training_dataset_ids or [],
@@ -499,6 +530,7 @@ def publish_model_folder(
             training_sources=training_sources,
             evaluation_status=evaluation_status,
             reviewed_model_card=reviewed_model_card,
+            finetuned_from_revision=finetuned_from_revision,
         )
         verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
         commit = upload_folder(
@@ -537,12 +569,7 @@ def _validate_model_package(source: Path) -> None:
         ValueError:
             If a required package file or weight set is missing or malformed.
     """
-    required = {
-        "config.json",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "tokenizer_config.json",
-    }
+    required = {"config.json", "processor_config.json", "tokenizer_config.json"}
     missing = [name for name in required if not _regular_file(source / name)]
     if missing:
         raise ValueError("Cohere package is missing: " + ", ".join(sorted(missing)))
@@ -557,24 +584,33 @@ def _validate_model_package(source: Path) -> None:
         documents[name] = document
     if documents["config.json"].get("model_type") != "cohere_asr":
         raise ValueError("Cohere config.json has the wrong model_type")
-    preprocessor = documents["preprocessor_config.json"]
-    if preprocessor.get("feature_extractor_type") != "CohereAsrFeatureExtractor":
-        raise ValueError("Cohere preprocessor config has the wrong feature extractor")
-    if (
-        not isinstance(preprocessor.get("sampling_rate"), int)
-        or preprocessor["sampling_rate"] <= 0
-    ):
-        raise ValueError("Cohere preprocessor config has an invalid sampling rate")
-    if (
-        documents["processor_config.json"].get("processor_class")
-        != "CohereAsrProcessor"
-    ):
+    processor = documents["processor_config.json"]
+    if processor.get("processor_class") != "CohereAsrProcessor":
         raise ValueError("Cohere processor config has the wrong processor_class")
+    feature_extractor = processor.get("feature_extractor")
+    if not isinstance(feature_extractor, dict):
+        raise ValueError("Cohere processor config has no feature extractor metadata")
+    if feature_extractor.get("feature_extractor_type") != "CohereAsrFeatureExtractor":
+        raise ValueError("Cohere processor config has the wrong feature extractor")
+    if (
+        not isinstance(feature_extractor.get("sampling_rate"), int)
+        or feature_extractor["sampling_rate"] <= 0
+    ):
+        raise ValueError("Cohere processor config has an invalid sampling rate")
     tokenizer = documents["tokenizer_config.json"]
-    if tokenizer.get("tokenizer_class") != "CohereTokenizer":
+    if tokenizer.get("tokenizer_class") != "TokenizersBackend":
         raise ValueError("Cohere tokenizer config has the wrong tokenizer_class")
-    if not any(_regular_file(source / name) for name in _TOKENIZER_FILES):
-        raise ValueError("Cohere package is missing tokenizer vocabulary/model files")
+    if tokenizer.get("backend") != "tokenizers":
+        raise ValueError("Cohere tokenizer config has the wrong backend")
+    tokenizer_json = source / "tokenizer.json"
+    if not _regular_file(tokenizer_json):
+        raise ValueError("Cohere package is missing tokenizer.json")
+    try:
+        tokenizer_document = json.loads(tokenizer_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Cohere tokenizer.json is not valid JSON") from error
+    if not isinstance(tokenizer_document, dict):
+        raise ValueError("Cohere tokenizer.json must contain an object")
 
     single = source / "model.safetensors"
     index_path = source / "model.safetensors.index.json"
@@ -613,10 +649,36 @@ def _validate_model_package(source: Path) -> None:
         for name in referenced
     ):
         raise ValueError("Incomplete sharded weight index")
-    if set(path.name for path in shard_paths) != referenced:
+    if {path.name for path in shard_paths} != referenced:
         raise ValueError("Sharded weight files do not match the index")
+    shard_tensors: dict[str, set[str]] = {}
     for shard_name in sorted(referenced):
-        _validate_safetensors_file(source / shard_name)
+        shard_tensors[shard_name] = _validate_safetensors_file(source / shard_name)
+    for shard_name, actual_tensors in shard_tensors.items():
+        expected_tensors = {
+            tensor_name
+            for tensor_name, assigned_shard in weight_map.items()
+            if assigned_shard == shard_name
+        }
+        missing = expected_tensors - actual_tensors
+        if missing:
+            tensor_name = sorted(missing)[0]
+            raise ValueError(
+                f"Sharded index maps {tensor_name!r} to a shard without that tensor"
+            )
+        extra = actual_tensors - expected_tensors
+        if extra:
+            indexed_tensors = set(weight_map)
+            unindexed = extra - indexed_tensors
+            if unindexed:
+                raise ValueError(
+                    "Sharded weight files contain unindexed tensors: "
+                    + ", ".join(sorted(unindexed))
+                )
+            raise ValueError(
+                f"Sharded tensor set does not match index for {shard_name}: "
+                + ", ".join(sorted(extra))
+            )
 
 
 def _regular_file(path: Path) -> bool:
@@ -624,8 +686,11 @@ def _regular_file(path: Path) -> bool:
     return path.is_file() and not path.is_symlink()
 
 
-def _validate_safetensors_file(path: Path) -> None:
+def _validate_safetensors_file(path: Path) -> set[str]:
     """Read safetensors metadata without materialising tensor data.
+
+    Returns:
+        The tensor names stored in the file.
 
     Raises:
         ValueError:
@@ -635,10 +700,12 @@ def _validate_safetensors_file(path: Path) -> None:
         from safetensors import SafetensorError, safe_open
 
         with safe_open(str(path), framework="pt", device="cpu") as handle:
-            if not handle.keys():
+            tensor_names = set(handle.keys())
+            if not tensor_names:
                 raise ValueError(f"Safetensors file is empty: {path.name}")
-            for tensor_name in handle.keys():
+            for tensor_name in tensor_names:
                 handle.get_slice(tensor_name)
+            return tensor_names
     except (OSError, RuntimeError, SafetensorError, ValueError) as error:
         raise ValueError(f"Invalid safetensors weights: {path.name}") from error
 
@@ -651,6 +718,7 @@ def _stage_model_card(
     training_sources: list[dict[str, object]],
     evaluation_status: str,
     reviewed_model_card: Path | None,
+    finetuned_from_revision: str | None = None,
 ) -> None:
     """Stage a generated or reviewed card, never arbitrary source files.
 
@@ -658,19 +726,26 @@ def _stage_model_card(
         ValueError:
             If a reviewed card is not a safe, complete provenance record.
     """
+    _validate_base_model_metadata(
+        finetuned_from=finetuned_from, finetuned_from_revision=finetuned_from_revision
+    )
     if reviewed_model_card is not None:
         if not _regular_file(reviewed_model_card):
             raise ValueError("Reviewed model card must be a regular file")
         card = reviewed_model_card.read_text(encoding="utf-8")
         forbidden = ("manifest_path", "source_wav_path", "HF_TOKEN", "HUGGINGFACE")
-        required_markers = ("license: openrail", "base_model:", "private", "internal")
+        card_lower = card.lower()
+        required_markers = ("license: openrail", "private", "internal")
+        frontmatter = _read_model_card_frontmatter(card)
         if (
             any(
                 str(value) not in card
                 for source in training_sources
                 for value in source.values()
             )
-            or any(marker not in card for marker in required_markers)
+            or any(marker not in card_lower for marker in required_markers)
+            or frontmatter.get("base_model") != finetuned_from
+            or frontmatter.get("base_model_revision") != finetuned_from_revision
             or any(marker in card for marker in forbidden)
             or re.search(r"(?:^|\s)/(?:Users|home|private|tmp|var)/", card)
         ):
@@ -689,14 +764,86 @@ def _stage_model_card(
         "---\n"
         f"language:\n{language_lines}\nlicense: openrail\nlibrary_name: transformers\n"
         "pipeline_tag: automatic-speech-recognition\n"
-        f"base_model: {finetuned_from}\ndatasets:\n{dataset_lines}\n---\n\n"
-        "# Private internal Danish-English ASR checkpoint\n\n"
+        f"base_model: {finetuned_from}\n"
+        + (
+            f"base_model_revision: {finetuned_from_revision}\n"
+            if finetuned_from_revision is not None
+            else ""
+        )
+        + f"datasets:\n{dataset_lines}\n---\n\n"
+        + "# Private internal Danish-English ASR checkpoint\n\n"
         "This private Cohere checkpoint is for internal research, evaluation and "
         "testing only. It is not for public distribution or production use.\n\n"
         "## Training-source provenance\n\n"
         f"{source_lines}\n\n## Evaluation status\n\n{evaluation_status}\n",
         encoding="utf-8",
     )
+
+
+_UniqueKeySafeLoader.add_constructor(
+    BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+
+
+def _read_model_card_frontmatter(card: str) -> dict[str, str]:
+    """Read required scalar metadata from a model card's YAML frontmatter.
+
+    Returns:
+        The parsed base model metadata, or an empty dictionary for invalid
+        frontmatter.
+    """
+    lines = card.splitlines()
+    if len(lines) < 3 or lines[0].strip() != "---":
+        return {}
+    try:
+        end = next(
+            index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"
+        )
+    except StopIteration:
+        return {}
+
+    body_lines = lines[end + 1 :]
+    first_body_line = next(
+        (index for index, line in enumerate(body_lines) if line.strip()), None
+    )
+    if first_body_line is not None and body_lines[first_body_line].strip() == "---":
+        if any(line.strip() == "---" for line in body_lines[first_body_line + 1 :]):
+            return {}
+
+    try:
+        metadata = yaml.load("\n".join(lines[1:end]), Loader=_UniqueKeySafeLoader)
+    except (TypeError, ValueError, yaml.YAMLError):
+        return {}
+    if not isinstance(metadata, dict):
+        return {}
+
+    required_fields = ("base_model", "base_model_revision")
+    parsed_fields: dict[str, str] = {}
+    for field in required_fields:
+        value = metadata.get(field)
+        if not isinstance(value, str):
+            return {}
+        parsed_fields[field] = value
+    return parsed_fields
+
+
+def _validate_base_model_metadata(
+    finetuned_from: str, finetuned_from_revision: str | None
+) -> None:
+    """Require the immutable base model identity used by publication.
+
+    Raises:
+        ValueError:
+            If the base model ID or pinned revision is missing.
+    """
+    if (
+        not finetuned_from.strip()
+        or not finetuned_from_revision
+        or not finetuned_from_revision.strip()
+    ):
+        raise ValueError(
+            "Publication requires an exact base model and pinned base model revision"
+        )
 
 
 def _validate_training_sources(
@@ -735,6 +882,155 @@ def _validate_training_sources(
             raise ValueError("Each training source needs complete structured metadata")
         if any(key in source for key in ("path", "manifest_path")):
             raise ValueError("Local paths are not permitted in model-card provenance")
+
+
+def push_model_to_hub(
+    trainer: Trainer,
+    model_name: str,
+    finetuned_from: str,
+    create_pr: bool,
+    language: str = "da",
+    license: str = "openrail",
+    tasks: list[str] | None = None,
+    commit_message: str = "Finished finetuning 🎉",
+    private: bool = False,
+    private_only: bool = False,
+    model_card_languages: list[str] | None = None,
+    training_dataset_ids: list[str] | None = None,
+    evaluation_status: str = "Not evaluated.",
+    finetuned_from_revision: str | None = None,
+) -> CommitInfo | None:
+    """Upload a filtered model artefact set to the Hugging Face Hub.
+
+    The upload is staged in a temporary directory so trainer output, datasets and
+    experiment-tracking artefacts cannot become part of the Hub commit.
+
+    Args:
+        trainer:
+            The Trainer object containing the model and tokenizer to upload.
+        model_name:
+            The name of the model.
+        finetuned_from:
+            The ID of the model that was finetuned.
+        create_pr:
+            Whether to create a pull request.
+        language (optional):
+            Retained for API compatibility. The model card is bilingual.
+        license (optional):
+            Must be ``openrail`` for this publication path.
+        tasks (optional):
+            Retained for API compatibility; this path publishes ASR models.
+        commit_message (optional):
+            Message to commit while pushing. Defaults to "Finished finetuning 🎉".
+        private (optional):
+            Whether the destination repository must be private. Defaults to False.
+        private_only (optional):
+            Whether to refuse all public repositories. Defaults to False.
+        model_card_languages (optional):
+            Additional model-card language metadata. Danish and English are always
+            included.
+        training_dataset_ids (optional):
+            Exact Hub dataset identifiers used for training.
+        evaluation_status (optional):
+            Short evaluation-status statement for the model card.
+        finetuned_from_revision:
+            Immutable revision of the base model. Required for publication.
+
+    Returns:
+        The commit information, or None if the process is not the main process.
+
+    Raises:
+        ValueError:
+            If private-only publication is requested without private=true, or if a
+            licence other than openrail is requested.
+    """
+    del language, tasks, model_name
+    if license.lower() != "openrail":
+        raise ValueError("Private ASR publication requires the openrail licence")
+    token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
+    validate_private_only_config({"private_only": private_only, "private": private})
+    repo_id = trainer.hub_model_id or getattr(trainer.args, "hub_model_id", None)
+    api: HfApi | None = None
+    requires_private = private or private_only
+    if requires_private:
+        if repo_id is None:
+            raise ValueError("Private publication requires a Hub model ID")
+        api = ensure_private_hub_repository(repo_id=repo_id, token=token)
+
+    # Trainer's own asynchronous pushes must never publish this output directory.
+    trainer.args.push_to_hub = False
+    if trainer.hub_model_id is None:
+        trainer.init_hf_repo(token=token)
+        repo_id = trainer.hub_model_id
+
+    if not trainer.is_world_process_zero():
+        return None
+    trainer._finish_current_push()
+
+    languages = list(model_card_languages or ["da", "en"])
+    for required_language in ("da", "en"):
+        if required_language not in languages:
+            languages.append(required_language)
+    with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
+        staging_path = Path(staging_dir)
+        _copy_model_artefacts(
+            source=Path(trainer.args.output_dir or "."), destination=staging_path
+        )
+        _write_model_card(
+            destination=staging_path / "README.md",
+            finetuned_from=finetuned_from,
+            model_card_languages=languages,
+            training_dataset_ids=training_dataset_ids or [],
+            evaluation_status=evaluation_status,
+            finetuned_from_revision=finetuned_from_revision,
+        )
+        if requires_private:
+            assert api is not None
+            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
+        commit = upload_folder(
+            repo_id=repo_id or "",
+            create_pr=create_pr,
+            folder_path=staging_path,
+            commit_message=commit_message,
+            token=token or True,
+        )
+        if requires_private:
+            assert api is not None
+            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
+    return commit
+
+
+def _write_model_card(
+    destination: Path,
+    finetuned_from: str,
+    model_card_languages: list[str],
+    training_dataset_ids: list[str],
+    evaluation_status: str,
+    finetuned_from_revision: str | None,
+) -> None:
+    """Write a backwards-compatible minimal card for trainer publication."""
+    sources: list[dict[str, object]] = [
+        {
+            "id": dataset_id,
+            "source": dataset_id,
+            "subset": "unspecified",
+            "split": "unspecified",
+            "revision": "unspecified",
+            "probability": "unspecified",
+            "language": "da/en",
+        }
+        for dataset_id in training_dataset_ids
+    ]
+    _stage_model_card(
+        destination=destination,
+        finetuned_from=finetuned_from,
+        model_card_languages=model_card_languages,
+        training_dataset_ids=training_dataset_ids,
+        training_sources=sources,
+        evaluation_status=evaluation_status,
+        reviewed_model_card=None,
+        finetuned_from_revision=finetuned_from_revision,
+    )
 
 
 def ensure_private_hub_repository(repo_id: str, token: str | None) -> HfApi:
@@ -809,149 +1105,6 @@ def validate_private_only_config(config: object) -> None:
         raise ValueError("A private-only run must set private=true")
 
 
-def push_model_to_hub(
-    trainer: Trainer,
-    model_name: str,
-    finetuned_from: str,
-    create_pr: bool,
-    language: str = "da",
-    license: str = "openrail",
-    tasks: list[str] | None = None,
-    commit_message: str = "Finished finetuning 🎉",
-    private: bool = False,
-    private_only: bool = False,
-    model_card_languages: list[str] | None = None,
-    training_dataset_ids: list[str] | None = None,
-    evaluation_status: str = "Not evaluated.",
-) -> CommitInfo | None:
-    """Upload a filtered model artefact set to the Hugging Face Hub.
-
-    The upload is staged in a temporary directory so trainer output, datasets and
-    experiment-tracking artefacts cannot become part of the Hub commit.
-
-    Args:
-        trainer:
-            The Trainer object containing the model and tokenizer to upload.
-        model_name:
-            The name of the model.
-        finetuned_from:
-            The ID of the model that was finetuned.
-        create_pr:
-            Whether to create a pull request.
-        language (optional):
-            Retained for API compatibility. The model card is bilingual.
-        license (optional):
-            Must be ``openrail`` for this publication path.
-        tasks (optional):
-            Retained for API compatibility; this path publishes ASR models.
-        commit_message (optional):
-            Message to commit while pushing. Defaults to "Finished finetuning 🎉".
-        private (optional):
-            Whether the destination repository must be private. Defaults to False.
-        private_only (optional):
-            Whether to refuse all public repositories. Defaults to False.
-        model_card_languages (optional):
-            Additional model-card language metadata. Danish and English are always
-            included.
-        training_dataset_ids (optional):
-            Exact Hub dataset identifiers used for training.
-        evaluation_status (optional):
-            Short evaluation-status statement for the model card.
-
-    Returns:
-        The commit information, or None if the process is not the main process.
-
-    Raises:
-        ValueError:
-            If private-only publication is requested without private=true, or if a
-            licence other than openrail is requested.
-    """
-    del language, tasks, model_name
-    if license.lower() != "openrail":
-        raise ValueError("Private ASR publication requires the openrail licence")
-    token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
-    validate_private_only_config({"private_only": private_only, "private": private})
-    repo_id = trainer.hub_model_id or getattr(trainer.args, "hub_model_id", None)
-    api: HfApi | None = None
-    requires_private = private or private_only
-    if requires_private:
-        if repo_id is None:
-            raise ValueError("Private publication requires a Hub model ID")
-        api = ensure_private_hub_repository(repo_id=repo_id, token=token)
-
-    # Trainer's own asynchronous pushes must never publish this output directory.
-    trainer.args.push_to_hub = False
-    if trainer.hub_model_id is None:
-        trainer.init_hf_repo(token=token)
-        repo_id = trainer.hub_model_id
-
-    if not trainer.is_world_process_zero():
-        return None
-    trainer._finish_current_push()
-
-    languages = list(model_card_languages or ["da", "en"])
-    for required_language in ("da", "en"):
-        if required_language not in languages:
-            languages.append(required_language)
-    with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
-        staging_path = Path(staging_dir)
-        _copy_model_artefacts(
-            source=Path(trainer.args.output_dir or "."), destination=staging_path
-        )
-        _write_model_card(
-            destination=staging_path / "README.md",
-            finetuned_from=finetuned_from,
-            model_card_languages=languages,
-            training_dataset_ids=training_dataset_ids or [],
-            evaluation_status=evaluation_status,
-        )
-        if requires_private:
-            assert api is not None
-            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
-        commit = upload_folder(
-            repo_id=repo_id or "",
-            create_pr=create_pr,
-            folder_path=staging_path,
-            commit_message=commit_message,
-            token=token or True,
-        )
-        if requires_private:
-            assert api is not None
-            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
-    return commit
-
-
-def _write_model_card(
-    destination: Path,
-    finetuned_from: str,
-    model_card_languages: list[str],
-    training_dataset_ids: list[str],
-    evaluation_status: str,
-) -> None:
-    """Write a backwards-compatible minimal card for trainer publication."""
-    sources: list[dict[str, object]] = [
-        {
-            "id": dataset_id,
-            "source": dataset_id,
-            "subset": "unspecified",
-            "split": "unspecified",
-            "revision": "unspecified",
-            "probability": "unspecified",
-            "language": "da/en",
-        }
-        for dataset_id in training_dataset_ids
-    ]
-    _stage_model_card(
-        destination=destination,
-        finetuned_from=finetuned_from,
-        model_card_languages=model_card_languages,
-        training_dataset_ids=training_dataset_ids,
-        training_sources=sources,
-        evaluation_status=evaluation_status,
-        reviewed_model_card=None,
-    )
-
-
 class transformers_output_ignored:
     """Context manager to block terminal output."""
 
@@ -967,3 +1120,25 @@ class transformers_output_ignored:
     ) -> None:
         """Exit the context manager."""
         hf_logging.set_verbosity_info()
+
+
+def validate_transcript_revision(revision: str) -> str:
+    """Validate an immutable private transcript dataset revision.
+
+    Args:
+        revision:
+            The Hub revision to use for the private transcript dataset.
+
+    Returns:
+        The unchanged, validated revision.
+
+    Raises:
+        ValueError:
+            If ``revision`` is not a complete hexadecimal commit SHA.
+    """
+    if not _FULL_COMMIT_SHA.fullmatch(revision):
+        raise ValueError(
+            "P1 transcript revision must be a full 40-character commit SHA; "
+            "mutable branches and abbreviated or non-hex revisions are forbidden."
+        )
+    return revision

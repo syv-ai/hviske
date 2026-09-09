@@ -16,6 +16,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 from hviske.data import _load_transcript_dataset, join_audio_and_transcripts
+from hviske.utils import validate_transcript_revision
 
 logger = logging.getLogger("hviske_data_preflight")
 
@@ -57,11 +58,14 @@ def _preflight_hub_source(
     )
     has_transcript_join = source_config.get("transcript_dataset_id") is not None
     if has_transcript_join:
+        transcript_revision = validate_transcript_revision(
+            str(source_config.transcript_revision)
+        )
         transcript = _load_transcript_dataset(
             dataset_id=str(source_config.transcript_dataset_id),
             subset=source_config.get("transcript_subset"),
             split=str(source_config.get("transcript_split", "train")),
-            revision=str(source_config.transcript_revision),
+            revision=transcript_revision,
             cache_dir=cache_dir,
             trust_remote_code=source_config.get("transcript_trust_remote_code", False),
             dataset_loader=dataset_loader,
@@ -194,8 +198,8 @@ def _preflight_local_manifest(source_name: str, manifest_path: Path) -> None:
 class HubApi(t.Protocol):
     """Hub operations needed by the data preflight."""
 
-    def model_info(self, repo_id: str) -> object:
-        """Return metadata for an accessible model repository."""
+    def model_info(self, repo_id: str, *, revision: str) -> object:
+        """Return metadata for an accessible model repository revision."""
         ...
 
     def whoami(self) -> dict[str, object]:
@@ -218,11 +222,19 @@ def preflight_finetuning_data(
         hub_api (optional):
             Hub API client. Defaults to an authenticated ``HfApi`` client.
     """
+    for source_config in config.datasets.values():
+        transcript_dataset_id = source_config.get("transcript_dataset_id")
+        if transcript_dataset_id is not None:
+            validate_transcript_revision(str(source_config.transcript_revision))
+
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     api: HubApi = hub_api or HfApi(token=token)
     identity = api.whoami()
     logger.info("Authenticated to the Hugging Face Hub as %s", identity.get("name"))
-    api.model_info(repo_id=str(config.model.pretrained_model_id))
+    api.model_info(
+        repo_id=str(config.model.pretrained_model_id),
+        revision=str(config.model.revision),
+    )
     logger.info("Confirmed access to model %s", config.model.pretrained_model_id)
 
     for source_name, source_config in config.datasets.items():

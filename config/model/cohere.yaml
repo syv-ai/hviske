@@ -2,6 +2,7 @@
 name: cohere
 type: cohere
 pretrained_model_id: CohereLabs/cohere-transcribe-03-2026
+revision: b1eacc2686a3d08ceaae5f24a88b1d519620bc09
 freeze_feature_encoder: false
 
 # Data hyperparameters

@@ -12,6 +12,9 @@ from omegaconf.errors import InterpolationResolutionError
 import hviske.utils as utils
 from scripts.publish_private_model import training_sources_from_config
 
+P1_TRANSCRIPT_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
 TRAINING_NAMES = [
     "p1",
     "drtv_local",
@@ -78,6 +81,24 @@ def test_p1_transcript_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> 
 
     with pytest.raises(InterpolationResolutionError, match="P1_TRANSCRIPT_REVISION"):
         OmegaConf.resolve(config)
+
+
+@pytest.mark.parametrize("revision", ["main", "0123456", "g" * 40])
+def test_p1_transcript_revision_rejects_mutable_or_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, revision: str
+) -> None:
+    """P1 transcript loads reject branches, short SHAs and non-hex revisions."""
+    monkeypatch.setenv("P1_TRANSCRIPT_REVISION", revision)
+    monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
+    monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
+    monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
+    config = compose(config_name="sparkie_bilingual")
+    OmegaConf.resolve(config)
+
+    from hviske.utils import validate_transcript_revision
+
+    with pytest.raises(ValueError, match="full 40-character"):
+        validate_transcript_revision(str(config.datasets.p1.transcript_revision))
 
 
 def test_sparkie_dataset_coordinates_and_revisions(
@@ -189,7 +210,7 @@ def test_sparkie_dataset_coordinates_and_revisions(
         datasets.p1.transcript_join_column,
         datasets.p1.transcript_text_column,
     ) == ("syvai/p1-transcripts", None, "train", "audio_id", "audio_id", "text")
-    assert datasets.p1.transcript_revision == "transcript-revision"
+    assert datasets.p1.transcript_revision == P1_TRANSCRIPT_SHA
     assert datasets.p1.transcript_trust_remote_code is False
     assert all(
         dataset.get("trust_remote_code", False) is False
@@ -209,7 +230,7 @@ def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
     Returns:
         The resolved Sparkie preset.
     """
-    monkeypatch.setenv("P1_TRANSCRIPT_REVISION", "transcript-revision")
+    monkeypatch.setenv("P1_TRANSCRIPT_REVISION", P1_TRANSCRIPT_SHA)
     monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
     monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
     monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
@@ -270,6 +291,7 @@ def test_sparkie_model_card_contains_safe_complete_provenance(
         training_sources=sources,
         evaluation_status="Pilot reviewed.",
         reviewed_model_card=None,
+        finetuned_from_revision=str(config.model.revision),
     )
     card = card_path.read_text(encoding="utf-8")
     for source in sources:
@@ -278,6 +300,7 @@ def test_sparkie_model_card_contains_safe_complete_provenance(
     assert str(config.datasets.drtv_local.manifest_path) not in card
     assert "license: openrail" in card
     assert "base_model: CohereLabs/cohere-transcribe-03-2026" in card
+    assert "base_model_revision: b1eacc2686a3d08ceaae5f24a88b1d519620bc09" in card
     assert "Pilot reviewed." in card
 
 
@@ -287,6 +310,7 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
 
     assert config.push_to_hub is False
     assert config.enable_experiment_tracking is False
+    assert config.model.revision == "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
     assert config.private is True
     assert config.private_only is True
     assert config.save_total_limit == 3
@@ -338,7 +362,7 @@ def test_sparkie_publication_provenance_is_complete(
     assert p1_sources[0]["probability"] == 0.08
     joined = t.cast(dict[str, object], p1_sources[0]["joined_transcript"])
     assert joined["dataset_id"] == "syvai/p1-transcripts"
-    assert joined["revision"] == "transcript-revision"
+    assert joined["revision"] == P1_TRANSCRIPT_SHA
     assert joined["audio_join_column"] == "audio_id"
     assert joined["transcript_join_column"] == "audio_id"
     assert joined["transcript_text_column"] == "text"

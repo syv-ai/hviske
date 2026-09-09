@@ -49,6 +49,7 @@ def main(config: DictConfig) -> None:
         language=getattr(config, "language", "da"),
         punctuation=getattr(config, "punctuation", True),
         max_new_tokens=getattr(config, "max_new_tokens", 256),
+        revision=getattr(config, "model_revision", None),
     )
 
     logger.info("Loading the punctuation fixer model...")
