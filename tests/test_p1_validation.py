@@ -350,6 +350,35 @@ def test_play_audio_uses_argv_without_shell(
     ]
 
 
+def test_rejected_audit_candidates_use_immutable_source_locators() -> None:
+    """Rejected and borderline reviews point back to source intervals."""
+    rows = [
+        {
+            **_row(1, "rejected"),
+            "source_repository": "org/source",
+            "source_revision": "b" * 40,
+            "source_start_ms": 100,
+            "source_end_ms": 900,
+        },
+        {
+            **_row(2, "borderline"),
+            "source_repository": "org/source",
+            "source_revision": "b" * 40,
+            "source_start_ms": 200,
+            "source_end_ms": 800,
+        },
+    ]
+    manifest = create_blinded_audit_manifest(
+        rows, accepted_quota=0, rejected_quota=1, borderline_quota=1
+    )
+
+    assert all("parquet_path" not in item for item in manifest)
+    assert {item["source_file_id"] for item in manifest} == {
+        "programme-0",
+        "programme-1",
+    }
+
+
 def test_remote_aggregate_is_bounded() -> None:
     """A bounded remote aggregate must not pull one row beyond its limit."""
     consumed = 0

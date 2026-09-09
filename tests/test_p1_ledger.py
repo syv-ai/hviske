@@ -167,6 +167,24 @@ def test_publication_path_collision_is_refused(tmp_path: Path) -> None:
             )
 
 
+def test_purged_batch_child_finalisation_is_idempotent(tmp_path: Path) -> None:
+    """A restart after physical purge repairs all child states without reupload."""
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        add_batch(ledger)
+        ledger.transition_programme("programme-1", LedgerState.PROCESSING)
+        ledger.transition_programme("programme-1", LedgerState.SHARDED)
+        ledger.transition_batch("batch-1", LedgerState.PROCESSING)
+        ledger.transition_batch("batch-1", LedgerState.SHARDED)
+        ledger.transition_batch("batch-1", LedgerState.COMMITTED, commit_id=COMMIT)
+        ledger.transition_batch("batch-1", LedgerState.VERIFIED)
+        ledger.purge_batch("batch-1")
+
+        assert ledger.finalise_batch_children("batch-1").state is LedgerState.PURGED
+        assert ledger.programme("programme-1").state is LedgerState.PURGED
+        assert ledger.shard("shard-1").state is LedgerState.PURGED
+        ledger.finalise_batch_children("batch-1")
+
+
 def test_rejected_programmes_and_retryable_transitions_are_durable(
     tmp_path: Path,
 ) -> None:

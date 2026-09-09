@@ -291,7 +291,7 @@ class HfApiAdapter:
 
         def chunks() -> c.Iterator[bytes]:
             handle = self._filesystem.open(
-                f"{repo_id}/{path}", mode="rb", revision=revision
+                f"datasets/{repo_id}/{path}", mode="rb", revision=revision
             )
             try:
                 while chunk := handle.read(1024 * 1024):
@@ -527,14 +527,17 @@ def publish_batch(
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     local_evidence = tuple(_local_evidence(shard) for shard in shards)
     _assert_unique_paths(local_evidence)
-    _refuse_remote_collisions(api, repo_id, local_evidence)
     counts = rejection_counts if rejection_counts is not None else {}
     _assert_safe_metadata(counts)
 
     manifest_root = staging_dir or shards[0].path.parent
     if not manifest_root.is_dir() or manifest_root.is_symlink():
         raise AllowListError("batch staging directory is not a regular directory")
-    manifest_path = manifest_root / "batch-manifest.json"
+    manifest_relative_path = _manifest_repo_path(batch_id)
+    manifest_path = manifest_root / manifest_relative_path
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if manifest_path.parent.is_symlink():
+        raise AllowListError("batch manifest directory must not be a symlink")
     manifest = _manifest_bytes(
         batch_id=batch_id,
         shards=local_evidence,
@@ -549,7 +552,7 @@ def publish_batch(
     else:
         _write_durable(manifest_path, manifest)
     manifest_evidence = ShardEvidence(
-        path="batch-manifest.json",
+        path=manifest_relative_path,
         byte_size=len(manifest),
         row_count=0,
         sha256=_sha256_bytes(manifest),
@@ -572,6 +575,7 @@ def publish_batch(
             purge_callback=purge_callback,
             local_paths=tuple(shard.path for shard in shards),
         )
+    _refuse_remote_collisions(api, repo_id, (*local_evidence, manifest_evidence))
     operations = tuple(
         [
             UploadOperation(path_in_repo=item.path, path=shard.path)
@@ -693,7 +697,7 @@ def verify_batch(
     expected = (
         *evidence_items,
         ShardEvidence(
-            path="batch-manifest.json",
+            path=_manifest_repo_path(batch_id),
             byte_size=len(manifest),
             row_count=0,
             sha256=_sha256_bytes(manifest),
@@ -703,7 +707,7 @@ def verify_batch(
         api.repo_info(repo_id=repo_id, repo_type="dataset", revision=commit_id), repo_id
     )
     streamed_files = _verify_remote(api, repo_id, expected=expected, revision=commit_id)
-    remote_manifest = streamed_files.get("batch-manifest.json", manifest)
+    remote_manifest = streamed_files.get(_manifest_repo_path(batch_id), manifest)
     if remote_manifest != manifest:
         raise VerificationError("batch manifest schema or contents differ")
     try:
@@ -838,9 +842,9 @@ def validate_local_shard(path: Path, *, expected_row_count: int | None = None) -
     """Validate one local shard before it is eligible for upload.
 
     The Parquet Arrow schema and Hugging Face feature metadata are compared as one
-    object, so missing, extra, and type-wrong fields cannot pass.  A deterministic
-    first row is decoded to prove the mono 16 kHz FLAC contract without retaining a
-    complete shard in memory.
+    object, so missing, extra, and type-wrong fields cannot pass. Every row is
+    decoded to prove the mono 16 kHz FLAC contract without retaining a complete
+    shard in memory.
 
     Args:
         path:
@@ -861,15 +865,19 @@ def validate_local_shard(path: Path, *, expected_row_count: int | None = None) -
         if expected_row_count is not None and parquet.metadata is not None:
             if parquet.metadata.num_rows != expected_row_count:
                 raise VerificationError(f"row count mismatch for {path}")
-        batch = next(parquet.iter_batches(batch_size=1), None)
+        batches = parquet.iter_batches(batch_size=1)
+        batch = next(batches, None)
+        if batch is None or batch.num_rows == 0:
+            raise VerificationError(f"empty local shard: {path}")
+        _validate_row(batch.to_pylist()[0], str(path))
+        for batch in batches:
+            for row in batch.to_pylist():
+                _validate_row(row, str(path))
     except VerificationError:
         raise
     except Exception as error:
         raise VerificationError(f"could not read local shard: {path}") from error
-    if batch is None or batch.num_rows == 0:
-        raise VerificationError(f"empty local shard: {path}")
-    row = batch.to_pylist()[0]
-    _validate_row(row, str(path))
+    return
 
 
 def _validate_row(row: object, shard_path: str) -> None:
@@ -927,6 +935,18 @@ def _manifest_bytes(
     return json.dumps(
         payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode()
+
+
+def _manifest_repo_path(batch_id: str) -> str:
+    """Return the immutable repository path for one batch manifest.
+
+    Raises:
+        AllowListError:
+            If the batch identifier cannot safely be used as a path component.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", batch_id):
+        raise AllowListError("batch_id is not safe for a manifest path")
+    return f"manifests/{batch_id}.json"
 
 
 def _refuse_remote_collisions(
@@ -1076,7 +1096,8 @@ def _verify_remote(
                 repo_id,
                 item=item,
                 revision=revision,
-                retain=item.path == "batch-manifest.json",
+                retain=item.path.startswith("manifests/")
+                and item.path.endswith(".json"),
             )
             if content is not None:
                 retained[item.path] = content

@@ -57,6 +57,18 @@ def test_audio_parser_decodes_genuine_48khz_flac_native_shape() -> None:
     assert np.allclose(audio.value[:, 0], native[:, 0], atol=1 / 32_768)
 
 
+def test_audio_parser_derives_flac_metadata_when_declarations_are_absent() -> None:
+    """FLAC headers are authoritative when optional row metadata is absent."""
+    payload = io.BytesIO()
+    sf.write(payload, np.zeros((12, 1), dtype=np.float32), 22_050, format="FLAC")
+
+    parsed = parse_audio_row({"file_id": "x", "audio": {"bytes": payload.getvalue()}})
+
+    assert parsed.sampling_rate == 22_050
+    assert parsed.channels == 1
+    assert isinstance(parsed.value, np.ndarray)
+
+
 def test_discovery_projects_out_audio_column(tmp_path: Path) -> None:
     """Metadata discovery returns no embedded audio payload."""
     _write_source_files(tmp_path)
@@ -124,6 +136,25 @@ def _write_source_files(root: Path) -> tuple[Path, Path]:
         pa.Table.from_pylist(transcript_rows), transcript_path, row_group_size=1
     )
     return audio_path, transcript_path
+
+
+def test_hf_source_reads_under_explicit_dataset_namespace() -> None:
+    """Pinned remote source reads use the datasets namespace explicitly."""
+    source = HfP1Source()
+    paths: list[str] = []
+
+    class Filesystem:
+        def open(self, path: str, *_: object, **__: object) -> io.BytesIO:
+            paths.append(path)
+            return io.BytesIO(b"not parquet")
+
+    source._fs = Filesystem()
+    with pytest.raises(Exception):
+        with source._parquet(
+            "data/train.parquet", repository="org/source", revision="a" * 40
+        ):
+            pass
+    assert paths == ["datasets/org/source/data/train.parquet"]
 
 
 def test_plan_uses_local_tree_metadata_and_orders_shards(tmp_path: Path) -> None:

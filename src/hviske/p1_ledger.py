@@ -791,6 +791,90 @@ class Ledger:
             self._refresh_batch_counts(connection, batch_id)
         return self.batch(batch_id)
 
+    def finalise_batch_children(self, batch_id: str) -> BatchRecord:
+        """Idempotently finish every shard and programme in a purged batch.
+
+        The physical purge is necessarily outside SQLite.  Keeping this recovery
+        step transactional means a crash between unlinking files and child-state
+        updates can be repaired without re-uploading the batch.
+
+        Returns:
+            The purged batch record.
+
+        Raises:
+            KeyError:
+                If an attached programme is absent.
+            InvalidTransition:
+                If the batch or a child has not reached a finalisable state.
+            EvidenceError:
+                If the batch has no commit or a child has conflicting evidence.
+        """
+        batch = self.batch(batch_id)
+        if batch.state is not LedgerState.PURGED:
+            raise InvalidTransition("child finalisation requires a purged batch")
+        if batch.commit_id is None:
+            raise EvidenceError("purged batches require a commit SHA")
+        now = self._now()
+        with self.transaction() as connection:
+            shard_rows = connection.execute(
+                "SELECT shard_id, programme_id, state "
+                "FROM shards WHERE batch_id = ? ORDER BY shard_id",
+                (batch_id,),
+            ).fetchall()
+            programme_ids = sorted(
+                {row["programme_id"] for row in shard_rows if row["programme_id"]}
+            )
+            for row in shard_rows:
+                if row["state"] not in {
+                    LedgerState.SHARDED.value,
+                    LedgerState.COMMITTED.value,
+                    LedgerState.VERIFIED.value,
+                    LedgerState.PURGED.value,
+                }:
+                    raise InvalidTransition(
+                        f"cannot finalise shard in state {row['state']}"
+                    )
+                connection.execute(
+                    """UPDATE shards SET state = ?,
+                    verification_time = COALESCE(verification_time, ?),
+                    purge_time = COALESCE(purge_time, ?), updated_at = ?
+                    WHERE shard_id = ?""",
+                    (LedgerState.PURGED.value, now, now, now, row["shard_id"]),
+                )
+            for programme_id in programme_ids:
+                row = connection.execute(
+                    "SELECT state, commit_id FROM programmes WHERE programme_id = ?",
+                    (programme_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown programme {programme_id!r}")
+                if row["commit_id"] is not None and row["commit_id"] != batch.commit_id:
+                    raise EvidenceError("child commit SHA differs from batch")
+                if row["state"] not in {
+                    LedgerState.SHARDED.value,
+                    LedgerState.COMMITTED.value,
+                    LedgerState.VERIFIED.value,
+                    LedgerState.PURGED.value,
+                }:
+                    raise InvalidTransition(
+                        f"cannot finalise programme in state {row['state']}"
+                    )
+                connection.execute(
+                    """UPDATE programmes SET state = ?, commit_id = ?,
+                    verification_time = COALESCE(verification_time, ?),
+                    purge_time = COALESCE(purge_time, ?), updated_at = ?
+                    WHERE programme_id = ?""",
+                    (
+                        LedgerState.PURGED.value,
+                        batch.commit_id,
+                        now,
+                        now,
+                        now,
+                        programme_id,
+                    ),
+                )
+        return self.batch(batch_id)
+
     def mark_batch_verified(
         self,
         batch_id: str,
@@ -1200,6 +1284,22 @@ class Ledger:
         """Return one programme record."""
         row = self._fetch("programmes", "programme_id", programme_id)
         return self._programme_record(row)
+
+    def purged_batches_with_pending_children(self) -> tuple[BatchRecord, ...]:
+        """Return purged batches whose child transitions were interrupted."""
+        rows = self._connection.execute(
+            """SELECT DISTINCT b.* FROM batches AS b
+            JOIN shards AS s ON s.batch_id = b.batch_id
+            LEFT JOIN programmes AS p ON p.programme_id = s.programme_id
+            WHERE b.state = ? AND (s.state != ? OR p.state != ?)
+            ORDER BY b.batch_id""",
+            (
+                LedgerState.PURGED.value,
+                LedgerState.PURGED.value,
+                LedgerState.PURGED.value,
+            ),
+        ).fetchall()
+        return tuple(self._batch_record(row) for row in rows)
 
     def reconstruct_work(
         self,
