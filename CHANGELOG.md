@@ -11,3 +11,5 @@
   publication.
 - Add pinned offline Silero and Danish CTC alignment adapters, source-audio
   resampling, and bounded Audio-compatible Parquet sharding.
+- Reassemble P1 execution behind a reusable, metadata-only planning and
+  restart-safe pipeline with private-target initialisation and bounded audit metadata.
