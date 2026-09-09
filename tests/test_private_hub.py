@@ -27,6 +27,61 @@ class FakeRepositoryNotFoundError(Exception):
     """Hub repository-not-found error for the mocked API."""
 
 
+def test_model_card_frontmatter_accepts_exact_top_level_metadata() -> None:
+    """Valid frontmatter returns the exact required top-level strings."""
+    card = (
+        "---\n"
+        "license: openrail\n"
+        "base_model: org/base-model\n"
+        "base_model_revision: base-revision\n"
+        "---\n\n"
+        "# Private internal checkpoint\n"
+    )
+
+    assert utils._read_model_card_frontmatter(card) == {
+        "base_model": "org/base-model",
+        "base_model_revision": "base-revision",
+    }
+
+
+def test_model_card_frontmatter_rejects_multiple_blocks() -> None:
+    """A reviewed card must contain only one frontmatter block."""
+    card = (
+        "---\n"
+        "base_model: org/base-model\n"
+        "base_model_revision: base-revision\n"
+        "---\n\n"
+        "---\n"
+        "base_model: org/base-model\n"
+        "base_model_revision: base-revision\n"
+        "---\n"
+    )
+
+    assert utils._read_model_card_frontmatter(card) == {}
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        "metadata:\n  base_model: org/base-model\n"
+        "  base_model_revision: base-revision\n",
+        "base_model: [org/base-model]\nbase_model_revision: base-revision\n",
+        "base_model: org/base-model\nbase_model_revision: {value: base-revision}\n",
+        "base_model: null\nbase_model_revision: base-revision\n",
+        "base_model: [org/base-model\nbase_model_revision: base-revision\n",
+        'base_model: !!python/object/apply:os.system ["echo unsafe"]\n'
+        "base_model_revision: base-revision\n",
+        "base_model: org/base-model\nbase_model_revision: base-revision\n"
+        "base_model: duplicate\n",
+    ),
+)
+def test_model_card_frontmatter_rejects_unsafe_metadata(metadata: str) -> None:
+    """Frontmatter requires unique top-level scalar metadata."""
+    card = f"---\n{metadata}---\n\n# Body\n"
+
+    assert utils._read_model_card_frontmatter(card) == {}
+
+
 def test_model_card_requires_pinned_base_metadata(tmp_path: Path) -> None:
     """Generated cards cannot omit the exact base model revision."""
     with pytest.raises(ValueError, match="pinned base model revision"):

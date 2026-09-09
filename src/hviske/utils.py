@@ -17,6 +17,7 @@ from types import TracebackType
 import datasets.utils.logging as ds_logging
 import tqdm as tqdm_package
 import transformers.utils.logging as hf_logging
+import yaml
 from datasets import (
     Dataset,
     IterableDataset,
@@ -28,6 +29,9 @@ from huggingface_hub import CommitInfo, HfApi, upload_folder
 from huggingface_hub.errors import RepositoryNotFoundError
 from tqdm.auto import tqdm
 from transformers.trainer import Trainer
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
+from yaml.resolver import BaseResolver
 
 logger = logging.getLogger(__package__)
 
@@ -65,6 +69,36 @@ _SHARDED_MODEL_ARTEFACT = re.compile(
     r"(?:model|pytorch_model)-\d{5}-of-\d{5}\.(?:bin|safetensors)\Z"
 )
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader, node: MappingNode, deep: bool = False
+) -> dict[object, object]:
+    """Construct a mapping while rejecting duplicate keys.
+
+    Returns:
+        The constructed mapping.
+
+    Raises:
+        ConstructorError:
+            If the mapping contains a duplicate key.
+    """
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key: {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
 
 
 def block_terminal_output() -> None:
@@ -746,8 +780,13 @@ def _stage_model_card(
     )
 
 
+_UniqueKeySafeLoader.add_constructor(
+    BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+
+
 def _read_model_card_frontmatter(card: str) -> dict[str, str]:
-    """Read scalar metadata from a model card's YAML frontmatter.
+    """Read required scalar metadata from a model card's YAML frontmatter.
 
     Returns:
         The parsed base model metadata, or an empty dictionary for invalid
@@ -762,15 +801,30 @@ def _read_model_card_frontmatter(card: str) -> dict[str, str]:
         )
     except StopIteration:
         return {}
-    metadata: dict[str, str] = {}
-    for line in lines[1:end]:
-        key, separator, value = line.partition(":")
-        if separator and key.strip() in {"base_model", "base_model_revision"}:
-            field = key.strip()
-            if field in metadata:
-                return {}
-            metadata[field] = value.strip().strip("'\"")
-    return metadata
+
+    body_lines = lines[end + 1 :]
+    first_body_line = next(
+        (index for index, line in enumerate(body_lines) if line.strip()), None
+    )
+    if first_body_line is not None and body_lines[first_body_line].strip() == "---":
+        if any(line.strip() == "---" for line in body_lines[first_body_line + 1 :]):
+            return {}
+
+    try:
+        metadata = yaml.load("\n".join(lines[1:end]), Loader=_UniqueKeySafeLoader)
+    except (TypeError, ValueError, yaml.YAMLError):
+        return {}
+    if not isinstance(metadata, dict):
+        return {}
+
+    required_fields = ("base_model", "base_model_revision")
+    parsed_fields: dict[str, str] = {}
+    for field in required_fields:
+        value = metadata.get(field)
+        if not isinstance(value, str):
+            return {}
+        parsed_fields[field] = value
+    return parsed_fields
 
 
 def _validate_base_model_metadata(
