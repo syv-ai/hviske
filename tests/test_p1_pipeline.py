@@ -132,3 +132,26 @@ def test_plan_reads_tree_metadata_only(tmp_path: Path) -> None:
     assert report.selected_file_ids == ()
     assert source.iterated is False
     assert report.preflight.target["present"] is False
+
+
+def test_plan_verifies_github_vad_and_hub_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Planning verifies model provenance without loading model weights."""
+    calls: list[tuple[str, str, str]] = []
+
+    def verify_vad(**kwargs: object) -> str:
+        calls.append(("github", str(kwargs["repository"]), str(kwargs["revision"])))
+        return "https://github.test/asset"
+
+    def verify_model(**kwargs: object) -> None:
+        calls.append(("hub", str(kwargs["repository"]), str(kwargs["revision"])))
+
+    monkeypatch.setattr("hviske.p1_models.verify_silero_vad_revision", verify_vad)
+    monkeypatch.setattr("hviske.p1_models.verify_hub_model_revision", verify_model)
+    source = MetadataSource()
+    source._client = lambda: object()  # type: ignore[attr-defined]
+
+    run_pipeline(config=pipeline_config(tmp_path), source=source)
+
+    assert [item[0] for item in calls] == ["github", "hub", "hub"]

@@ -10,6 +10,7 @@ import collections.abc as c
 import dataclasses
 import gc
 import importlib
+import itertools
 import json
 import os
 import shutil
@@ -34,13 +35,11 @@ from hviske.p1_contracts import (
     SegmentationContract,
     SourceCoordinates,
     SourceProgramme,
-    SourceWord,
     VADContract,
     pipeline_config_sha256,
 )
 from hviske.p1_ledger import Ledger
 from hviske.p1_segments import CTCBackend, VADBackend, segment_programme, write_shards
-from hviske.p1_source import SourceShard
 
 
 @dataclass(frozen=True)
@@ -58,6 +57,8 @@ class PipelineSettings:
     queue_slots: int
     upload_concurrency: int
     verification_concurrency: int
+    source_max_batch_rows: int
+    source_max_batch_bytes: int
     programme_limit: int | None
     source_file_id: str | None
     resume: bool
@@ -71,6 +72,9 @@ class PipelineSettings:
     ctc_model_revision: str
     anomaly_model_repository: str
     anomaly_model_revision: str
+    vad_model_path: str
+    vad_model_blob: str
+    vad_model_sha256: str
     model_revisions: dict[str, object]
     segmentation: SegmentationContract
     normalisation: NormalisationContract
@@ -147,6 +151,10 @@ class PipelineSettings:
             verification_concurrency=_as_int(
                 runtime.get("verification_concurrency", 1)
             ),
+            source_max_batch_rows=_as_int(runtime.get("source_max_batch_rows", 1)),
+            source_max_batch_bytes=_as_int(
+                runtime.get("source_max_batch_bytes", 64 * 1024 * 1024)
+            ),
             programme_limit=_optional_int(root.get("programme_limit")),
             source_file_id=_optional_str(root.get("source_file_id")),
             resume=bool(root.get("resume", True)),
@@ -164,8 +172,16 @@ class PipelineSettings:
             anomaly_model_revision=str(
                 t.cast(dict[str, object], anomaly_raw["repository"])["revision"]
             ),
+            vad_model_path=str(vad_raw["model_path"]),
+            vad_model_blob=str(vad_raw["model_blob"]),
+            vad_model_sha256=str(vad_raw["model_sha256"]),
             model_revisions={
-                "vad": vad_repo,
+                "vad": {
+                    **vad_repo,
+                    "model_path": str(vad_raw["model_path"]),
+                    "model_blob": str(vad_raw["model_blob"]),
+                    "model_sha256": str(vad_raw["model_sha256"]),
+                },
                 "ctc": ctc_repo,
                 "anomaly": anomaly_raw["repository"],
             },
@@ -269,14 +285,14 @@ def run_pipeline(
     vad: VADBackend | None = None,
     ctc: CTCBackend | None = None,
 ) -> BuildReport:
-    """Execute the P1 pipeline, using metadata-only planning when available.
-
-    The production source exposes ``plan``.  Keeping the small legacy dispatch is
-    intentional: it preserves the injectable API used by older offline tests while
-    all real Hub work follows the disk-backed pointer path below.
+    """Execute the P1 pipeline through the native P1 source contract.
 
     Returns:
         Metadata-only or completed build evidence.
+
+    Raises:
+        TypeError:
+            If the source does not expose the native planning API.
     """
     settings = PipelineSettings.from_config(config)
     if settings.mode == "initialise":
@@ -292,15 +308,11 @@ def run_pipeline(
             audio_repository=settings.source_audio_repository,
             transcript_repository=settings.source_transcript_repository,
             max_source_object_bytes=settings.max_source_bytes,
+            max_batch_rows=settings.source_max_batch_rows,
+            max_batch_bytes=settings.source_max_batch_bytes,
         )
     if not hasattr(source, "plan"):
-        return _run_legacy_pipeline(
-            config=config,
-            source=t.cast(SourceAdapter, source),
-            hub=hub,
-            vad=vad,
-            ctc=ctc,
-        )
+        raise TypeError("source must expose the p1_source planning API")
     return _run_native_pipeline(config=config, source=source, hub=hub, vad=vad, ctc=ctc)
 
 
@@ -451,6 +463,105 @@ def target_privacy(hub: object | None, repo_id: str) -> dict[str, object]:
     }
 
 
+def _run_native_pipeline(
+    *,
+    config: DictConfig,
+    source: object,
+    hub: object | None,
+    vad: VADBackend | None,
+    ctc: CTCBackend | None,
+) -> BuildReport:
+    """Run a production-shaped source with no in-memory corpus materialisation.
+
+    Returns:
+        Metadata-only or completed build evidence.
+
+    Raises:
+        ValueError:
+            If the mode or worker configuration is unsafe.
+    """
+    settings = PipelineSettings.from_config(config)
+    if settings.mode not in {"plan", "pilot", "production", "build", "initialise"}:
+        raise ValueError("mode must be plan, pilot, production, build, or initialise")
+    if settings.mode == "pilot" and settings.programme_limit is None:
+        raise ValueError("pilot mode requires programme_limit")
+    if settings.workers != 1:
+        raise ValueError("P1 permits exactly one programme worker")
+    scratch = configure_scratch(settings.scratch_root)
+    log = MetadataLog(scratch / "p1-events.jsonl")
+    from hviske.p1_source import SourcePlan
+
+    plan = t.cast(
+        SourcePlan,
+        source.plan(
+            audio_revision=settings.source_audio_revision,
+            transcript_revision=settings.source_transcript_revision,
+        ),
+    )
+    shards = tuple(sorted(plan.audio_shards, key=lambda item: item.path))
+    maximum_source_bytes = max((item.byte_size for item in shards), default=0)
+    if settings.mode != "plan" and hub is None:
+        hub = make_hub()
+    preflight = preflight_pipeline(
+        settings=settings,
+        source=source,
+        hub=hub,
+        shards=shards,
+        selected_programmes=0,
+        maximum_source_bytes=maximum_source_bytes,
+    )
+    log.write({"event": "preflight", **preflight.as_dict()})
+    report = BuildReport(preflight=preflight, selected_file_ids=(), rejection_counts={})
+    if settings.mode == "plan":
+        return report
+    if settings.mode == "initialise":
+        initialise_target(hub=hub, settings=settings)
+        return report
+
+    index_path = scratch / "transcript-pointers.sqlite"
+    index_builder = getattr(source, "build_transcript_index")
+    index = index_builder(
+        revision=settings.source_transcript_revision,
+        path=index_path,
+        objects=plan.transcript_objects,
+    )
+    candidates = _native_candidates(
+        source=source,
+        shards=shards,
+        index=index,
+        programme_limit=settings.programme_limit,
+        source_file_id=settings.source_file_id,
+        pilot=settings.mode == "pilot",
+        log=log,
+    )
+    if isinstance(candidates, list):
+        report.selected_file_ids = tuple(item[0] for item in candidates)
+        report.preflight = dataclasses.replace(
+            report.preflight, selected_programmes=len(candidates)
+        )
+    if vad is None:
+        vad = make_silero_vad(settings)
+    if ctc is None:
+        ctc = make_ctc_backend(settings)
+    ledger_path = scratch / "ledger.sqlite"
+    with Ledger(ledger_path) as ledger:
+        _recover_native_batches(
+            source=source, settings=settings, ledger=ledger, hub=hub
+        )
+        _process_native_programmes(
+            source=source,
+            settings=settings,
+            candidates=candidates,
+            ledger=ledger,
+            hub=hub,
+            vad=vad,
+            ctc=ctc,
+            report=report,
+            log=log,
+        )
+    return report
+
+
 class MetadataLog:
     """Append-only metadata JSONL log that refuses payload-bearing values."""
 
@@ -476,193 +587,84 @@ class MetadataLog:
             os.fsync(stream.fileno())
 
 
-@dataclass(frozen=True)
-class IndexRejection:
-    """A metadata-only transcript-index rejection."""
-
-    reason: str
-    file_id: str | None
-
-
-@dataclass(frozen=True)
-class TranscriptRecord:
-    """One indexed transcript retained only for the current bounded run."""
-
-    file_id: str
-    row: dict[str, object]
-
-
-@dataclass(frozen=True)
-class TranscriptIndex:
-    """Deterministic file-id index and its metadata-only rejection evidence."""
-
-    records: dict[str, TranscriptRecord]
-    rejections: tuple[IndexRejection, ...]
-
-
-class SourceAdapter(t.Protocol):
-    """Metadata and bounded-audio interface used by the pipeline."""
-
-    def iter_programmes(
-        self, *, shard: SourceShard, index: TranscriptIndex
-    ) -> c.Iterable[object]:
-        """Yield joined programme metadata for one source shard."""
-
-    def iter_transcripts(self, *, revision: str) -> c.Iterable[object]:
-        """Yield transcript rows without decoding audio."""
-
-    def list_audio_shards(self, *, revision: str) -> c.Iterable[object]:
-        """Return source object metadata."""
-
-    def retrieve_audio(self, *, programme: object, shard: SourceShard) -> object:
-        """Retrieve exactly one programme's audio."""
-
-
-def _run_legacy_pipeline(
+def _native_candidates(
     *,
-    config: DictConfig,
-    source: SourceAdapter | None = None,
-    hub: object | None = None,
-    vad: VADBackend | None = None,
-    ctc: CTCBackend | None = None,
-) -> BuildReport:
-    """Execute one restartable P1 run.
+    source: object,
+    shards: c.Sequence[object],
+    index: object,
+    programme_limit: int | None,
+    source_file_id: str | None,
+    pilot: bool,
+    log: MetadataLog,
+) -> c.Iterable[tuple[str, object, object]]:
+    """Select source pointers with a bounded, multi-axis pilot reservoir.
 
-    All source and transcript discovery is completed before a build can retrieve audio.
-    The default adapters are lazy, allowing tests and plan runs to use fakes without
-    importing or downloading any model.
-
-    Returns:
-        Bounded counters and preflight evidence.
-
-    Raises:
-        ValueError:
-            If ``mode`` is not a supported pipeline mode.
-    """
-    settings = PipelineSettings.from_config(config)
-    if settings.mode not in {"plan", "pilot", "production", "build"}:
-        raise ValueError("mode must be plan, pilot, production, or build")
-    if settings.mode == "pilot" and settings.programme_limit is None:
-        raise ValueError("pilot mode requires programme_limit")
-    if settings.workers != 1:
-        raise ValueError("P1 permits exactly one programme worker")
-    if settings.queue_slots < 1:
-        raise ValueError("queue_slots must be positive")
-    scratch = configure_scratch(settings.scratch_root)
-    log = MetadataLog(scratch / "p1-events.jsonl")
-    default_source = source is None
-    if source is None:
-        from hviske.p1_source import HfP1Source
-
-        source = t.cast(
-            SourceAdapter,
-            HfP1Source(
-                audio_repository=settings.source_audio_repository,
-                transcript_repository=settings.source_transcript_repository,
-                max_source_object_bytes=settings.max_source_bytes,
-            ),
-        )
-    if hub is None and (settings.mode != "plan" or default_source):
-        hub = make_hub()
-    shards = sorted_source_shards(source, settings.source_audio_revision)
-    index = build_transcript_index(
-        source.iter_transcripts(revision=settings.source_transcript_revision), log=log
-    )
-    programmes = list(
-        iter_selected_programmes(
-            source=source,
-            shards=shards,
-            index=index,
-            programme_limit=settings.programme_limit,
-            source_file_id=settings.source_file_id,
-            log=log,
-        )
-    )
-    maximum_source_bytes = max((item[2].byte_size for item in programmes), default=0)
-    preflight = preflight_pipeline(
-        settings=settings,
-        source=source,
-        hub=hub,
-        shards=shards,
-        selected_programmes=len(programmes),
-        maximum_source_bytes=maximum_source_bytes,
-    )
-    log.write({"event": "preflight", **preflight.as_dict()})
-    index_rejection_counts: dict[str, int] = {}
-    for rejection in index.rejections:
-        index_rejection_counts[rejection.reason] = (
-            index_rejection_counts.get(rejection.reason, 0) + 1
-        )
-    report = BuildReport(
-        preflight=preflight,
-        selected_file_ids=tuple(item[0] for item in programmes),
-        rejected=len(index.rejections),
-        rejection_counts=index_rejection_counts,
-    )
-    if settings.mode == "plan":
-        return report
-
-    if vad is None:
-        vad = make_silero_vad(settings)
-    if ctc is None:
-        ctc = make_ctc_backend(settings)
-    ledger_path = scratch / "ledger.sqlite"
-    with Ledger(ledger_path) as ledger:
-        initialise_target(hub=hub, settings=settings)
-        process_programmes(
-            source=source,
-            settings=settings,
-            programmes=programmes,
-            ledger=ledger,
-            hub=hub,
-            vad=vad,
-            ctc=ctc,
-            report=report,
-            log=log,
-        )
-    return report
-
-
-def build_transcript_index(
-    rows: c.Iterable[object], *, log: MetadataLog | None = None
-) -> TranscriptIndex:
-    """Index authenticated transcript metadata.
+    Metadata is projected by the source adapter.  Pilot mode makes two metadata-only
+    passes: the first selects required strata through the shared validation sampler,
+    and the second resolves only those identifiers to source pointers.  No corpus-sized
+    object or Parquet row is retained.
 
     Returns:
-        A file-id index and metadata-only rejection evidence.
+        A bounded list or a streaming iterator of source pointers.
     """
-    records: dict[str, TranscriptRecord] = {}
-    seen_keys: set[str] = set()
-    rejections: list[IndexRejection] = []
-    for raw in rows:
-        row = as_mapping(raw)
-        raw_id = row.get("file_id")
-        file_id = raw_id if isinstance(raw_id, str) and raw_id.strip() else None
-        text = row.get("transcript_text")
-        duplicate = file_id is not None and file_id in seen_keys
-        if file_id is not None:
-            seen_keys.add(file_id)
-        if file_id is None:
-            rejection = IndexRejection("null_file_id", None)
-        elif duplicate:
-            rejection = IndexRejection("duplicate_file_id", file_id)
-        elif file_id in records:
-            rejection = IndexRejection("duplicate_file_id", file_id)
-        elif not isinstance(text, str) or not text.strip():
-            rejection = IndexRejection("empty_text", file_id)
-        else:
-            records[file_id] = TranscriptRecord(file_id=file_id, row=row)
-            continue
-        rejections.append(rejection)
-        if log is not None:
-            log.write(
-                {
-                    "event": "transcript_rejection",
-                    "reason": rejection.reason,
-                    "source_file_id": rejection.file_id,
+
+    def stream() -> c.Iterator[tuple[str, object, object]]:
+        seen: set[str] = set()
+        metadata_iterator = getattr(source, "iter_programme_metadata")
+        for shard in shards:
+            for raw in metadata_iterator(shard=shard):
+                row = as_mapping(raw)
+                file_id = row.get("file_id")
+                if not isinstance(file_id, str) or not file_id or file_id in seen:
+                    continue
+                if source_file_id is not None and file_id != source_file_id:
+                    continue
+                pointer = getattr(index, "get")(file_id)
+                if pointer is None:
+                    log.write(
+                        {
+                            "event": "programme_rejection",
+                            "source_file_id": file_id,
+                            "reason": "missing_transcript",
+                        }
+                    )
+                    continue
+                seen.add(file_id)
+                safe = {
+                    key: value
+                    for key, value in row.items()
+                    if key.casefold()
+                    not in {
+                        "audio",
+                        "text",
+                        "transcript",
+                        "transcript_text",
+                        "words",
+                        "word_timestamps",
+                        "timestamps",
+                    }
+                    and isinstance(value, (str, int, float, bool, type(None)))
                 }
-            )
-    return TranscriptIndex(records=records, rejections=tuple(rejections))
+                safe["id"] = file_id
+                yield file_id, safe, (shard, pointer)
+
+    if programme_limit is None:
+        return stream()
+    if not pilot:
+        return list(itertools.islice(stream(), programme_limit))
+    from hviske.p1_validation import stratified_sample
+
+    def metadata_rows() -> c.Iterator[Mapping[str, object]]:
+        for candidate in stream():
+            yield t.cast(Mapping[str, object], candidate[1])
+
+    selected_rows = stratified_sample(
+        metadata_rows(), sample_size=programme_limit, seed="p1-pilot"
+    )
+    selected_ids = {str(row["id"]) for row in selected_rows}
+    selected = [candidate for candidate in stream() if candidate[0] in selected_ids]
+    selected.sort(key=lambda item: item[0])
+    return selected
 
 
 def as_mapping(value: object) -> dict[str, object]:
@@ -682,6 +684,471 @@ def as_mapping(value: object) -> dict[str, object]:
                 result[key] = item
         return result
     raise TypeError("source rows must be mappings")
+
+
+def _process_native_programmes(
+    *,
+    source: object,
+    settings: PipelineSettings,
+    candidates: c.Iterable[tuple[str, object, object]],
+    ledger: Ledger,
+    hub: object,
+    vad: VADBackend,
+    ctc: CTCBackend,
+    report: BuildReport,
+    log: MetadataLog,
+) -> None:
+    """Retrieve, segment, and publish one selected programme at a time.
+
+    Raises:
+        ValueError:
+            If a selected programme produces no shard or has invalid state.
+    """
+    from hviske.p1_ledger import ShardAllocation
+
+    for file_id, metadata, locator in candidates:
+        report.max_in_flight = max(report.max_in_flight, 1)
+        shard, transcript_pointer = t.cast(tuple[object, object], locator)
+        programme_id = f"p1-{file_id}"
+        ledger.discover_programme(
+            programme_id,
+            source_file_id=file_id,
+            source_revisions={
+                "audio": {
+                    "repository": settings.source_audio_repository,
+                    "revision": settings.source_audio_revision,
+                },
+                "transcripts": {
+                    "repository": settings.source_transcript_repository,
+                    "revision": settings.source_transcript_revision,
+                },
+            },
+            pipeline_digest=settings.pipeline_digest,
+            source_duration_ms=_as_int(as_mapping(metadata).get("duration_ms", 1)),
+        )
+        state = ledger.programme(programme_id).state.value
+        if settings.resume and state in {"purged", "verified", "sharded"}:
+            continue
+        try:
+            started = time.monotonic()
+            enforce_scratch_cap(settings)
+            ledger.start_processing(programme_id)
+            transcript = source.fetch_transcript(transcript_pointer)
+            enforce_scratch_cap(settings)
+            duration = _as_int(as_mapping(metadata).get("duration_ms", 0))
+            if duration <= 0:
+                duration = max((word.end_ms for word in transcript.words), default=0)
+            programme = SourceProgramme(
+                file_id=file_id,
+                duration_ms=duration,
+                words=tuple(transcript.words),
+                transcript_text=transcript.text,
+            )
+            audio_pointer = next(
+                item
+                for item in source.iter_programme_pointers(shard=shard)
+                if item.file_id == file_id
+            )
+            parsed_audio = source.fetch_audio(pointer=audio_pointer)
+            enforce_scratch_cap(settings)
+            audio = _decoded_native_audio(parsed_audio, file_id=file_id)
+            result = segment_programme(
+                words=programme.words,
+                audio=audio,
+                source_file_id=file_id,
+                source_duration_ms=programme.duration_ms,
+                segmentation=settings.segmentation,
+                normalisation=settings.normalisation,
+                ctc=ctc,
+                pipeline_version=settings.pipeline_version,
+                pipeline_config_sha256=settings.pipeline_digest,
+                vad=vad,
+                sampling_rate=parsed_audio.sampling_rate,
+                channels=parsed_audio.channels,
+            )
+            report.accepted_segments += len(result.rows)
+            report.rejected += len(result.rejections)
+            for _, reason in result.rejections:
+                report.rejection_counts[reason] = (
+                    report.rejection_counts.get(reason, 0) + 1
+                )
+            output = settings.scratch_root / "staging" / file_id
+            written = write_shards(
+                result.rows, output_dir=output, target_bytes=settings.target_shard_bytes
+            )
+            enforce_scratch_cap(settings)
+            if not written.shards:
+                raise ValueError("programme produced no publication shard")
+            allocations = tuple(
+                ShardAllocation(
+                    local_path=item.path,
+                    remote_path=f"data/train/{programme_id}-{ordinal:05d}.parquet",
+                    sha256=item.evidence.sha256,
+                    byte_size=item.evidence.byte_size,
+                    row_count=item.evidence.row_count,
+                )
+                for ordinal, item in enumerate(written.shards)
+            )
+            batch, shard_records = ledger.allocate_batch_with_shards(
+                programme_id,
+                allocations,
+                accepted_count=len(result.rows),
+                rejected_count=len(result.rejections),
+                processed_duration_ms=int((time.monotonic() - started) * 1000),
+                rejection_counts={
+                    reason: sum(1 for _, value in result.rejections if value == reason)
+                    for _, reason in result.rejections
+                },
+            )
+            report.shard_count += len(shard_records)
+            purge_source_temporary(getattr(source, "last_temporary", None))
+            ledger.mark_source_temps_purged(programme_id, evidence={"deleted": True})
+            _publish_native_pending(
+                hub=hub,
+                settings=settings,
+                ledger=ledger,
+                pending=tuple(
+                    _local_shard_from_record(record) for record in shard_records
+                ),
+                pending_ids=tuple(record.shard_id for record in shard_records),
+                batch_id=batch.batch_id,
+                audit_rows=result.rows,
+            )
+            report.processed += 1
+        except Exception as exc:
+            report.rejected += 1
+            report.rejection_counts[RejectionCategory.DECODE_ERROR.value] = (
+                report.rejection_counts.get(RejectionCategory.DECODE_ERROR.value, 0) + 1
+            )
+            current = ledger.programme(programme_id)
+            if current.state.value not in {
+                "sharded",
+                "committed",
+                "verified",
+                "purged",
+            }:
+                ledger.transition_programme(
+                    programme_id, target=_state("retryable"), last_error=str(exc)[:500]
+                )
+            log.write(
+                {
+                    "event": "programme_error",
+                    "source_file_id": file_id,
+                    "reason": "decode_error",
+                }
+            )
+        finally:
+            gc.collect()
+        enforce_scratch_cap(settings)
+    enforce_scratch_cap(settings)
+
+
+def _decoded_native_audio(parsed_audio: object, *, file_id: str) -> np.ndarray:
+    """Decode a native source payload through the source contract.
+
+    Returns:
+        A decoded source array; resampling is performed by ``segment_programme``.
+
+    Raises:
+        TypeError:
+            If the source did not return a parsed array payload.
+    """
+    from hviske.p1_source import ParsedAudio, parse_audio_row
+
+    if not isinstance(parsed_audio, ParsedAudio):
+        raise TypeError("native source must return ParsedAudio")
+    value = parsed_audio.value
+    if isinstance(value, (bytes, bytearray)):
+        parsed_audio = parse_audio_row(
+            {
+                "file_id": file_id,
+                "audio": {
+                    "bytes": bytes(value),
+                    "sampling_rate": parsed_audio.sampling_rate,
+                    "channels": parsed_audio.channels,
+                },
+            },
+            expected_file_id=file_id,
+        )
+        value = parsed_audio.value
+    if not isinstance(value, np.ndarray):
+        raise TypeError("native source audio must decode to an ndarray")
+    return np.asarray(value, dtype=np.float32)
+
+
+def _local_shard_from_record(record: object) -> object:
+    """Build the publisher's local shard from durable ledger identity.
+
+    Returns:
+        A publisher-compatible local shard.
+
+    Raises:
+        ValueError:
+            If the ledger record has no local path.
+    """
+    from hviske.p1_publish import LocalShard
+
+    local_path = getattr(record, "local_path", None)
+    if local_path is None:
+        raise ValueError("ledger shard has no durable local path")
+    return LocalShard(
+        path=Path(local_path),
+        repo_path=str(getattr(record, "path")),
+        row_count=int(getattr(record, "row_count")),
+    )
+
+
+def _publish_native_pending(
+    *,
+    hub: object,
+    settings: PipelineSettings,
+    ledger: Ledger,
+    pending: c.Sequence[object],
+    pending_ids: c.Sequence[str],
+    batch_id: str,
+    audit_rows: c.Sequence[object] = (),
+) -> None:
+    """Publish a ledger-allocated batch and add locators after immutable commit."""
+    del pending_ids
+    evidence = publish_pending(
+        hub=hub,
+        settings=settings,
+        ledger=ledger,
+        batch_id=batch_id,
+        pending=pending,
+        pending_ids=(),
+    )
+    if audit_rows and evidence.commit_id is not None:
+        _record_audit_candidates(
+            rows=audit_rows,
+            path=settings.scratch_root / "audit-candidates.jsonl",
+            repository=settings.target_private_repo,
+            revision=evidence.commit_id,
+            remote_paths=tuple(record.path for record in ledger.shards(batch_id)),
+            row_counts=tuple(record.row_count for record in ledger.shards(batch_id)),
+        )
+
+
+def _record_audit_candidates(
+    *,
+    rows: c.Sequence[object],
+    path: Path,
+    repository: str,
+    revision: str,
+    remote_paths: tuple[str, ...],
+    row_counts: tuple[int, ...],
+) -> None:
+    """Persist bounded blinded audit metadata with committed row locators."""
+    from hviske.p1_validation import create_blinded_audit_manifest
+
+    candidates: list[dict[str, object]] = []
+    row_index = 0
+    for shard_path, shard_rows in zip(remote_paths, row_counts):
+        for offset, row in enumerate(rows[row_index : row_index + shard_rows]):
+            candidates.append(
+                {
+                    "status": "accepted",
+                    "segment_id": getattr(row, "segment_id"),
+                    "source_file_id": getattr(row, "source_file_id"),
+                    "source_start_ms": getattr(row, "source_start_ms"),
+                    "source_end_ms": getattr(row, "source_end_ms"),
+                    "duration_ms": getattr(row, "duration_ms"),
+                    "repository": repository,
+                    "revision": revision,
+                    "parquet_path": shard_path,
+                    "row_locator": offset,
+                }
+            )
+            row_index += 1
+    if not candidates:
+        return
+    selected = create_blinded_audit_manifest(
+        candidates, accepted_quota=min(200, len(candidates)), seed="p1"
+    )
+    with path.open("a", encoding="utf-8") as stream:
+        for candidate in selected:
+            stream.write(json.dumps(candidate, sort_keys=True) + "\\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def publish_pending(
+    *,
+    hub: object,
+    settings: PipelineSettings,
+    ledger: Ledger,
+    batch_id: str,
+    pending: c.Sequence[object],
+    pending_ids: c.Sequence[str],
+) -> object:
+    """Publish a complete ledger batch through the shared verified publisher.
+
+    Returns:
+        Verified publication evidence.
+
+    Raises:
+        ValueError:
+            If the batch has no local shards.
+    """
+    from hviske.p1_publish import HubClient, LocalShard, publish_batch
+
+    shards = t.cast(c.Sequence[LocalShard], pending)
+    if not shards:
+        raise ValueError("publication batch has no local shards")
+    try:
+        record = ledger.batch(batch_id)
+    except KeyError:
+        record = ledger.register_batch(
+            batch_id, pipeline_digest=settings.pipeline_digest
+        )
+        ledger.transition_batch(batch_id, _state("processing"))
+        for shard_id in pending_ids:
+            ledger.attach_shard(batch_id, shard_id)
+        ledger.transition_batch(batch_id, _state("sharded"))
+        record = ledger.batch(batch_id)
+    programme_ids = tuple(
+        sorted(
+            {
+                item.programme_id
+                for item in ledger.shards(batch_id)
+                if item.programme_id is not None
+            }
+        )
+    )
+
+    def purge(paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
+
+    evidence = publish_batch(
+        t.cast(HubClient, hub),
+        settings.target_private_repo,
+        batch_id,
+        shards,
+        programme_count=record.programme_count,
+        rejection_counts={
+            RejectionCategory(key): value
+            for key, value in record.rejection_counts.items()
+        },
+        staging_dir=Path(shards[0].path).parent,
+        ledger=ledger,
+        purge_callback=purge,
+    )
+    for programme_id in programme_ids:
+        programme = ledger.programme(programme_id)
+        if programme.state is _state("sharded"):
+            ledger.transition_programme(
+                programme_id, _state("committed"), commit_id=evidence.commit_id
+            )
+            ledger.transition_programme(programme_id, _state("verified"))
+        if ledger.batch(batch_id).state is _state("purged"):
+            for shard in ledger.shards(batch_id):
+                if shard.state is _state("verified"):
+                    ledger.transition_shard(shard.shard_id, _state("purged"))
+            if ledger.programme(programme_id).state is _state("verified"):
+                ledger.transition_programme(programme_id, _state("purged"))
+    return evidence
+
+
+def _state(value: str) -> LedgerState:
+    """Resolve a ledger state while keeping transition calls concise.
+
+    Returns:
+        The corresponding ledger state.
+    """
+    return LedgerState(value)
+
+
+def enforce_scratch_cap(settings: PipelineSettings) -> None:
+    """Reject a run that exceeds its hard scratch quota.
+
+    Raises:
+        P1PreflightError:
+            If regular files exceed the configured quota.
+    """
+    if directory_size(settings.scratch_root) > settings.max_scratch_bytes:
+        raise P1PreflightError("scratch hard cap exceeded")
+
+
+class P1PreflightError(RuntimeError):
+    """Raised when a safety gate fails before source audio retrieval."""
+
+
+def purge_source_temporary(value: object) -> None:
+    """Delete only a source adapter's explicitly owned temporary path."""
+    if isinstance(value, (str, Path)):
+        path = Path(value)
+        if path.is_file() and not path.is_symlink():
+            path.unlink()
+
+
+def _recover_native_batches(
+    *, source: object, settings: PipelineSettings, ledger: Ledger, hub: object
+) -> None:
+    """Reconcile every durable local and remote item after a restart.
+
+    Recovery uses only the exact local path persisted by the atomic allocation.  A
+    basename or a count of files is never evidence of identity.  Remote verification
+    remains mandatory even when all local files are present.
+    """
+    del source
+    from hviske.p1_publish import HubClient, verify_batch
+
+    unattached, _ = ledger.recovery_work()
+    for record in unattached:
+        local_path = getattr(record, "local_path", None)
+        if local_path is not None:
+            ledger.reconcile_local_shard(record.shard_id, Path(local_path))
+
+    for batch, records in ledger.reconstruct_work():
+        paths = tuple(
+            Path(record.local_path)
+            for record in records
+            if record.local_path is not None
+            and ledger.reconcile_local_shard(record.shard_id, Path(record.local_path))
+        )
+        if (
+            batch.commit_id is None
+            and batch.state is _state("sharded")
+            and records
+            and len(paths) == len(records)
+        ):
+            _publish_native_pending(
+                hub=hub,
+                settings=settings,
+                ledger=ledger,
+                pending=tuple(_local_shard_from_record(record) for record in records),
+                pending_ids=tuple(record.shard_id for record in records),
+                batch_id=batch.batch_id,
+            )
+            continue
+        if batch.commit_id is None:
+            continue
+        verify_batch(
+            t.cast(HubClient, hub),
+            settings.target_private_repo,
+            batch.batch_id,
+            ledger=ledger,
+            manifest_path=(paths[0].parent / "batch-manifest.json" if paths else None),
+            purge_callback=_unlink_recovered if len(paths) == len(records) else None,
+            local_paths=paths,
+        )
+        recovered_batch = ledger.batch(batch.batch_id)
+        for programme_id in {
+            record.programme_id for record in records if record.programme_id is not None
+        }:
+            programme = ledger.programme(programme_id)
+            if programme.state is _state("sharded"):
+                ledger.transition_programme(
+                    programme_id, _state("committed"), commit_id=batch.commit_id
+                )
+                ledger.transition_programme(programme_id, _state("verified"))
+            if recovered_batch.state is _state("purged"):
+                for shard in ledger.shards(batch.batch_id):
+                    if shard.state is _state("verified"):
+                        ledger.transition_shard(shard.shard_id, _state("purged"))
+                ledger.transition_programme(programme_id, _state("purged"))
 
 
 def configure_scratch(root: Path) -> Path:
@@ -736,93 +1203,6 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
     )
     initialise_private_dataset(
         t.cast(HubClient, hub), settings.target_private_repo, card=card
-    )
-
-
-def iter_selected_programmes(
-    *,
-    source: SourceAdapter,
-    shards: c.Sequence[SourceShard],
-    index: TranscriptIndex,
-    programme_limit: int | None,
-    source_file_id: str | None,
-    log: MetadataLog | None = None,
-) -> c.Iterator[tuple[str, SourceProgramme, SourceShard]]:
-    """Join metadata in shard/path order with deterministic de-duplication.
-
-    Yields:
-        Joined programmes in the selected deterministic order.
-    """
-    seen: set[str] = set()
-    candidates: list[tuple[str, SourceProgramme, SourceShard]] = []
-    for shard in shards:
-        for raw in source.iter_programmes(shard=shard, index=index):
-            row = as_mapping(raw)
-            file_id = row.get("file_id")
-            if (
-                not isinstance(file_id, str)
-                or file_id not in index.records
-                or file_id in seen
-            ):
-                continue
-            if source_file_id is not None and file_id != source_file_id:
-                continue
-            try:
-                programme = programme_from_row(row, index.records[file_id])
-            except (TypeError, ValueError):
-                if log is not None:
-                    log.write(
-                        {
-                            "event": "programme_rejection",
-                            "source_file_id": file_id,
-                            "reason": "invalid_timestamps",
-                        }
-                    )
-                continue
-            candidates.append((file_id, programme, shard))
-            seen.add(file_id)
-    candidates.sort(key=lambda item: (item[2].path, item[0]))
-    if programme_limit is not None:
-        candidates = candidates[:programme_limit]
-    yield from candidates
-
-
-def programme_from_row(
-    row: dict[str, object], transcript: TranscriptRecord
-) -> SourceProgramme:
-    """Build a validated joined programme from source metadata and transcript words.
-
-    Returns:
-        A validated source programme.
-    """
-    merged = {**transcript.row, **row}
-    duration = merged.get("duration_ms", merged.get("audio_duration_ms"))
-    if duration is None:
-        duration_seconds = merged.get("duration")
-        duration = (
-            float(duration_seconds) * 1000
-            if isinstance(duration_seconds, (int, float))
-            else 0
-        )
-    words = merged.get(
-        "words", merged.get("word_timestamps", merged.get("timestamps", ()))
-    )
-    parsed_words: list[SourceWord] = []
-    for word in t.cast(c.Iterable[object], words or ()):
-        item = as_mapping(word)
-        parsed_words.append(
-            SourceWord(
-                text=str(item.get("text", item.get("word", ""))),
-                start_ms=_as_int(item.get("start_ms", item.get("start", 0))),
-                end_ms=_as_int(item.get("end_ms", item.get("end", 0))),
-                speaker_id=_optional_str(item.get("speaker_id", item.get("speaker"))),
-            )
-        )
-    return SourceProgramme(
-        file_id=transcript.file_id,
-        duration_ms=_as_int(duration),
-        words=tuple(parsed_words),
-        transcript_text=str(merged.get("transcript_text", "")),
     )
 
 
@@ -898,14 +1278,8 @@ def preflight_pipeline(
             "revision": settings.source_transcript_revision,
         },
     }
-    # ``HfP1Source.plan`` already resolves both revisions using repository/tree
-    # metadata.  Calling its compatibility checker here would repeat the network
-    # request (and local mirrors have no Hub client at all).
-    source_revision_ok = (
-        True
-        if hasattr(source, "plan")
-        else check_source_revisions(source, source_revisions)
-    )
+    # The source plan has already resolved both immutable repository revisions.
+    source_revision_ok = True
     model_revision_ok = check_model_revisions(source, settings.model_revisions)
     required = calculate_scratch_requirement(
         settings=settings,
@@ -957,858 +1331,38 @@ def preflight_pipeline(
     )
 
 
-class P1PreflightError(RuntimeError):
-    """Raised when a safety gate fails before source audio retrieval."""
-
-
 def check_model_revisions(source: object, revisions: dict[str, object]) -> bool:
-    """Validate pinned model coordinates without loading model weights.
+    """Verify every pinned model without loading model weights.
+
+    The VAD is a GitHub asset, while the CTC and anomaly models are Hub models.  A
+    real source supplies the authenticated Hub API used for both model checks.  Small
+    offline fakes intentionally opt out by not exposing a client.
 
     Returns:
-        Whether the source adapter confirmed all model revisions.
+        ``True`` when all pinned coordinates have been verified.
     """
-    checker = getattr(source, "check_model_revisions", None)
-    if checker is not None:
-        return bool(checker(revisions=revisions))
     if getattr(source, "local_root", None) is not None:
         return True
     client_getter = getattr(source, "_client", None)
     if client_getter is None:
-        return True
+        checker = getattr(source, "check_model_revisions", None)
+        return True if checker is None else bool(checker(revisions=revisions))
+    from hviske.p1_models import verify_hub_model_revision, verify_silero_vad_revision
+
     api = client_getter()
-    for coordinate in revisions.values():
-        item = t.cast(dict[str, object], coordinate)
-        api.repo_info(item["repository"], repo_type="model", revision=item["revision"])
+    vad = t.cast(dict[str, object], revisions["vad"])
+    verify_silero_vad_revision(
+        repository=str(vad["repository"]),
+        revision=str(vad["revision"]),
+        model_path=str(vad.get("model_path")),
+        expected_blob=str(vad.get("model_blob")),
+        expected_sha256=str(vad.get("model_sha256")),
+    )
+    for name in ("ctc", "anomaly"):
+        coordinate = t.cast(dict[str, object], revisions[name])
+        verify_hub_model_revision(
+            repository=str(coordinate["repository"]),
+            revision=str(coordinate["revision"]),
+            api=api,
+        )
     return True
-
-
-def check_source_revisions(source: object, revisions: dict[str, object]) -> bool:
-    """Ask an adapter to validate immutable coordinates without reading payloads.
-
-    Returns:
-        Whether all source revisions are available.
-    """
-    checker = getattr(source, "check_revisions", None)
-    if checker is None:
-        return True
-    try:
-        return bool(checker(revisions=revisions))
-    except TypeError:
-        audio = t.cast(dict[str, object], revisions["audio"])
-        transcripts = t.cast(dict[str, object], revisions["transcripts"])
-        return bool(
-            checker(
-                audio_revision=str(audio["revision"]),
-                transcript_revision=str(transcripts["revision"]),
-            )
-        )
-
-
-def process_programmes(
-    *,
-    source: SourceAdapter,
-    settings: PipelineSettings,
-    programmes: c.Sequence[tuple[str, SourceProgramme, SourceShard]],
-    ledger: Ledger,
-    hub: object,
-    vad: VADBackend,
-    ctc: CTCBackend,
-    report: BuildReport,
-    log: MetadataLog,
-) -> None:
-    """Process one programme at a time and publish bounded shard batches."""
-    from hviske.p1_publish import LocalShard
-
-    pending: list[LocalShard] = []
-    pending_ids: list[str] = []
-    for file_id, programme, shard in programmes:
-        report.max_in_flight = max(report.max_in_flight, 1)
-        programme_id = f"p1-{file_id}"
-        ledger.discover_programme(
-            programme_id,
-            source_file_id=file_id,
-            source_revisions={
-                "audio": {
-                    "repository": settings.source_audio_repository,
-                    "revision": settings.source_audio_revision,
-                },
-                "transcripts": {
-                    "repository": settings.source_transcript_repository,
-                    "revision": settings.source_transcript_revision,
-                },
-            },
-            pipeline_digest=settings.pipeline_digest,
-            source_duration_ms=programme.duration_ms,
-        )
-        state = ledger.programme(programme_id).state.value
-        if settings.resume and state in {"purged", "verified"}:
-            continue
-        ledger.start_processing(programme_id)
-        started = time.monotonic()
-        source_audio: object | None = None
-        try:
-            source_audio = source.retrieve_audio(programme=programme, shard=shard)
-            audio = decode_source_audio(source_audio)
-            result = segment_programme(
-                words=programme.words,
-                audio=audio,
-                source_file_id=file_id,
-                source_duration_ms=programme.duration_ms,
-                segmentation=settings.segmentation,
-                normalisation=settings.normalisation,
-                ctc=ctc,
-                pipeline_version=settings.pipeline_version,
-                pipeline_config_sha256=settings.pipeline_digest,
-                vad=vad,
-            )
-            report.accepted_segments += len(result.rows)
-            report.rejected += len(result.rejections)
-            for _, reason in result.rejections:
-                report.rejection_counts[reason] = (
-                    report.rejection_counts.get(reason, 0) + 1
-                )
-            out = settings.scratch_root / "staging" / file_id
-            shards_written = write_shards(
-                result.rows, output_dir=out, target_bytes=settings.target_shard_bytes
-            )
-            rejection_counts = {
-                reason: sum(
-                    1 for _, item_reason in result.rejections if item_reason == reason
-                )
-                for _, reason in result.rejections
-            }
-            ledger.transition_programme(
-                programme_id,
-                target=_state("sharded"),
-                evidence={
-                    "accepted_count": len(result.rows),
-                    "rejected_count": len(result.rejections),
-                    "processed_duration_ms": int((time.monotonic() - started) * 1000),
-                    "rejection_counts": rejection_counts,
-                },
-            )
-            # Register every fsynced shard before allowing source deletion. This
-            # leaves enough durable evidence to regenerate a failed upload.
-            for item in shards_written.shards:
-                shard_id = f"{programme_id}-{Path(item.path).stem}"
-                shard_sequence = ledger.allocate_shard_sequence()
-                repo_path = f"data/train/part-{shard_sequence:05d}.parquet"
-                ledger.register_shard(
-                    shard_id,
-                    path=repo_path,
-                    sha256=item.evidence.sha256,
-                    byte_size=item.evidence.byte_size,
-                    row_count=item.evidence.row_count,
-                    programme_id=programme_id,
-                )
-                pending.append(
-                    LocalShard(Path(item.path), repo_path, item.evidence.row_count)
-                )
-                pending_ids.append(shard_id)
-                report.shard_count += 1
-            # No source bytes survive this point: all local shard files are fsynced
-            # and their metadata is already durable in SQLite.
-            purge_source_temporary(source_audio)
-            ledger.mark_source_temps_purged(
-                programme_id, evidence={"deleted": True, "kind": "source-temporary"}
-            )
-            report.processed += 1
-            enforce_scratch_cap(settings)
-        except Exception as exc:
-            report.rejected += 1
-            report.rejection_counts[RejectionCategory.DECODE_ERROR.value] = (
-                report.rejection_counts.get(RejectionCategory.DECODE_ERROR.value, 0) + 1
-            )
-            ledger.transition_programme(
-                programme_id, target=_state("retryable"), last_error=str(exc)[:500]
-            )
-            log.write(
-                {
-                    "event": "programme_error",
-                    "source_file_id": file_id,
-                    "reason": "decode_error",
-                }
-            )
-        finally:
-            del source_audio
-            gc.collect()
-        if len(pending) >= settings.shards_per_commit:
-            publish_pending(
-                hub=hub,
-                settings=settings,
-                ledger=ledger,
-                batch_id=ledger.allocate_batch_id(),
-                pending=pending,
-                pending_ids=pending_ids,
-            )
-            pending, pending_ids = [], []
-            enforce_scratch_cap(settings)
-    if pending:
-        publish_pending(
-            hub=hub,
-            settings=settings,
-            ledger=ledger,
-            batch_id=ledger.allocate_batch_id(),
-            pending=pending,
-            pending_ids=pending_ids,
-        )
-    enforce_scratch_cap(settings)
-
-
-def _state(value: str) -> LedgerState:
-    return LedgerState(value)
-
-
-def decode_source_audio(value: object) -> np.ndarray:
-    """Decode one programme lazily, accepting arrays and production FLAC files.
-
-    Returns:
-        One mono audio array.
-
-    Raises:
-        TypeError:
-            If the adapter returns an unsupported payload.
-    """
-    if isinstance(value, np.ndarray):
-        return value
-    if isinstance(value, (bytes, bytearray)):
-        import io
-
-        import soundfile as sf
-
-        return np.asarray(sf.read(io.BytesIO(bytes(value)), dtype="float32")[0])
-    if isinstance(value, (str, Path)):
-        import soundfile as sf
-
-        return np.asarray(sf.read(str(value), dtype="float32")[0])
-    raise TypeError("audio adapter must return an ndarray, bytes, or path")
-
-
-def enforce_scratch_cap(settings: PipelineSettings) -> None:
-    """Raise when hard-cap monitoring observes an over-quota scratch tree.
-
-    Raises:
-        P1PreflightError:
-            If the configured scratch quota has been exceeded.
-    """
-    used = directory_size(settings.scratch_root)
-    if used > settings.max_scratch_bytes:
-        raise P1PreflightError("scratch hard cap exceeded")
-
-
-def publish_pending(
-    *,
-    hub: object,
-    settings: PipelineSettings,
-    ledger: Ledger,
-    batch_id: str,
-    pending: c.Sequence[object],
-    pending_ids: c.Sequence[str],
-) -> None:
-    """Verify and purge a bounded publication batch through the shared publisher."""
-    from hviske.p1_publish import HubClient, LocalShard, publish_batch
-
-    api = t.cast(HubClient, hub)
-    shards = t.cast(c.Sequence[LocalShard], pending)
-    existing = ledger.register_batch(batch_id, pipeline_digest=settings.pipeline_digest)
-    programme_id_values: list[str] = []
-    for shard_id in pending_ids:
-        programme_id = ledger.shard(shard_id).programme_id
-        if programme_id is not None:
-            programme_id_values.append(programme_id)
-    programme_ids = tuple(sorted(set(programme_id_values)))
-    if existing.state is _state("committed"):
-        present = ledger.reconcile_committed_batch(
-            batch_id,
-            lambda commit_id, paths: remote_paths_present(
-                hub=hub,
-                repo_id=settings.target_private_repo,
-                commit_id=commit_id,
-                paths=paths,
-            ),
-        )
-        if present:
-            ledger.transition_batch(batch_id, _state("verified"))
-            for shard_id in pending_ids:
-                ledger.transition_shard(shard_id, _state("committed"))
-                ledger.transition_shard(shard_id, _state("verified"))
-            purge_publication_files(pending=pending)
-            ledger.purge_batch(
-                batch_id, evidence={"deleted": True, "kind": "publication-artifact"}
-            )
-            for shard_id in pending_ids:
-                ledger.transition_shard(shard_id, _state("purged"))
-            for programme_id in programme_ids:
-                ledger.transition_programme(programme_id, _state("purged"))
-            return
-    if existing.state is not _state("sharded"):
-        ledger.transition_batch(batch_id, _state("processing"))
-        for shard_id in pending_ids:
-            ledger.attach_shard(batch_id, shard_id)
-        ledger.transition_batch(batch_id, _state("sharded"))
-
-    def durable(evidence: object) -> None:
-        commit_id = getattr(evidence, "commit_id")
-        ledger.transition_batch(batch_id, _state("committed"), commit_id=commit_id)
-        ledger.transition_batch(batch_id, _state("verified"))
-        for shard_id in pending_ids:
-            ledger.transition_shard(shard_id, _state("committed"))
-            ledger.transition_shard(shard_id, _state("verified"))
-        for programme_id in programme_ids:
-            ledger.transition_programme(
-                programme_id, _state("committed"), commit_id=commit_id
-            )
-            ledger.transition_programme(programme_id, _state("verified"))
-
-    def purge(paths: tuple[Path, ...]) -> None:
-        for path in paths:
-            if path.exists():
-                path.unlink()
-        ledger.purge_batch(
-            batch_id, evidence={"deleted": True, "kind": "publication-artifact"}
-        )
-        for shard_id in pending_ids:
-            ledger.transition_shard(shard_id, _state("purged"))
-        for programme_id in programme_ids:
-            ledger.transition_programme(programme_id, _state("purged"))
-
-    publish_batch(
-        api,
-        settings.target_private_repo,
-        batch_id,
-        shards,
-        durable_verification=durable,
-        purge_callback=purge,
-        staging_dir=Path(shards[0].path).parent,
-    )
-
-
-def purge_publication_files(*, pending: c.Sequence[object]) -> None:
-    """Remove only local shard files and their generated batch manifests."""
-    parents: set[Path] = set()
-    for item in pending:
-        path = getattr(item, "path")
-        if isinstance(path, Path):
-            if path.is_file() and not path.is_symlink():
-                path.unlink()
-            parents.add(path.parent)
-    for parent in parents:
-        manifest = parent / "batch-manifest.json"
-        if manifest.is_file() and not manifest.is_symlink():
-            manifest.unlink()
-
-
-def remote_paths_present(
-    *, hub: object, repo_id: str, commit_id: str, paths: tuple[str, ...]
-) -> bool:
-    """Check all committed shard paths before retrying an interrupted upload.
-
-    Returns:
-        True only when every publication path is present at the immutable commit.
-    """
-    getter = getattr(hub, "get_paths_info")
-    found = tuple(getter(repo_id, list(paths), repo_type="dataset", revision=commit_id))
-    return len(found) == len(paths)
-
-
-def purge_source_temporary(value: object) -> None:
-    """Delete only a source temporary after local shard fsync, never arbitrary paths."""
-    if isinstance(value, Path) and value.is_file() and not value.is_symlink():
-        value.unlink()
-
-
-def sorted_source_shards(
-    source: SourceAdapter, revision: str
-) -> tuple[SourceShard, ...]:
-    """Return source objects in an explicit path order, never in Hub listing order."""
-    result = []
-    for raw in source.list_audio_shards(revision=revision):
-        item = as_mapping(raw)
-        path = item.get("path", item.get("name"))
-        if not isinstance(path, str) or not path:
-            continue
-        size = item.get("size", item.get("byte_size", 0))
-        result.append(
-            SourceShard(
-                path=path,
-                byte_size=_as_int(size),
-                revision=revision,
-                oid=_optional_str(item.get("oid")),
-            )
-        )
-    return tuple(sorted(result, key=lambda item: item.path))
-
-
-def _run_native_pipeline(
-    *,
-    config: DictConfig,
-    source: object,
-    hub: object | None,
-    vad: VADBackend | None,
-    ctc: CTCBackend | None,
-) -> BuildReport:
-    """Run a production-shaped source with no in-memory corpus materialisation.
-
-    Returns:
-        Metadata-only or completed build evidence.
-
-    Raises:
-        ValueError:
-            If the mode or worker configuration is unsafe.
-    """
-    settings = PipelineSettings.from_config(config)
-    if settings.mode not in {"plan", "pilot", "production", "build", "initialise"}:
-        raise ValueError("mode must be plan, pilot, production, build, or initialise")
-    if settings.mode == "pilot" and settings.programme_limit is None:
-        raise ValueError("pilot mode requires programme_limit")
-    if settings.workers != 1:
-        raise ValueError("P1 permits exactly one programme worker")
-    scratch = configure_scratch(settings.scratch_root)
-    log = MetadataLog(scratch / "p1-events.jsonl")
-    from hviske.p1_source import SourcePlan
-
-    plan = t.cast(
-        SourcePlan,
-        source.plan(
-            audio_revision=settings.source_audio_revision,
-            transcript_revision=settings.source_transcript_revision,
-        ),
-    )
-    shards = tuple(sorted(plan.audio_shards, key=lambda item: item.path))
-    maximum_source_bytes = max((item.byte_size for item in shards), default=0)
-    preflight = preflight_pipeline(
-        settings=settings,
-        source=source,
-        hub=hub,
-        shards=shards,
-        selected_programmes=0,
-        maximum_source_bytes=maximum_source_bytes,
-    )
-    log.write({"event": "preflight", **preflight.as_dict()})
-    report = BuildReport(preflight=preflight, selected_file_ids=(), rejection_counts={})
-    if settings.mode == "plan":
-        return report
-    if hub is None:
-        hub = make_hub()
-    if settings.mode == "initialise":
-        initialise_target(hub=hub, settings=settings)
-        return report
-
-    index_path = scratch / "transcript-pointers.sqlite"
-    index_builder = getattr(source, "build_transcript_index")
-    index = index_builder(
-        revision=settings.source_transcript_revision,
-        path=index_path,
-        objects=plan.transcript_objects,
-    )
-    candidates = _native_candidates(
-        source=source,
-        shards=shards,
-        index=index,
-        programme_limit=settings.programme_limit,
-        source_file_id=settings.source_file_id,
-        pilot=settings.mode == "pilot",
-        log=log,
-    )
-    if isinstance(candidates, list):
-        report.selected_file_ids = tuple(item[0] for item in candidates)
-        report.preflight = dataclasses.replace(
-            report.preflight, selected_programmes=len(candidates)
-        )
-    if vad is None:
-        vad = make_silero_vad(settings)
-    if ctc is None:
-        ctc = make_ctc_backend(settings)
-    ledger_path = scratch / "ledger.sqlite"
-    with Ledger(ledger_path) as ledger:
-        _recover_native_batches(
-            source=source, settings=settings, ledger=ledger, hub=hub
-        )
-        _process_native_programmes(
-            source=source,
-            settings=settings,
-            candidates=candidates,
-            ledger=ledger,
-            hub=hub,
-            vad=vad,
-            ctc=ctc,
-            report=report,
-            log=log,
-        )
-    return report
-
-
-def _native_candidates(
-    *,
-    source: object,
-    shards: c.Sequence[object],
-    index: object,
-    programme_limit: int | None,
-    source_file_id: str | None,
-    pilot: bool,
-    log: MetadataLog,
-) -> c.Iterable[tuple[str, object, object]]:
-    """Select metadata pointers, using a stable hash reservoir for pilots.
-
-    Returns:
-        A bounded list for a limited run or a streaming iterator for production.
-    """
-
-    def stream() -> c.Iterator[tuple[str, object, object]]:
-        # Unlimited production runs do not retain a corpus-sized identifier set;
-        # bounded runs keep only a small duplicate window around their reservoir.
-        seen: set[str] = set()
-        seen_limit = 0 if programme_limit is None else max(32, programme_limit * 4)
-        for shard in shards:
-            metadata_iterator = getattr(source, "iter_programme_metadata", None)
-            if metadata_iterator is None:
-                metadata_iterator = getattr(source, "iter_programmes")
-            for raw in metadata_iterator(shard=shard):
-                row = as_mapping(raw)
-                file_id = row.get("file_id")
-                if not isinstance(file_id, str) or not file_id or file_id in seen:
-                    continue
-                if source_file_id is not None and file_id != source_file_id:
-                    continue
-                pointer = getattr(index, "get")(file_id)
-                if pointer is None:
-                    log.write(
-                        {
-                            "event": "programme_rejection",
-                            "source_file_id": file_id,
-                            "reason": "missing_transcript",
-                        }
-                    )
-                    continue
-                safe_metadata = {
-                    key: value
-                    for key, value in row.items()
-                    if key.casefold()
-                    not in {
-                        "audio",
-                        "text",
-                        "transcript",
-                        "transcript_text",
-                        "words",
-                        "word_timestamps",
-                        "timestamps",
-                    }
-                    and isinstance(value, (str, int, float, bool, type(None)))
-                }
-                if seen_limit:
-                    seen.add(file_id)
-                    if len(seen) > seen_limit:
-                        seen.clear()
-                yield file_id, safe_metadata, (shard, pointer)
-
-    if programme_limit is None:
-        return stream()
-    selected: list[tuple[str, object, object]] = []
-    for candidate in stream():
-        selected.append(candidate)
-        if pilot:
-            selected.sort(key=lambda item: _candidate_rank(item[0]))
-            del selected[programme_limit:]
-        elif len(selected) == programme_limit:
-            break
-    selected.sort(key=lambda item: _candidate_rank(item[0]) if pilot else item[0])
-    return selected
-
-
-def _candidate_rank(file_id: str) -> str:
-    """Return a stable pseudo-random rank without retaining source content."""
-    import hashlib
-
-    return hashlib.sha256(f"p1-pilot\\0{file_id}".encode()).hexdigest()
-
-
-def _process_native_programmes(
-    *,
-    source: object,
-    settings: PipelineSettings,
-    candidates: c.Iterable[tuple[str, object, object]],
-    ledger: Ledger,
-    hub: object,
-    vad: VADBackend,
-    ctc: CTCBackend,
-    report: BuildReport,
-    log: MetadataLog,
-) -> None:
-    """Retrieve, segment, and publish one selected programme at a time."""
-    from hviske.p1_publish import LocalShard
-
-    pending: list[LocalShard] = []
-    pending_ids: list[str] = []
-    for file_id, metadata, locator in candidates:
-        report.max_in_flight = max(report.max_in_flight, 1)
-        shard, transcript_pointer = t.cast(tuple[object, object], locator)
-        programme_id = f"p1-{file_id}"
-        ledger.discover_programme(
-            programme_id,
-            source_file_id=file_id,
-            source_revisions={
-                "audio": {
-                    "repository": settings.source_audio_repository,
-                    "revision": settings.source_audio_revision,
-                },
-                "transcripts": {
-                    "repository": settings.source_transcript_repository,
-                    "revision": settings.source_transcript_revision,
-                },
-            },
-            pipeline_digest=settings.pipeline_digest,
-            source_duration_ms=_as_int(as_mapping(metadata).get("duration_ms", 1)),
-        )
-        state = ledger.programme(programme_id).state.value
-        if settings.resume and state in {"purged", "verified", "sharded"}:
-            continue
-        try:
-            enforce_scratch_cap(settings)
-            ledger.start_processing(programme_id)
-            transcript = source.fetch_transcript(transcript_pointer)
-            enforce_scratch_cap(settings)
-            duration = _as_int(as_mapping(metadata).get("duration_ms", 0))
-            if duration <= 0:
-                duration = max((word.end_ms for word in transcript.words), default=0)
-            programme = SourceProgramme(
-                file_id=file_id,
-                duration_ms=duration,
-                words=tuple(transcript.words),
-                transcript_text=transcript.text,
-            )
-            audio_pointer = next(
-                item
-                for item in source.iter_programme_pointers(shard=shard)
-                if item.file_id == file_id
-            )
-            parsed_audio = source.fetch_audio(pointer=audio_pointer)
-            enforce_scratch_cap(settings)
-            result = segment_programme(
-                words=programme.words,
-                audio=np.asarray(parsed_audio.value),
-                source_file_id=file_id,
-                source_duration_ms=programme.duration_ms,
-                segmentation=settings.segmentation,
-                normalisation=settings.normalisation,
-                ctc=ctc,
-                pipeline_version=settings.pipeline_version,
-                pipeline_config_sha256=settings.pipeline_digest,
-                vad=vad,
-                sampling_rate=parsed_audio.sampling_rate,
-            )
-            report.accepted_segments += len(result.rows)
-            report.rejected += len(result.rejections)
-            _record_audit_candidates(
-                rows=result.rows, path=settings.scratch_root / "audit-candidates.jsonl"
-            )
-            for _, reason in result.rejections:
-                report.rejection_counts[reason] = (
-                    report.rejection_counts.get(reason, 0) + 1
-                )
-            output = settings.scratch_root / "staging" / file_id
-            written = write_shards(
-                result.rows, output_dir=output, target_bytes=settings.target_shard_bytes
-            )
-            enforce_scratch_cap(settings)
-            ledger.transition_programme(
-                programme_id,
-                target=_state("sharded"),
-                evidence={
-                    "accepted_count": len(result.rows),
-                    "rejected_count": len(result.rejections),
-                },
-            )
-            for item in written.shards:
-                sequence = ledger.allocate_shard_sequence()
-                shard_id = f"shard-{sequence:08d}"
-                repo_path = f"data/train/part-{sequence:05d}.parquet"
-                ledger.register_shard(
-                    shard_id,
-                    path=repo_path,
-                    sha256=item.evidence.sha256,
-                    byte_size=item.evidence.byte_size,
-                    row_count=item.evidence.row_count,
-                    programme_id=programme_id,
-                )
-                pending.append(
-                    LocalShard(Path(item.path), repo_path, item.evidence.row_count)
-                )
-                pending_ids.append(shard_id)
-                report.shard_count += 1
-            purge_source_temporary(getattr(source, "last_temporary", None))
-            ledger.mark_source_temps_purged(programme_id, evidence={"deleted": True})
-            report.processed += 1
-        except Exception as exc:
-            report.rejected += 1
-            report.rejection_counts[RejectionCategory.DECODE_ERROR.value] = (
-                report.rejection_counts.get(RejectionCategory.DECODE_ERROR.value, 0) + 1
-            )
-            ledger.transition_programme(
-                programme_id, target=_state("retryable"), last_error=str(exc)[:500]
-            )
-            log.write(
-                {
-                    "event": "programme_error",
-                    "source_file_id": file_id,
-                    "reason": "decode_error",
-                }
-            )
-        finally:
-            gc.collect()
-        if len(pending) >= settings.shards_per_commit:
-            _publish_native_pending(
-                hub=hub,
-                settings=settings,
-                ledger=ledger,
-                pending=pending,
-                pending_ids=pending_ids,
-            )
-            pending, pending_ids = [], []
-        enforce_scratch_cap(settings)
-    if pending:
-        _publish_native_pending(
-            hub=hub,
-            settings=settings,
-            ledger=ledger,
-            pending=pending,
-            pending_ids=pending_ids,
-        )
-    enforce_scratch_cap(settings)
-
-
-def _publish_native_pending(
-    *,
-    hub: object,
-    settings: PipelineSettings,
-    ledger: Ledger,
-    pending: c.Sequence[object],
-    pending_ids: c.Sequence[str],
-    batch_id: str | None = None,
-) -> None:
-    """Allocate and publish a complete, bounded pending batch."""
-    if batch_id is None:
-        batch_id = ledger.allocate_batch_id()
-    publish_pending(
-        hub=hub,
-        settings=settings,
-        ledger=ledger,
-        batch_id=batch_id,
-        pending=pending,
-        pending_ids=pending_ids,
-    )
-
-
-def _record_audit_candidates(*, rows: c.Sequence[object], path: Path) -> None:
-    """Persist bounded blinded audit metadata, never training payload fields."""
-    from hviske.p1_validation import build_representative_audit_candidates
-
-    candidates = [
-        {
-            "status": "accepted",
-            "segment_id": getattr(row, "segment_id"),
-            "source_file_id": getattr(row, "source_file_id"),
-            "source_start_ms": getattr(row, "source_start_ms"),
-            "source_end_ms": getattr(row, "source_end_ms"),
-            "duration_ms": getattr(row, "duration_ms"),
-        }
-        for row in rows
-    ]
-    if not candidates:
-        return
-    selected = build_representative_audit_candidates(
-        candidates, accepted_quota=min(200, len(candidates)), seed="p1"
-    )
-    with path.open("a", encoding="utf-8") as stream:
-        for candidate in selected:
-            stream.write(json.dumps(candidate, sort_keys=True) + "\\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-
-
-def _recover_native_batches(
-    *, source: object, settings: PipelineSettings, ledger: Ledger, hub: object
-) -> None:
-    """Verify committed work recorded before a process interruption.
-
-    Local paths are recovered only when their basename and durable digest both match
-    a ledger record.  No arbitrary staging file is eligible for deletion.
-    """
-    del source
-    from hviske.p1_publish import HubClient, LocalShard, verify_batch
-
-    staging = settings.scratch_root / "staging"
-    for batch, records in ledger.reconstruct_work():
-        paths = tuple(
-            path
-            for record in records
-            if (
-                path := _matching_local_shard(
-                    ledger=ledger, record=record, staging=staging
-                )
-            )
-            is not None
-        )
-        if (
-            batch.commit_id is None
-            and batch.state
-            in {_state("discovered"), _state("processing"), _state("sharded")}
-            and records
-            and len(paths) == len(records)
-        ):
-            _publish_native_pending(
-                hub=hub,
-                settings=settings,
-                ledger=ledger,
-                pending=tuple(
-                    LocalShard(path, record.path, record.row_count)
-                    for record, path in zip(records, paths)
-                ),
-                pending_ids=tuple(record.shard_id for record in records),
-                batch_id=batch.batch_id,
-            )
-            continue
-        if batch.commit_id is None or batch.state not in {
-            _state("committed"),
-            _state("verified"),
-        }:
-            continue
-        verify_batch(
-            t.cast(HubClient, hub),
-            settings.target_private_repo,
-            batch.batch_id,
-            ledger=ledger,
-            purge_callback=None if not paths else _unlink_recovered,
-            local_paths=paths,
-        )
-        recovered_batch = ledger.batch(batch.batch_id)
-        for programme_id in {
-            record.programme_id for record in records if record.programme_id is not None
-        }:
-            programme = ledger.programme(programme_id)
-            if programme.state is _state("sharded"):
-                ledger.transition_programme(
-                    programme_id, _state("committed"), commit_id=batch.commit_id
-                )
-                ledger.transition_programme(programme_id, _state("verified"))
-            if recovered_batch.state is _state("purged"):
-                ledger.transition_programme(programme_id, _state("purged"))
-
-
-def _matching_local_shard(
-    *, ledger: Ledger, record: object, staging: Path
-) -> Path | None:
-    """Find one local shard whose bytes match its durable ledger evidence.
-
-    Returns:
-        The matching regular file, or ``None`` when recovery evidence is absent.
-    """
-    shard_id = str(getattr(record, "shard_id"))
-    name = Path(str(getattr(record, "path"))).name
-    return next(
-        (
-            path
-            for path in staging.rglob(name)
-            if ledger.reconcile_local_shard(shard_id, path)
-        ),
-        None,
-    )
