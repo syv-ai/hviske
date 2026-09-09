@@ -1,0 +1,454 @@
+# P1 segmentation and private publication plan
+
+## Goal
+
+Build a private, immutable Danish ASR training dataset from the P1 programme audio
+and full-programme transcripts. The derived examples must be short, accurately
+aligned, and directly streamable by Hviske.
+
+The pipeline must never materialise the complete source or derived corpus on local
+disk or Sparkie. It processes bounded batches, uploads completed Parquet shards,
+verifies the remote bytes, and deletes the local copies.
+
+This dataset is a hard prerequisite for the Olmix benchmark. The current runtime join
+between `syvai/p1` and `syvai/p1-transcripts` is not a training solution because each
+usable transcript covers a complete radio programme while Hviske rejects audio at or
+above 10 seconds.
+
+## Fixed source coordinates
+
+The first implementation must pin these source revisions:
+
+- Audio: `syvai/p1` at
+  `449b9c2294026df6d0d37538f279fdec03f565ff`.
+- Transcripts: `syvai/p1-transcripts` at
+  `41132579816d86e889635f84f30511279f026359`.
+- Join key on both sides: `file_id`.
+- Transcript text: `transcript_text`.
+
+The measured transcript side contains 16,640 unique programme rows. Two rows have no
+usable text and must be recorded as rejected rather than treated as fatal. The usable
+rows include word timestamps and speaker identifiers. Programme durations range from
+120 to 9,060 seconds, with a median of 1,500 seconds.
+
+The source coordinates, alignment backend, model revision, normalisation rules, and
+pipeline version form the reproducibility identity. A change to any of them requires a
+new derived dataset revision and new deterministic segment identifiers.
+
+## Output contract
+
+The proposed target is a private dataset repository named `syvai/p1-segments`. The
+repository must remain private throughout creation, upload, validation, and use.
+
+Each `train` row has these fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `audio` | `Audio(16000)` | Audio feature backed by a mono FLAC payload. |
+| `audio_sha256` | string | Digest of the encoded FLAC payload. |
+| `text` | string | Verbatim segment text before model normalisation. |
+| `alignment_text` | string | Canonical text supplied to the aligner. |
+| `alignment_word_map` | list[string] | Mapping from alignment units to source words. |
+| `language` | string | Always `da`. |
+| `segment_id` | string | Deterministic content and provenance identifier. |
+| `source_file_id` | string | P1 programme join key. |
+| `source_start_ms` | int64 | Final clip start in the source programme. |
+| `source_end_ms` | int64 | Final clip end in the source programme. |
+| `duration_ms` | int32 | Exact decoded clip duration. |
+| `speaker_ids` | list[string] | Speakers represented in the clip. |
+| `proposal_start_ms` | int64 | Start from the supplied word timestamps. |
+| `proposal_end_ms` | int64 | End from the supplied word timestamps. |
+| `alignment_score` | float32 | Backend-specific segment confidence. |
+| `alignment_score_type` | string | Pinned score algorithm and scale. |
+| `start_drift_ms` | int32 | Final start minus proposal start. |
+| `end_drift_ms` | int32 | Final end minus proposal end. |
+| `vad_speech_ratio` | float32 | Fraction of the final clip classified as speech. |
+| `alignment_backend` | string | Pinned aligner and model identity. |
+| `pipeline_version` | string | Human-readable segmentation-contract version. |
+| `pipeline_config_sha256` | string | Digest of the complete identity manifest. |
+
+Do not include credentials, cache paths, machine names, or transient job identifiers.
+Preserve enough provenance to reproduce or audit every segment.
+
+First build a canonical identity manifest containing source and code revisions, VAD and
+aligner code and model revisions, text normalisation, segmentation and quality
+thresholds, output encoding, and schema version. Serialise it with UTF-8, Unicode NFC,
+sorted keys, no insignificant whitespace, JSON escaping, and exact numeric types. Store
+its SHA-256 digest as `pipeline_config_sha256`.
+
+Build `segment_id` from a second canonical JSON object containing that digest,
+`source_file_id`, final integer millisecond boundaries, and exact published `text`.
+Apply the same serialisation and take its SHA-256 digest. Canonical JSON provides field
+framing and prevents concatenation collisions. A changed identity component produces a
+new configuration digest and new segment IDs.
+
+Write shards under `data/train/part-NNNNN.parquet`. Target approximately 500 MB per
+file, matching existing repository conventions. Store lossless FLAC payloads and write
+Hugging Face feature metadata where the Parquet publication path supports it. Validate
+the exact uploaded schema. If streaming load does not reconstruct the feature, cast the
+column explicitly with `Audio(sampling_rate=16000)` in the Hviske loader.
+
+## Alignment design
+
+### Use supplied timestamps as proposals
+
+Do not run unconstrained speech recognition over each full programme. The transcript
+already provides word timestamps and speaker information. Use them to define local
+text and audio windows, detect obvious source defects, and construct initial segment
+boundaries.
+
+Normalise timestamps into one monotonic millisecond timebase. Reject a programme
+before alignment when timestamps are missing, non-finite, outside the audio duration,
+or substantially non-monotonic. Record the exact rejection reason in the ledger.
+
+Create a canonical `alignment_text` separately from the verbatim training text. Record
+a reversible mapping from every retained alignment unit to its source word. The mapping
+must make case folding, punctuation removal, number expansion, unsupported characters,
+and optional romanisation auditable. Never infer published text by reversing aligner
+normalisation.
+
+### Form candidate segments
+
+Build candidates from consecutive words with these rules:
+
+- Target speech-bearing clips between 2 and 8 seconds.
+- Enforce a final duration below 10 seconds, never equal to 10 seconds.
+- Prefer punctuation, speaker changes, and VAD silence as boundaries.
+- Do not cross a speaker change unless the pilot proves that the supplied speaker
+  labels are too noisy to use safely.
+- Do not split a word or duplicate a word across adjacent candidates.
+- Add bounded context around each proposal for alignment, but remove it from the
+  published clip.
+- Preserve the original text. Apply Hviske's model normalisation only during training.
+
+The exact target duration, context, and silence thresholds are pilot parameters, not
+hard-coded assumptions. Store them in a versioned configuration file.
+
+### Refine with VAD and CTC alignment
+
+Run a pinned, offline VAD model over the programme once. Use VAD to snap proposal
+edges to nearby silence and reject low-speech-coverage clips. VAD is a boundary and
+speech-coverage signal, not a transcript, music, or noise classifier. Apply any music
+or noise rejection through a separate pinned heuristic or classifier validated in the
+pilot.
+
+Refine and verify each local candidate with a Danish-capable CTC forced aligner. The
+first implementation should adapt the Python interface exposed by
+[`ctc-forced-aligner`](https://github.com/MahmoudAshraf97/ctc-forced-aligner): it
+supports ISO 639-3 language identifiers, chunked emissions, word timestamps, and
+alignment scores. Pin both the code commit and model commit.
+
+Do not adopt its default model without checking its licence and Danish pilot quality.
+Select the production model through the pilot. A model is eligible only when:
+
+- its licence permits this private commercial data-preparation use;
+- its tokenizer covers Danish letters and the normalised transcript sufficiently;
+- it produces stable word scores and boundaries on representative P1 programmes;
+- it is independent enough from the target training model to provide useful checks;
+- its exact Hub revision can be pinned.
+
+WhisperX supports the locality rationale: VAD and transcription proposals are followed
+by a language-specific phoneme model and dynamic time warping. It is not evidence for
+the CTC implementation. The CTC method comes from `ctc-forced-aligner` and
+`ctc-segmentation`. NeMo Forced Aligner is a fallback only if a suitable licensed
+Danish CTC checkpoint is available. Montreal Forced Aligner is not the first choice
+because it adds lexicon and acoustic-model maintenance without using the supplied word
+timestamps.
+
+### Correct drift once
+
+Compare CTC word boundaries with the supplied proposals inside each programme window.
+If high-confidence anchor words show a consistent offset or linear drift, fit a robust
+piecewise-affine correction and rerun alignment once with recentered windows.
+
+Reject the affected region instead of repeatedly correcting it when residuals are
+nonlinear, discontinuous, or concentrated around missing transcript spans. Report
+start drift, end drift, residual quantiles, and drift against programme position.
+This catches clock drift and transcript insertions or omissions separately.
+
+### Score and filter
+
+Keep both raw backend scores and derived quality signals. A segment is publishable
+only when all of these gates pass:
+
+- decoded duration is above Hviske's minimum and below 10 seconds;
+- text is non-empty and contains at least one trainable character;
+- timestamps are ordered and within the decoded source duration;
+- CTC alignment confidence exceeds the pilot threshold;
+- proposal-to-final drift is within the pilot limit;
+- VAD speech ratio exceeds the pilot threshold;
+- boundary speech clipping is below the pilot threshold;
+- no word is duplicated or dropped within an accepted contiguous transcript region;
+- speaker-overlap and music heuristics pass;
+- FLAC encoding and a fresh 16 kHz mono decode succeed;
+- `segment_id` is unique.
+
+The `ctc-segmentation` reference implementation scores an utterance from minima over
+chunk-level means of aligned frame probabilities. `ctc-forced-aligner` derives span
+scores from its aligned emission frames. Store the exact backend, formula, revision,
+and raw inputs needed to interpret a score. These scales are not interchangeable;
+choose thresholds from the P1 pilot rather than copying a value across backends.
+
+Do not silently repair unsupported or mismatched text. Record rejection categories
+such as `empty_text`, `invalid_timestamps`, `low_alignment_score`, `excessive_drift`,
+`low_speech_ratio`, `speaker_overlap`, `boundary_clipping`, and `decode_error`.
+
+## Bounded processing and publication
+
+### Scratch-space contract
+
+Use a dedicated scratch root for source downloads, decoded programme audio, open
+Parquet files, and pending upload batches. Do not use an unbounded default Hugging Face
+cache.
+
+Before starting, calculate the required free space as:
+
+1. the maximum source and decoded bytes for every active worker and queue slot;
+2. every open shard and configured pending shard in an unverified batch;
+3. temporary encoder, Parquet, upload, and checksum files;
+4. one remote-verification stream buffer per concurrent verification;
+5. the SQLite ledger and metadata manifests;
+6. a fixed safety margin.
+
+Abort before downloading source audio when the free-space or quota check fails. Expose
+`--max-scratch-bytes`, `--max-source-bytes`, and `--shards-per-commit`. Also check GPU
+memory, the selected CUDA device, Hub access, target repository privacy, and source
+revision availability before processing.
+
+One worker owns one programme at a time. A bounded queue may overlap CPU FLAC encoding
+with GPU alignment, but every slot must be part of the scratch calculation. Once all
+rows from a programme are durably appended and fsynced to a recoverable local shard,
+record that state and delete its source, decoded, and alignment temporary bytes. A lost
+or corrupt uncommitted shard is regenerated by deterministic redownload from the pinned
+source. Never retain source programmes until a multi-shard upload batch completes, and
+never let Datasets materialise the complete audio split or derived dataset.
+
+### Durable ledger
+
+Maintain a local SQLite ledger containing metadata only. It must survive restarts but
+must not contain audio bytes, credentials, or the complete transcript corpus.
+
+Track these state transitions:
+
+`discovered -> processing -> sharded -> committed -> verified -> purged`
+
+A failed item moves to `rejected` or `retryable`. A state transition and its evidence
+must commit atomically. Record source ID, source revisions, pipeline version, attempts,
+counts, durations, rejection counts, shard paths, byte sizes, SHA-256 digests, Hub
+commit IDs, verification time, and purge time.
+
+On restart:
+
+- reset abandoned `processing` rows to `retryable`;
+- reuse complete local shards only when their digests match the ledger;
+- query the remote commit before re-uploading a `committed` shard;
+- never regenerate or overwrite a `verified` path with different bytes;
+- resume from the first state lacking durable evidence.
+
+### Private repository setup
+
+Create the target with `HfApi.create_repo(..., repo_type="dataset", private=True)`.
+Immediately query repository metadata and abort unless `private` is true. Commit a
+dataset card and `.gitattributes` before data upload. Recheck authenticated repository
+metadata immediately before and after every data commit and every metadata or card
+update. Abort before sending bytes when `private is not True`; treat a post-commit
+privacy failure as an incident and stop all further processing.
+
+The dataset card must describe source provenance, permitted use, private-access terms,
+alignment method, field schema, known limitations, rejection policy, source and model
+revisions, and the absence of a public redistribution grant. Confirm the organisation
+has enough private storage for the pilot estimate before the full run.
+
+Use the existing authenticated Hub session. Do not place a token in a command, tmux
+history, environment dump, log, repository file, or dataset metadata.
+
+### Incremental upload
+
+Close each Parquet shard atomically, decode and validate it, then add it to the pending
+batch. Upload a bounded batch with explicit `HfApi.create_commit` operations and
+fewer than 100 files per commit. Each operation must name one allow-listed shard or
+manifest path.
+If `upload_folder` is retained as a fallback, populate a new isolated batch directory
+with only allow-listed regular files, reject symlinks and unexpected entries, and remove
+the directory after verification. Start with 8 to 16 shards per commit, subject to the
+scratch budget.
+
+For every batch:
+
+1. write a metadata-only batch manifest with paths, sizes, row counts, and SHA-256
+   digests;
+2. upload the Parquet shards and manifest in one commit;
+3. record the returned immutable Hub commit ID;
+4. query every path at that commit with `get_paths_info`;
+5. compare path and size, plus the LFS or Xet digest when exposed;
+6. stream each remote object through SHA-256 without retaining it when the API does not
+   expose a comparable content digest;
+7. open the committed revision with `load_dataset(..., streaming=True)` and decode a
+   deterministic sample from every shard;
+8. mark the batch `verified` only after all checks pass;
+9. delete the verified local shards and batch staging files;
+10. fsync the ledger state to `purged`.
+
+If any check fails, retain the complete pending batch and retry. Never delete a local
+object based only on a successful HTTP status or process exit code.
+
+Hugging Face recommends `upload_folder` or `hf upload` for resumable large uploads,
+fewer than 100 files per commit, fewer than 100,000 files per repository, fewer than
+10,000 entries per folder, and files below 200 GB. The proposed layout and shard size
+stay well inside those limits. Parquet is explicitly recommended for large datasets
+and avoids a custom loading script.
+
+### Finalise an immutable release
+
+After the final batch:
+
+- compare discovered, processed, rejected, accepted, committed, and purged programme
+  counts;
+- recompute total rows, audio hours, bytes, and rejection counts from remote shards;
+- verify no duplicate `segment_id`, source interval, or remote path exists;
+- update the dataset card with final statistics and the full quality report;
+- record the final 40-character commit SHA;
+- pin that exact SHA in `config/datasets/p1.yaml`;
+- optionally create a human-readable tag, but never use it as the immutable pin;
+- remove the transcript join fields from the training configuration;
+- keep only the metadata ledger and reports locally.
+
+The old partial-transcript join remains useful defensive code for other datasets, but
+P1 training must load the derived segmented dataset directly.
+
+## Phased implementation
+
+### Phase 0: source, legal, and storage gate
+
+- Reconfirm both immutable source revisions and schemas.
+- Measure source object-size and duration maxima without downloading the full split.
+- Confirm target repository ownership, privacy, licence wording, and storage quota.
+- Select candidate VAD and CTC models whose licences permit the intended use.
+- Define the scratch budget and failure policy.
+
+**Gate:** no audio processing starts until privacy, licensing, storage, and bounded
+cache behaviour are proven.
+
+### Phase 1: repository implementation
+
+Add these components:
+
+- `src/hviske/p1_segments.py` for proposal parsing, segmentation, alignment scoring,
+  drift correction, filtering, deterministic IDs, and shard writing;
+- `src/hviske/p1_ledger.py` for atomic state transitions and restart logic;
+- `src/hviske/p1_publish.py` for private repository checks, commits, and verification;
+- `src/scripts/build_p1_segments.py` as the non-interactive Hydra entry point;
+- `config/p1_segments.yaml` for pinned revisions and tunable pilot thresholds;
+- focused tests using synthetic waveforms and in-memory Hub fakes.
+
+The script must support `mode=plan`, `programme_limit=...`, `source_file_id=...`,
+and `resume=true`. Plan mode performs every precondition and size calculation without
+retrieving audio.
+
+**Gate:** tests prove deterministic IDs, exact duration filtering, no duplicate or
+missing candidate words, bounded shard rotation, crash-safe resume, private-only
+upload, and checksum verification. They separately prove source-temporary deletion
+after recoverable local sharding and publication-artefact deletion only after remote
+verification.
+
+### Phase 2: representative pilot
+
+Process a small stratified sample, not the first rows in the stream. Include short and
+long programmes, several show types, multiple speaker counts, music-heavy material,
+low language probability, early and late programme positions, and the tails of the
+proposal-confidence and drift distributions.
+
+Manually audit at least 200 accepted clips and 100 rejected or borderline clips. The
+audit records clipped speech, wrong text, missing words, inserted words, speaker
+mixing, music dominance, and boundary quality. Reviewers must listen without seeing
+whether a clip passed or failed.
+
+Use an independent ASR model as an anomaly detector and report normalised WER, but do
+not treat model agreement as ground truth. Stratify the audit across confidence and
+drift deciles so aggregate random sampling cannot hide bad tails.
+
+Tune thresholds once, version the resulting configuration, and rerun the pilot from
+scratch.
+
+**Gate:** at least 98% of audited accepted clips have no material text mismatch or
+speech clipping, no systematic defect appears by show or programme position, and the
+rejection report explains every excluded clip. If this gate fails, change the method
+or thresholds and repeat the pilot.
+
+### Phase 3: bounded production run
+
+Run one visible, named tmux session on Sparkie. Check existing GPU processes and free
+disk before launch. Do not stop or alter unrelated services without separate
+permission.
+
+Publish one bounded batch at a time. Capture progress from the SQLite ledger and Hub
+commit history, not from tmux scrollback alone. Emit metadata-only JSONL operational
+logs with counts, timings, scratch use, and rejection categories.
+
+**Gate:** every remote batch is committed, content-verified, and stream-decodable
+before its local Parquet shards and batch staging are purged. Programme source and
+alignment temporaries were already purged after recoverable local sharding. Scratch use
+never exceeds the configured cap.
+
+### Phase 4: corpus validation
+
+Produce a remote-derived report covering:
+
+- accepted and rejected programmes and segments;
+- total and per-show audio hours;
+- duration, word-count, score, speech-ratio, and drift distributions;
+- coverage against usable transcript duration;
+- rejection reasons and rates;
+- duplicate IDs and overlapping source intervals;
+- speaker-count and programme-position breakdowns;
+- independent-ASR anomaly rates;
+- a fresh stratified manual audit from the final revision.
+
+**Gate:** all structural checks pass, the final manual audit meets the Phase 2 target,
+and unexplained show-level or position-level quality regressions are resolved.
+
+### Phase 5: Hviske integration
+
+Update `config/datasets/p1.yaml` to read `syvai/p1-segments`, `train`, `audio`, and
+`text` at the final immutable revision. Remove all runtime transcript-join environment
+variables from the P1 path.
+
+Strengthen `src/scripts/preflight_finetuning_data.py` so P1 preflight retrieves and
+processes at least one genuine post-filter segment. It must decode the audio, verify
+text, duration, language, and required metadata, and prove that
+`load_data_for_finetuning` yields a training example.
+
+Update `SPARKIE.md`, tests, and the Olmix launcher documentation with the pinned derived
+revision.
+
+**Gate:** focused tests, Ruff, Ty, and both two-step model smokes pass using the private
+segmented P1 dataset.
+
+## Evidence to retain
+
+Retain only:
+
+- source, model, and code revisions;
+- versioned configuration and normalisation rules;
+- metadata-only SQLite ledger and batch manifests;
+- shard paths, sizes, row counts, SHA-256 digests, and Hub commit IDs;
+- aggregate quality reports and manual-audit decisions;
+- operational timings and peak scratch usage.
+
+Delete programme audio, extracted clips, alignment tensors, and temporary transcripts
+after their rows are recoverably sharded and fsynced. Delete local Parquet shards,
+batch staging, and remote-verification downloads only after the remote commit and
+content verification are durable in the ledger.
+
+## Primary references
+
+- [WhisperX paper](https://arxiv.org/abs/2303.00747)
+- [WhisperX implementation](https://github.com/m-bain/whisperX)
+- [CTC segmentation paper](https://arxiv.org/abs/2007.09127)
+- [CTC segmentation implementation](https://github.com/lumaku/ctc-segmentation)
+- [CTC forced aligner](https://github.com/MahmoudAshraf97/ctc-forced-aligner)
+- [NeMo NFA](https://github.com/NVIDIA/NeMo/tree/main/tools/nemo_forced_aligner)
+- [Hugging Face upload guide](https://huggingface.co/docs/huggingface_hub/guides/upload)
+- [Hub guidance](https://huggingface.co/docs/hub/repositories-recommendations)
+- [Datasets Parquet loading](https://huggingface.co/docs/datasets/en/loading#parquet)
+- [Datasets audio loading](https://huggingface.co/docs/datasets/en/audio_load)
