@@ -8,6 +8,16 @@ import numpy as np
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from safetensors.numpy import save_file
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import (
+    CohereAsrConfig,
+    CohereAsrFeatureExtractor,
+    CohereAsrForConditionalGeneration,
+    CohereAsrProcessor,
+    TokenizersBackend,
+)
 from transformers.trainer import Trainer
 
 import hviske.utils as utils
@@ -78,37 +88,70 @@ def test_private_only_refuses_private_false() -> None:
         utils.validate_private_only_config({"private_only": True, "private": False})
 
 
-def test_publication_accepts_valid_cohere_package(tmp_path: Path) -> None:
-    """A complete Cohere package passes the reloadability gate."""
+def test_publication_accepts_native_cohere_save_and_reload(tmp_path: Path) -> None:
+    """A native Transformers save passes validation and local reload."""
     _minimal_cohere_package(tmp_path)
     utils._validate_model_package(tmp_path)
+
+    processor = CohereAsrProcessor.from_pretrained(tmp_path, local_files_only=True)
+    model = CohereAsrForConditionalGeneration.from_pretrained(
+        tmp_path, local_files_only=True
+    )
+    assert isinstance(processor, CohereAsrProcessor)
+    assert isinstance(model, CohereAsrForConditionalGeneration)
+    assert processor.tokenizer.__class__.__name__ == "TokenizersBackend"
+    assert not (tmp_path / "preprocessor_config.json").exists()
 
 
 def _minimal_cohere_package(
     folder: Path, *, weights: bool = True, processor: bool = True
 ) -> None:
-    """Create the smallest package accepted by the Cohere publication gate."""
-    (folder / "config.json").write_text(
-        '{"model_type": "cohere_asr"}', encoding="utf-8"
+    """Save a tiny native Transformers Cohere package for publication tests."""
+    vocabulary = {
+        "<unk>": 0,
+        "<pad>": 1,
+        "<eos>": 2,
+        "<bos>": 3,
+        "<|da|>": 4,
+        "hello": 5,
+    }
+    tokenizer_backend = Tokenizer(WordLevel(vocab=vocabulary, unk_token="<unk>"))
+    tokenizer_backend.pre_tokenizer = Whitespace()
+    tokenizer = TokenizersBackend(
+        tokenizer_object=tokenizer_backend,
+        unk_token="<unk>",
+        pad_token="<pad>",
+        eos_token="<eos>",
+        bos_token="<bos>",
     )
-    if processor:
-        (folder / "preprocessor_config.json").write_text(
-            '{"feature_extractor_type": "CohereAsrFeatureExtractor", '
-            '"sampling_rate": 16000}',
-            encoding="utf-8",
-        )
-        (folder / "processor_config.json").write_text(
-            '{"processor_class": "CohereAsrProcessor"}', encoding="utf-8"
-        )
-        (folder / "tokenizer_config.json").write_text(
-            '{"tokenizer_class": "CohereTokenizer"}', encoding="utf-8"
-        )
-        (folder / "tokenizer.json").write_text("{}", encoding="utf-8")
+    config_factory = t.cast(t.Callable[..., CohereAsrConfig], CohereAsrConfig)
+    config = config_factory(
+        vocab_size=len(vocabulary),
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=16,
+        max_position_embeddings=16,
+        pad_token_id=1,
+        eos_token_id=2,
+        bos_token_id=3,
+        encoder_config={
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "intermediate_size": 16,
+        },
+    )
+    model = CohereAsrForConditionalGeneration(config)
     if weights:
-        save_file(
-            {"audio_projection.weight": np.ones((1, 1), dtype=np.float32)},
-            folder / "model.safetensors",
-        )
+        model.save_pretrained(folder, safe_serialization=True)
+    else:
+        folder.mkdir(exist_ok=True)
+        (folder / "config.json").write_text(config.to_json_string(), encoding="utf-8")
+    if processor:
+        cohere_processor = CohereAsrProcessor(CohereAsrFeatureExtractor(), tokenizer)
+        cohere_processor.save_pretrained(folder)
 
 
 def test_publication_rejects_corrupt_weights(tmp_path: Path) -> None:
@@ -137,7 +180,7 @@ def test_publication_rejects_malformed_sharded_index(tmp_path: Path) -> None:
 def test_publication_rejects_missing_processor(tmp_path: Path) -> None:
     """A weight file without Cohere processor essentials is incomplete."""
     _minimal_cohere_package(tmp_path, processor=False)
-    with pytest.raises(ValueError, match="preprocessor_config"):
+    with pytest.raises(ValueError, match="processor_config"):
         utils._validate_model_package(tmp_path)
 
 
@@ -161,6 +204,43 @@ def test_publication_rejects_missing_weights(tmp_path: Path) -> None:
     """Processor metadata alone is not a reloadable model."""
     _minimal_cohere_package(tmp_path, weights=False)
     with pytest.raises(ValueError, match="needs model"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_tensor_in_wrong_shard(tmp_path: Path) -> None:
+    """An index entry must point to the shard that stores its tensor."""
+    _minimal_cohere_package(tmp_path, weights=False)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"encoder.weight": "model-00001-of-00002.safetensors", '
+        '"decoder.weight": "model-00002-of-00002.safetensors"}}',
+        encoding="utf-8",
+    )
+    for name in (
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    ):
+        save_file(
+            {"decoder.weight": np.ones((1, 1), dtype=np.float32)}, tmp_path / name
+        )
+    with pytest.raises(ValueError, match="shard without that tensor"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_unindexed_shard_tensor(tmp_path: Path) -> None:
+    """A shard cannot contain tensors omitted from the weight map."""
+    _minimal_cohere_package(tmp_path, weights=False)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"encoder.weight": "model-00001-of-00001.safetensors"}}',
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "encoder.weight": np.ones((1, 1), dtype=np.float32),
+            "extra.weight": np.ones((1, 1), dtype=np.float32),
+        },
+        tmp_path / "model-00001-of-00001.safetensors",
+    )
+    with pytest.raises(ValueError, match="unindexed tensors"):
         utils._validate_model_package(tmp_path)
 
 
@@ -273,7 +353,7 @@ def test_publish_stages_exact_top_level_allowlist(
         {
             "README.md",
             "config.json",
-            "preprocessor_config.json",
+            "generation_config.json",
             "model.safetensors",
             "tokenizer.json",
             "tokenizer_config.json",

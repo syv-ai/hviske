@@ -88,7 +88,10 @@ def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
     )
     config = OmegaConf.create(
         {
-            "model": {"pretrained_model_id": "org/gated-model"},
+            "model": {
+                "pretrained_model_id": "org/gated-model",
+                "revision": "b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
+            },
             "cache_dir": None,
             "datasets": {
                 "p1": {
@@ -103,7 +106,7 @@ def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
                     "transcript_dataset_id": "org/transcripts",
                     "transcript_subset": None,
                     "transcript_split": "train",
-                    "transcript_revision": "transcript-sha",
+                    "transcript_revision": "0123456789abcdef0123456789abcdef01234567",
                     "transcript_join_column": "recording_id",
                     "transcript_text_column": "text",
                     "transcript_trust_remote_code": False,
@@ -148,13 +151,15 @@ def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
     api = FakeHubApi()
     preflight_finetuning_data(config=config, dataset_loader=fake_loader, hub_api=api)
 
-    assert api.model_ids == ["org/gated-model"]
+    assert api.model_ids == [
+        ("org/gated-model", "b1eacc2686a3d08ceaae5f24a88b1d519620bc09")
+    ]
     assert len(calls) == 3
     assert [call["streaming"] for call in calls] == [True, False, True]
     assert all(call["trust_remote_code"] is False for call in calls)
     assert [call["revision"] for call in calls] == [
         "audio-sha",
-        "transcript-sha",
+        "0123456789abcdef0123456789abcdef01234567",
         "evaluation-sha",
     ]
 
@@ -164,15 +169,15 @@ class FakeHubApi:
 
     def __init__(self) -> None:
         """Initialise an empty model access log."""
-        self.model_ids: list[str] = []
+        self.model_ids: list[tuple[str, str]] = []
 
-    def model_info(self, repo_id: str) -> object:
+    def model_info(self, repo_id: str, *, revision: str) -> object:
         """Record the model repository checked by the preflight.
 
         Returns:
             Placeholder model metadata.
         """
-        self.model_ids.append(repo_id)
+        self.model_ids.append((repo_id, revision))
         return object()
 
     def whoami(self) -> dict[str, object]:
@@ -184,7 +189,10 @@ def test_preflight_rejects_missing_schema_without_consuming_a_second_row() -> No
     """A schema error stops after the first streamed row."""
     config = OmegaConf.create(
         {
-            "model": {"pretrained_model_id": "org/gated-model"},
+            "model": {
+                "pretrained_model_id": "org/gated-model",
+                "revision": "b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
+            },
             "cache_dir": None,
             "datasets": {
                 "broken": {

@@ -11,6 +11,7 @@ p1:
   transcript_dataset_id: syvai/p1-transcripts
   transcript_subset: null
   transcript_split: train
+  # Require an immutable full commit SHA; the preflight and loader reject branches.
   transcript_revision: ${oc.env:P1_TRANSCRIPT_REVISION}
   transcript_trust_remote_code: false
   # The private transcript schema is not assumed. Set these after inspecting it.

@@ -32,6 +32,7 @@ def add_validations(
     language: str = "da",
     punctuation: bool = True,
     max_new_tokens: int = 256,
+    revision: str | None = None,
 ) -> Dataset | DatasetDict:
     """Add the ASR validation columns to the dataset.
 
@@ -60,6 +61,8 @@ def add_validations(
             Whether native Cohere should produce punctuation. Defaults to ``True``.
         max_new_tokens (optional):
             Maximum number of tokens generated per audio input. Defaults to ``256``.
+        revision (optional):
+            Immutable Hub revision for a native Cohere checkpoint.
 
     Returns:
         The dataset with the validation columns added.
@@ -110,6 +113,7 @@ def add_validations(
         language=language,
         punctuation=punctuation,
         max_new_tokens=max_new_tokens,
+        revision=revision,
     )
 
     for split_name, split in processed_dataset.items():

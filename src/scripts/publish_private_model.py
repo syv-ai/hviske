@@ -6,7 +6,7 @@ import click
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
-from hviske.utils import publish_model_folder
+from hviske.utils import publish_model_folder, validate_transcript_revision
 
 
 @click.command()
@@ -58,6 +58,7 @@ def main(
         training_sources=sources,
         evaluation_status=evaluation_status,
         reviewed_model_card=reviewed_model_card,
+        finetuned_from_revision=str(config.model.revision),
     )
 
 
@@ -106,7 +107,9 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
                 "dataset_id": str(transcript_id),
                 "subset": str(source_config.get("transcript_subset") or "none"),
                 "split": str(source_config.get("transcript_split", "train")),
-                "revision": str(source_config.transcript_revision),
+                "revision": validate_transcript_revision(
+                    str(source_config.transcript_revision)
+                ),
                 "join_column": str(source_config.transcript_join_column),
                 "text_column": str(source_config.transcript_text_column),
             }

@@ -236,19 +236,15 @@ def test_native_cohere_loader_dispatches_model_aware_transcriber(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The shared loader selects the prompt-aware path for native Cohere."""
-    monkeypatch.setattr(
-        "hviske.cohere.AutoConfig.from_pretrained",
-        MagicMock(return_value=SimpleNamespace(model_type="cohere_asr")),
-    )
+    config_loader = MagicMock(return_value=SimpleNamespace(model_type="cohere_asr"))
     processor = MagicMock(spec=CohereAsrProcessor)
     model = MagicMock(spec=CohereAsrForConditionalGeneration)
+    processor_loader = MagicMock(return_value=processor)
+    model_loader = MagicMock(return_value=model)
+    monkeypatch.setattr("hviske.cohere.AutoConfig.from_pretrained", config_loader)
+    monkeypatch.setattr(CohereAsrProcessor, "from_pretrained", processor_loader)
     monkeypatch.setattr(
-        CohereAsrProcessor, "from_pretrained", MagicMock(return_value=processor)
-    )
-    monkeypatch.setattr(
-        CohereAsrForConditionalGeneration,
-        "from_pretrained",
-        MagicMock(return_value=model),
+        CohereAsrForConditionalGeneration, "from_pretrained", model_loader
     )
     transcriber = load_asr_transcriber(
         model_id="test/cohere",
@@ -257,11 +253,16 @@ def test_native_cohere_loader_dispatches_model_aware_transcriber(
         language="sv",
         punctuation=False,
         max_new_tokens=37,
+        revision="b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
     )
     assert isinstance(transcriber, CohereASRTranscriber)
     assert transcriber.language == "sv"
     assert transcriber.punctuation is False
     assert transcriber.max_new_tokens == 37
+    revision = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
+    assert config_loader.call_args.kwargs["revision"] == revision
+    assert processor_loader.call_args.kwargs["revision"] == revision
+    assert model_loader.call_args.kwargs["revision"] == revision
 
 
 def test_native_cohere_transcriber_builds_prompt_and_reassembles_chunks() -> None:
@@ -359,3 +360,11 @@ def test_native_loading_disables_remote_code(monkeypatch: pytest.MonkeyPatch) ->
     setup.load_model()
     assert processor_loader.call_args.kwargs["trust_remote_code"] is False
     assert model_loader.call_args.kwargs["trust_remote_code"] is False
+    assert (
+        processor_loader.call_args.kwargs["revision"]
+        == "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
+    )
+    assert (
+        model_loader.call_args.kwargs["revision"]
+        == "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
+    )

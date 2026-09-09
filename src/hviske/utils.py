@@ -64,16 +64,7 @@ _MODEL_ARTEFACT_NAMES = frozenset(
 _SHARDED_MODEL_ARTEFACT = re.compile(
     r"(?:model|pytorch_model)-\d{5}-of-\d{5}\.(?:bin|safetensors)\Z"
 )
-_TOKENIZER_FILES = frozenset(
-    {
-        "tokenizer.json",
-        "tokenizer.model",
-        "vocab.json",
-        "vocab.txt",
-        "spiece.model",
-        "sentencepiece.bpe.model",
-    }
-)
+_FULL_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 
 def block_terminal_output() -> None:
@@ -443,6 +434,7 @@ def publish_model_folder(
     evaluation_status: str = "Not evaluated.",
     training_sources: list[dict[str, object]] | None = None,
     reviewed_model_card: Path | None = None,
+    finetuned_from_revision: str | None = None,
 ) -> CommitInfo:
     """Publish a model folder through one private Hub commit.
 
@@ -467,6 +459,8 @@ def publish_model_folder(
             Structured source provenance for the model card.
         reviewed_model_card (optional):
             A reviewed README to use instead of the generated card.
+        finetuned_from_revision (optional):
+            Immutable revision of the base model.
 
     Returns:
         The model-file upload commit information.
@@ -499,6 +493,7 @@ def publish_model_folder(
             training_sources=training_sources,
             evaluation_status=evaluation_status,
             reviewed_model_card=reviewed_model_card,
+            finetuned_from_revision=finetuned_from_revision,
         )
         verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
         commit = upload_folder(
@@ -537,12 +532,7 @@ def _validate_model_package(source: Path) -> None:
         ValueError:
             If a required package file or weight set is missing or malformed.
     """
-    required = {
-        "config.json",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "tokenizer_config.json",
-    }
+    required = {"config.json", "processor_config.json", "tokenizer_config.json"}
     missing = [name for name in required if not _regular_file(source / name)]
     if missing:
         raise ValueError("Cohere package is missing: " + ", ".join(sorted(missing)))
@@ -557,24 +547,33 @@ def _validate_model_package(source: Path) -> None:
         documents[name] = document
     if documents["config.json"].get("model_type") != "cohere_asr":
         raise ValueError("Cohere config.json has the wrong model_type")
-    preprocessor = documents["preprocessor_config.json"]
-    if preprocessor.get("feature_extractor_type") != "CohereAsrFeatureExtractor":
-        raise ValueError("Cohere preprocessor config has the wrong feature extractor")
-    if (
-        not isinstance(preprocessor.get("sampling_rate"), int)
-        or preprocessor["sampling_rate"] <= 0
-    ):
-        raise ValueError("Cohere preprocessor config has an invalid sampling rate")
-    if (
-        documents["processor_config.json"].get("processor_class")
-        != "CohereAsrProcessor"
-    ):
+    processor = documents["processor_config.json"]
+    if processor.get("processor_class") != "CohereAsrProcessor":
         raise ValueError("Cohere processor config has the wrong processor_class")
+    feature_extractor = processor.get("feature_extractor")
+    if not isinstance(feature_extractor, dict):
+        raise ValueError("Cohere processor config has no feature extractor metadata")
+    if feature_extractor.get("feature_extractor_type") != "CohereAsrFeatureExtractor":
+        raise ValueError("Cohere processor config has the wrong feature extractor")
+    if (
+        not isinstance(feature_extractor.get("sampling_rate"), int)
+        or feature_extractor["sampling_rate"] <= 0
+    ):
+        raise ValueError("Cohere processor config has an invalid sampling rate")
     tokenizer = documents["tokenizer_config.json"]
-    if tokenizer.get("tokenizer_class") != "CohereTokenizer":
+    if tokenizer.get("tokenizer_class") != "TokenizersBackend":
         raise ValueError("Cohere tokenizer config has the wrong tokenizer_class")
-    if not any(_regular_file(source / name) for name in _TOKENIZER_FILES):
-        raise ValueError("Cohere package is missing tokenizer vocabulary/model files")
+    if tokenizer.get("backend") != "tokenizers":
+        raise ValueError("Cohere tokenizer config has the wrong backend")
+    tokenizer_json = source / "tokenizer.json"
+    if not _regular_file(tokenizer_json):
+        raise ValueError("Cohere package is missing tokenizer.json")
+    try:
+        tokenizer_document = json.loads(tokenizer_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Cohere tokenizer.json is not valid JSON") from error
+    if not isinstance(tokenizer_document, dict):
+        raise ValueError("Cohere tokenizer.json must contain an object")
 
     single = source / "model.safetensors"
     index_path = source / "model.safetensors.index.json"
@@ -613,10 +612,28 @@ def _validate_model_package(source: Path) -> None:
         for name in referenced
     ):
         raise ValueError("Incomplete sharded weight index")
-    if set(path.name for path in shard_paths) != referenced:
+    if {path.name for path in shard_paths} != referenced:
         raise ValueError("Sharded weight files do not match the index")
+    shard_tensors: dict[str, set[str]] = {}
     for shard_name in sorted(referenced):
-        _validate_safetensors_file(source / shard_name)
+        shard_tensors[shard_name] = _validate_safetensors_file(source / shard_name)
+    for tensor_name, shard_name in weight_map.items():
+        if tensor_name not in shard_tensors[shard_name]:
+            raise ValueError(
+                f"Sharded index maps {tensor_name!r} to a shard without that tensor"
+            )
+    indexed_tensors = set(weight_map)
+    unindexed = {
+        tensor_name
+        for tensors in shard_tensors.values()
+        for tensor_name in tensors
+        if tensor_name not in indexed_tensors
+    }
+    if unindexed:
+        raise ValueError(
+            "Sharded weight files contain unindexed tensors: "
+            + ", ".join(sorted(unindexed))
+        )
 
 
 def _regular_file(path: Path) -> bool:
@@ -624,8 +641,11 @@ def _regular_file(path: Path) -> bool:
     return path.is_file() and not path.is_symlink()
 
 
-def _validate_safetensors_file(path: Path) -> None:
+def _validate_safetensors_file(path: Path) -> set[str]:
     """Read safetensors metadata without materialising tensor data.
+
+    Returns:
+        The tensor names stored in the file.
 
     Raises:
         ValueError:
@@ -635,10 +655,12 @@ def _validate_safetensors_file(path: Path) -> None:
         from safetensors import SafetensorError, safe_open
 
         with safe_open(str(path), framework="pt", device="cpu") as handle:
-            if not handle.keys():
+            tensor_names = set(handle.keys())
+            if not tensor_names:
                 raise ValueError(f"Safetensors file is empty: {path.name}")
-            for tensor_name in handle.keys():
+            for tensor_name in tensor_names:
                 handle.get_slice(tensor_name)
+            return tensor_names
     except (OSError, RuntimeError, SafetensorError, ValueError) as error:
         raise ValueError(f"Invalid safetensors weights: {path.name}") from error
 
@@ -651,6 +673,7 @@ def _stage_model_card(
     training_sources: list[dict[str, object]],
     evaluation_status: str,
     reviewed_model_card: Path | None,
+    finetuned_from_revision: str | None = None,
 ) -> None:
     """Stage a generated or reviewed card, never arbitrary source files.
 
@@ -689,8 +712,14 @@ def _stage_model_card(
         "---\n"
         f"language:\n{language_lines}\nlicense: openrail\nlibrary_name: transformers\n"
         "pipeline_tag: automatic-speech-recognition\n"
-        f"base_model: {finetuned_from}\ndatasets:\n{dataset_lines}\n---\n\n"
-        "# Private internal Danish-English ASR checkpoint\n\n"
+        f"base_model: {finetuned_from}\n"
+        + (
+            f"base_model_revision: {finetuned_from_revision}\n"
+            if finetuned_from_revision is not None
+            else ""
+        )
+        + f"datasets:\n{dataset_lines}\n---\n\n"
+        + "# Private internal Danish-English ASR checkpoint\n\n"
         "This private Cohere checkpoint is for internal research, evaluation and "
         "testing only. It is not for public distribution or production use.\n\n"
         "## Training-source provenance\n\n"
@@ -949,6 +978,7 @@ def _write_model_card(
         training_sources=sources,
         evaluation_status=evaluation_status,
         reviewed_model_card=None,
+        finetuned_from_revision=None,
     )
 
 
@@ -967,3 +997,25 @@ class transformers_output_ignored:
     ) -> None:
         """Exit the context manager."""
         hf_logging.set_verbosity_info()
+
+
+def validate_transcript_revision(revision: str) -> str:
+    """Validate an immutable private transcript dataset revision.
+
+    Args:
+        revision:
+            The Hub revision to use for the private transcript dataset.
+
+    Returns:
+        The unchanged, validated revision.
+
+    Raises:
+        ValueError:
+            If ``revision`` is not a complete hexadecimal commit SHA.
+    """
+    if not _FULL_COMMIT_SHA.fullmatch(revision):
+        raise ValueError(
+            "P1 transcript revision must be a full 40-character commit SHA; "
+            "mutable branches and abbreviated or non-hex revisions are forbidden."
+        )
+    return revision

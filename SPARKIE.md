@@ -24,7 +24,7 @@ Set the exact private transcript revision and join columns after checking the pi
 private schema:
 
 ```bash
-export P1_TRANSCRIPT_REVISION=<full-p1-transcripts-commit-sha>
+export P1_TRANSCRIPT_REVISION=<full-40-hex-p1-transcripts-commit-sha>
 export P1_AUDIO_JOIN_COLUMN=<p1-audio-key-column>
 export P1_TRANSCRIPT_JOIN_COLUMN=<p1-transcript-key-column>
 export P1_TRANSCRIPT_TEXT_COLUMN=<p1-transcript-text-column>

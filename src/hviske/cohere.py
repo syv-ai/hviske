@@ -40,6 +40,10 @@ from .utils import transformers_output_ignored
 logger = logging.getLogger(__package__)
 
 
+COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
+COHERE_MODEL_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
+
+
 class CohereAsrProcessor(TransformersCohereAsrProcessor):
     """Native Cohere processor with checkpoint-aware language validation.
 
@@ -136,6 +140,7 @@ class CohereModelSetup(ModelSetup):
                 self.config.model.pretrained_model_id,
                 token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
                 trust_remote_code=False,
+                revision=_cohere_revision(self.config),
             )
         if self.config.model.freeze_feature_encoder:
             encoder = model.model.encoder
@@ -160,6 +165,7 @@ class CohereModelSetup(ModelSetup):
             self.config.model.pretrained_model_id,
             token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
             trust_remote_code=False,
+            revision=_cohere_revision(self.config),
         )
         if not isinstance(processor, CohereAsrProcessor):
             raise TypeError(
@@ -183,15 +189,22 @@ class CohereModelSetup(ModelSetup):
         else:
             model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
 
+        revision = (
+            None
+            if Path(self.config.model_dir).exists()
+            else _cohere_revision(self.config)
+        )
         processor = CohereAsrProcessor.from_pretrained(
             model_path,
             token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
             trust_remote_code=False,
+            revision=revision or "main",
         )
         model = CohereAsrForConditionalGeneration.from_pretrained(
             model_path,
             token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
             trust_remote_code=False,
+            revision=revision or "main",
         )
         if not isinstance(processor, CohereAsrProcessor):
             raise TypeError(
@@ -292,6 +305,11 @@ class CohereModelSetup(ModelSetup):
             ddp_find_unused_parameters=False,
             accelerator_config=AcceleratorConfig(dispatch_batches=False).to_dict(),
         )
+
+
+def _cohere_revision(config: DictConfig) -> str:
+    """Return the immutable base-model revision from a model configuration."""
+    return str(config.model.get("revision", COHERE_MODEL_REVISION))
 
 
 class CohereSeq2SeqTrainer(Seq2SeqTrainer):
@@ -632,6 +650,7 @@ def load_asr_transcriber(
     language: str = "da",
     punctuation: bool = True,
     max_new_tokens: int = 256,
+    revision: str | None = None,
 ) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
     """Load a model-aware ASR transcriber.
 
@@ -651,6 +670,10 @@ def load_asr_transcriber(
             Whether native Cohere should produce punctuation. Defaults to ``True``.
         max_new_tokens (optional):
             Maximum number of tokens generated per audio input. Defaults to ``256``.
+        revision (optional):
+            Immutable Hub revision for a native Cohere checkpoint. Defaults to the
+            pinned official Cohere checkpoint revision when ``model_id`` is that base
+            checkpoint.
 
     Returns:
         A native Cohere adapter or a standard Transformers ASR pipeline.
@@ -662,13 +685,17 @@ def load_asr_transcriber(
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be at least one.")
     if not no_lm:
-        config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        if revision is None and model_id == COHERE_MODEL_ID:
+            revision = COHERE_MODEL_REVISION
+        config = AutoConfig.from_pretrained(
+            model_id, trust_remote_code=False, revision=revision or "main"
+        )
         if getattr(config, "model_type", None) == "cohere_asr":
             processor = CohereAsrProcessor.from_pretrained(
-                model_id, trust_remote_code=False
+                model_id, trust_remote_code=False, revision=revision or "main"
             )
             model = CohereAsrForConditionalGeneration.from_pretrained(
-                model_id, trust_remote_code=False
+                model_id, trust_remote_code=False, revision=revision or "main"
             )
             t.cast(Callable[..., object], model.to)(device)
             return CohereASRTranscriber(

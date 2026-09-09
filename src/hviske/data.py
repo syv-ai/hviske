@@ -44,6 +44,7 @@ from .utils import (
     convert_numeral_to_words,
     interpret_dataset_name,
     no_datasets_progress_bars,
+    validate_transcript_revision,
 )
 
 logger = logging.getLogger(__package__)
@@ -484,6 +485,11 @@ def load_data_for_finetuning(
 
         is_local_vtt = dataset_config.get("type") == "local_vtt"
         transcript_dataset_id = dataset_config.get("transcript_dataset_id")
+        transcript_revision = None
+        if transcript_dataset_id is not None:
+            transcript_revision = validate_transcript_revision(
+                str(dataset_config.transcript_revision)
+            )
 
         if is_local_vtt:
             ds = load_vtt_manifest(
@@ -572,7 +578,7 @@ def load_data_for_finetuning(
                 dataset_id=transcript_dataset_id,
                 subset=dataset_config.get("transcript_subset"),
                 split=dataset_config.get("transcript_split", "train"),
-                revision=dataset_config.get("transcript_revision"),
+                revision=transcript_revision,
                 cache_dir=config.cache_dir,
                 trust_remote_code=dataset_config.get(
                     "transcript_trust_remote_code", False
