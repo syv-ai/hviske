@@ -64,7 +64,8 @@ segmentation:
   target_maximum_duration_ms: 8000
   maximum_duration_ms: 9999
   maximum_drift_ms: 500
-  minimum_alignment_score: 0.0
+  # Pilot-tunable: ctc-segmentation returns mean log probabilities <= 0.
+  minimum_alignment_score: -10.0
   minimum_vad_speech_ratio: 0.0
 
 output:
@@ -81,6 +82,9 @@ runtime:
   queue_slots: 1
   upload_concurrency: 1
   verification_concurrency: 1
+  # Keep projected source access bounded to one small Arrow batch.
+  source_max_batch_rows: 1
+  source_max_batch_bytes: 67108864
   device: cuda:0
   shards_per_commit: 8
   target_shard_bytes: 500000000

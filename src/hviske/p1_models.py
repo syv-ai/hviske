@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import typing as t
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,7 @@ class HuggingFaceCTCBackend(CTCBackend):
         import torch
         from transformers import AutoModelForCTC, AutoProcessor
 
+        verify_hub_model_revision(repository=repository, revision=revision)
         self._torch = torch
         self._processor = AutoProcessor.from_pretrained(repository, revision=revision)
         self._model = AutoModelForCTC.from_pretrained(repository, revision=revision)
@@ -106,6 +108,39 @@ class HuggingFaceCTCBackend(CTCBackend):
         if len(word_map) != len(result.word_boundaries):
             raise ValueError("word map does not match tokenised alignment words")
         return result
+
+
+def verify_hub_model_revision(
+    *, repository: str, revision: str, api: object | None = None
+) -> None:
+    """Verify a Hub model through Hugging Face's repository API.
+
+    Silero is deliberately not routed through this function: it is a GitHub asset,
+    and its commit/blob identity is checked by :func:`verify_silero_vad_revision`.
+
+    Raises:
+        ModelPinError:
+            If the revision is incomplete or resolves to another revision.
+    """
+    if len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
+        raise ModelPinError("Hub model revision must be a complete 40-character SHA")
+    client = api
+    if client is None:
+        from huggingface_hub import HfApi
+
+        client = HfApi()
+    repo_info = client.repo_info(repository, revision=revision)
+    resolved = (
+        repo_info.get("sha")
+        if isinstance(repo_info, c.Mapping)
+        else getattr(repo_info, "sha", None)
+    )
+    if resolved is not None and resolved != revision:
+        raise ModelPinError("Hugging Face did not resolve the pinned model revision")
+
+
+class ModelPinError(ValueError):
+    """Raised when a pinned model asset is absent or has changed."""
 
 
 @dataclass
@@ -212,7 +247,13 @@ def download_silero_vad(
     if destination.exists() and sidecar.exists():
         verify_silero_vad_asset(destination, require_provenance=True)
         return destination
-    url = f"https://github.com/{SILERO_REPOSITORY}/raw/{SILERO_REVISION}/{SILERO_MODEL_PATH}"
+    if opener is None:
+        url = verify_silero_vad_revision()
+    else:
+        url = (
+            f"https://raw.githubusercontent.com/{SILERO_REPOSITORY}/"
+            f"{SILERO_REVISION}/{SILERO_MODEL_PATH}"
+        )
     stream_opener = opener or urllib.request.urlopen
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     try:
@@ -278,6 +319,8 @@ def verify_silero_vad_asset(
         raise ModelPinError("Silero repository revision is not pinned")
     if model_path != SILERO_MODEL_PATH:
         raise ModelPinError("Silero asset path is not pinned")
+    if expected_blob != SILERO_MODEL_BLOB or expected_sha256 != SILERO_MODEL_SHA256:
+        raise ModelPinError("Silero asset digests are not pinned")
     if not path.is_file():
         raise ModelPinError(f"missing Silero JIT asset: {path}")
     payload = path.read_bytes()
@@ -313,5 +356,78 @@ def verify_silero_vad_asset(
         raise ModelPinError("Silero provenance sidecar does not match the pin")
 
 
-class ModelPinError(ValueError):
-    """Raised when a pinned model asset is absent or has changed."""
+def verify_silero_vad_revision(
+    *,
+    repository: str = SILERO_REPOSITORY,
+    revision: str = SILERO_REVISION,
+    model_path: str = SILERO_MODEL_PATH,
+    expected_blob: str = SILERO_MODEL_BLOB,
+    expected_sha256: str = SILERO_MODEL_SHA256,
+    path: Path | None = None,
+    opener: c.Callable[[str], c.BinaryIO] | None = None,
+) -> str:
+    """Verify Silero's exact GitHub commit and blob before downloading it.
+
+    Returns:
+        The immutable raw-file URL for the verified GitHub revision.
+
+    Raises:
+        ModelPinError:
+            If GitHub resolves either coordinate to a different object.
+    """
+    if repository != SILERO_REPOSITORY:
+        raise ModelPinError("Silero repository is not pinned")
+    if revision != SILERO_REVISION:
+        raise ModelPinError("Silero revision is not pinned")
+    if (
+        model_path != SILERO_MODEL_PATH
+        or expected_blob != SILERO_MODEL_BLOB
+        or expected_sha256 != SILERO_MODEL_SHA256
+    ):
+        raise ModelPinError("Silero asset coordinates are not pinned")
+    stream_opener = opener or urllib.request.urlopen
+    api_root = "https://api.github.com/repos/"
+    encoded_repository = urllib.parse.quote(repository, safe="/")
+    commit_url = f"{api_root}{encoded_repository}/commits/{revision}"
+    commit = _read_json_url(commit_url, stream_opener)
+    if commit.get("sha") != revision:
+        raise ModelPinError("GitHub did not resolve the pinned Silero commit")
+    encoded_path = urllib.parse.quote(model_path, safe="/")
+    contents_url = (
+        f"{api_root}{encoded_repository}/contents/{encoded_path}?ref={revision}"
+    )
+    contents = _read_json_url(contents_url, stream_opener)
+    if contents.get("sha") != expected_blob:
+        raise ModelPinError("GitHub did not resolve the pinned Silero blob")
+    if path is not None:
+        verify_silero_vad_asset(
+            path,
+            repository=repository,
+            revision=revision,
+            model_path=model_path,
+            expected_blob=expected_blob,
+            expected_sha256=expected_sha256,
+        )
+    return f"https://raw.githubusercontent.com/{repository}/{revision}/{model_path}"
+
+
+def _read_json_url(
+    url: str, opener: c.Callable[[str], c.BinaryIO]
+) -> dict[str, object]:
+    """Read one GitHub API response without introducing a Hub client.
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        ModelPinError:
+            If the response cannot be decoded as an object.
+    """
+    try:
+        with opener(url) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ModelPinError(f"could not verify GitHub model metadata: {url}") from exc
+    if not isinstance(value, dict):
+        raise ModelPinError("GitHub model metadata is not an object")
+    return t.cast(dict[str, object], value)

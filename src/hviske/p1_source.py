@@ -11,6 +11,7 @@ import collections.abc as c
 import contextlib
 import dataclasses
 import decimal
+import io
 import json
 import logging
 import math
@@ -22,8 +23,9 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+import soundfile as sf
 
-from .p1_contracts import SourceWord
+from .p1_contracts import SourceWord, annotate_source_words
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -267,11 +269,12 @@ class TranscriptPointerIndex:
 
 @dataclasses.dataclass(frozen=True)
 class ParsedAudio:
-    """One fetched audio row, retaining its source sampling rate."""
+    """One fetched audio row, retaining its source shape and sampling rate."""
 
     file_id: str
     value: bytes | np.ndarray | Path
     sampling_rate: int
+    channels: int = 1
 
 
 class HfP1Source:
@@ -285,6 +288,8 @@ class HfP1Source:
         token: str | bool | None = True,
         local_root: Path | None = None,
         max_source_object_bytes: int = 4_000_000_000,
+        max_batch_rows: int = 1,
+        max_batch_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         """Create an adapter without downloading source data.
 
@@ -294,18 +299,24 @@ class HfP1Source:
             transcript_repository (optional): Pinned transcript repository identifier.
             local_root (optional): Test or mirror root containing both repositories.
             max_source_object_bytes (optional): Hard object-size limit before retrieval.
+            max_batch_rows (optional): Maximum projected rows held in one Arrow batch.
+            max_batch_bytes (optional): Maximum projected Arrow batch size.
 
         Raises:
             ValueError:
-                If the object-size limit is not positive.
+                If a configured bound is not positive.
         """
         if max_source_object_bytes <= 0:
             raise ValueError("max_source_object_bytes must be positive")
+        if max_batch_rows <= 0 or max_batch_bytes <= 0:
+            raise ValueError("batch bounds must be positive")
         self.token = token
         self.audio_repository = audio_repository
         self.transcript_repository = transcript_repository
         self.local_root = Path(local_root) if local_root is not None else None
         self.max_source_object_bytes = max_source_object_bytes
+        self.max_batch_rows = max_batch_rows
+        self.max_batch_bytes = max_batch_bytes
         self._api: object | None = None
         self._fs: object | None = None
 
@@ -339,8 +350,11 @@ class HfP1Source:
                 for row_group in range(parquet.num_row_groups):
                     row_offset = 0
                     for batch in parquet.iter_batches(
-                        row_groups=[row_group], columns=columns, batch_size=1024
+                        row_groups=[row_group],
+                        columns=columns,
+                        batch_size=self.max_batch_rows,
                     ):
+                        _check_batch_bytes(batch, self.max_batch_bytes)
                         for row in batch.to_pylist():
                             file_id = _file_id(row)
                             if file_id is None:
@@ -451,8 +465,13 @@ class HfP1Source:
             revision=pointer.revision,
         ) as parquet:
             columns = _transcript_payload_columns(parquet.schema_arrow.names)
-            batch = parquet.read_row_group(pointer.row_group, columns=columns)
-            row = batch.slice(pointer.row_index, 1).to_pylist()[0]
+            row = _read_one_row(
+                parquet=parquet,
+                row_group=pointer.row_group,
+                row_index=pointer.row_index,
+                columns=columns,
+                max_batch_bytes=self.max_batch_bytes,
+            )
         parsed = parse_transcript_row(row=row, expected_file_id=pointer.file_id)
         return dataclasses.replace(parsed, metadata=pointer.metadata)
 
@@ -490,11 +509,20 @@ class HfP1Source:
             columns = tuple(
                 name for name in parquet.schema_arrow.names if name.lower() != "audio"
             )
+            effective_batch_size = self._batch_size(batch_size)
             for row_group in range(parquet.num_row_groups):
                 for batch in parquet.iter_batches(
-                    row_groups=[row_group], columns=columns, batch_size=batch_size
+                    row_groups=[row_group],
+                    columns=columns,
+                    batch_size=effective_batch_size,
                 ):
+                    _check_batch_bytes(batch, self.max_batch_bytes)
                     yield from batch.to_pylist()
+
+    def _batch_size(self, requested: int) -> int:
+        if requested <= 0:
+            raise ValueError("batch_size must be positive")
+        return min(requested, self.max_batch_rows)
 
     def list_audio_shards(self, *, revision: str) -> tuple[dict[str, object], ...]:
         """List audio Parquet objects from authenticated tree metadata only.
@@ -686,11 +714,20 @@ class HfP1Source:
                 for name in parquet.schema_arrow.names
                 if name.lower() in {"audio", "file_id"}
             )
-            batch = parquet.read_row_group(row_group, columns=columns)
-            row = batch.slice(row_index, 1).to_pylist()[0]
+            row = _read_one_row(
+                parquet=parquet,
+                row_group=row_group,
+                row_index=row_index,
+                columns=columns,
+                max_batch_bytes=self.max_batch_bytes,
+            )
             sampling_rate = _audio_sampling_rate(parquet)
+            channels = _audio_channels(parquet)
         return parse_audio_row(
-            row, expected_file_id=expected_file_id, default_sampling_rate=sampling_rate
+            row,
+            expected_file_id=expected_file_id,
+            default_sampling_rate=sampling_rate,
+            default_channels=channels,
         )
 
     def iter_programme_pointers(
@@ -704,11 +741,15 @@ class HfP1Source:
             columns = tuple(
                 name for name in parquet.schema_arrow.names if name.lower() != "audio"
             )
+            effective_batch_size = self._batch_size(batch_size)
             for row_group in range(parquet.num_row_groups):
                 row_index = 0
                 for batch in parquet.iter_batches(
-                    row_groups=[row_group], columns=columns, batch_size=batch_size
+                    row_groups=[row_group],
+                    columns=columns,
+                    batch_size=effective_batch_size,
                 ):
+                    _check_batch_bytes(batch, self.max_batch_bytes)
                     for row in batch.to_pylist():
                         file_id = _file_id(row)
                         if file_id is not None:
@@ -723,6 +764,40 @@ class HfP1Source:
 
 
 P1Source = HfP1Source
+
+
+def _audio_channels(parquet: pq.ParquetFile) -> int | None:
+    """Read an Audio feature's channel count from Parquet schema metadata.
+
+    Returns:
+        The declared channel count, or ``None`` when it is absent.
+    """
+    metadata = parquet.schema_arrow.metadata or {}
+    feature_json = metadata.get(b"huggingface")
+    if feature_json is None:
+        return None
+    try:
+        value: object = json.loads(feature_json)
+    except (TypeError, ValueError):
+        return None
+    return _find_channels(value)
+
+
+def _find_channels(value: object) -> int | None:
+    if isinstance(value, c.Mapping):
+        channels = value.get("channels")
+        if isinstance(channels, numbers.Integral) and not isinstance(channels, bool):
+            return int(channels)
+        for child in value.values():
+            found = _find_channels(child)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_channels(child)
+            if found is not None:
+                return found
+    return None
 
 
 def _audio_sampling_rate(parquet: pq.ParquetFile) -> int | None:
@@ -769,6 +844,46 @@ def _programme_file_id(programme: object) -> str | None:
 def _file_id(row: c.Mapping[str, object]) -> str | None:
     value = row.get("file_id", row.get("audio_id"))
     return value if isinstance(value, str) and value else None
+
+
+def _read_one_row(
+    *,
+    parquet: pq.ParquetFile,
+    row_group: int,
+    row_index: int,
+    columns: c.Sequence[str],
+    max_batch_bytes: int,
+) -> dict[str, object]:
+    """Read one projected row without materialising its row group.
+
+    Returns:
+        The selected row as a mapping.
+
+    Raises:
+        InvalidSourceRecord:
+            If coordinates do not identify a row.
+    """
+    if row_group < 0 or row_index < 0:
+        raise InvalidSourceRecord("source row coordinates must be non-negative")
+    offset = 0
+    for batch in parquet.iter_batches(
+        row_groups=[row_group], columns=list(columns), batch_size=1
+    ):
+        _check_batch_bytes(batch, max_batch_bytes)
+        if offset == row_index:
+            rows = batch.to_pylist()
+            if rows:
+                return rows[0]
+        offset += 1
+    raise InvalidSourceRecord("source row coordinate is outside its row group")
+
+
+def _check_batch_bytes(batch: object, maximum: int) -> None:
+    size = int(getattr(batch, "nbytes", 0))
+    if size > maximum:
+        raise SourceObjectTooLarge(
+            f"projected Arrow batch ({size} bytes) exceeds {maximum} bytes"
+        )
 
 
 def _scalar_metadata(row: c.Mapping[str, object]) -> tuple[tuple[str, str], ...]:
@@ -840,6 +955,7 @@ def parse_audio_row(
     row: c.Mapping[str, object],
     expected_file_id: str | None = None,
     default_sampling_rate: int | None = None,
+    default_channels: int | None = None,
 ) -> ParsedAudio:
     """Parse an embedded audio row and expose its source sampling rate.
 
@@ -865,16 +981,62 @@ def parse_audio_row(
         or int(rate) <= 0
     ):
         raise InvalidSourceRecord(f"audio row {file_id} has an invalid sampling rate")
+    declared_channels = audio.get("channels", row.get("channels", default_channels))
+    if declared_channels is not None and (
+        isinstance(declared_channels, bool)
+        or not isinstance(declared_channels, numbers.Integral)
+        or int(declared_channels) <= 0
+    ):
+        raise InvalidSourceRecord(f"audio row {file_id} has invalid channel metadata")
     value = audio.get("array", audio.get("bytes", audio.get("path")))
     if value is None or not isinstance(
         value, (bytes, str, Path, np.ndarray, list, tuple)
     ):
         raise InvalidSourceRecord(f"audio row {file_id} has an invalid payload")
+    if isinstance(value, bytes) and value.startswith(b"fLaC"):
+        try:
+            decoded, decoded_rate = sf.read(
+                io.BytesIO(value), dtype="float32", always_2d=True
+            )
+        except (RuntimeError, sf.LibsndfileError) as exc:
+            raise InvalidSourceRecord(
+                f"audio row {file_id} contains invalid FLAC"
+            ) from exc
+        if decoded_rate != int(rate):
+            raise InvalidSourceRecord(
+                f"audio row {file_id} rate metadata does not match FLAC"
+            )
+        actual_channels = int(decoded.shape[1])
+        if declared_channels is not None and actual_channels != int(declared_channels):
+            raise InvalidSourceRecord(
+                f"audio row {file_id} channel metadata does not match FLAC"
+            )
+        return ParsedAudio(
+            file_id=file_id,
+            value=np.asarray(decoded, dtype=np.float32),
+            sampling_rate=int(rate),
+            channels=actual_channels,
+        )
     if isinstance(value, (list, tuple)):
         value = np.asarray(value)
+    if isinstance(value, np.ndarray):
+        if value.ndim == 1:
+            actual_channels = 1
+        elif value.ndim == 2:
+            actual_channels = int(value.shape[1])
+        else:
+            raise InvalidSourceRecord(f"audio row {file_id} has an invalid shape")
+        if declared_channels is not None and actual_channels != int(declared_channels):
+            raise InvalidSourceRecord(
+                f"audio row {file_id} channel metadata does not match"
+            )
+    else:
+        actual_channels = int(declared_channels or 1)
     if isinstance(value, str):
         value = Path(value)
-    return ParsedAudio(file_id=file_id, value=value, sampling_rate=int(rate))
+    return ParsedAudio(
+        file_id=file_id, value=value, sampling_rate=int(rate), channels=actual_channels
+    )
 
 
 def parse_transcript_row(
@@ -970,7 +1132,13 @@ def parse_transcript_row(
     text = explicit_text if isinstance(explicit_text, str) else "".join(pieces)
     if not text:
         raise InvalidSourceRecord(f"transcript {file_id} is empty")
-    return ParsedTranscript(file_id=file_id, text=text, words=tuple(words))
+    try:
+        annotated_words = annotate_source_words(words, text)
+    except ValueError as exc:
+        raise InvalidSourceRecord(
+            f"transcript {file_id} words do not reconstruct its verbatim text"
+        ) from exc
+    return ParsedTranscript(file_id=file_id, text=text, words=annotated_words)
 
 
 def _first_present(row: c.Mapping[str, object], names: c.Sequence[str]) -> object:

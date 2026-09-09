@@ -171,13 +171,29 @@ class SourceCoordinates(ContractModel):
         return self
 
 
+class SourceTextSpan(ContractModel):
+    """A half-open character span in the verbatim programme transcript."""
+
+    start: StrictInt = Field(ge=0)
+    end: StrictInt = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _span_is_ordered(self) -> SourceTextSpan:
+        if self.end <= self.start:
+            raise ValueError("source text span end must be greater than start")
+        return self
+
+
 class SourceWord(ContractModel):
-    """A transcript word with its source-programme span."""
+    """A transcript word with timing and auditable source-text spans."""
 
     text: StrictStr
     start_ms: StrictInt = Field(ge=0)
     end_ms: StrictInt = Field(gt=0)
     speaker_id: StrictStr | None = None
+    source_span: SourceTextSpan | None = None
+    separator_span: SourceTextSpan | None = None
+    separator_text: StrictStr = ""
 
     @model_validator(mode="after")
     def _span_is_ordered(self) -> SourceWord:
@@ -185,16 +201,28 @@ class SourceWord(ContractModel):
             raise ValueError("word end_ms must be greater than start_ms")
         if not self.text.strip():
             raise ValueError("word text must not be empty")
+        if self.source_span is not None and (
+            self.source_span.end - self.source_span.start != len(self.text)
+        ):
+            raise ValueError("source character span does not match word text")
+        if self.separator_span is None and self.separator_text:
+            raise ValueError("separator text requires a separator span")
+        if self.separator_span is not None and (
+            self.separator_span.end - self.separator_span.start
+            != len(self.separator_text)
+        ):
+            raise ValueError("separator span does not match separator text")
         return self
 
 
 class SourceProgramme(ContractModel):
-    """A joined P1 programme and its ordered transcript words."""
+    """A joined P1 programme and its ordered words and separator spans."""
 
     file_id: StrictStr
     duration_ms: StrictInt = Field(gt=0)
     words: tuple[SourceWord, ...]
     transcript_text: StrictStr | None = None
+    separator_spans: tuple[SourceTextSpan, ...] = ()
 
     @field_validator("file_id")
     def _file_id_is_present(value: str) -> str:
@@ -211,7 +239,57 @@ class SourceProgramme(ContractModel):
             if word.end_ms > self.duration_ms:
                 raise ValueError("word span must fit programme duration")
             previous_end = word.end_ms
+        if self.transcript_text is not None and self.words:
+            annotated = annotate_source_words(self.words, self.transcript_text)
+            object.__setattr__(self, "words", annotated)
+            object.__setattr__(
+                self,
+                "separator_spans",
+                tuple(
+                    word.separator_span
+                    for word in annotated
+                    if word.separator_span is not None
+                ),
+            )
         return self
+
+
+def annotate_source_words(
+    words: tuple[SourceWord, ...] | list[SourceWord], transcript_text: str
+) -> tuple[SourceWord, ...]:
+    """Attach exact character and separator spans to transcript words.
+
+    The source text is treated as authoritative.  A word that cannot be found in
+    order is rejected rather than silently normalised or re-spaced.
+
+    Returns:
+        Words carrying their source and separator spans.
+
+    Raises:
+        ValueError:
+            If a word is absent or out of order in the transcript.
+    """
+    cursor = 0
+    annotated: list[SourceWord] = []
+    for index, word in enumerate(words):
+        start = transcript_text.find(word.text, cursor)
+        if start < 0:
+            raise ValueError(f"word {index} is not present in transcript text")
+        source_span = SourceTextSpan(start=start, end=start + len(word.text))
+        separator_span = (
+            SourceTextSpan(start=cursor, end=start) if start > cursor else None
+        )
+        annotated.append(
+            word.model_copy(
+                update={
+                    "source_span": source_span,
+                    "separator_span": separator_span,
+                    "separator_text": transcript_text[cursor:start],
+                }
+            )
+        )
+        cursor = start + len(word.text)
+    return tuple(annotated)
 
 
 OUTPUT_SCHEMA = OutputSchema(
