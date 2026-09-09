@@ -76,7 +76,10 @@ Here are some of the more important available keys:
   set to `True`, the model will be private. The default is not to push the model to the
   Hub. `private_only` hard-fails public destinations and verifies Hub visibility before
   and after upload. The production Sparkie preset keeps publication off during training;
-  use its separate `publish_private_model.py` command after review.
+  use its separate `publish_private_model.py` command after review. Publication stages
+  only recognised top-level model, tokenizer and processor artefacts, and records the
+  exact training dataset IDs supplied with `--training-dataset-id` in a bilingual
+  internal-use model card. Trainer automatic pushes remain disabled.
 - `enable_experiment_tracking`: Whether training monitoring during training should be
   enabled. Defaults to false. You can also set `experiment_tracking` to either `wandb`
   or `mlflow` to specify which experiment tracking tool to use (`wandb` is used by

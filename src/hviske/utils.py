@@ -6,7 +6,8 @@ import logging
 import multiprocessing as mp
 import os
 import re
-import typing as t
+import shutil
+import tempfile
 import warnings
 from functools import partialmethod
 from pathlib import Path
@@ -31,6 +32,37 @@ logger = logging.getLogger(__package__)
 
 
 NUMERAL_REGEX = re.compile(r"\b(0|[1-9]\d{0,2}(?:(?:\.\d{3})*|\d*)(?:,\d+)?)\b")
+
+
+_MODEL_ARTEFACT_NAMES = frozenset(
+    {
+        "added_tokens.json",
+        "config.json",
+        "decoder_config.json",
+        "feature_extractor_config.json",
+        "generation_config.json",
+        "merges.txt",
+        "normalizer.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "sentencepiece.bpe.model",
+        "special_tokens_map.json",
+        "spiece.model",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "vocab.json",
+        "vocab.txt",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+        "chat_template.jinja",
+    }
+)
+_SHARDED_MODEL_ARTEFACT = re.compile(
+    r"(?:model|pytorch_model)-\d{5}-of-\d{5}\.(?:bin|safetensors)\Z"
+)
 
 
 def block_terminal_output() -> None:
@@ -313,8 +345,10 @@ def publish_model_folder(
     private: bool,
     model_card_languages: list[str],
     commit_message: str = "Publish private model",
+    training_dataset_ids: list[str] | None = None,
+    evaluation_status: str = "Not evaluated.",
 ) -> CommitInfo:
-    """Publish a model folder after enforcing private-only Hub visibility.
+    """Publish a model folder through one private Hub commit.
 
     Args:
         folder_path:
@@ -329,69 +363,39 @@ def publish_model_folder(
             Languages to include in the model-card metadata.
         commit_message (optional):
             Hub commit message. Defaults to "Publish private model".
+        training_dataset_ids (optional):
+            Exact Hub dataset identifiers used for training.
+        evaluation_status (optional):
+            Short evaluation-status statement for the model card.
 
     Returns:
         The model-file upload commit information.
-
     """
     validate_private_only_config({"private_only": True, "private": private})
     token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
     api = ensure_private_hub_repository(repo_id=repo_id, token=token)
-    commit = upload_folder(
-        repo_id=repo_id,
-        folder_path=folder_path,
-        token=token or True,
-        commit_message=commit_message,
-        allow_patterns=[
-            "*.bin",
-            "*.json",
-            "*.jinja",
-            "*.model",
-            "*.safetensors",
-            "*.txt",
-        ],
-        ignore_patterns=[
-            "_*",
-            "checkpoint-*",
-            "*.arrow",
-            "*.csv",
-            "*.flac",
-            "*.jsonl",
-            "*.log",
-            "*.yaml",
-            "*.yml",
-            "trainer_state.json",
-            "all_results.json",
-            "eval_results.json",
-            "train_results.json",
-            "*.mp3",
-            "*.parquet",
-            "*.wav",
-            "*.vtt",
-            ".hydra/**",
-            "mlruns/**",
-            "runs/**",
-            "wandb/**",
-        ],
-    )
-    language_lines = "\n".join(f"- {language}" for language in model_card_languages)
-    card = (
-        "---\n"
-        f"language:\n{language_lines}\n"
-        "library_name: transformers\n"
-        "pipeline_tag: automatic-speech-recognition\n"
-        f"base_model: {finetuned_from}\n"
-        "---\n"
-    )
-    api.upload_file(
-        path_or_fileobj=card.encode(),
-        path_in_repo="README.md",
-        repo_id=repo_id,
-        repo_type="model",
-        token=token or True,
-        commit_message="Add bilingual model-card metadata",
-    )
-    verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+    languages = list(model_card_languages)
+    for required_language in ("da", "en"):
+        if required_language not in languages:
+            languages.append(required_language)
+    with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
+        staging_path = Path(staging_dir)
+        _copy_model_artefacts(source=Path(folder_path), destination=staging_path)
+        _write_model_card(
+            destination=staging_path / "README.md",
+            finetuned_from=finetuned_from,
+            model_card_languages=languages,
+            training_dataset_ids=training_dataset_ids or [],
+            evaluation_status=evaluation_status,
+        )
+        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
+        commit = upload_folder(
+            repo_id=repo_id,
+            folder_path=staging_path,
+            token=token or True,
+            commit_message=commit_message,
+        )
+        verify_private_hub_repository(api=api, repo_id=repo_id, token=token)
     return commit
 
 
@@ -407,12 +411,13 @@ def push_model_to_hub(
     private: bool = False,
     private_only: bool = False,
     model_card_languages: list[str] | None = None,
+    training_dataset_ids: list[str] | None = None,
+    evaluation_status: str = "Not evaluated.",
 ) -> CommitInfo | None:
-    """Upload model and tokenizer to the Hugging Face Hub.
+    """Upload a filtered model artefact set to the Hugging Face Hub.
 
-    This uses the model stored as `trainer.model` and the tokenizer stored as
-    `trainer.tokenizer`, and uploads them to the model ID stored in
-    `trainer.args.hub_model_id`.
+    The upload is staged in a temporary directory so trainer output, datasets and
+    experiment-tracking artefacts cannot become part of the Hub commit.
 
     Args:
         trainer:
@@ -424,12 +429,11 @@ def push_model_to_hub(
         create_pr:
             Whether to create a pull request.
         language (optional):
-            The language of the model. Defaults to "da" (Danish).
+            Retained for API compatibility. The model card is bilingual.
         license (optional):
-            The license of the model. Defaults to "openrail".
+            Must be ``openrail`` for this publication path.
         tasks (optional):
-            The tasks the model is fine-tuned for. Defaults to
-            ["automatic-speech-recognition"].
+            Retained for API compatibility; this path publishes ASR models.
         commit_message (optional):
             Message to commit while pushing. Defaults to "Finished finetuning 🎉".
         private (optional):
@@ -437,87 +441,126 @@ def push_model_to_hub(
         private_only (optional):
             Whether to refuse all public repositories. Defaults to False.
         model_card_languages (optional):
-            Language metadata to write to the model card. Defaults to ``language``.
+            Additional model-card language metadata. Danish and English are always
+            included.
+        training_dataset_ids (optional):
+            Exact Hub dataset identifiers used for training.
+        evaluation_status (optional):
+            Short evaluation-status statement for the model card.
 
     Returns:
         The commit information, or None if the process is not the main process.
 
     Raises:
         ValueError:
-            If private-only publication is requested without private=true.
+            If private-only publication is requested without private=true, or if a
+            licence other than openrail is requested.
     """
+    del language, tasks, model_name
+    if license.lower() != "openrail":
+        raise ValueError("Private ASR publication requires the openrail licence")
     token = os.getenv("HUGGINGFACE_HUB_TOKEN", None)
     validate_private_only_config({"private_only": private_only, "private": private})
     repo_id = trainer.hub_model_id or getattr(trainer.args, "hub_model_id", None)
-    if private_only:
+    api: HfApi | None = None
+    requires_private = private or private_only
+    if requires_private:
         if repo_id is None:
-            raise ValueError("Private-only publication requires a Hub model ID")
-        ensure_private_hub_repository(repo_id=repo_id, token=token)
+            raise ValueError("Private publication requires a Hub model ID")
+        api = ensure_private_hub_repository(repo_id=repo_id, token=token)
 
-    # In case the user calls this method with trainer.args.push_to_hub = False
+    # Trainer's own asynchronous pushes must never publish this output directory.
+    trainer.args.push_to_hub = False
     if trainer.hub_model_id is None:
         trainer.init_hf_repo(token=token)
         repo_id = trainer.hub_model_id
 
-    # Only push from one node
     if not trainer.is_world_process_zero():
         return None
-
-    trainer.create_model_card(
-        model_name=model_name,
-        language=t.cast(str, model_card_languages or language),
-        license=license,
-        tasks=tasks or ["automatic-speech-recognition"],
-        finetuned_from=finetuned_from,
-    )
-
-    # Wait for the current upload to be finished.
     trainer._finish_current_push()
-    commit = upload_folder(
-        repo_id=repo_id or "",
-        create_pr=create_pr,
-        folder_path=trainer.args.output_dir or ".",
-        commit_message=commit_message,
-        token=token or True,
-        allow_patterns=[
-            "README.md",
-            "*.bin",
-            "*.json",
-            "*.jinja",
-            "*.model",
-            "*.safetensors",
-            "*.txt",
-        ],
-        ignore_patterns=[
-            "_*",
-            "checkpoint-*",
-            "*.arrow",
-            "*.audio",
-            "*.csv",
-            "*.flac",
-            "*.jsonl",
-            "*.log",
-            "*.yaml",
-            "*.yml",
-            "trainer_state.json",
-            "all_results.json",
-            "eval_results.json",
-            "train_results.json",
-            "*.mp3",
-            "*.parquet",
-            "*.wav",
-            "*.vtt",
-            ".hydra/**",
-            "mlruns/**",
-            "runs/**",
-            "wandb/**",
-        ],
-    )
-    if private_only:
-        verify_private_hub_repository(
-            api=HfApi(token=token or True), repo_id=repo_id or "", token=token
+
+    languages = list(model_card_languages or ["da", "en"])
+    for required_language in ("da", "en"):
+        if required_language not in languages:
+            languages.append(required_language)
+    with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
+        staging_path = Path(staging_dir)
+        _copy_model_artefacts(
+            source=Path(trainer.args.output_dir or "."), destination=staging_path
         )
+        _write_model_card(
+            destination=staging_path / "README.md",
+            finetuned_from=finetuned_from,
+            model_card_languages=languages,
+            training_dataset_ids=training_dataset_ids or [],
+            evaluation_status=evaluation_status,
+        )
+        if requires_private:
+            assert api is not None
+            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
+        commit = upload_folder(
+            repo_id=repo_id or "",
+            create_pr=create_pr,
+            folder_path=staging_path,
+            commit_message=commit_message,
+            token=token or True,
+        )
+        if requires_private:
+            assert api is not None
+            verify_private_hub_repository(api=api, repo_id=repo_id or "", token=token)
     return commit
+
+
+def _copy_model_artefacts(source: Path, destination: Path) -> None:
+    """Copy only recognised regular files from a model output directory.
+
+    Raises:
+        ValueError:
+            If the source is not a directory.
+    """
+    if not source.is_dir():
+        raise ValueError(f"Model output directory does not exist: {source}")
+    for candidate in source.iterdir():
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        is_sharded = _SHARDED_MODEL_ARTEFACT.fullmatch(candidate.name) is not None
+        if candidate.name not in _MODEL_ARTEFACT_NAMES and not is_sharded:
+            continue
+        shutil.copy2(candidate, destination / candidate.name)
+
+
+def _write_model_card(
+    destination: Path,
+    finetuned_from: str,
+    model_card_languages: list[str],
+    training_dataset_ids: list[str],
+    evaluation_status: str,
+) -> None:
+    """Write the publication model card without machine-local information."""
+    language_lines = "\n".join(f"- {language}" for language in model_card_languages)
+    dataset_lines = "\n".join(f"- {dataset_id}" for dataset_id in training_dataset_ids)
+    if not dataset_lines:
+        dataset_lines = "- Not supplied by the caller."
+    destination.write_text(
+        "---\n"
+        f"language:\n{language_lines}\n"
+        "license: openrail\n"
+        "library_name: transformers\n"
+        "pipeline_tag: automatic-speech-recognition\n"
+        f"base_model: {finetuned_from}\n"
+        "datasets:\n"
+        f"{dataset_lines}\n"
+        "---\n\n"
+        "# Private internal Danish-English ASR checkpoint\n\n"
+        "This is a private internal Danish-English automatic speech recognition "
+        "checkpoint. It is intended for internal research, evaluation and testing "
+        "only, not for public distribution or production use.\n\n"
+        "## Training datasets\n\n"
+        f"{dataset_lines}\n\n"
+        "## Evaluation status\n\n"
+        f"{evaluation_status}\n",
+        encoding="utf-8",
+    )
 
 
 def convert_numeral_to_words(numeral: str, inside_larger_numeral: bool = False) -> str:

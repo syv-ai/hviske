@@ -26,12 +26,25 @@ from hviske.utils import publish_model_folder
     is_flag=True,
     help="Confirm that this publication must remain private.",
 )
+@click.option(
+    "--training-dataset-id",
+    multiple=True,
+    help="Exact Hugging Face dataset ID used for training (repeatable).",
+)
+@click.option(
+    "--evaluation-status",
+    default="Not evaluated.",
+    show_default=True,
+    help="Evaluation status to record in the model card.",
+)
 def main(
     model_dir: Path,
     repo_id: str,
     finetuned_from: str,
     language: tuple[str, ...],
     private: bool,
+    training_dataset_id: tuple[str, ...],
+    evaluation_status: str,
 ) -> None:
     """Upload MODEL_DIR to REPO_ID without exposing private training artefacts."""
     publish_model_folder(
@@ -40,6 +53,8 @@ def main(
         finetuned_from=finetuned_from,
         private=private,
         model_card_languages=list(language),
+        training_dataset_ids=list(training_dataset_id),
+        evaluation_status=evaluation_status,
     )
 
 
