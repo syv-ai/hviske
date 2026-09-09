@@ -12,9 +12,13 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
+import shlex
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import typing as t
@@ -94,9 +98,9 @@ class PinnedHubClipRetriever:
             raise ValueError("candidate repository differs from pinned repository")
         if revision and revision != self.revision:
             raise ValueError("candidate revision differs from pinned revision")
-        parquet_path = _parquet_path(entry)
-        if not parquet_path:
-            raise ValueError("candidate has no remote Parquet path")
+        parquet_path, locator, candidate_revision = _validate_audit_locator(entry)
+        if candidate_revision != self.revision:
+            raise ValueError("candidate revision differs from pinned revision")
         expected_shard = _string(entry, "parquet_sha256", "shard_sha256")
         if expected_shard:
             _validate_remote_shard_hash(
@@ -106,9 +110,6 @@ class PinnedHubClipRetriever:
                 parquet_path=parquet_path,
                 expected=expected_shard,
             )
-        locator = _row_locator(entry, 0)
-        if locator < 0:
-            raise ValueError("candidate row locator must be non-negative")
         loader = getattr(self.hub, "load_dataset", None)
         if loader is None:
             raise TypeError("Hub adapter must provide load_dataset")
@@ -194,16 +195,16 @@ def _metadata_digest(row: MetadataRow) -> str:
     ).hexdigest()
 
 
-def _parquet_path(row: MetadataRow) -> str | None:
-    """Read a Parquet object path, never treating an audio path as one.
-
-    Returns:
-        A Parquet path, or ``None`` when the row has no such locator.
-    """
-    value = _string(
-        row, "parquet_path", "remote_parquet_path", "shard_path", "source_parquet"
-    )
-    return value if value and value.lower().endswith(".parquet") else None
+def _row_at(dataset: object, locator: int) -> MetadataRow:
+    iterator = iter(dataset) if isinstance(dataset, c.Iterable) else None
+    if iterator is None:
+        raise TypeError("Hub dataset must be iterable in streaming mode")
+    for index, row in enumerate(iterator):
+        if index == locator:
+            if not isinstance(row, c.Mapping):
+                raise TypeError("Hub dataset rows must be mappings")
+            return row
+    raise FileNotFoundError(f"Parquet row {locator} was not found")
 
 
 def _string(row: MetadataRow, *keys: str) -> str | None:
@@ -218,19 +219,30 @@ def _string(row: MetadataRow, *keys: str) -> str | None:
     return None
 
 
-def _row_at(dataset: object, locator: int) -> MetadataRow:
-    iterator = iter(dataset) if isinstance(dataset, c.Iterable) else None
-    if iterator is None:
-        raise TypeError("Hub dataset must be iterable in streaming mode")
-    for index, row in enumerate(iterator):
-        if index == locator:
-            if not isinstance(row, c.Mapping):
-                raise TypeError("Hub dataset rows must be mappings")
-            return row
-    raise FileNotFoundError(f"Parquet row {locator} was not found")
+def _validate_audit_locator(row: MetadataRow) -> tuple[str, int, str]:
+    """Validate the immutable remote locator required by an audit record.
+
+    Returns:
+        The Parquet path, row locator, and immutable commit SHA.
+
+    Raises:
+        ValueError:
+            If any required locator field is absent or malformed.
+    """
+    parquet_path = _parquet_path(row)
+    if parquet_path is None:
+        raise ValueError("audit candidates require a remote Parquet path")
+    locator = _explicit_row_locator(row)
+    if locator is None or locator < 0:
+        raise ValueError("audit candidates require a non-negative row locator")
+    revision = _string(row, "revision", "hub_revision")
+    if revision is None or not _COMMIT_SHA.fullmatch(revision):
+        raise ValueError("audit candidates require a complete immutable commit SHA")
+    return parquet_path, locator, revision
 
 
-def _row_locator(row: MetadataRow, fallback: int) -> int:
+def _explicit_row_locator(row: MetadataRow) -> int | None:
+    """Return the supplied Parquet row locator, without inventing one."""
     for key in ("row_locator", "row_index", "parquet_row"):
         value = row.get(key)
         if isinstance(value, bool):
@@ -241,7 +253,19 @@ def _row_locator(row: MetadataRow, fallback: int) -> int:
             return int(value)
         if isinstance(value, str) and value.isdigit():
             return int(value)
-    return fallback
+    return None
+
+
+def _parquet_path(row: MetadataRow) -> str | None:
+    """Read a Parquet object path, never treating an audio path as one.
+
+    Returns:
+        A Parquet path, or ``None`` when the row has no such locator.
+    """
+    value = _string(
+        row, "parquet_path", "remote_parquet_path", "shard_path", "source_parquet"
+    )
+    return value if value and value.lower().endswith(".parquet") else None
 
 
 def _validate_remote_shard_hash(
@@ -284,6 +308,57 @@ def _object_value(value: object, name: str) -> str | None:
     nested = getattr(value, "lfs", None)
     candidate = getattr(nested, name, None)
     return candidate if isinstance(candidate, str) else None
+
+
+class SourceClipRetriever:
+    """Adapt a one-at-a-time source retrieval callback for rejected clips.
+
+    The callback receives only the source locator from a candidate and must return
+    bytes or a path.  It is deliberately not a cache: callers get one temporary
+    review file and the file is removed when review finishes.
+    """
+
+    def __init__(self, callback: c.Callable[[MetadataRow], bytes | Path]) -> None:
+        """Initialise the non-retaining source adapter."""
+        self._callback = callback
+
+    def retrieve(self, entry: MetadataRow) -> bytes | Path:
+        """Retrieve one source interval.
+
+        Returns:
+            One source clip as bytes or a temporary path.
+
+        Raises:
+            ValueError:
+                If the candidate lacks a complete source locator.
+        """
+        for key in ("source_repository", "source_revision", "source_file_id"):
+            if not _string(entry, key):
+                raise ValueError(f"candidate has no {key}")
+        source_revision = _string(entry, "source_revision")
+        if source_revision is None or not _COMMIT_SHA.fullmatch(source_revision):
+            raise ValueError(
+                "candidate source revision must be an immutable commit SHA"
+            )
+        for key in ("source_start_ms", "source_end_ms"):
+            if _integer(entry, key) is None:
+                raise ValueError(f"candidate has no {key}")
+        return self._callback(entry)
+
+
+def _integer(row: MetadataRow, *keys: str) -> int | None:
+    value = _number(row, *keys)
+    return int(value) if value is not None else None
+
+
+def _number(row: MetadataRow, *keys: str) -> float | None:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+    return None
 
 
 def _asr_report(
@@ -556,16 +631,6 @@ def _first_number(row: MetadataRow, keys: tuple[str, ...]) -> float | None:
     return _number(row, *keys)
 
 
-def _number(row: MetadataRow, *keys: str) -> float | None:
-    for key in keys:
-        value = row.get(key)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            return float(value)
-    return None
-
-
 def _position_decile(row: MetadataRow) -> str:
     value = _number(row, "programme_position", "position")
     if value is None:
@@ -793,7 +858,13 @@ class MetadataLedger:
                 stratum_json TEXT NOT NULL,
                 metadata_sha256 TEXT NOT NULL,
                 audio_sha256 TEXT,
-                parquet_sha256 TEXT
+                parquet_sha256 TEXT,
+                source_file_id TEXT,
+                source_repository TEXT,
+                source_revision TEXT,
+                source_start_ms INTEGER,
+                source_end_ms INTEGER,
+                retrieved_at REAL
             );
             CREATE TABLE IF NOT EXISTS blind_decisions (
                 audit_id TEXT PRIMARY KEY,
@@ -811,6 +882,12 @@ class MetadataLedger:
         )
         for table, column, definition in (
             ("audit_candidates", "parquet_sha256", "TEXT"),
+            ("audit_candidates", "source_file_id", "TEXT"),
+            ("audit_candidates", "source_repository", "TEXT"),
+            ("audit_candidates", "source_revision", "TEXT"),
+            ("audit_candidates", "source_start_ms", "INTEGER"),
+            ("audit_candidates", "source_end_ms", "INTEGER"),
+            ("audit_candidates", "retrieved_at", "REAL"),
             ("blind_decisions", "details_json", "TEXT NOT NULL DEFAULT '{}'"),
         ):
             columns = {
@@ -860,6 +937,7 @@ class MetadataLedger:
             TypeError:
                 If the stratum is not iterable.
         """
+        _validate_audit_locator(candidate)
         stratum = candidate.get("stratum", ())
         if isinstance(stratum, (str, bytes)):
             stratum = [str(stratum)]
@@ -868,18 +946,28 @@ class MetadataLedger:
         values = [str(value) for value in stratum]
         self.connection.execute(
             """INSERT OR REPLACE INTO audit_candidates
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (audit_id, segment_id, repository, revision, parquet_path,
+             row_locator, stratum_json, metadata_sha256, audio_sha256,
+             parquet_sha256, source_file_id, source_repository, source_revision,
+             source_start_ms, source_end_ms, retrieved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _string(candidate, "audit_id") or "",
                 _string(candidate, "segment_id") or "",
                 _string(candidate, "repository", "repo_id"),
-                _string(candidate, "revision"),
+                _string(candidate, "revision", "hub_revision"),
                 _parquet_path(candidate),
-                _row_locator(candidate, 0),
+                _explicit_row_locator(candidate),
                 json.dumps(values, separators=(",", ":")),
                 _string(candidate, "metadata_sha256") or "",
                 _string(candidate, "audio_sha256"),
                 _string(candidate, "parquet_sha256", "shard_sha256"),
+                _string(candidate, "source_file_id"),
+                _string(candidate, "source_repository"),
+                _string(candidate, "source_revision"),
+                _integer(candidate, "source_start_ms"),
+                _integer(candidate, "source_end_ms"),
+                None,
             ),
         )
         self.connection.commit()
@@ -893,8 +981,18 @@ class MetadataLedger:
         """
         audit_id = _string(decision, "audit_id")
         value = _string(decision, "decision")
-        if not audit_id or not value:
-            raise ValueError("a blinded decision needs audit_id and decision")
+        if not audit_id or value not in {"accepted", "rejected", "borderline"}:
+            raise ValueError(
+                "a blinded decision needs audit_id and an accepted, rejected, "
+                "or borderline decision"
+            )
+        candidate_exists = self.connection.execute(
+            "SELECT retrieved_at FROM audit_candidates WHERE audit_id = ?", (audit_id,)
+        ).fetchone()
+        if candidate_exists is None:
+            raise ValueError("a decision needs a persisted audit candidate")
+        if candidate_exists[0] is None:
+            raise ValueError("a decision needs successful clip retrieval")
         wer = _number(decision, "normalised_wer", "wer")
         anomaly = decision.get("independent_asr_anomaly")
         details = {
@@ -930,7 +1028,8 @@ class MetadataLedger:
         cursor = self.connection.execute(
             "SELECT audit_id, segment_id, repository, revision, parquet_path, "
             "row_locator, stratum_json, metadata_sha256, audio_sha256, "
-            "parquet_sha256 FROM audit_candidates ORDER BY audit_id"
+            "parquet_sha256, source_file_id, source_repository, source_revision, "
+            "source_start_ms, source_end_ms FROM audit_candidates ORDER BY audit_id"
         )
         for values in cursor:
             yield {
@@ -945,6 +1044,11 @@ class MetadataLedger:
                 "metadata_sha256": values[7],
                 **({"audio_sha256": values[8]} if values[8] else {}),
                 **({"parquet_sha256": values[9]} if values[9] else {}),
+                **({"source_file_id": values[10]} if values[10] else {}),
+                **({"source_repository": values[11]} if values[11] else {}),
+                **({"source_revision": values[12]} if values[12] else {}),
+                **({"source_start_ms": values[13]} if values[13] is not None else {}),
+                **({"source_end_ms": values[14]} if values[14] is not None else {}),
             }
 
     def close(self) -> None:
@@ -973,6 +1077,21 @@ class MetadataLedger:
             if isinstance(details, dict):
                 result.update(details)
             yield result
+
+    def mark_retrieved(self, audit_id: str) -> None:
+        """Record successful validation of one temporary clip retrieval.
+
+        Raises:
+            ValueError:
+                If the audit ID is not persisted.
+        """
+        updated = self.connection.execute(
+            "UPDATE audit_candidates SET retrieved_at = ? WHERE audit_id = ?",
+            (time.time(), audit_id),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("cannot mark an unknown audit candidate as retrieved")
+        self.connection.commit()
 
     def quality_checks(self) -> dict[str, object]:
         """Return duplicate-ID and same-source overlapping-interval findings."""
@@ -1038,6 +1157,8 @@ def _metadata_copy(row: MetadataRow) -> dict[str, object]:
         "segment_id",
         "id",
         "source_file_id",
+        "source_repository",
+        "source_revision",
         "programme_id",
         "source_start_ms",
         "source_end_ms",
@@ -1089,11 +1210,6 @@ def _metadata_copy(row: MetadataRow) -> dict[str, object]:
         "parquet_row",
     }
     return {key: value for key, value in row.items() if key in allowed}
-
-
-def _integer(row: MetadataRow, *keys: str) -> int | None:
-    value = _number(row, *keys)
-    return int(value) if value is not None else None
 
 
 def _speaker_count(row: MetadataRow) -> int:
@@ -1239,6 +1355,7 @@ def create_blinded_audit_manifest(
     for ordinal, row in enumerate(rows):
         status = _status(row)
         if quotas[status]:
+            _validate_audit_locator(row)
             safe_row = _metadata_copy(row)
             safe_row["_p1_metadata_sha256"] = _string(
                 row, "metadata_sha256"
@@ -1274,6 +1391,11 @@ def create_blinded_audit_manifest(
             parquet_sha256=_string(
                 row, "parquet_sha256", "shard_sha256", "_p1_parquet_sha256"
             ),
+            source_file_id=_string(row, "source_file_id", "programme_id"),
+            source_repository=_string(row, "source_repository"),
+            source_revision=_string(row, "source_revision"),
+            source_start_ms=_integer(row, "source_start_ms"),
+            source_end_ms=_integer(row, "source_end_ms"),
         )
         manifest.append(candidate.as_dict())
     return manifest
@@ -1297,6 +1419,25 @@ class AuditCandidate:
     metadata_sha256: str
     audio_sha256: str | None = None
     parquet_sha256: str | None = None
+    source_file_id: str | None = None
+    source_repository: str | None = None
+    source_revision: str | None = None
+    source_start_ms: int | None = None
+    source_end_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject durable records that cannot be retrieved later.
+
+        Raises:
+            ValueError:
+                If the remote locator is incomplete or malformed.
+        """
+        if not self.parquet_path or not self.parquet_path.lower().endswith(".parquet"):
+            raise ValueError("audit candidates require a remote Parquet path")
+        if self.row_locator < 0:
+            raise ValueError("audit candidates require a non-negative row locator")
+        if self.revision is None or not _COMMIT_SHA.fullmatch(self.revision):
+            raise ValueError("audit candidates require a complete immutable commit SHA")
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-compatible metadata record without the source label."""
@@ -1315,47 +1456,57 @@ class AuditCandidate:
             result["audio_sha256"] = self.audio_sha256
         if self.parquet_sha256 is not None:
             result["parquet_sha256"] = self.parquet_sha256
+        if self.source_file_id is not None:
+            result["source_file_id"] = self.source_file_id
+        if self.source_repository is not None:
+            result["source_repository"] = self.source_repository
+        if self.source_revision is not None:
+            result["source_revision"] = self.source_revision
+        if self.source_start_ms is not None:
+            result["source_start_ms"] = self.source_start_ms
+        if self.source_end_ms is not None:
+            result["source_end_ms"] = self.source_end_ms
         return result
 
 
 class _StratifiedReservoir:
-    """Order-independent reservoir with bounded groups and records."""
+    """Bounded, multi-axis reservoir with one fair bucket per stratum.
+
+    A bucket is a complete combination of the required axes, rather than one axis
+    selected after the fact.  Each bucket receives a fair share of the bounded
+    capacity; a seeded ``random.Random`` priority makes selection reproducible
+    without depending on Python's process-randomised ``hash`` function.
+    """
 
     def __init__(self, capacity: int) -> None:
+        if capacity < 0:
+            raise ValueError("reservoir capacity must not be negative")
         self.capacity = capacity
-        self.groups: dict[tuple[str, ...], list[tuple[str, dict[str, object]]]] = {}
+        self.groups: dict[tuple[str, ...], list[tuple[float, dict[str, object]]]] = {}
 
     def add(self, row: dict[str, object], *, seed: str, ordinal: int) -> None:
+        """Add a row while retaining at most ``capacity`` metadata records."""
+        del ordinal
         if not self.capacity:
             return
         key = _stratum_key(row)
-        identity = _identity(row)
-        digest = hashlib.sha256(f"{seed}\0{identity}".encode()).hexdigest()
-        if key not in self.groups and len(self.groups) >= self.capacity:
-            new_priority = hashlib.sha256(
-                f"{seed}\0stratum\0{key}".encode()
-            ).hexdigest()
-            worst = max(
-                self.groups,
-                key=lambda item: hashlib.sha256(
-                    f"{seed}\0stratum\0{item}".encode()
-                ).hexdigest(),
-            )
-            if (
-                new_priority
-                >= hashlib.sha256(f"{seed}\0stratum\0{worst}".encode()).hexdigest()
-            ):
-                return
-            del self.groups[worst]
-        bucket = self.groups.setdefault(key, [])
-        bucket.append((digest, row))
+        if key not in self.groups:
+            if len(self.groups) >= self.capacity:
+                new_priority = _random_priority(seed, "stratum", key)
+                worst = max(
+                    self.groups,
+                    key=lambda item: _random_priority(seed, "stratum", item),
+                )
+                if new_priority >= _random_priority(seed, "stratum", worst):
+                    return
+                del self.groups[worst]
+            self.groups[key] = []
+        bucket = self.groups[key]
+        bucket.append((_random_priority(seed, "row", key, _identity(row)), row))
         bucket.sort(key=lambda item: (item[0], _identity(item[1])))
-        limit = max(1, self.capacity // max(1, len(self.groups)))
+        limit = max(1, self.capacity // len(self.groups))
         for values in self.groups.values():
             del values[limit:]
-        # ``ordinal`` is accepted to make callers explicit about stream position;
-        # identity-derived priorities are used so reversing a remote stream is safe.
-        del ordinal
 
     def rows(self) -> list[dict[str, object]]:
         """Return round-robin records without exceeding the reservoir capacity."""
@@ -1374,6 +1525,12 @@ class _StratifiedReservoir:
                 break
             depth += 1
         return result
+
+
+def _random_priority(seed: str, *parts: object) -> float:
+    """Return a stable pseudo-random priority without using process hash state."""
+    generator = random.Random("\0".join([seed, *(str(part) for part in parts)]))
+    return generator.random()
 
 
 def _stratum_key(row: MetadataRow) -> tuple[str, ...]:
@@ -1433,7 +1590,14 @@ def _explicit_or_decile(row: MetadataRow, keys: tuple[str, ...], value: float) -
     """
     explicit = _string(row, *keys)
     if explicit:
-        return explicit if explicit.startswith("d") else f"d{explicit}"
+        label = explicit.casefold()
+        if label.startswith("d"):
+            label = label[1:]
+        try:
+            decile = int(label)
+        except ValueError:
+            decile = int(value * 10)
+        return f"d{min(9, max(0, decile))}"
     return f"d{min(9, max(0, int(value * 10)))}"
 
 
@@ -1456,6 +1620,11 @@ def _candidate_source_rows(
     """
     del status, seed
     return list(rows)
+
+
+def _row_locator(row: MetadataRow, fallback: int) -> int:
+    explicit = _explicit_row_locator(row)
+    return fallback if explicit is None else explicit
 
 
 def build_structural_report(
@@ -1494,6 +1663,66 @@ def deterministic_deciles(values: c.Iterable[float]) -> list[int]:
     for rank, index in enumerate(order):
         result[index] = min(9, rank * 10 // max(1, len(numbers)))
     return result
+
+
+def export_clip_for_review(
+    entry: MetadataRow, retriever: ClipRetriever, destination: Path
+) -> Path:
+    """Retrieve one clip to a caller-selected path without recording a decision.
+
+    The temporary retrieval file is removed before this function returns.  This is
+    the non-playing path for a reviewer who controls playback outside the CLI.
+
+    Returns:
+        The requested destination path.
+    """
+    source = retrieve_one_for_review(entry, retriever)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        return destination
+    finally:
+        source.unlink(missing_ok=True)
+
+
+def retrieve_one_for_review(
+    entry: MetadataRow, retriever: ClipRetriever, *, temporary_root: Path | None = None
+) -> Path:
+    """Retrieve one audit clip into a uniquely named temporary file.
+
+    Returns:
+        A temporary path containing the single retrieved clip.
+
+    Raises:
+        TypeError:
+            If the retriever returns neither bytes nor a path.
+        ValueError:
+            If the locator is invalid or retrieved audio is empty.
+    """
+    root = temporary_root.expanduser() if temporary_root else None
+    if root:
+        root.mkdir(parents=True, exist_ok=True)
+    _validate_audit_locator(entry)
+    result = retriever.retrieve(entry)
+    if isinstance(result, Path):
+        suffix = result.suffix or ".audio"
+        handle, target = tempfile.mkstemp(prefix="p1-review-", suffix=suffix, dir=root)
+        os.close(handle)
+        shutil.copyfile(result, target)
+        if Path(target).stat().st_size == 0:
+            Path(target).unlink(missing_ok=True)
+            raise ValueError("retrieved clip is empty")
+        return Path(target)
+    if not isinstance(result, bytes):
+        raise TypeError("clip retriever must return bytes or a Path")
+    if not result:
+        raise ValueError("retrieved clip is empty")
+    handle, target = tempfile.mkstemp(prefix="p1-review-", suffix=".flac", dir=root)
+    with os.fdopen(handle, "wb") as output:
+        output.write(result)
+        output.flush()
+        os.fsync(output.fileno())
+    return Path(target)
 
 
 def persist_audit_candidates(database: Path | str, candidates: RowStream) -> int:
@@ -1561,9 +1790,41 @@ def _decision_copy(decision: MetadataRow, *, audit_id: str | None) -> dict[str, 
     for key in allowed:
         if key in decision and isinstance(decision[key], (str, int, float, bool)):
             result[key] = decision[key]
-    if "decision" not in result:
-        result["decision"] = "unrecorded"
+    if result.get("decision") not in {"accepted", "rejected", "borderline"}:
+        raise ValueError("a review decision must be accepted, rejected, or borderline")
     return result
+
+
+def play_audio(path: Path, player: str | c.Sequence[str] | None = None) -> None:
+    """Play one temporary clip using a safe argument vector.
+
+    Args:
+        path:
+            Audio file to play.
+        player (optional):
+            Executable and optional arguments, either as a sequence or a shell-like
+            command string. Defaults to the first available platform player.
+
+    """
+    command = _player_command(player)
+    subprocess.run([*command, str(path)], check=True)
+
+
+def _player_command(player: str | c.Sequence[str] | None) -> list[str]:
+    if player is not None:
+        command = shlex.split(player) if isinstance(player, str) else list(player)
+        if not command:
+            raise ValueError("audio player command must not be empty")
+        return command
+    candidates = (
+        (("afplay",) if sys.platform == "darwin" else ())
+        + (("ffplay", "-nodisp", "-autoexit", "-loglevel", "error"),)
+        + (("paplay",), ("aplay",))
+    )
+    for candidate in candidates:
+        if shutil.which(candidate[0]):
+            return list(candidate)
+    raise FileNotFoundError("no local audio player is available")
 
 
 def review_one_clip(
@@ -1573,6 +1834,7 @@ def review_one_clip(
     *,
     temporary_root: Path | None = None,
     decision_store: MetadataLedger | None = None,
+    player: c.Callable[[Path], None] | None = None,
 ) -> dict[str, object]:
     """Run one blind review, persist its decision, and delete temporary audio.
 
@@ -1588,6 +1850,10 @@ def review_one_clip(
     """
     path = retrieve_one_for_review(entry, retriever, temporary_root=temporary_root)
     try:
+        if decision_store is not None:
+            decision_store.mark_retrieved(_string(entry, "audit_id") or "")
+        if player is not None:
+            player(path)
         blind_entry = _blind_candidate(entry)
         decision = reviewer(path, blind_entry)
         if not isinstance(decision, c.Mapping):
@@ -1620,38 +1886,6 @@ def _blind_candidate(entry: MetadataRow) -> dict[str, object]:
         "waveform",
     }
     return {key: value for key, value in entry.items() if key not in hidden}
-
-
-def retrieve_one_for_review(
-    entry: MetadataRow, retriever: ClipRetriever, *, temporary_root: Path | None = None
-) -> Path:
-    """Retrieve one audit clip into a uniquely named temporary file.
-
-    Returns:
-        A temporary path containing the single retrieved clip.
-
-    Raises:
-        TypeError:
-            If the retriever returns neither bytes nor a path.
-    """
-    root = temporary_root.expanduser() if temporary_root else None
-    if root:
-        root.mkdir(parents=True, exist_ok=True)
-    result = retriever.retrieve(entry)
-    if isinstance(result, Path):
-        suffix = result.suffix or ".audio"
-        handle, target = tempfile.mkstemp(prefix="p1-review-", suffix=suffix, dir=root)
-        os.close(handle)
-        shutil.copyfile(result, target)
-        return Path(target)
-    if not isinstance(result, bytes):
-        raise TypeError("clip retriever must return bytes or a Path")
-    handle, target = tempfile.mkstemp(prefix="p1-review-", suffix=".flac", dir=root)
-    with os.fdopen(handle, "wb") as output:
-        output.write(result)
-        output.flush()
-        os.fsync(output.fileno())
-    return Path(target)
 
 
 def score_asr_anomalies(
@@ -1725,6 +1959,7 @@ normalised_word_error_rate = normalised_wer
 __all__ = [
     "AuditCandidate",
     "ClipRetriever",
+    "SourceClipRetriever",
     "PinnedHubClipRetriever",
     "HfClipRetriever",
     "IndependentASR",
@@ -1745,6 +1980,8 @@ __all__ = [
     "normalised_wer",
     "normalised_word_error_rate",
     "review_one_clip",
+    "export_clip_for_review",
+    "play_audio",
     "persist_audit_candidates",
     "persist_blinded_decision",
     "score_asr_anomalies",

@@ -6,6 +6,8 @@ import collections.abc as c
 import typing as t
 from pathlib import Path
 
+import pytest
+
 from hviske.p1_validation import (
     MetadataLedger,
     PinnedHubClipRetriever,
@@ -16,8 +18,10 @@ from hviske.p1_validation import (
     check_duplicate_and_overlaps,
     create_blinded_audit_manifest,
     deterministic_deciles,
+    export_clip_for_review,
     normalised_wer,
     persist_audit_candidates,
+    play_audio,
     review_one_clip,
     score_asr_anomalies,
     stratified_sample,
@@ -54,6 +58,10 @@ def _row(index: int, status: str = "accepted") -> dict[str, object]:
         "drift_ms": index * 10,
         "text": "et test",
         "remote_path": f"clips/{index}.flac",
+        "repository": "org/p1",
+        "revision": "a" * 40,
+        "parquet_path": "data/train/part.parquet",
+        "row_locator": index,
     }
 
 
@@ -113,6 +121,24 @@ def test_blinded_manifest_has_all_quotas_without_labels() -> None:
         "segment-1",
         "segment-2",
     }
+    required_axes = {
+        "duration-",
+        "show-",
+        "speakers-",
+        "music",
+        "language-",
+        "position-",
+        "confidence-",
+        "drift-",
+    }
+    for item in manifest:
+        strata = t.cast(list[str], item["stratum"])
+        assert len(strata) == 8
+        prefixes = {
+            "music" if value in {"music", "speech"} else value.split("-", 1)[0] + "-"
+            for value in strata
+        }
+        assert prefixes == required_axes
 
 
 def test_bounded_reservoir_does_not_retain_audio_or_grow() -> None:
@@ -162,6 +188,23 @@ def test_duplicate_and_overlap_checks_are_metadata_only(tmp_path: Path) -> None:
     assert checks["passes"] is False
 
 
+def test_export_retrieves_one_clip_and_leaves_no_temporary_audio(
+    tmp_path: Path,
+) -> None:
+    """The non-playing export path does not create a decision or retain temp audio."""
+    candidate = create_blinded_audit_manifest(
+        [_row(0)], accepted_quota=1, rejected_quota=0
+    )[0]
+    destination = tmp_path / "controlled-review.flac"
+    export_clip_for_review(
+        candidate,
+        type("Retriever", (), {"retrieve": lambda _self, entry: b"audio"})(),
+        destination,
+    )
+    assert destination.read_bytes() == b"audio"
+    assert [path for path in tmp_path.iterdir() if path != destination] == []
+
+
 def test_final_report_and_manual_audit_summary(tmp_path: Path) -> None:
     """The final report combines structural and independent audit evidence."""
     report = build_final_quality_report(
@@ -197,6 +240,30 @@ def test_independent_asr_metrics_and_normalisation() -> None:
     assert result["anomalies"] == 1
 
 
+def test_manifest_keeps_exact_remote_locator_and_immutable_revision() -> None:
+    """Audit records retain the exact Parquet locator needed for one-row retrieval."""
+    row = {
+        **_row(4),
+        "repository": "org/source",
+        "revision": "b" * 40,
+        "parquet_path": "shards/train-004.parquet",
+        "row_locator": 37,
+        "source_file_id": "file-004",
+        "source_start_ms": 1200,
+        "source_end_ms": 2300,
+    }
+    candidate = create_blinded_audit_manifest(
+        [row], accepted_quota=1, rejected_quota=0
+    )[0]
+    assert candidate["repository"] == "org/source"
+    assert candidate["revision"] == "b" * 40
+    assert candidate["remote_parquet_path"] == "shards/train-004.parquet"
+    assert candidate["row_locator"] == 37
+    assert candidate["source_file_id"] == "file-004"
+    assert candidate["source_start_ms"] == 1200
+    assert candidate["source_end_ms"] == 2300
+
+
 def test_one_item_review_deletes_audio(tmp_path: Path) -> None:
     """The one-item review deletes its temporary clip on successful review."""
     seen: list[Path] = []
@@ -211,7 +278,15 @@ def test_one_item_review_deletes_audio(tmp_path: Path) -> None:
         return {"decision": "accepted"}
 
     result = review_one_clip(
-        {"audit_id": "audit-1"}, Retriever(), reviewer, temporary_root=tmp_path
+        {
+            "audit_id": "audit-1",
+            "parquet_path": "data/train/part.parquet",
+            "row_locator": 0,
+            "revision": "a" * 40,
+        },
+        Retriever(),
+        reviewer,
+        temporary_root=tmp_path,
     )
 
     assert result["decision"] == "accepted"
@@ -257,6 +332,24 @@ def test_pinned_hub_retriever_reads_one_embedded_row() -> None:
     assert retriever.retrieve(candidate) == b"one clip"
 
 
+def test_play_audio_uses_argv_without_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Configured players are split into argv and never passed through a shell."""
+    calls: list[dict[str, object]] = []
+
+    def run(command: list[str], *, check: bool) -> None:
+        calls.append({"command": command, "check": check})
+
+    monkeypatch.setattr("hviske.p1_validation.subprocess.run", run)
+    path = tmp_path / "clip;touch unsafe"
+    path.write_bytes(b"audio")
+    play_audio(path, player='player --flag "value with spaces"')
+    assert calls == [
+        {"command": ["player", "--flag", "value with spaces", str(path)], "check": True}
+    ]
+
+
 def test_remote_aggregate_is_bounded() -> None:
     """A bounded remote aggregate must not pull one row beyond its limit."""
     consumed = 0
@@ -272,3 +365,69 @@ def test_remote_aggregate_is_bounded() -> None:
     assert consumed == 3
     totals = t.cast(dict[str, object], report["totals"])
     assert totals["segments"] == 3
+
+
+def test_retrieval_failure_cannot_persist_decision(tmp_path: Path) -> None:
+    """A failed fetch leaves no decision in the metadata-only ledger.
+
+    Raises:
+        AssertionError:
+            If a broken retriever unexpectedly returns.
+    """
+    database = tmp_path / "audit.sqlite"
+    candidate = create_blinded_audit_manifest(
+        [_row(0)], accepted_quota=1, rejected_quota=0
+    )[0]
+    persist_audit_candidates(database, [candidate])
+    ledger = MetadataLedger(database)
+    try:
+
+        class BrokenRetriever:
+            def retrieve(self, entry: t.Mapping[str, object]) -> bytes:
+                del entry
+                raise FileNotFoundError("gone")
+
+        try:
+            review_one_clip(
+                candidate,
+                BrokenRetriever(),
+                lambda _path, _entry: {"decision": "accepted"},
+                decision_store=ledger,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("retrieval failure unexpectedly returned")
+        assert list(ledger.decision_rows()) == []
+    finally:
+        ledger.close()
+
+
+def test_review_plays_before_decision_and_persists_only_after_retrieval(
+    tmp_path: Path,
+) -> None:
+    """Playback precedes the reviewer and a successful retrieval is recorded."""
+    database = tmp_path / "audit.sqlite"
+    candidate = create_blinded_audit_manifest(
+        [_row(0)], accepted_quota=1, rejected_quota=0
+    )[0]
+    persist_audit_candidates(database, [candidate])
+    events: list[str] = []
+    ledger = MetadataLedger(database)
+    try:
+        result = review_one_clip(
+            candidate,
+            type("Retriever", (), {"retrieve": lambda _self, entry: b"audio"})(),
+            lambda _path, _entry: events.append("decision") or {"decision": "accepted"},
+            decision_store=ledger,
+            player=lambda _path: events.append("played"),
+        )
+    finally:
+        ledger.close()
+    assert result["decision"] == "accepted"
+    assert events == ["played", "decision"]
+    check = MetadataLedger(database)
+    try:
+        assert list(check.decision_rows())[0]["decision"] == "accepted"
+    finally:
+        check.close()
