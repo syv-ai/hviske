@@ -101,4 +101,19 @@ def finetune(config: DictConfig) -> None:
             private=config.private,
             private_only=config.get("private_only", False),
             model_card_languages=config.get("model_card_languages"),
+            training_dataset_ids=list(
+                config.get("training_dataset_ids")
+                or [
+                    str(dataset_config.id)
+                    for dataset_config in config.datasets.values()
+                ]
+            ),
+            evaluation_status=(
+                config.get("evaluation_status")
+                or (
+                    "Evaluation ran during training."
+                    if eval_dataset is not None
+                    else "Not evaluated: no validation set was configured."
+                )
+            ),
         )

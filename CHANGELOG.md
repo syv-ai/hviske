@@ -9,6 +9,12 @@
 - Added the private Sparkie bilingual Cohere preset, streamable English sources, and a
   verified separate model publication command.
 
+### Changed
+
+- Hardened private model publication to stage an explicit top-level artefact allowlist,
+  include a bilingual internal-use model card, and verify private Hub visibility around
+  one upload commit. Trainer automatic pushes remain disabled.
+
 ### Fixed
 
 - Made dataset probability validation tolerant of floating-point rounding while rejecting
