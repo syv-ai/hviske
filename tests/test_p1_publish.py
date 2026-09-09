@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections.abc as c
 import hashlib
+import io
 import tempfile
 import typing as t
 from dataclasses import dataclass
@@ -11,10 +12,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import numpy as np
+import pyarrow.parquet as pq
 import pytest
+import soundfile as sf
 from huggingface_hub.utils import RepositoryNotFoundError
 
-from hviske.p1_contracts import LedgerState
+from hviske.p1_contracts import LedgerState, OutputRow, ShardEvidence
 from hviske.p1_ledger import Ledger
 from hviske.p1_publish import (
     AllowListError,
@@ -23,12 +27,15 @@ from hviske.p1_publish import (
     PublicationError,
     UploadOperation,
     VerificationError,
+    _stream_remote,
     build_dataset_card,
     initialise_private_dataset,
     publish_batch,
+    validate_local_shard,
     validate_staging_directory,
     verify_batch,
 )
+from hviske.p1_segments import _rows_table
 
 
 def test_batch_verifies_every_path_and_streams_every_shard(tmp_path: Path) -> None:
@@ -306,6 +313,45 @@ def test_invalid_commit_is_not_accepted(tmp_path: Path) -> None:
     assert path.exists()
 
 
+def test_local_validation_enforces_exact_schema_audio_and_duration(
+    tmp_path: Path,
+) -> None:
+    """Local publication rejects wrong feature metadata and audio evidence."""
+    payload_stream = io.BytesIO()
+    sf.write(payload_stream, np.zeros(160, dtype=np.float32), 16000, format="FLAC")
+    payload = payload_stream.getvalue()
+    row = OutputRow(
+        audio=payload,
+        audio_sha256=hashlib.sha256(payload).hexdigest(),
+        text="hej",
+        alignment_text="hej",
+        alignment_word_map=("hej",),
+        segment_id="a" * 64,
+        source_file_id="source",
+        source_start_ms=0,
+        source_end_ms=10,
+        duration_ms=10,
+        speaker_ids=(),
+        proposal_start_ms=0,
+        proposal_end_ms=10,
+        alignment_score=1.0,
+        alignment_score_type="test",
+        start_drift_ms=0,
+        end_drift_ms=0,
+        vad_speech_ratio=1.0,
+        alignment_backend="test",
+        pipeline_version="test",
+        pipeline_config_sha256="b" * 64,
+    )
+    path = tmp_path / "valid.parquet"
+    pq.write_table(_rows_table([row]), path)
+    validate_local_shard(path, expected_row_count=1)
+    broken = tmp_path / "broken.parquet"
+    pq.write_table(_rows_table([row.model_copy(update={"duration_ms": 9})]), broken)
+    with pytest.raises(VerificationError, match="duration"):
+        validate_local_shard(broken)
+
+
 def test_missing_repository_is_created_private_before_initialisation() -> None:
     """A missing repository is created private and checked before its card commit."""
     hub = MemoryHub(missing=True)
@@ -366,6 +412,23 @@ def test_purge_requires_and_follows_durable_verification(tmp_path: Path) -> None
     assert evidence.state.value == "purged"
     assert events[-2:] == ["durable", "purge"]
     assert not path.exists()
+
+
+def test_remote_digest_stream_does_not_retain_shard_bytes() -> None:
+    """Remote digesting consumes chunks without joining a shard payload."""
+    hub = MemoryHub()
+    hub.files["one.parquet"] = b"x" * 1024
+    evidence = ShardEvidence(
+        path="one.parquet",
+        byte_size=1024,
+        row_count=1,
+        sha256=hashlib.sha256(b"x" * 1024).hexdigest(),
+    )
+    digest, retained = _stream_remote(
+        hub, "org/p1", item=evidence, revision="a" * 40, retain=False
+    )
+    assert digest == evidence.sha256
+    assert retained is None
 
 
 def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
