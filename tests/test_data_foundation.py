@@ -20,11 +20,51 @@ from datasets import (
 from hviske.data import (
     _dataset_cache_identity,
     _limit_validation_dataset,
+    _set_source_language,
+    _standardise_training_dataset,
     _validate_dataset_probabilities,
     join_audio_and_transcripts,
     process_dataset,
 )
-from hviske.local_vtt import build_vtt_manifest, decode_vtt_audio, load_vtt_manifest
+from hviske.local_vtt import (
+    VTTParseStats,
+    build_vtt_manifest,
+    decode_vtt_audio,
+    load_vtt_manifest,
+    parse_vtt,
+)
+
+
+def test_build_vtt_manifest_is_atomic_on_fatal_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed build cannot replace a previously complete manifest."""
+    wav_path = tmp_path / "programme.wav"
+    _write_wav(wav_path)
+    vtt_path = wav_path.with_suffix(".vtt")
+    vtt_path.write_text("WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n", encoding="utf-8")
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text("previous\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "hviske.local_vtt.sf.info", lambda _: (_ for _ in ()).throw(OSError("boom"))
+    )
+
+    with pytest.raises(OSError, match="boom"):
+        build_vtt_manifest(
+            source_directories=[tmp_path], output_path=manifest_path, language="da"
+        )
+
+    assert manifest_path.read_text(encoding="utf-8") == "previous\n"
+    assert not list(tmp_path.glob(".manifest.jsonl.*.tmp"))
+
+
+def _write_wav(path: Path) -> None:
+    samples = (np.zeros(16_000, dtype=np.int16)).tobytes()
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(samples)
 
 
 def test_dataset_cache_identity_includes_all_dataset_coordinates() -> None:
@@ -165,15 +205,6 @@ def test_local_and_hub_iterable_datasets_can_be_interleaved(tmp_path: Path) -> N
     assert {row["text"] for row in interleaved} == {"local", "hub"}
 
 
-def _write_wav(path: Path) -> None:
-    samples = (np.zeros(16_000, dtype=np.int16)).tobytes()
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(16_000)
-        wav_file.writeframes(samples)
-
-
 def test_mixed_language_dataset_reaches_prompt_processor() -> None:
     """Each interleaved source language reaches the Cohere processor."""
     dataset = interleave_datasets(
@@ -213,7 +244,7 @@ class PromptProcessor:
         """Initialise the language call log."""
         self.languages: list[str] = []
 
-    def __call__(self, audio: object, **kwargs: object) -> dict[str, list[list[int]]]:
+    def __call__(self, audio: object, **kwargs: object) -> dict[str, object]:
         """Record a processor call and return minimal model features.
 
         Returns:
@@ -222,7 +253,7 @@ class PromptProcessor:
         del audio
         self.languages.append(str(kwargs["language"]))
         return {
-            "input_features": [[1]],
+            "input_features": [[[1.0]]],
             "attention_mask": [[1]],
             "decoder_input_ids": [[1]],
             "labels": [[1]],
@@ -239,6 +270,86 @@ class PromptProcessor:
 
 def _audio() -> dict[str, object]:
     return {"array": [0.0] * 16_000, "sampling_rate": 16_000}
+
+
+def test_production_sources_have_restartable_interleave_schema(tmp_path: Path) -> None:
+    """Joined Hub streams and local VTT streams share a restartable schema."""
+    wav_path = tmp_path / "programme.wav"
+    _write_wav(wav_path)
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "source_wav_path": str(wav_path),
+                "start": 0.0,
+                "end": 1.0,
+                "duration": 1.0,
+                "text": "local",
+                "id": "local",
+                "language": "da",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    local = load_vtt_manifest(manifest_path, min_seconds=0.1, max_seconds=2.0)
+    local_features = local.features.copy()
+    local_features["audio"] = Audio(sampling_rate=16_000)
+    local = local.map(
+        function=lambda example: decode_vtt_audio(example, sampling_rate=16_000),
+        features=local_features,
+    )
+    local = t.cast(
+        IterableDataset, _standardise_training_dataset(local, sampling_rate=16_000)
+    )
+
+    hub = IterableDataset.from_generator(
+        lambda: iter(
+            [
+                {
+                    "recording_id": "hub",
+                    "audio": {"array": np.zeros(16_000), "sampling_rate": 16_000},
+                    "extra_metadata": "removed",
+                }
+            ]
+        ),
+        features=Features(
+            recording_id=Value("string"),
+            audio=Audio(sampling_rate=16_000),
+            extra_metadata=Value("string"),
+        ),
+    )
+    hub = join_audio_and_transcripts(
+        audio_dataset=hub,
+        transcript_dataset=Dataset.from_list(
+            [{"recording_id": "hub", "transcript": "hub"}]
+        ),
+        audio_join_column="recording_id",
+        transcript_join_column="recording_id",
+        transcript_text_column="transcript",
+    )
+    hub_features = hub.features.copy()
+    hub_features["language"] = Value("string")
+    hub = hub.map(
+        function=lambda example: _set_source_language(example, language="en"),
+        features=hub_features,
+    )
+    hub = t.cast(
+        IterableDataset, _standardise_training_dataset(hub, sampling_rate=16_000)
+    )
+
+    interleaved = interleave_datasets(
+        datasets=[local, hub],
+        probabilities=[0.5, 0.5],
+        seed=4242,
+        stopping_strategy="all_exhausted",
+    )
+    assert interleaved.features == local.features == hub.features
+    rows = list(interleaved)
+    restarted_rows = list(interleaved)
+    assert [row["text"] for row in rows] == [row["text"] for row in restarted_rows]
+    assert set(row["text"] for row in rows) == {"local", "hub"}
+    assert all(set(row) == {"audio", "text", "language"} for row in rows)
 
 
 def test_single_language_processor_uses_model_default() -> None:
@@ -298,6 +409,29 @@ def test_validation_sample_cap_is_applied_before_materialisation() -> None:
     assert consumed == [0, 1]
 
 
+def test_vtt_cleans_sparkie_rolling_and_style_cues(tmp_path: Path) -> None:
+    """YouTube and DRTV caption quirks are cleaned without aborting parsing."""
+    vtt_path = tmp_path / "sparkie.vtt"
+    vtt_path.write_text(
+        "\ufeffWEBVTT\n\n"
+        "00:00:00.000 --> 00:00:01.000\n"
+        "Hello <00:00:00.100><c>world</c>\n\n"
+        "00:00:01.000 --> 00:00:02.000\n"
+        "Hello world\n\n"
+        "00:00:02.000 --> 00:00:03.000\n"
+        "<i>world</i> again\n\n"
+        "00:00:03.000 --> 00:00:04.000\n\n"
+        "00:00:bad --> 00:05.000\nignored\n",
+        encoding="utf-8",
+    )
+    stats = VTTParseStats()
+
+    cues = parse_vtt(vtt_path, stats=stats)
+
+    assert [cue["text"] for cue in cues] == ["Hello world", "again"]
+    assert stats.cues_skipped == 3
+
+
 def test_vtt_manifest_does_not_open_audio_before_iteration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -322,6 +456,7 @@ def test_vtt_manifest_does_not_open_audio_before_iteration(
 
     def fail_if_opened(*args: object, **kwargs: object) -> None:
         nonlocal opened
+        del args, kwargs
         opened = True
         raise AssertionError("audio was opened while loading the manifest")
 
@@ -357,16 +492,6 @@ def test_vtt_manifest_slices_original_wav_without_copying(tmp_path: Path) -> Non
     array = t.cast(np.ndarray, audio["array"])
     assert array.shape[0] == 8_000
     assert decoded["text"] == "hello"
-
-
-def test_vtt_rejects_empty_cues(tmp_path: Path) -> None:
-    """Empty cues cannot enter a training manifest."""
-    vtt_path = tmp_path / "programme.vtt"
-    vtt_path.write_text("WEBVTT\n\n00:00.000 --> 00:01.000\n\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="Malformed|Empty"):
-        from hviske.local_vtt import parse_vtt
-
-        parse_vtt(vtt_path)
 
 
 def test_vtt_resampling_downmixes_and_preserves_cue_metadata(tmp_path: Path) -> None:
@@ -405,3 +530,13 @@ def test_vtt_resampling_downmixes_and_preserves_cue_metadata(tmp_path: Path) -> 
     low_audio = t.cast(dict[str, object], low_decoded["audio"])
     low_array = t.cast(np.ndarray, low_audio["array"])
     assert np.sqrt(np.mean((array - low_array / 2) ** 2)) < 0.01
+
+
+def test_vtt_skips_empty_cues(tmp_path: Path) -> None:
+    """Empty cues cannot enter a training manifest."""
+    vtt_path = tmp_path / "programme.vtt"
+    vtt_path.write_text("WEBVTT\n\n00:00.000 --> 00:01.000\n\n", encoding="utf-8")
+    stats = VTTParseStats()
+
+    assert parse_vtt(vtt_path, stats=stats) == []
+    assert stats.cues_skipped == 1
