@@ -119,6 +119,21 @@ def test_programme_complete_state_machine_and_evidence(tmp_path: Path) -> None:
         assert record.purge_time is not None
 
 
+def test_publication_path_collision_is_refused(tmp_path: Path) -> None:
+    """Two shard identities cannot claim the same publication path."""
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        add_batch(ledger)
+        with pytest.raises(EvidenceError, match="publication path"):
+            ledger.register_shard(
+                "shard-2",
+                path="train/shard-000.parquet",
+                sha256=DIGEST,
+                byte_size=4,
+                row_count=1,
+                batch_id="batch-1",
+            )
+
+
 def test_rejected_programmes_and_retryable_transitions_are_durable(
     tmp_path: Path,
 ) -> None:
@@ -205,6 +220,36 @@ def test_schema_is_atomic_and_metadata_only(tmp_path: Path) -> None:
     connection = sqlite3.connect(database)
     assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
     connection.close()
+
+
+def test_sequences_are_durable_monotonic_and_work_is_reconstructable(
+    tmp_path: Path,
+) -> None:
+    """Restarting never reuses an allocation and exposes committed work."""
+    database = tmp_path / "ledger.sqlite"
+    with Ledger(database) as ledger:
+        batch_id = ledger.allocate_batch_id()
+        shard_id = ledger.allocate_shard_id()
+        assert batch_id == "batch-00000001"
+        assert shard_id == "shard-00000001"
+        ledger.register_batch(batch_id, pipeline_digest=DIGEST)
+        ledger.register_shard(
+            shard_id,
+            path="data/part-00001.parquet",
+            sha256=DIGEST,
+            byte_size=4,
+            row_count=1,
+            batch_id=batch_id,
+        )
+        ledger.transition_batch(batch_id, LedgerState.PROCESSING)
+        ledger.transition_batch(batch_id, LedgerState.SHARDED)
+        ledger.record_commit(batch_id, COMMIT)
+    with Ledger(database) as ledger:
+        assert ledger.allocate_batch_id() == "batch-00000002"
+        assert ledger.allocate_shard_id() == "shard-00000002"
+        work = ledger.reconstruct_work()
+        assert work[0][0].state is LedgerState.COMMITTED
+        assert work[0][1][0].shard_id == "shard-00000001"
 
 
 def test_transaction_rolls_back_state_and_evidence(tmp_path: Path) -> None:

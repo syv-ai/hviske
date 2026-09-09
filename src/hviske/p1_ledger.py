@@ -30,6 +30,7 @@ from .p1_contracts import (
 )
 
 _SCHEMA_VERSION = 1
+_SEQUENCE_TABLE = "ledger_sequences"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _FORBIDDEN_KEYS = {
@@ -377,6 +378,14 @@ class Ledger:
                 )
             if batch_id is not None:
                 self._require_row(connection, "batches", "batch_id", batch_id)
+            collision = connection.execute(
+                """SELECT shard_id FROM shards WHERE path = ? AND shard_id != ?""",
+                (safe_path, shard_id),
+            ).fetchone()
+            if collision is not None:
+                raise EvidenceError(
+                    f"publication path already belongs to shard {collision[0]!r}"
+                )
             existing = connection.execute(
                 "SELECT * FROM shards WHERE shard_id = ?", (shard_id,)
             ).fetchone()
@@ -450,6 +459,46 @@ class Ledger:
 
     record_shard = register_shard
     create_shard = register_shard
+
+    def allocate_batch_id(self, prefix: str = "batch") -> str:
+        """Return a globally monotonic, collision-free batch identifier."""
+        self._validate_identifier(prefix, "prefix")
+        return f"{prefix}-{self.allocate_batch_sequence():08d}"
+
+    def allocate_batch_sequence(self) -> int:
+        """Allocate the next durable batch sequence number.
+
+        Allocation is performed under the ledger write transaction, so closing and
+        reopening a ledger cannot reuse a number and concurrent assemblers cannot
+        receive the same number.
+
+        Returns:
+            The newly allocated positive sequence number.
+        """
+        return self._allocate_sequence("batch")
+
+    def allocate_shard_id(self, prefix: str = "shard") -> str:
+        """Return a globally monotonic, collision-free shard identifier."""
+        self._validate_identifier(prefix, "prefix")
+        return f"{prefix}-{self.allocate_shard_sequence():08d}"
+
+    def allocate_shard_sequence(self) -> int:
+        """Allocate the next durable shard sequence number.
+
+        Returns:
+            The newly allocated positive sequence number.
+        """
+        return self._allocate_sequence("shard")
+
+    # These names are intentionally small aliases for assembler integrations.
+    next_batch_sequence = allocate_batch_sequence
+    next_shard_sequence = allocate_shard_sequence
+    allocate_batch_number = allocate_batch_sequence
+    allocate_shard_number = allocate_shard_sequence
+    new_batch_id = allocate_batch_id
+    new_shard_id = allocate_shard_id
+    next_batch_id = allocate_batch_id
+    next_shard_id = allocate_shard_id
 
     def register_batch(
         self, batch_id: str, *, pipeline_digest: str, duration_ms: int | None = None
@@ -556,6 +605,47 @@ class Ledger:
             self._refresh_batch_counts(connection, batch_id)
         return self.batch(batch_id)
 
+    def mark_batch_verified(
+        self,
+        batch_id: str,
+        *,
+        commit_id: str | None = None,
+        evidence: Mapping[str, object] | None = None,
+        shards: tuple[ShardEvidence, ...] | None = None,
+    ) -> BatchRecord:
+        """Durably record complete remote verification before local deletion.
+
+        Returns:
+            The verified batch record.
+
+        Raises:
+            EvidenceError:
+                If commit or shard evidence differs from the ledger.
+        """
+        record = self.batch(batch_id)
+        expected = commit_id or record.commit_id
+        if expected is None:
+            raise EvidenceError("verified batches require a commit SHA")
+        if record.commit_id != expected:
+            raise EvidenceError("verification commit SHA differs from the ledger")
+        if shards is not None:
+            durable = tuple(
+                ShardEvidence(
+                    path=item.path,
+                    byte_size=item.byte_size,
+                    row_count=item.row_count,
+                    sha256=item.sha256,
+                )
+                for item in self.shards(batch_id)
+            )
+            if tuple(shards) != durable:
+                raise EvidenceError("verification shard evidence differs from ledger")
+        if record.state is LedgerState.VERIFIED or record.state is LedgerState.PURGED:
+            return record
+        return self.transition_batch(
+            batch_id, LedgerState.VERIFIED, commit_id=expected, evidence=evidence
+        )
+
     def purge_batch(
         self, batch_id: str, *, evidence: Mapping[str, object] | None = None
     ) -> BatchRecord:
@@ -599,35 +689,35 @@ class Ledger:
             )
         return self.batch(batch_id)
 
-    def transition_batch(
-        self,
-        batch_id: str,
-        target: LedgerState,
-        *,
-        evidence: Mapping[str, object] | None = None,
-        commit_id: str | None = None,
-        **fields: object,
-    ) -> BatchRecord:
-        """Atomically transition a batch and persist publication evidence.
+    def record_commit(self, batch_id: str, commit_id: str) -> BatchRecord:
+        """Durably record a Hub commit immediately after it is created.
+
+        This is deliberately separate from verification: a restart must be able to
+        resume verification of a commit that exists remotely but was not verified.
 
         Returns:
-            The resulting batch record.
+            The committed batch record.
+
+        Raises:
+            EvidenceError:
+                If the commit differs from an already recorded commit.
         """
-        combined = self._fields_from_evidence(evidence, fields)
-        if commit_id is not None:
-            self._validate_commit(commit_id)
-            combined["commit_id"] = commit_id
-        return cast(
-            BatchRecord,
-            self._transition(
-                table="batches",
-                identifier_column="batch_id",
-                identifier=batch_id,
-                target=target,
-                evidence=evidence,
-                fields=combined,
-            ),
+        self._validate_commit(commit_id)
+        record = self.batch(batch_id)
+        if record.state in {
+            LedgerState.COMMITTED,
+            LedgerState.VERIFIED,
+            LedgerState.PURGED,
+        }:
+            if record.commit_id != commit_id:
+                raise EvidenceError("a batch commit SHA is immutable")
+            return record
+        return self.transition_batch(
+            batch_id, LedgerState.COMMITTED, commit_id=commit_id
         )
+
+    record_verification = mark_batch_verified
+    mark_verified = mark_batch_verified
 
     def reconcile_committed_batch(
         self, batch_id: str, remote_commit_exists: object
@@ -670,6 +760,36 @@ class Ledger:
             )
         return present
 
+    def transition_batch(
+        self,
+        batch_id: str,
+        target: LedgerState,
+        *,
+        evidence: Mapping[str, object] | None = None,
+        commit_id: str | None = None,
+        **fields: object,
+    ) -> BatchRecord:
+        """Atomically transition a batch and persist publication evidence.
+
+        Returns:
+            The resulting batch record.
+        """
+        combined = self._fields_from_evidence(evidence, fields)
+        if commit_id is not None:
+            self._validate_commit(commit_id)
+            combined["commit_id"] = commit_id
+        return cast(
+            BatchRecord,
+            self._transition(
+                table="batches",
+                identifier_column="batch_id",
+                identifier=batch_id,
+                target=target,
+                evidence=evidence,
+                fields=combined,
+            ),
+        )
+
     reconcile_remote = reconcile_committed_batch
 
     def reconcile_local_shard(self, shard_id: str, local_path: str | Path) -> bool:
@@ -692,10 +812,116 @@ class Ledger:
 
     local_shard_matches = reconcile_local_shard
 
+    def allocate_sequence(self, kind: str) -> int:
+        """Allocate a durable sequence for ``batch`` or ``shard`` work.
+
+        Returns:
+            The newly allocated positive sequence number.
+        """
+        return self._allocate_sequence(kind)
+
+    def _allocate_sequence(self, kind: str) -> int:
+        if kind not in {"batch", "shard"}:
+            raise ValueError(f"unknown sequence kind: {kind}")
+        with self.transaction() as connection:
+            row = connection.execute(
+                f"SELECT next_value FROM {_SEQUENCE_TABLE} WHERE kind = ?", (kind,)
+            ).fetchone()
+            value = 1 if row is None else int(row[0])
+            table = "batches" if kind == "batch" else "shards"
+            identifier = "batch_id" if kind == "batch" else "shard_id"
+            existing = connection.execute(
+                f"SELECT {identifier} FROM {table}"
+            ).fetchall()
+            suffixes = [
+                int(match.group(1))
+                for item in existing
+                if (match := re.search(r"-(\d+)$", str(item[0]))) is not None
+            ]
+            value = max(value, max(suffixes, default=0) + 1)
+            if row is None:
+                connection.execute(
+                    f"INSERT INTO {_SEQUENCE_TABLE} (kind, next_value) VALUES (?, ?)",
+                    (kind, value + 1),
+                )
+            else:
+                connection.execute(
+                    f"UPDATE {_SEQUENCE_TABLE} SET next_value = ? WHERE kind = ?",
+                    (value + 1, kind),
+                )
+        return value
+
+    def committed_batches(self) -> tuple[BatchRecord, ...]:
+        """Return committed batches, including ones awaiting verification."""
+        rows = self._connection.execute(
+            "SELECT * FROM batches WHERE state = ? ORDER BY batch_id",
+            (LedgerState.COMMITTED.value,),
+        ).fetchall()
+        return tuple(self._batch_record(row) for row in rows)
+
+    def pending_shards(self, batch_id: str | None = None) -> tuple[ShardRecord, ...]:
+        """Return local shard records that have not completed publication."""
+        if batch_id is None:
+            rows = self._connection.execute(
+                """SELECT * FROM shards WHERE state IN (?, ?, ?, ?, ?, ?)
+                ORDER BY shard_id""",
+                (
+                    LedgerState.DISCOVERED.value,
+                    LedgerState.PROCESSING.value,
+                    LedgerState.SHARDED.value,
+                    LedgerState.RETRYABLE.value,
+                    LedgerState.COMMITTED.value,
+                    LedgerState.VERIFIED.value,
+                ),
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                """SELECT * FROM shards WHERE batch_id = ?
+                AND state IN (?, ?, ?, ?, ?, ?) ORDER BY shard_id""",
+                (
+                    batch_id,
+                    LedgerState.DISCOVERED.value,
+                    LedgerState.PROCESSING.value,
+                    LedgerState.SHARDED.value,
+                    LedgerState.RETRYABLE.value,
+                    LedgerState.COMMITTED.value,
+                    LedgerState.VERIFIED.value,
+                ),
+            ).fetchall()
+        return tuple(self._shard_record(row) for row in rows)
+
     def programme(self, programme_id: str) -> ProgrammeRecord:
         """Return one programme record."""
         row = self._fetch("programmes", "programme_id", programme_id)
         return self._programme_record(row)
+
+    def reconstruct_work(
+        self,
+    ) -> tuple[tuple[BatchRecord, tuple[ShardRecord, ...]], ...]:
+        """Reconstruct pending and committed work for a restarted assembler.
+
+        Returns:
+            Batches and their deterministically ordered shard records.
+        """
+        return tuple(
+            (batch, self.shards(batch.batch_id)) for batch in self.pending_batches()
+        )
+
+    def pending_batches(self) -> tuple[BatchRecord, ...]:
+        """Return all batches that may need assembly or recovery after restart."""
+        states = (
+            LedgerState.DISCOVERED.value,
+            LedgerState.PROCESSING.value,
+            LedgerState.SHARDED.value,
+            LedgerState.RETRYABLE.value,
+            LedgerState.COMMITTED.value,
+            LedgerState.VERIFIED.value,
+        )
+        rows = self._connection.execute(
+            "SELECT * FROM batches WHERE state IN (?, ?, ?, ?, ?, ?) ORDER BY batch_id",
+            states,
+        ).fetchall()
+        return tuple(self._batch_record(row) for row in rows)
 
     def reset_abandoned_processing(self) -> int:
         """Reset all processing rows, as a newly opened ledger is a restart.
@@ -773,6 +999,12 @@ class Ledger:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > _SCHEMA_VERSION:
                 raise LedgerError("ledger schema is newer than this package")
+            connection.execute(
+                f"""CREATE TABLE IF NOT EXISTS {_SEQUENCE_TABLE} (
+                    kind TEXT PRIMARY KEY,
+                    next_value INTEGER NOT NULL CHECK (next_value > 0)
+                )"""
+            )
             if version < 1:
                 connection.execute(
                     """CREATE TABLE programmes (
@@ -905,6 +1137,13 @@ class Ledger:
         with self.transaction() as connection:
             row = self._require_row(connection, table, identifier_column, identifier)
             current = LedgerState(row["state"])
+            requested_commit = fields.get("commit_id")
+            if requested_commit is not None and row["commit_id"] is not None:
+                self._validate_commit(cast(str, requested_commit))
+                if requested_commit != row["commit_id"]:
+                    raise EvidenceError(
+                        "a committed object cannot change its commit SHA"
+                    )
             if current == target:
                 return self._record_for_table(table, row)
             if not valid_ledger_transition(current, target):

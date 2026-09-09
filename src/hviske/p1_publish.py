@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections.abc as c
 import hashlib
 import json
+import os
 import re
 import tempfile
 import typing as t
@@ -15,7 +16,16 @@ from datasets import load_dataset
 from huggingface_hub import CommitOperationAdd, HfApi, HfFileSystem, hf_hub_url
 from huggingface_hub.utils import RepositoryNotFoundError
 
-from .p1_contracts import BatchEvidence, LedgerState, RejectionCategory, ShardEvidence
+from .p1_contracts import (
+    OUTPUT_SCHEMA,
+    BatchEvidence,
+    LedgerState,
+    RejectionCategory,
+    ShardEvidence,
+)
+
+if t.TYPE_CHECKING:
+    from .p1_ledger import Ledger
 
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -195,6 +205,18 @@ class HfApiAdapter:
             token=self._token,
         )
 
+    def list_repo_files(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> c.Iterable[str]:
+        """List paths at a revision for collision checks.
+
+        Returns:
+            Repository-relative paths.
+        """
+        return self._api.list_repo_files(
+            repo_id=repo_id, repo_type=repo_type, revision=revision, token=self._token
+        )
+
     def load_dataset(
         self, repo_id: str, *, shard_path: str, revision: str, streaming: bool
     ) -> object:
@@ -279,6 +301,12 @@ class HubClient(t.Protocol):
         self, repo_id: str, paths: list[str], *, repo_type: str, revision: str
     ) -> c.Iterable[object]:
         """Return metadata for paths at an immutable revision."""
+        ...
+
+    def list_repo_files(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> c.Iterable[str]:
+        """List paths at a revision for collision checks."""
         ...
 
     def load_dataset(
@@ -394,11 +422,15 @@ def _mutate_commit(
     *,
     operations: c.Sequence[UploadOperation],
     message: str,
+    commit_recorded: c.Callable[[str], None] | None = None,
 ) -> object:
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     result = api.create_commit(
         repo_id, operations, repo_type="dataset", commit_message=message
     )
+    commit_id = _commit_sha(result)
+    if commit_recorded is not None:
+        commit_recorded(commit_id)
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     return result
 
@@ -412,9 +444,13 @@ def publish_batch(
     programme_count: int = 0,
     rejection_counts: dict[RejectionCategory, int] | None = None,
     validator: c.Callable[[object, str], None] | None = None,
+    schema_validator: c.Callable[[object, str], None] | None = None,
+    expected_schema: object | None = None,
     durable_verification: c.Callable[[BatchEvidence], None] | None = None,
     purge_callback: c.Callable[[tuple[Path, ...]], None] | None = None,
     staging_dir: Path | None = None,
+    ledger: Ledger | None = None,
+    commit_recorded: c.Callable[[str], None] | None = None,
 ) -> BatchEvidence:
     """Commit, verify, stream-decode, and optionally purge one bounded batch.
 
@@ -441,6 +477,15 @@ def publish_batch(
         staging_dir (optional):
             Durable directory for the pending manifest. Defaults to the first
             shard's directory; it is retained until the purge callback runs.
+        ledger (optional):
+            Ledger that records the commit before verification and verification
+            before purge.
+        commit_recorded (optional):
+            Callback invoked immediately after the Hub returns its commit SHA.
+        schema_validator (optional):
+            Callback that checks the exact remote dataset schema.
+        expected_schema (optional):
+            Feature or Arrow schema compared exactly with each remote shard.
 
     Returns:
         Verified or purged batch evidence.
@@ -448,8 +493,6 @@ def publish_batch(
     Raises:
         AllowListError:
             If a local file or batch size is unsafe.
-        PublicationError:
-            If durable verification is missing before a requested purge.
     """
     if not shards:
         raise AllowListError("a publication batch must contain at least one shard")
@@ -458,6 +501,7 @@ def publish_batch(
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     local_evidence = tuple(_local_evidence(shard) for shard in shards)
     _assert_unique_paths(local_evidence)
+    _refuse_remote_collisions(api, repo_id, local_evidence)
     counts = rejection_counts if rejection_counts is not None else {}
     _assert_safe_metadata(counts)
 
@@ -477,14 +521,31 @@ def publish_batch(
         if manifest_path.read_bytes() != manifest:
             raise AllowListError("existing batch manifest does not match this batch")
     else:
-        manifest_path.write_bytes(manifest)
+        _write_durable(manifest_path, manifest)
     manifest_evidence = ShardEvidence(
         path="batch-manifest.json",
         byte_size=len(manifest),
         row_count=0,
         sha256=_sha256_bytes(manifest),
     )
-    expected = (*local_evidence, manifest_evidence)
+    if ledger is not None and ledger.batch(batch_id).state in {
+        LedgerState.COMMITTED,
+        LedgerState.VERIFIED,
+        LedgerState.PURGED,
+    }:
+        return verify_batch(
+            api,
+            repo_id,
+            batch_id,
+            local_evidence=local_evidence,
+            manifest_path=manifest_path,
+            ledger=ledger,
+            validator=validator,
+            schema_validator=schema_validator,
+            expected_schema=expected_schema,
+            purge_callback=purge_callback,
+            local_paths=tuple(shard.path for shard in shards),
+        )
     operations = tuple(
         [
             UploadOperation(path_in_repo=item.path, path=shard.path)
@@ -492,45 +553,205 @@ def publish_batch(
         ]
         + [UploadOperation(path_in_repo=manifest_evidence.path, path=manifest_path)]
     )
-    commit = _mutate_commit(
-        api, repo_id, operations=operations, message=f"Publish P1 batch {batch_id}"
+    commit_id: str | None = None
+
+    def remember_commit(value: str) -> None:
+        nonlocal commit_id
+        commit_id = value
+        if ledger is not None:
+            ledger.record_commit(batch_id, value)
+        if commit_recorded is not None:
+            commit_recorded(value)
+
+    _mutate_commit(
+        api,
+        repo_id,
+        operations=operations,
+        message=f"Publish P1 batch {batch_id}",
+        commit_recorded=remember_commit,
     )
-    commit_id = _commit_sha(commit)
-    _verify_remote(api, repo_id, expected=expected, revision=commit_id)
+    assert commit_id is not None
+    return verify_batch(
+        api,
+        repo_id,
+        batch_id,
+        local_evidence=local_evidence,
+        manifest_path=manifest_path,
+        commit_id=commit_id,
+        programme_count=programme_count,
+        rejection_counts=counts,
+        validator=validator,
+        schema_validator=schema_validator,
+        expected_schema=expected_schema,
+        ledger=ledger,
+        durable_verification=durable_verification,
+        purge_callback=(
+            None if purge_callback is None else lambda paths: purge_callback(paths)
+        ),
+        local_paths=tuple(shard.path for shard in shards),
+    )
+
+
+def verify_batch(
+    api: HubClient,
+    repo_id: str,
+    batch_id: str,
+    *,
+    local_evidence: c.Sequence[ShardEvidence] | None = None,
+    manifest_path: Path | None = None,
+    commit_id: str | None = None,
+    programme_count: int = 0,
+    rejection_counts: dict[RejectionCategory, int] | None = None,
+    validator: c.Callable[[object, str], None] | None = None,
+    schema_validator: c.Callable[[object, str], None] | None = None,
+    expected_schema: object | None = None,
+    ledger: Ledger | None = None,
+    durable_verification: c.Callable[[BatchEvidence], None] | None = None,
+    purge_callback: c.Callable[[tuple[Path, ...]], None] | None = None,
+    local_paths: c.Sequence[Path] | None = None,
+) -> BatchEvidence:
+    """Idempotently verify a committed batch and optionally purge its files.
+
+    Recovery uses the immutable commit and evidence in ``ledger`` when local
+    assembly state is unavailable. Every expected object is checked by path, size,
+    and SHA-256 (streaming when Hub metadata does not expose a digest); the
+    manifest is parsed and compared byte-for-byte to its canonical schema, then a
+    deterministic streaming decode is performed for every shard. Verification is
+    recorded before ``purge_callback`` is called.
+
+    Returns:
+        Complete verified batch evidence, or purged evidence when requested.
+
+    Raises:
+        PublicationError:
+            If no durable commit or verification record is available.
+        VerificationError:
+            If any remote object, manifest, schema, or audio decode is invalid.
+    """
+    if ledger is not None:
+        record = ledger.batch(batch_id)
+        if record.commit_id is None:
+            raise PublicationError("batch has no durable commit to recover")
+        if commit_id is not None and commit_id != record.commit_id:
+            raise PublicationError("recovery commit differs from the ledger")
+        commit_id = record.commit_id
+        if local_evidence is None:
+            local_evidence = tuple(
+                ShardEvidence(
+                    path=item.path,
+                    byte_size=item.byte_size,
+                    row_count=item.row_count,
+                    sha256=item.sha256,
+                )
+                for item in ledger.shards(batch_id)
+            )
+        programme_count = record.programme_count
+        rejection_counts = {
+            RejectionCategory(key): value
+            for key, value in record.rejection_counts.items()
+        }
+    if commit_id is None or not _COMMIT_SHA.fullmatch(commit_id):
+        raise PublicationError("recovery requires a complete immutable commit SHA")
+    evidence_items = tuple(local_evidence or ())
+    if not evidence_items:
+        raise PublicationError("a publication batch must contain at least one shard")
+    _assert_unique_paths(evidence_items)
+    counts = rejection_counts if rejection_counts is not None else {}
+    _assert_safe_metadata(counts)
+    manifest = _manifest_bytes(
+        batch_id=batch_id,
+        shards=evidence_items,
+        programme_count=programme_count,
+        rejection_counts=counts,
+    )
+    expected = (
+        *evidence_items,
+        ShardEvidence(
+            path="batch-manifest.json",
+            byte_size=len(manifest),
+            row_count=0,
+            sha256=_sha256_bytes(manifest),
+        ),
+    )
+    _assert_private(
+        api.repo_info(repo_id=repo_id, repo_type="dataset", revision=commit_id), repo_id
+    )
+    streamed_files = _verify_remote(api, repo_id, expected=expected, revision=commit_id)
+    remote_manifest = streamed_files.get("batch-manifest.json", manifest)
+    if remote_manifest != manifest:
+        raise VerificationError("batch manifest schema or contents differ")
+    try:
+        parsed = json.loads(remote_manifest)
+    except (TypeError, ValueError) as error:
+        raise VerificationError("batch manifest is not valid JSON") from error
+    expected_payload = json.loads(manifest)
+    if parsed != expected_payload or set(parsed) != set(expected_payload):
+        raise VerificationError("batch manifest schema is not exact")
+
     check = validator or validate_streaming_sample
-    for item in local_evidence:
+    for item in evidence_items:
         dataset = api.load_dataset(
             repo_id, shard_path=item.path, revision=commit_id, streaming=True
         )
         check(dataset, item.path)
-
-    evidence = BatchEvidence(
+        if schema_validator is not None:
+            schema_validator(dataset, item.path)
+        if expected_schema is not None:
+            actual_schema = getattr(dataset, "features", None)
+            if actual_schema is None:
+                actual_schema = getattr(dataset, "schema", None)
+            if actual_schema != expected_schema:
+                raise VerificationError(f"exact schema mismatch for {item.path}")
+        else:
+            _validate_default_schema(dataset, item.path)
+    result = BatchEvidence(
         batch_id=batch_id,
         state=LedgerState.VERIFIED,
-        shards=local_evidence,
+        shards=evidence_items,
         commit_id=commit_id,
         programme_count=programme_count,
-        row_count=sum(item.row_count for item in local_evidence),
+        row_count=sum(item.row_count for item in evidence_items),
         rejection_counts=counts,
     )
+    durable = durable_verification is not None
+    if ledger is not None:
+        ledger.mark_batch_verified(batch_id, commit_id=commit_id, shards=evidence_items)
+        for shard in ledger.shards(batch_id):
+            if shard.state not in {LedgerState.VERIFIED, LedgerState.PURGED}:
+                if shard.state is not LedgerState.COMMITTED:
+                    ledger.transition_shard(shard.shard_id, LedgerState.COMMITTED)
+                ledger.transition_shard(shard.shard_id, LedgerState.VERIFIED)
+        durable = True
     if durable_verification is not None:
-        durable_verification(evidence)
+        durable_verification(result)
     if purge_callback is not None:
-        if durable_verification is None:
+        if not durable:
             raise PublicationError("purge requires a durable verification callback")
-        purge_callback(tuple(shard.path for shard in shards) + (manifest_path,))
-        return evidence.model_copy(update={"state": LedgerState.PURGED})
-    return evidence
+        if ledger is not None and ledger.batch(batch_id).state is LedgerState.PURGED:
+            return result.model_copy(update={"state": LedgerState.PURGED})
+        paths = tuple(local_paths or ())
+        if manifest_path is not None:
+            paths += (manifest_path,)
+        purge_callback(paths)
+        if ledger is not None and ledger.batch(batch_id).state is LedgerState.VERIFIED:
+            ledger.purge_batch(
+                batch_id, evidence={"deleted": True, "kind": "publication-artifact"}
+            )
+        return result.model_copy(update={"state": LedgerState.PURGED})
+    return result
 
 
-class AllowListError(PublicationError):
-    """Raised when an upload contains an unsafe local path."""
+recover_batch = verify_batch
 
 
 def _assert_unique_paths(shards: tuple[ShardEvidence, ...]) -> None:
     paths = [shard.path for shard in shards]
     if len(paths) != len(set(paths)):
         raise AllowListError("a batch contains duplicate repository paths")
+
+
+class AllowListError(PublicationError):
+    """Raised when an upload contains an unsafe local path."""
 
 
 def _local_evidence(shard: LocalShard) -> ShardEvidence:
@@ -591,13 +812,55 @@ def _manifest_bytes(
     ).encode()
 
 
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
+def _refuse_remote_collisions(
+    api: HubClient, repo_id: str, expected: tuple[ShardEvidence, ...]
+) -> None:
+    """Refuse overwriting paths from an unrelated publication.
+
+    Raises:
+        AllowListError:
+            If a requested path already exists in the repository.
+    """
+    listing = getattr(api, "list_repo_files", None)
+    if not callable(listing):
+        return
+    try:
+        existing = set(listing(repo_id, repo_type="dataset", revision=None))
+    except Exception as error:
+        raise AllowListError("could not establish remote path safety") from error
+    collisions = existing.intersection(item.path for item in expected)
+    if collisions:
+        raise AllowListError(
+            "remote publication path collision: " + ", ".join(sorted(collisions))
+        )
+
+
+def _stream_digest(chunks: c.Iterable[bytes]) -> str:
+    digest = hashlib.sha256()
+    for chunk in chunks:
+        if not isinstance(chunk, bytes):
+            raise VerificationError("remote stream yielded a non-bytes chunk")
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_default_schema(dataset: object, shard_path: str) -> None:
+    features = getattr(dataset, "features", None)
+    if features is None:
+        return
+    if isinstance(features, dict):
+        names = tuple(features)
+    else:
+        keys = getattr(features, "keys", None)
+        names = tuple(keys()) if callable(keys) else ()
+    expected = tuple(field.name for field in OUTPUT_SCHEMA.fields)
+    if names != expected:
+        raise VerificationError(f"exact P1 schema mismatch for {shard_path}")
 
 
 def _verify_remote(
     api: HubClient, repo_id: str, *, expected: tuple[ShardEvidence, ...], revision: str
-) -> None:
+) -> dict[str, bytes]:
     infos = tuple(
         api.get_paths_info(
             repo_id,
@@ -607,22 +870,28 @@ def _verify_remote(
         )
     )
     by_path = {_value(info, "path"): info for info in infos}
+    if len(infos) != len(expected) or set(by_path) != {item.path for item in expected}:
+        raise VerificationError("remote paths do not exactly match the manifest")
+    streamed_files: dict[str, bytes] = {}
     for item in expected:
         info = by_path.get(item.path)
         if info is None:
             raise VerificationError(f"missing remote path at {revision}: {item.path}")
         size = _value(info, "size", "size_bytes")
-        if size != item.byte_size:
+        if not isinstance(size, int) or size != item.byte_size:
             raise VerificationError(f"size mismatch for {item.path}")
         digest = _remote_digest(info)
         if digest is None:
-            digest = _stream_digest(
+            content = b"".join(
                 api.stream_file(
                     repo_id, item.path, repo_type="dataset", revision=revision
                 )
             )
+            streamed_files[item.path] = content
+            digest = _sha256_bytes(content)
         if digest != item.sha256:
             raise VerificationError(f"SHA-256 mismatch for {item.path}")
+    return streamed_files
 
 
 def _remote_digest(info: object) -> str | None:
@@ -633,13 +902,15 @@ def _remote_digest(info: object) -> str | None:
     return None
 
 
-def _stream_digest(chunks: c.Iterable[bytes]) -> str:
-    digest = hashlib.sha256()
-    for chunk in chunks:
-        if not isinstance(chunk, bytes):
-            raise VerificationError("remote stream yielded a non-bytes chunk")
-        digest.update(chunk)
-    return digest.hexdigest()
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _write_durable(path: Path, content: bytes) -> None:
+    with path.open("wb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def validate_staging_directory(
@@ -696,3 +967,11 @@ def validate_streaming_sample(dataset: object, shard_path: str) -> None:
         ) from error
     if sample is None:
         raise VerificationError(f"empty streaming shard: {shard_path}")
+    if not isinstance(sample, dict) or "audio" not in sample or "text" not in sample:
+        raise VerificationError(f"schema cannot decode a P1 row: {shard_path}")
+    audio = sample["audio"]
+    if not isinstance(audio, dict):
+        raise VerificationError(f"audio is not a structured feature: {shard_path}")
+    payload = audio.get("array", audio.get("bytes"))
+    if payload is None or (hasattr(payload, "__len__") and len(payload) == 0):
+        raise VerificationError(f"audio payload is empty: {shard_path}")

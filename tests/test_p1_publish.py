@@ -14,6 +14,8 @@ import httpx
 import pytest
 from huggingface_hub.utils import RepositoryNotFoundError
 
+from hviske.p1_contracts import LedgerState
+from hviske.p1_ledger import Ledger
 from hviske.p1_publish import (
     AllowListError,
     LocalShard,
@@ -25,6 +27,7 @@ from hviske.p1_publish import (
     initialise_private_dataset,
     publish_batch,
     validate_staging_directory,
+    verify_batch,
 )
 
 
@@ -76,6 +79,7 @@ class MemoryHub:
     decode_empty: bool = False
     missing: bool = False
     corrupt_stream: bool = False
+    existing_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Initialise the fake's mutable repository state."""
@@ -132,6 +136,12 @@ class MemoryHub:
                 attrs["sha256"] = hashlib.sha256(content).hexdigest()
             result.append(SimpleNamespace(**attrs))
         return result
+
+    def list_repo_files(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> c.Iterable[str]:
+        """Return paths already present in the fake repository."""
+        return self.existing_paths
 
     def load_dataset(
         self, repo_id: str, *, shard_path: str, revision: str, streaming: bool
@@ -213,6 +223,48 @@ def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
         publish_batch(MemoryHub(), "org/p1", "batch", shards)
 
 
+def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> None:
+    """A failed verification leaves a committed ledger record for recovery."""
+    path = tmp_path / "one.parquet"
+    path.write_bytes(b"data")
+    database = tmp_path / "ledger.sqlite"
+    hub = MemoryHub()
+    with Ledger(database) as ledger:
+        ledger.register_batch("batch", pipeline_digest="a" * 64)
+        ledger.register_shard(
+            "shard",
+            path="one.parquet",
+            sha256=hashlib.sha256(b"data").hexdigest(),
+            byte_size=4,
+            row_count=1,
+            batch_id="batch",
+        )
+        ledger.transition_batch("batch", LedgerState.PROCESSING)
+        ledger.transition_batch("batch", LedgerState.SHARDED)
+        with pytest.raises(VerificationError):
+            publish_batch(
+                hub,
+                "org/p1",
+                "batch",
+                [LocalShard(path, "one.parquet", 1)],
+                ledger=ledger,
+                validator=lambda _dataset, _path: (_ for _ in ()).throw(
+                    VerificationError("injected crash")
+                ),
+            )
+        assert ledger.batch("batch").state is LedgerState.COMMITTED
+    with Ledger(database) as ledger:
+        verified = verify_batch(
+            hub,
+            "org/p1",
+            "batch",
+            ledger=ledger,
+            manifest_path=tmp_path / "batch-manifest.json",
+        )
+        assert verified.state is LedgerState.VERIFIED
+        assert ledger.batch("batch").state is LedgerState.VERIFIED
+
+
 def test_digest_failure_retains_local_artefacts(tmp_path: Path) -> None:
     """A digest mismatch never invokes a purge."""
     path = tmp_path / "one.parquet"
@@ -225,7 +277,7 @@ def test_digest_failure_retains_local_artefacts(tmp_path: Path) -> None:
 
 
 def test_exposed_digest_avoids_remote_download() -> None:
-    """An exposed SHA-256 avoids retaining or streaming a remote object."""
+    """An exposed SHA-256 avoids streaming Parquet payloads."""
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "one.parquet"
         path.write_bytes(b"data")
@@ -314,6 +366,16 @@ def test_purge_requires_and_follows_durable_verification(tmp_path: Path) -> None
     assert evidence.state.value == "purged"
     assert events[-2:] == ["durable", "purge"]
     assert not path.exists()
+
+
+def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
+    """Publishing never overwrites a path owned by an existing publication."""
+    path = tmp_path / "one.parquet"
+    path.write_bytes(b"data")
+    hub = MemoryHub(existing_paths=("one.parquet",))
+    with pytest.raises(AllowListError, match="collision"):
+        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+    assert not hub.commits
 
 
 def test_stream_decode_failure_retains_the_pending_batch(tmp_path: Path) -> None:
