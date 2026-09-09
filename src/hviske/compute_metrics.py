@@ -2,6 +2,7 @@
 
 import logging
 import os
+import typing as t
 
 import numpy as np
 from numpy.typing import NDArray
@@ -39,7 +40,7 @@ def compute_error_rate_metrics(
     pad_token = tokenizer.pad_token_id
 
     # Shape: [batch_size, seq_len, vocab_size] or [batch_size, seq_len]
-    predictions: NDArray[np.number] = pred.predictions  # type: ignore[assignment]
+    predictions: NDArray[np.number] = t.cast(NDArray[np.number], pred.predictions)
 
     # Set the ground truth labels with label id -100 to be the padding token id. This
     # ensures that the WER metric does not consider these labels in its computation.

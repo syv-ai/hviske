@@ -61,33 +61,16 @@ TRAINING_PROBABILITIES = [
 ]
 
 
-def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
-    """Resolve the preset with placeholders for private p1 schema fields.
-
-    Returns:
-        The resolved Sparkie preset.
-    """
-    monkeypatch.setenv("P1_TRANSCRIPT_REVISION", "transcript-revision")
+def test_p1_transcript_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The private transcript revision cannot silently follow a mutable branch."""
+    monkeypatch.delenv("P1_TRANSCRIPT_REVISION", raising=False)
     monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
     monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
     monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
-    return compose(config_name="sparkie_bilingual")
+    config = compose(config_name="sparkie_bilingual")
 
-
-def test_sparkie_training_order_and_probabilities(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The preset keeps source order aligned with the approved probabilities."""
-    config = _preset(monkeypatch)
-
-    assert list(config.datasets) == TRAINING_NAMES
-    assert [
-        dataset.get("id", dataset.get("type")) for dataset in config.datasets.values()
-    ] == TRAINING_IDS
-    assert list(config.dataset_probabilities) == TRAINING_PROBABILITIES
-    assert sum(config.dataset_probabilities) == pytest.approx(1.0)
-    assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.6)
-    assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
+    with pytest.raises(InterpolationResolutionError, match="P1_TRANSCRIPT_REVISION"):
+        OmegaConf.resolve(config)
 
 
 def test_sparkie_dataset_coordinates_and_revisions(
@@ -199,6 +182,19 @@ def test_sparkie_dataset_coordinates_and_revisions(
     )
 
 
+def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
+    """Resolve the preset with placeholders for private p1 schema fields.
+
+    Returns:
+        The resolved Sparkie preset.
+    """
+    monkeypatch.setenv("P1_TRANSCRIPT_REVISION", "transcript-revision")
+    monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
+    monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
+    monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
+    return compose(config_name="sparkie_bilingual")
+
+
 def test_sparkie_evaluation_and_exclusions(monkeypatch: pytest.MonkeyPatch) -> None:
     """FLEURS remains evaluation-only and superseded English sources stay absent."""
     config = _preset(monkeypatch)
@@ -262,16 +258,20 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     ]
 
 
-def test_p1_transcript_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The private transcript revision cannot silently follow a mutable branch."""
-    monkeypatch.delenv("P1_TRANSCRIPT_REVISION", raising=False)
-    monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
-    monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
-    monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
-    config = compose(config_name="sparkie_bilingual")
+def test_sparkie_training_order_and_probabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preset keeps source order aligned with the approved probabilities."""
+    config = _preset(monkeypatch)
 
-    with pytest.raises(InterpolationResolutionError, match="P1_TRANSCRIPT_REVISION"):
-        OmegaConf.resolve(config)
+    assert list(config.datasets) == TRAINING_NAMES
+    assert [
+        dataset.get("id", dataset.get("type")) for dataset in config.datasets.values()
+    ] == TRAINING_IDS
+    assert list(config.dataset_probabilities) == TRAINING_PROBABILITIES
+    assert sum(config.dataset_probabilities) == pytest.approx(1.0)
+    assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.6)
+    assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
 
 
 def test_youtube_local_manifest_is_danish() -> None:

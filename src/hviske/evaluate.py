@@ -56,13 +56,11 @@ def evaluate(config: DictConfig) -> pd.DataFrame:
 
     predictions: list[str] = list()
     with (
-        tqdm(  # pyrefly: ignore[bad-context-manager]
-            total=len(dataset), desc="Transcribing"
-        ) as pbar,
+        tqdm(total=len(dataset), desc="Transcribing") as pbar,
         transformers_output_ignored(),
     ):
         for out in t.cast(Callable[..., Iterable[dict[str, str]]], transcriber)(
-            KeyDataset(  # pyrefly: ignore[bad-argument-type]
+            KeyDataset(
                 dataset=t.cast(TorchDataset[object], dataset), key=config.audio_column
             ),
             batch_size=config.batch_size,
@@ -130,49 +128,6 @@ def convert_evaluation_dataset_to_df(
     return df
 
 
-def load_asr_pipeline(
-    model_id: str,
-    no_lm: bool,
-    language: str = "da",
-    punctuation: bool = True,
-    max_new_tokens: int = 256,
-) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
-    """Load the ASR pipeline.
-
-    Args:
-        model_id:
-            The model ID to load.
-        no_lm:
-            Whether to load the ASR pipeline without a language model. Only applicable
-            to Wav2Vec 2.0 models.
-        language (optional):
-            Language code for native Cohere prompts. Defaults to ``da``.
-        punctuation (optional):
-            Whether native Cohere should produce punctuation. Defaults to ``True``.
-        max_new_tokens (optional):
-            Maximum number of tokens generated per audio input. Defaults to ``256``.
-
-    Returns:
-        The ASR pipeline or native Cohere transcriber.
-    """
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-
-    with transformers_output_ignored():
-        transcriber = load_asr_transcriber(
-            model_id=model_id,
-            no_lm=no_lm,
-            device=device,
-            language=language,
-            punctuation=punctuation,
-            max_new_tokens=max_new_tokens,
-        )
-
-    return transcriber
-
-
 def get_score_df(df: pd.DataFrame, categories: list[str]) -> pd.DataFrame:
     """Get the score DataFrame for the evaluation dataset.
 
@@ -229,3 +184,46 @@ def get_score_df(df: pd.DataFrame, categories: list[str]) -> pd.DataFrame:
 
     score_df = pd.DataFrame.from_records(data=records)
     return score_df
+
+
+def load_asr_pipeline(
+    model_id: str,
+    no_lm: bool,
+    language: str = "da",
+    punctuation: bool = True,
+    max_new_tokens: int = 256,
+) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
+    """Load the ASR pipeline.
+
+    Args:
+        model_id:
+            The model ID to load.
+        no_lm:
+            Whether to load the ASR pipeline without a language model. Only applicable
+            to Wav2Vec 2.0 models.
+        language (optional):
+            Language code for native Cohere prompts. Defaults to ``da``.
+        punctuation (optional):
+            Whether native Cohere should produce punctuation. Defaults to ``True``.
+        max_new_tokens (optional):
+            Maximum number of tokens generated per audio input. Defaults to ``256``.
+
+    Returns:
+        The ASR pipeline or native Cohere transcriber.
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    with transformers_output_ignored():
+        transcriber = load_asr_transcriber(
+            model_id=model_id,
+            no_lm=no_lm,
+            device=device,
+            language=language,
+            punctuation=punctuation,
+            max_new_tokens=max_new_tokens,
+        )
+
+    return transcriber

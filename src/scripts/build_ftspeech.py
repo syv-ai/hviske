@@ -114,27 +114,6 @@ def main(raw_data_dir: str | Path, output_dir: str | Path) -> None:
     )
 
 
-def preprocess_transcription(transcription: str) -> str:
-    """Preprocess a transcription.
-
-    Args:
-        transcription (str):
-            The transcription to preprocess.
-
-    Returns:
-        str:
-            The preprocessed transcription.
-    """
-    # Strip the transcription of <UNK> tokens, since these are not useful for training
-    # a speech recognition model
-    transcription = transcription.replace("<UNK>", "")
-
-    # Remove trailing whitespace and newlines
-    transcription = transcription.strip()
-
-    return transcription
-
-
 def split_audio(records: list[dict], input_dir: str | Path) -> None:
     """Loads a full audio clip and splits it according to the record.
 
@@ -203,6 +182,27 @@ def split_single_audio(
     out_ = audio_segment.export(str(new_audio_path.resolve()), format="wav")
     out_.close()
     del audio_segment
+
+
+def preprocess_transcription(transcription: str) -> str:
+    """Preprocess a transcription.
+
+    Args:
+        transcription (str):
+            The transcription to preprocess.
+
+    Returns:
+        str:
+            The preprocessed transcription.
+    """
+    # Strip the transcription of <UNK> tokens, since these are not useful for training
+    # a speech recognition model
+    transcription = transcription.replace("<UNK>", "")
+
+    # Remove trailing whitespace and newlines
+    transcription = transcription.strip()
+
+    return transcription
 
 
 if __name__ == "__main__":

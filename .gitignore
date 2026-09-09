@@ -51,9 +51,6 @@ coverage.xml
 # Django stuff:
 *.log
 
-# Sphinx documentation
-docs/_build/
-
 # PyBuilder
 target/
 
@@ -99,12 +96,6 @@ target/
 outputs/
 multirun/
 
-# Documentation
-docs/hviske_models/
-docs/hviske_models.html
-docs/index.html
-docs/search.json
-
 # Data
 data/
 
@@ -130,6 +121,10 @@ todo.md
 
 # Hviske cache
 .hviske-cache/
+
+# Slopo generated database and reports
+.slopo/*.db
+.slopo/report/
 
 # Background noises
 background-noises/

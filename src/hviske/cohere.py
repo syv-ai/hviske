@@ -40,242 +40,6 @@ from .utils import transformers_output_ignored
 logger = logging.getLogger(__package__)
 
 
-class CohereASRTranscriber:
-    """Run native Cohere ASR with its prompt-aware processor."""
-
-    def __init__(
-        self,
-        model: CohereAsrForConditionalGeneration,
-        processor: TransformersCohereAsrProcessor,
-        device: torch.device,
-        language: str = "da",
-        punctuation: bool = True,
-        max_new_tokens: int = 256,
-    ) -> None:
-        """Initialise a native Cohere transcriber.
-
-        Args:
-            model:
-                The native Cohere ASR model.
-            processor:
-                The native Cohere ASR processor.
-            device:
-                Device on which inference should run.
-            language (optional):
-                Language code used to construct the decoder prompt. Defaults to ``da``.
-            punctuation (optional):
-                Whether punctuation should be enabled. Defaults to ``True``.
-            max_new_tokens (optional):
-                Maximum number of tokens generated per audio input. Defaults to ``256``.
-
-        Raises:
-            ValueError:
-                If ``max_new_tokens`` is less than one.
-        """
-        if max_new_tokens < 1:
-            raise ValueError("max_new_tokens must be at least one.")
-        self.model = model
-        self.processor = processor
-        object.__setattr__(self, "_device", device)
-        self.language = language
-        self.punctuation = punctuation
-        self.max_new_tokens = max_new_tokens
-
-    def __call__(
-        self, inputs: object, batch_size: int = 1, **kwargs: object
-    ) -> dict[str, str] | Iterator[dict[str, str]]:
-        """Transcribe one audio input or an iterable of audio inputs.
-
-        ``AutomaticSpeechRecognitionPipeline`` cannot construct Cohere's decoder
-        prompt because its generic preprocessing call does not provide a language.
-        This small adapter keeps that model-specific contract in one place.
-
-        Returns:
-            A transcription dictionary for one input or an iterator of dictionaries.
-
-        Raises:
-            TypeError:
-                If inputs are neither audio nor an iterable of audio inputs.
-            ValueError:
-                If batch_size is less than one.
-        """
-        del kwargs
-        if isinstance(inputs, (dict, np.ndarray, torch.Tensor)) or (
-            isinstance(inputs, list)
-            and (not inputs or isinstance(inputs[0], (float, int)))
-        ):
-            return self._transcribe_batch(batch=[inputs])[0]
-        if isinstance(inputs, (str, bytes)) or not isinstance(inputs, Iterable):
-            raise TypeError("Cohere ASR inputs must be audio or an iterable of audio.")
-        if batch_size < 1:
-            raise ValueError("batch_size must be at least one.")
-        return self._transcribe_iter(inputs=inputs, batch_size=batch_size)
-
-    def _transcribe_iter(
-        self, inputs: Iterable[object], batch_size: int
-    ) -> Iterator[dict[str, str]]:
-        batch: list[object] = []
-        for audio in inputs:
-            batch.append(audio)
-            if len(batch) == batch_size:
-                yield from self._transcribe_batch(batch=batch)
-                batch = []
-        if batch:
-            yield from self._transcribe_batch(batch=batch)
-
-    def _transcribe_batch(self, batch: list[object]) -> list[dict[str, str]]:
-        audio_values: list[np.ndarray | torch.Tensor | list[float]] = []
-        sampling_rates: set[int] = set()
-        feature_extractor = getattr(self.processor, "feature_extractor")
-        expected_rate = int(getattr(feature_extractor, "sampling_rate"))
-        for item in batch:
-            if isinstance(item, dict):
-                raw_audio = item.get("array", item.get("raw"))
-                sampling_rate = item.get("sampling_rate", expected_rate)
-            else:
-                raw_audio = item
-                sampling_rate = expected_rate
-            if raw_audio is None or not isinstance(sampling_rate, (int, np.integer)):
-                raise ValueError(
-                    "Each Cohere audio input needs audio and sampling_rate."
-                )
-            audio_values.append(
-                t.cast(np.ndarray | torch.Tensor | list[float], raw_audio)
-            )
-            sampling_rates.add(int(sampling_rate))
-        if len(sampling_rates) != 1:
-            raise ValueError(
-                "All audio inputs in a Cohere batch must share a sampling rate."
-            )
-        sampling_rate = sampling_rates.pop()
-        process = t.cast(Callable[..., object], self.processor)
-        processed = t.cast(
-            dict[str, object],
-            process(
-                audio_values,
-                language=self.language,
-                punctuation=self.punctuation,
-                sampling_rate=sampling_rate,
-                return_tensors="pt",
-            ),
-        )
-        chunk_index = t.cast(
-            list[tuple[int, int | None]], processed["audio_chunk_index"]
-        )
-        generation_inputs = {
-            "input_features": t.cast(torch.Tensor, processed["input_features"]).to(
-                self._device
-            ),
-            "attention_mask": t.cast(torch.Tensor, processed["attention_mask"]).to(
-                self._device
-            ),
-            "decoder_input_ids": t.cast(
-                torch.Tensor, processed["decoder_input_ids"]
-            ).to(self._device),
-        }
-        generate = t.cast(Callable[..., object], self.model.generate)
-        with torch.no_grad():
-            generated = generate(
-                **generation_inputs, max_new_tokens=self.max_new_tokens
-            )
-        sequences = (
-            generated
-            if isinstance(generated, torch.Tensor)
-            else t.cast(torch.Tensor, getattr(generated, "sequences"))
-        )
-        decoded = self.processor.decode(
-            sequences,
-            skip_special_tokens=True,
-            audio_chunk_index=chunk_index,
-            language=self.language,
-        )
-        texts = [decoded] if isinstance(decoded, str) else list(decoded)
-        if len(texts) != len(batch):
-            raise RuntimeError(
-                "Native Cohere decoding returned a different number of outputs than "
-                "the input batch."
-            )
-        return [dict(text=text) for text in texts]
-
-
-def load_asr_transcriber(
-    model_id: str,
-    no_lm: bool,
-    device: torch.device,
-    language: str = "da",
-    punctuation: bool = True,
-    max_new_tokens: int = 256,
-) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
-    """Load a model-aware ASR transcriber.
-
-    Native Cohere checkpoints use :class:`CohereASRTranscriber`; Whisper and Wav2Vec2
-    retain the standard Transformers pipeline and its existing generation arguments.
-
-    Args:
-        model_id:
-            The model ID to load.
-        no_lm:
-            Whether to load the Wav2Vec2 pipeline without a language model.
-        device:
-            Device on which to run inference.
-        language (optional):
-            Language code for native Cohere prompts. Defaults to ``da``.
-        punctuation (optional):
-            Whether native Cohere should produce punctuation. Defaults to ``True``.
-        max_new_tokens (optional):
-            Maximum number of tokens generated per audio input. Defaults to ``256``.
-
-    Returns:
-        A native Cohere adapter or a standard Transformers ASR pipeline.
-
-    Raises:
-        ValueError:
-            If ``max_new_tokens`` is less than one.
-    """
-    if max_new_tokens < 1:
-        raise ValueError("max_new_tokens must be at least one.")
-    if not no_lm:
-        config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
-        if getattr(config, "model_type", None) == "cohere_asr":
-            processor = CohereAsrProcessor.from_pretrained(
-                model_id, trust_remote_code=False
-            )
-            model = CohereAsrForConditionalGeneration.from_pretrained(
-                model_id, trust_remote_code=False
-            )
-            t.cast(Callable[..., object], model.to)(device)
-            return CohereASRTranscriber(
-                model=model,
-                processor=processor,
-                device=device,
-                language=language,
-                punctuation=punctuation,
-                max_new_tokens=max_new_tokens,
-            )
-    if no_lm:
-        model = Wav2Vec2ForCTC.from_pretrained(model_id)
-        processor = Wav2Vec2Processor.from_pretrained(model_id)
-        tokenizer = getattr(processor, "tokenizer")
-        feature_extractor = getattr(processor, "feature_extractor")
-        return pipeline(
-            task="automatic-speech-recognition",
-            model=model,
-            tokenizer=tokenizer,
-            feature_extractor=feature_extractor,
-            device=device,
-        )
-    return pipeline(task="automatic-speech-recognition", model=model_id, device=device)
-
-
-def get_asr_call_kwargs(
-    transcriber: AutomaticSpeechRecognitionPipeline | CohereASRTranscriber,
-) -> dict[str, object]:
-    """Return generation arguments compatible with the selected ASR model."""
-    if isinstance(transcriber, CohereASRTranscriber):
-        return {}
-    return {"generate_kwargs": {"language": "danish", "task": "transcribe"}}
-
-
 class CohereAsrProcessor(TransformersCohereAsrProcessor):
     """Native Cohere processor with checkpoint-aware language validation.
 
@@ -333,6 +97,201 @@ class CohereAsrProcessor(TransformersCohereAsrProcessor):
         ]
         token_ids = tokenizer.convert_tokens_to_ids(tokens)
         return [int(token_id) for token_id in token_ids]
+
+
+class CohereModelSetup(ModelSetup):
+    """Model setup for native Transformers Cohere ASR models."""
+
+    def __init__(self, config: DictConfig) -> None:
+        """Initialise the model setup.
+
+        Args:
+            config:
+                The Hydra configuration object.
+        """
+        self.config = config
+        self.processor: CohereAsrProcessor
+        self.is_main_process = os.getenv("RANK", "0") == "0"
+
+    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
+        """Return the error-rate metric function."""
+        return partial(compute_error_rate_metrics, processor=self.processor)
+
+    def load_data_collator(self) -> DataCollatorCohereWithPadding:
+        """Return the Cohere prompt-aware data collator."""
+        return DataCollatorCohereWithPadding(
+            processor=self.processor,
+            padding=self.config.padding,
+            max_length=self.config.model.max_length,
+        )
+
+    def load_model(self) -> CohereAsrForConditionalGeneration:
+        """Load the native Cohere ASR model.
+
+        Returns:
+            The native Cohere model.
+        """
+        with transformers_output_ignored():
+            model = CohereAsrForConditionalGeneration.from_pretrained(
+                self.config.model.pretrained_model_id,
+                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+                trust_remote_code=False,
+            )
+        if self.config.model.freeze_feature_encoder:
+            encoder = model.model.encoder
+            for parameter in encoder.parameters():
+                parameter.requires_grad = False
+
+        # Gradient checkpointing and the decoder cache are incompatible.
+        model.config.use_cache = False
+        return model
+
+    def load_processor(self) -> CohereAsrProcessor:
+        """Load the native processor without remote Python code.
+
+        Returns:
+            The checkpoint processor.
+
+        Raises:
+            TypeError:
+                If the checkpoint is not a native Cohere processor.
+        """
+        processor = CohereAsrProcessor.from_pretrained(
+            self.config.model.pretrained_model_id,
+            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+            trust_remote_code=False,
+        )
+        if not isinstance(processor, CohereAsrProcessor):
+            raise TypeError(
+                "The checkpoint did not load as a native Cohere ASR processor."
+            )
+        self.processor = processor
+        return processor
+
+    def load_saved(self) -> PreTrainedModelData:
+        """Load a saved native Cohere model and its processing objects.
+
+        Returns:
+            The saved model, processor, collator and metric function.
+
+        Raises:
+            TypeError:
+                If the saved checkpoint contains non-native model objects.
+        """
+        if Path(self.config.model_dir).exists():
+            model_path = self.config.model_dir
+        else:
+            model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
+
+        processor = CohereAsrProcessor.from_pretrained(
+            model_path,
+            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+            trust_remote_code=False,
+        )
+        model = CohereAsrForConditionalGeneration.from_pretrained(
+            model_path,
+            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
+            trust_remote_code=False,
+        )
+        if not isinstance(processor, CohereAsrProcessor):
+            raise TypeError(
+                "The saved checkpoint did not contain a native Cohere processor."
+            )
+        if not isinstance(model, CohereAsrForConditionalGeneration):
+            raise TypeError(
+                "The saved checkpoint did not contain a native Cohere model."
+            )
+        return PreTrainedModelData(
+            processor=processor,
+            model=model,
+            data_collator=DataCollatorCohereWithPadding(
+                processor=processor,
+                padding=self.config.padding,
+                max_length=self.config.model.max_length,
+            ),
+            compute_metrics=partial(compute_error_rate_metrics, processor=processor),
+        )
+
+    def load_trainer_class(self) -> Type[Trainer]:
+        """Return the Cohere evaluation trainer."""
+        return CohereSeq2SeqTrainer
+
+    def load_training_arguments(self) -> TrainingArguments:
+        """Build the common training configuration for Cohere.
+
+        Returns:
+            The sequence-to-sequence training arguments.
+        """
+        num_devices = max(torch.cuda.device_count(), 1)
+        per_device_total_batch_size = self.config.total_batch_size // num_devices
+        gradient_accumulation_steps = (
+            per_device_total_batch_size // self.config.per_device_batch_size
+        )
+        if gradient_accumulation_steps == 0:
+            gradient_accumulation_steps = 1
+
+        fp16 = False
+        bf16 = False
+        if not mps_is_available():
+            if self.config.bf16_allowed and torch.cuda.is_bf16_supported():
+                bf16 = True
+            elif self.config.fp16_allowed and torch.cuda.is_available():
+                fp16 = True
+
+        if self.config.early_stopping:
+            self.config.save_total_limit = max(self.config.save_total_limit, 1)
+        metric_name = (
+            (
+                f"val_{self.config.evaluation_datasets[0].id.split('/')[-1]}_"
+                f"{self.config.evaluation_datasets[0].subset}_cer"
+            )
+            .lower()
+            .replace("-", "_")
+        )
+
+        return Seq2SeqTrainingArguments(
+            output_dir=self.config.model_dir,
+            hub_model_id=f"{self.config.hub_organisation}/{self.config.model_id}",
+            hub_private_repo=self.config.private,
+            per_device_train_batch_size=self.config.per_device_batch_size,
+            per_device_eval_batch_size=self.config.per_device_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            learning_rate=self.config.model.learning_rate,
+            lr_scheduler_type=SchedulerType.COSINE,
+            warmup_steps=self.config.warmup_steps,
+            max_steps=self.config.max_steps,
+            fp16=fp16,
+            bf16=bf16,
+            push_to_hub=False,
+            eval_strategy="steps",
+            eval_steps=self.config.eval_steps,
+            save_steps=self.config.save_steps,
+            save_strategy="no" if self.config.save_total_limit == 0 else "steps",
+            logging_steps=self.config.logging_steps,
+            length_column_name="input_length",
+            gradient_checkpointing=self.config.gradient_checkpointing,
+            gradient_checkpointing_kwargs=dict(use_reentrant=False),
+            save_total_limit=self.config.save_total_limit,
+            load_best_model_at_end=self.config.early_stopping,
+            metric_for_best_model=metric_name,
+            greater_is_better=False,
+            seed=self.config.seed,
+            remove_unused_columns=False,
+            optim=OptimizerNames.ADAMW_TORCH,
+            adam_beta1=self.config.adam_first_momentum,
+            adam_beta2=self.config.adam_second_momentum,
+            report_to=[self.config.experiment_tracking.type]
+            if self.config.enable_experiment_tracking
+            else [],
+            ignore_data_skip=self.config.ignore_data_skip,
+            predict_with_generate=True,
+            generation_max_length=self.config.model.max_length,
+            use_cpu=hasattr(sys, "_called_from_test"),
+            dataloader_num_workers=self.config.dataloader_num_workers,
+            dataloader_drop_last=True,
+            ddp_find_unused_parameters=False,
+            accelerator_config=AcceleratorConfig(dispatch_batches=False).to_dict(),
+        )
 
 
 class CohereSeq2SeqTrainer(Seq2SeqTrainer):
@@ -499,196 +458,237 @@ class CohereSeq2SeqTrainer(Seq2SeqTrainer):
         return t.cast(float | None, loss), generated_tokens, labels
 
 
-class CohereModelSetup(ModelSetup):
-    """Model setup for native Transformers Cohere ASR models."""
+class CohereASRTranscriber:
+    """Run native Cohere ASR with its prompt-aware processor."""
 
-    def __init__(self, config: DictConfig) -> None:
-        """Initialise the model setup.
+    def __init__(
+        self,
+        model: CohereAsrForConditionalGeneration,
+        processor: TransformersCohereAsrProcessor,
+        device: torch.device,
+        language: str = "da",
+        punctuation: bool = True,
+        max_new_tokens: int = 256,
+    ) -> None:
+        """Initialise a native Cohere transcriber.
 
         Args:
-            config:
-                The Hydra configuration object.
-        """
-        self.config = config
-        self.processor: CohereAsrProcessor
-        self.is_main_process = os.getenv("RANK", "0") == "0"
-
-    def load_processor(self) -> CohereAsrProcessor:
-        """Load the native processor without remote Python code.
-
-        Returns:
-            The checkpoint processor.
+            model:
+                The native Cohere ASR model.
+            processor:
+                The native Cohere ASR processor.
+            device:
+                Device on which inference should run.
+            language (optional):
+                Language code used to construct the decoder prompt. Defaults to ``da``.
+            punctuation (optional):
+                Whether punctuation should be enabled. Defaults to ``True``.
+            max_new_tokens (optional):
+                Maximum number of tokens generated per audio input. Defaults to ``256``.
 
         Raises:
-            TypeError:
-                If the checkpoint is not a native Cohere processor.
+            ValueError:
+                If ``max_new_tokens`` is less than one.
         """
-        processor = CohereAsrProcessor.from_pretrained(
-            self.config.model.pretrained_model_id,
-            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-            trust_remote_code=False,
-        )
-        if not isinstance(processor, CohereAsrProcessor):
-            raise TypeError(
-                "The checkpoint did not load as a native Cohere ASR processor."
-            )
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least one.")
+        self.model = model
         self.processor = processor
-        return processor
+        object.__setattr__(self, "_device", device)
+        self.language = language
+        self.punctuation = punctuation
+        self.max_new_tokens = max_new_tokens
 
-    def load_model(self) -> CohereAsrForConditionalGeneration:
-        """Load the native Cohere ASR model.
+    def __call__(
+        self, inputs: object, batch_size: int = 1, **kwargs: object
+    ) -> dict[str, str] | Iterator[dict[str, str]]:
+        """Transcribe one audio input or an iterable of audio inputs.
 
-        Returns:
-            The native Cohere model.
-        """
-        with transformers_output_ignored():
-            model = CohereAsrForConditionalGeneration.from_pretrained(
-                self.config.model.pretrained_model_id,
-                token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-                trust_remote_code=False,
-            )
-        if self.config.model.freeze_feature_encoder:
-            encoder = model.model.encoder
-            for parameter in encoder.parameters():
-                parameter.requires_grad = False
-
-        # Gradient checkpointing and the decoder cache are incompatible.
-        model.config.use_cache = False
-        return model
-
-    def load_data_collator(self) -> DataCollatorCohereWithPadding:
-        """Return the Cohere prompt-aware data collator."""
-        return DataCollatorCohereWithPadding(
-            processor=self.processor,
-            padding=self.config.padding,
-            max_length=self.config.model.max_length,
-        )
-
-    def load_trainer_class(self) -> Type[Trainer]:
-        """Return the Cohere evaluation trainer."""
-        return CohereSeq2SeqTrainer
-
-    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
-        """Return the error-rate metric function."""
-        return partial(compute_error_rate_metrics, processor=self.processor)
-
-    def load_training_arguments(self) -> TrainingArguments:
-        """Build the common training configuration for Cohere.
+        ``AutomaticSpeechRecognitionPipeline`` cannot construct Cohere's decoder
+        prompt because its generic preprocessing call does not provide a language.
+        This small adapter keeps that model-specific contract in one place.
 
         Returns:
-            The sequence-to-sequence training arguments.
-        """
-        num_devices = max(torch.cuda.device_count(), 1)
-        per_device_total_batch_size = self.config.total_batch_size // num_devices
-        gradient_accumulation_steps = (
-            per_device_total_batch_size // self.config.per_device_batch_size
-        )
-        if gradient_accumulation_steps == 0:
-            gradient_accumulation_steps = 1
-
-        fp16 = False
-        bf16 = False
-        if not mps_is_available():
-            if self.config.bf16_allowed and torch.cuda.is_bf16_supported():
-                bf16 = True
-            elif self.config.fp16_allowed and torch.cuda.is_available():
-                fp16 = True
-
-        if self.config.early_stopping:
-            self.config.save_total_limit = max(self.config.save_total_limit, 1)
-        metric_name = (
-            (
-                f"val_{self.config.evaluation_datasets[0].id.split('/')[-1]}_"
-                f"{self.config.evaluation_datasets[0].subset}_cer"
-            )
-            .lower()
-            .replace("-", "_")
-        )
-
-        return Seq2SeqTrainingArguments(
-            output_dir=self.config.model_dir,
-            hub_model_id=f"{self.config.hub_organisation}/{self.config.model_id}",
-            hub_private_repo=self.config.private,
-            per_device_train_batch_size=self.config.per_device_batch_size,
-            per_device_eval_batch_size=self.config.per_device_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=self.config.model.learning_rate,
-            lr_scheduler_type=SchedulerType.COSINE,
-            warmup_steps=self.config.warmup_steps,
-            max_steps=self.config.max_steps,
-            fp16=fp16,
-            bf16=bf16,
-            push_to_hub=False,
-            eval_strategy="steps",
-            eval_steps=self.config.eval_steps,
-            save_steps=self.config.save_steps,
-            save_strategy="no" if self.config.save_total_limit == 0 else "steps",
-            logging_steps=self.config.logging_steps,
-            length_column_name="input_length",
-            gradient_checkpointing=self.config.gradient_checkpointing,
-            gradient_checkpointing_kwargs=dict(use_reentrant=False),
-            save_total_limit=self.config.save_total_limit,
-            load_best_model_at_end=self.config.early_stopping,
-            metric_for_best_model=metric_name,
-            greater_is_better=False,
-            seed=self.config.seed,
-            remove_unused_columns=False,
-            optim=OptimizerNames.ADAMW_TORCH,
-            adam_beta1=self.config.adam_first_momentum,
-            adam_beta2=self.config.adam_second_momentum,
-            report_to=[self.config.experiment_tracking.type]
-            if self.config.enable_experiment_tracking
-            else [],
-            ignore_data_skip=self.config.ignore_data_skip,
-            predict_with_generate=True,
-            generation_max_length=self.config.model.max_length,
-            use_cpu=hasattr(sys, "_called_from_test"),
-            dataloader_num_workers=self.config.dataloader_num_workers,
-            dataloader_drop_last=True,
-            ddp_find_unused_parameters=False,
-            accelerator_config=AcceleratorConfig(dispatch_batches=False).to_dict(),
-        )
-
-    def load_saved(self) -> PreTrainedModelData:
-        """Load a saved native Cohere model and its processing objects.
-
-        Returns:
-            The saved model, processor, collator and metric function.
+            A transcription dictionary for one input or an iterator of dictionaries.
 
         Raises:
             TypeError:
-                If the saved checkpoint contains non-native model objects.
+                If inputs are neither audio nor an iterable of audio inputs.
+            ValueError:
+                If batch_size is less than one.
         """
-        if Path(self.config.model_dir).exists():
-            model_path = self.config.model_dir
-        else:
-            model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
+        del kwargs
+        if isinstance(inputs, (dict, np.ndarray, torch.Tensor)) or (
+            isinstance(inputs, list)
+            and (not inputs or isinstance(inputs[0], (float, int)))
+        ):
+            return self._transcribe_batch(batch=[inputs])[0]
+        if isinstance(inputs, (str, bytes)) or not isinstance(inputs, Iterable):
+            raise TypeError("Cohere ASR inputs must be audio or an iterable of audio.")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least one.")
+        return self._transcribe_iter(inputs=inputs, batch_size=batch_size)
 
-        processor = CohereAsrProcessor.from_pretrained(
-            model_path,
-            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-            trust_remote_code=False,
-        )
-        model = CohereAsrForConditionalGeneration.from_pretrained(
-            model_path,
-            token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
-            trust_remote_code=False,
-        )
-        if not isinstance(processor, CohereAsrProcessor):
-            raise TypeError(
-                "The saved checkpoint did not contain a native Cohere processor."
+    def _transcribe_batch(self, batch: list[object]) -> list[dict[str, str]]:
+        audio_values: list[np.ndarray | torch.Tensor | list[float]] = []
+        sampling_rates: set[int] = set()
+        feature_extractor = getattr(self.processor, "feature_extractor")
+        expected_rate = int(getattr(feature_extractor, "sampling_rate"))
+        for item in batch:
+            if isinstance(item, dict):
+                raw_audio = item.get("array", item.get("raw"))
+                sampling_rate = item.get("sampling_rate", expected_rate)
+            else:
+                raw_audio = item
+                sampling_rate = expected_rate
+            if raw_audio is None or not isinstance(sampling_rate, (int, np.integer)):
+                raise ValueError(
+                    "Each Cohere audio input needs audio and sampling_rate."
+                )
+            audio_values.append(
+                t.cast(np.ndarray | torch.Tensor | list[float], raw_audio)
             )
-        if not isinstance(model, CohereAsrForConditionalGeneration):
-            raise TypeError(
-                "The saved checkpoint did not contain a native Cohere model."
+            sampling_rates.add(int(sampling_rate))
+        if len(sampling_rates) != 1:
+            raise ValueError(
+                "All audio inputs in a Cohere batch must share a sampling rate."
             )
-        return PreTrainedModelData(
-            processor=processor,
-            model=model,
-            data_collator=DataCollatorCohereWithPadding(
-                processor=processor,
-                padding=self.config.padding,
-                max_length=self.config.model.max_length,
+        sampling_rate = sampling_rates.pop()
+        process = t.cast(Callable[..., object], self.processor)
+        processed = t.cast(
+            dict[str, object],
+            process(
+                audio_values,
+                language=self.language,
+                punctuation=self.punctuation,
+                sampling_rate=sampling_rate,
+                return_tensors="pt",
             ),
-            compute_metrics=partial(compute_error_rate_metrics, processor=processor),
         )
+        chunk_index = t.cast(
+            list[tuple[int, int | None]], processed["audio_chunk_index"]
+        )
+        generation_inputs = {
+            "input_features": t.cast(torch.Tensor, processed["input_features"]).to(
+                self._device
+            ),
+            "attention_mask": t.cast(torch.Tensor, processed["attention_mask"]).to(
+                self._device
+            ),
+            "decoder_input_ids": t.cast(
+                torch.Tensor, processed["decoder_input_ids"]
+            ).to(self._device),
+        }
+        generate = t.cast(Callable[..., object], self.model.generate)
+        with torch.no_grad():
+            generated = generate(
+                **generation_inputs, max_new_tokens=self.max_new_tokens
+            )
+        sequences = (
+            generated
+            if isinstance(generated, torch.Tensor)
+            else t.cast(torch.Tensor, getattr(generated, "sequences"))
+        )
+        decoded = self.processor.decode(
+            sequences,
+            skip_special_tokens=True,
+            audio_chunk_index=chunk_index,
+            language=self.language,
+        )
+        texts = [decoded] if isinstance(decoded, str) else list(decoded)
+        if len(texts) != len(batch):
+            raise RuntimeError(
+                "Native Cohere decoding returned a different number of outputs than "
+                "the input batch."
+            )
+        return [dict(text=text) for text in texts]
+
+    def _transcribe_iter(
+        self, inputs: Iterable[object], batch_size: int
+    ) -> Iterator[dict[str, str]]:
+        batch: list[object] = []
+        for audio in inputs:
+            batch.append(audio)
+            if len(batch) == batch_size:
+                yield from self._transcribe_batch(batch=batch)
+                batch = []
+        if batch:
+            yield from self._transcribe_batch(batch=batch)
+
+
+def get_asr_call_kwargs(
+    transcriber: AutomaticSpeechRecognitionPipeline | CohereASRTranscriber,
+) -> dict[str, object]:
+    """Return generation arguments compatible with the selected ASR model."""
+    if isinstance(transcriber, CohereASRTranscriber):
+        return {}
+    return {"generate_kwargs": {"language": "danish", "task": "transcribe"}}
+
+
+def load_asr_transcriber(
+    model_id: str,
+    no_lm: bool,
+    device: torch.device,
+    language: str = "da",
+    punctuation: bool = True,
+    max_new_tokens: int = 256,
+) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
+    """Load a model-aware ASR transcriber.
+
+    Native Cohere checkpoints use :class:`CohereASRTranscriber`; Whisper and Wav2Vec2
+    retain the standard Transformers pipeline and its existing generation arguments.
+
+    Args:
+        model_id:
+            The model ID to load.
+        no_lm:
+            Whether to load the Wav2Vec2 pipeline without a language model.
+        device:
+            Device on which to run inference.
+        language (optional):
+            Language code for native Cohere prompts. Defaults to ``da``.
+        punctuation (optional):
+            Whether native Cohere should produce punctuation. Defaults to ``True``.
+        max_new_tokens (optional):
+            Maximum number of tokens generated per audio input. Defaults to ``256``.
+
+    Returns:
+        A native Cohere adapter or a standard Transformers ASR pipeline.
+
+    Raises:
+        ValueError:
+            If ``max_new_tokens`` is less than one.
+    """
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be at least one.")
+    if not no_lm:
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        if getattr(config, "model_type", None) == "cohere_asr":
+            processor = CohereAsrProcessor.from_pretrained(
+                model_id, trust_remote_code=False
+            )
+            model = CohereAsrForConditionalGeneration.from_pretrained(
+                model_id, trust_remote_code=False
+            )
+            t.cast(Callable[..., object], model.to)(device)
+            return CohereASRTranscriber(
+                model=model,
+                processor=processor,
+                device=device,
+                language=language,
+                punctuation=punctuation,
+                max_new_tokens=max_new_tokens,
+            )
+    if no_lm:
+        model = Wav2Vec2ForCTC.from_pretrained(model_id)
+        processor = Wav2Vec2Processor.from_pretrained(model_id)
+        tokenizer = getattr(processor, "tokenizer")
+        feature_extractor = getattr(processor, "feature_extractor")
+        return pipeline(
+            task="automatic-speech-recognition",
+            model=model,
+            tokenizer=tokenizer,
+            feature_extractor=feature_extractor,
+            device=device,
+        )
+    return pipeline(task="automatic-speech-recognition", model=model_id, device=device)

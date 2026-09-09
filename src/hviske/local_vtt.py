@@ -66,6 +66,22 @@ def build_vtt_manifest(
                     manifest_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _manifest_row(
+    wav_path: Path, start: float, end: float, text: str, language: str
+) -> dict[str, str | float]:
+    stable_input = f"{wav_path.resolve()}\0{start:.3f}\0{end:.3f}\0{text}"
+    stable_id = hashlib.sha256(stable_input.encode()).hexdigest()[:24]
+    return {
+        "source_wav_path": str(wav_path.resolve()),
+        "start": start,
+        "end": end,
+        "text": text,
+        "id": stable_id,
+        "duration": end - start,
+        "language": language,
+    }
+
+
 def parse_vtt(path: Path) -> list[Cue]:
     """Parse non-empty cues from a WebVTT file.
 
@@ -99,6 +115,61 @@ def parse_vtt(path: Path) -> list[Cue]:
             raise ValueError(f"Empty or invalid VTT cue in {path}")
         cues.append({"start": start, "end": end, "text": text})
     return cues
+
+
+def _parse_timestamp(value: str, path: Path) -> float:
+    match = _TIMESTAMP_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(f"Malformed VTT timestamp {value!r} in {path}")
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes"))
+    seconds = int(match.group("seconds"))
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f"Malformed VTT timestamp {value!r} in {path}")
+    return hours * 3600 + minutes * 60 + seconds + int(match.group("millis")) / 1000
+
+
+def decode_vtt_audio(
+    example: dict[str, object], sampling_rate: int
+) -> dict[str, object]:
+    """Read one cue from its source WAV, rather than copying the source file.
+
+    Args:
+        example:
+            A manifest row.
+        sampling_rate:
+            Target sampling rate.
+
+    Returns:
+        The row with an in-memory ``audio`` array containing only the cue.
+
+    Raises:
+            ValueError:
+                If the cue does not fit inside the source WAV.
+    """
+    path = Path(str(example["source_wav_path"]))
+    start = float(t.cast(float, example["start"]))
+    end = float(t.cast(float, example["end"]))
+    with sf.SoundFile(path) as audio_file:
+        source_rate = audio_file.samplerate
+        start_frame = round(start * source_rate)
+        frame_count = round((end - start) * source_rate)
+        audio_file.seek(start_frame)
+        audio_array = audio_file.read(frames=frame_count, dtype="float32")
+    if start < 0 or end < start or audio_array.shape[0] != frame_count:
+        raise ValueError(f"Cue is outside source WAV: {path}")
+
+    waveform = torch.as_tensor(audio_array, dtype=torch.float32)
+    if waveform.ndim == 2:
+        waveform = waveform.mean(dim=1)
+    waveform = waveform.contiguous()
+    if source_rate != sampling_rate:
+        waveform = torchaudio.functional.resample(
+            waveform.unsqueeze(0), orig_freq=source_rate, new_freq=sampling_rate
+        )[0]
+    audio_array = waveform.contiguous().numpy()
+    example["audio"] = {"array": audio_array, "sampling_rate": sampling_rate}
+    return example
 
 
 def load_vtt_manifest(
@@ -146,74 +217,3 @@ def load_vtt_manifest(
             language=Value("string"),
         ),
     )
-
-
-def decode_vtt_audio(
-    example: dict[str, object], sampling_rate: int
-) -> dict[str, object]:
-    """Read one cue from its source WAV, rather than copying the source file.
-
-    Args:
-        example:
-            A manifest row.
-        sampling_rate:
-            Target sampling rate.
-
-    Returns:
-        The row with an in-memory ``audio`` array containing only the cue.
-
-    Raises:
-            ValueError:
-                If the cue does not fit inside the source WAV.
-    """
-    path = Path(str(example["source_wav_path"]))
-    start = float(t.cast(float, example["start"]))
-    end = float(t.cast(float, example["end"]))
-    with sf.SoundFile(path) as audio_file:
-        source_rate = audio_file.samplerate
-        start_frame = round(start * source_rate)
-        frame_count = round((end - start) * source_rate)
-        audio_file.seek(start_frame)
-        audio_array = audio_file.read(frames=frame_count, dtype="float32")
-    if start < 0 or end < start or audio_array.shape[0] != frame_count:
-        raise ValueError(f"Cue is outside source WAV: {path}")
-
-    waveform = torch.as_tensor(audio_array, dtype=torch.float32)
-    if waveform.ndim == 2:
-        waveform = waveform.mean(dim=1)
-    waveform = waveform.contiguous()
-    if source_rate != sampling_rate:
-        waveform = torchaudio.functional.resample(
-            waveform.unsqueeze(0), orig_freq=source_rate, new_freq=sampling_rate
-        )[0]
-    audio_array = waveform.contiguous().numpy()
-    example["audio"] = {"array": audio_array, "sampling_rate": sampling_rate}
-    return example
-
-
-def _manifest_row(
-    wav_path: Path, start: float, end: float, text: str, language: str
-) -> dict[str, str | float]:
-    stable_input = f"{wav_path.resolve()}\0{start:.3f}\0{end:.3f}\0{text}"
-    stable_id = hashlib.sha256(stable_input.encode()).hexdigest()[:24]
-    return {
-        "source_wav_path": str(wav_path.resolve()),
-        "start": start,
-        "end": end,
-        "text": text,
-        "id": stable_id,
-        "duration": end - start,
-        "language": language,
-    }
-
-
-def _parse_timestamp(value: str, path: Path) -> float:
-    match = _TIMESTAMP_PATTERN.fullmatch(value)
-    if match is None:
-        raise ValueError(f"Malformed VTT timestamp {value!r} in {path}")
-    hours = int(match.group("hours") or 0)
-    minutes = int(match.group("minutes"))
-    seconds = int(match.group("seconds"))
-    if minutes >= 60 or seconds >= 60:
-        raise ValueError(f"Malformed VTT timestamp {value!r} in {path}")
-    return hours * 3600 + minutes * 60 + seconds + int(match.group("millis")) / 1000

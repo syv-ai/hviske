@@ -158,7 +158,7 @@ def main(config: DictConfig) -> None:
         val_candidates: list[EvalDataset] = list()
         with Parallel(n_jobs=-2, batch_size=10) as parallel:
             for idx, best_test_candidate in enumerate(best_test_candidates):
-                val_candidates = parallel(  # pyrefly: ignore[bad-assignment]
+                val_candidates = parallel(
                     delayed(function=compute_test_candidate)(
                         seed=seed,
                         requirements=dict(
@@ -220,33 +220,6 @@ def main(config: DictConfig) -> None:
 
         logger.info(f"Test dataset:\n{test_dataset}")
         logger.info(f"Validation dataset:\n{val_dataset}")
-
-
-class AgeGroup(NamedTuple):
-    """Named tuple to represent an age group."""
-
-    min: int
-    max: int | None
-
-    def __repr__(self) -> str:
-        """Return the string representation of the AgeGroup class."""
-        if self.max is None:
-            return f"{self.min}-"
-        return f"{self.min}-{self.max - 1}"
-
-    def __contains__(self, age: object) -> bool:
-        """Check if an age is in the age group.
-
-        Args:
-            age:
-                The age to check.
-
-        Returns:
-            Whether the age is in the age group.
-        """
-        if not isinstance(age, int):
-            return False
-        return self.min <= age and (self.max is None or age < self.max)
 
 
 class EvalDataset:
@@ -336,52 +309,6 @@ class EvalDataset:
         self.satisfies_requirements = True
         self.populate()
 
-    @property
-    def difficulty(self) -> float:
-        """Return the difficulty of the dataset."""
-        return self.df.loc[self.indices].asr_cer.mean()
-
-    @property
-    def normalised_counts(self) -> dict[str, dict[str, float]]:
-        """Return the normalised counts of the dataset."""
-        return {
-            key: {
-                feature: count / len(self) if len(self) > 0 else 0
-                for feature, count in count_list.items()
-            }
-            for key, count_list in self.counts.items()
-        }
-
-    @property
-    def weights(self) -> dict[str, dict[str, float]]:
-        """The weights of the different features (such as dialect and age group).
-
-        The weights are computed as follows:
-            1. We first normalise the counts to probabilities. This is because we want
-               to sum up these weights for the different features, and using
-               probabilities instead of counts ensures that they're on the same scale,
-               making each feature equally important.
-            2. Next, we divide the normalised counts by the minimum value required for
-               the feature that we're currently computing the weights for. This will
-               yield values that are 1 when the feature is at the minimum value.
-            3. We next subtract these values from 1, which results in values that are 1
-               when the feature is near zero, and less than or equal to zero when the
-               feature is at the minimum required value.
-            4. Since we don't want negative weights, we clamp the values to be at least
-               a small positive value. We don't clamp to zero here, as we might dividing
-               by zero later on in that case.
-
-        Returns:
-            The weights
-        """
-        return {
-            feature: {
-                feature_value: max(1 - pct / self.requirements[feature], 1e-6)
-                for feature_value, pct in pct_dict.items()
-            }
-            for feature, pct_dict in self.normalised_counts.items()
-        }
-
     def populate(self) -> "EvalDataset":
         """Populate the dataset with samples.
 
@@ -454,19 +381,9 @@ class EvalDataset:
 
         return self
 
-    def _compute_score(self, row: pd.Series) -> float:
-        """Compute the score of a speaker in a row.
-
-        The score is computed as the sum of the weights of the features of the speaker.
-
-        Args:
-            row:
-                The row of the dataframe.
-
-        Returns:
-            The score of the speaker.
-        """
-        return sum(weight[row.loc[key]] for key, weight in self.weights.items())
+    def __len__(self) -> int:
+        """Return the length of the dataset."""
+        return len(self.indices)
 
     def __repr__(self) -> str:
         """Return the string representation of the EvalDataset class."""
@@ -488,31 +405,92 @@ class EvalDataset:
 
         return msg
 
-    def __len__(self) -> int:
-        """Return the length of the dataset."""
-        return len(self.indices)
+    def _compute_score(self, row: pd.Series) -> float:
+        """Compute the score of a speaker in a row.
+
+        The score is computed as the sum of the weights of the features of the speaker.
+
+        Args:
+            row:
+                The row of the dataframe.
+
+        Returns:
+            The score of the speaker.
+        """
+        return sum(weight[row.loc[key]] for key, weight in self.weights.items())
+
+    @property
+    def difficulty(self) -> float:
+        """Provide the difficulty of the dataset."""
+        return self.df.loc[self.indices].asr_cer.mean()
+
+    @property
+    def normalised_counts(self) -> dict[str, dict[str, float]]:
+        """Provide the normalised counts of the dataset."""
+        return {
+            key: {
+                feature: count / len(self) if len(self) > 0 else 0
+                for feature, count in count_list.items()
+            }
+            for key, count_list in self.counts.items()
+        }
+
+    @property
+    def weights(self) -> dict[str, dict[str, float]]:
+        """The weights of the different features (such as dialect and age group).
+
+        The weights are computed as follows:
+            1. We first normalise the counts to probabilities. This is because we want
+               to sum up these weights for the different features, and using
+               probabilities instead of counts ensures that they're on the same scale,
+               making each feature equally important.
+            2. Next, we divide the normalised counts by the minimum value required for
+               the feature that we're currently computing the weights for. This will
+               yield values that are 1 when the feature is at the minimum value.
+            3. We next subtract these values from 1, which results in values that are 1
+               when the feature is near zero, and less than or equal to zero when the
+               feature is at the minimum required value.
+            4. Since we don't want negative weights, we clamp the values to be at least
+               a small positive value. We don't clamp to zero here, as we might dividing
+               by zero later on in that case.
+
+        Returns:
+            The weights
+        """
+        return {
+            feature: {
+                feature_value: max(1 - pct / self.requirements[feature], 1e-6)
+                for feature_value, pct in pct_dict.items()
+            }
+            for feature, pct_dict in self.normalised_counts.items()
+        }
 
 
-def age_to_group(age: int, age_groups: list[AgeGroup]) -> str:
-    """Return the age group of a given age.
+class AgeGroup(NamedTuple):
+    """Named tuple to represent an age group."""
 
-    Args:
-        age:
-            The age of the speaker.
-        age_groups:
-            A list of the possible age groups.
+    min: int
+    max: int | None
 
-    Returns:
-        The age group of the speaker.
+    def __contains__(self, age: object) -> bool:
+        """Check if an age is in the age group.
 
-    Raises:
-        ValueError:
-            If the age is not in any age group.
-    """
-    for age_group in age_groups:
-        if age in age_group:
-            return str(age_group)
-    raise ValueError(f"Age {age} not in any age group, out of {age_groups}.")
+        Args:
+            age:
+                The age to check.
+
+        Returns:
+            Whether the age is in the age group.
+        """
+        if not isinstance(age, int):
+            return False
+        return self.min <= age and (self.max is None or age < self.max)
+
+    def __repr__(self) -> str:
+        """Return the string representation of the AgeGroup class."""
+        if self.max is None:
+            return f"{self.min}-"
+        return f"{self.min}-{self.max - 1}"
 
 
 def load_coral_metadata_df(
@@ -640,6 +618,28 @@ def load_coral_metadata_df(
     df.to_csv("coral-metadata.csv", index=False)
 
     return df
+
+
+def age_to_group(age: int, age_groups: list[AgeGroup]) -> str:
+    """Return the age group of a given age.
+
+    Args:
+        age:
+            The age of the speaker.
+        age_groups:
+            A list of the possible age groups.
+
+    Returns:
+        The age group of the speaker.
+
+    Raises:
+        ValueError:
+            If the age is not in any age group.
+    """
+    for age_group in age_groups:
+        if age in age_group:
+            return str(age_group)
+    raise ValueError(f"Age {age} not in any age group, out of {age_groups}.")
 
 
 if __name__ == "__main__":

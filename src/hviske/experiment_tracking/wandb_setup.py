@@ -8,17 +8,17 @@ from .extracking_setup import ExTrackingSetup
 class WandbSetup(ExTrackingSetup):
     """Wandb setup class."""
 
+    def run_finalization(self) -> None:
+        """Run the finalization of the experiment tracking setup."""
+        wandb.finish()  # type: ignore[attr-defined]
+        return
+
     def run_initialization(self) -> None:
         """Run the initialization of the experiment tracking setup."""
         wandb.init(  # type: ignore[attr-defined]
             project=self.config.experiment_tracking.name_experiment,
             name=self.config.experiment_tracking.name_run,
             group=self.config.experiment_tracking.name_group,
-            config=dict(self.config),
+            config={str(key): value for key, value in self.config.items()},
         )
-        return
-
-    def run_finalization(self) -> None:
-        """Run the finalization of the experiment tracking setup."""
-        wandb.finish()  # type: ignore[attr-defined]
         return

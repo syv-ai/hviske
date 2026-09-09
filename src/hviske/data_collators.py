@@ -1,5 +1,6 @@
 """Data collators for the models."""
 
+import collections.abc as c
 import logging
 from dataclasses import dataclass
 
@@ -96,98 +97,6 @@ class DataCollatorCTCWithPadding(DataCollatorMixin):
 
 
 @dataclass
-class DataCollatorSpeechSeq2SeqWithPadding(DataCollatorMixin):
-    """Data collator that will dynamically pad the inputs received.
-
-    Args:
-        processor:
-            The processor used for proccessing the data.
-        sample_rate:
-            The sample rate that the audio is in.
-        max_seconds_per_example:
-            The maximum number of seconds per example.
-        padding:
-            Select a strategy to pad the returned sequences (according to the model's
-            padding side and padding index) among:
-            * True or 'longest':
-                Pad to the longest sequence in the batch (or no padding if only a
-                single sequence if provided).
-            * 'max_length':
-                Pad to a maximum length specified with the argument max_length or to
-                the maximum acceptable input length for the model if that argument is
-                not provided.
-            * False or 'do_not_pad':
-                No padding (i.e., can output a batch with sequences of different
-                lengths).
-    """
-
-    processor: Processor
-    sample_rate: int
-    max_seconds_per_example: float
-    padding: bool | str
-    return_tensors: str = "pt"
-
-    def torch_call(self, features: list[dict]) -> BatchFeature:
-        """Collate the features.
-
-        Args:
-            features:
-                A list of feature dicts.
-
-        Returns:
-            BatchFeature:
-                A dictionary of the collated features.
-
-        Raises:
-            ValueError:
-                If the features do not contain either 'input_features' or 'audio' key.
-        """
-        if "input_features" in features[0]:
-            audio_features = [
-                dict(input_features=f["input_features"]) for f in features
-            ]
-        elif "audio" in features[0]:
-            audio_features = [dict(audio=f["audio"]["array"]) for f in features]
-        else:
-            raise ValueError(
-                "Features must contain either 'input_features' or 'audio' key."
-            )
-
-        # Get the batch
-        batch = self.processor.feature_extractor.pad(  # type: ignore[union-attr]
-            audio_features,
-            padding=self.padding,
-            return_tensors=self.return_tensors,
-            max_length=int(self.sample_rate * self.max_seconds_per_example),
-        )
-
-        # Get the tokenized label sequences
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-
-        # Pad the labels to max length
-        labels_batch = self.processor.tokenizer.pad(  # type: ignore[union-attr]
-            label_features,
-            padding=self.padding,
-            return_tensors=self.return_tensors,
-            max_length=min(self.processor.tokenizer.model_max_length, 512),  # type: ignore[union-attr]
-        )
-
-        # Replace padding with -100 to ignore loss correctly
-        labels = labels_batch["input_ids"].masked_fill(
-            labels_batch.attention_mask.ne(1), -100
-        )
-
-        # If bos token is appended in previous tokenization step, cut BOS token here as
-        # it's appended later anyway
-        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():  # type: ignore[union-attr]
-            labels = labels[:, 1:]
-
-        batch["labels"] = labels
-
-        return batch
-
-
-@dataclass
 class DataCollatorCohereWithPadding(DataCollatorMixin):
     """Collate Cohere features while retaining the decoder prompt.
 
@@ -280,9 +189,109 @@ def _as_int_list(values: object) -> list[int]:
 
     Returns:
         A list of integer IDs.
+
+    Raises:
+        TypeError:
+            If ``values`` is neither an integer nor an iterable.
     """
     if hasattr(values, "tolist"):
-        values = values.tolist()
+        tolist = getattr(values, "tolist")
+        if callable(tolist):
+            values = tolist()
     if isinstance(values, int):
         return [values]
-    return [int(value) for value in values]  # type: ignore[union-attr]
+    if not isinstance(values, c.Iterable):
+        raise TypeError("Expected an integer or iterable of integers")
+    return [int(value) for value in values]
+
+
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding(DataCollatorMixin):
+    """Data collator that will dynamically pad the inputs received.
+
+    Args:
+        processor:
+            The processor used for proccessing the data.
+        sample_rate:
+            The sample rate that the audio is in.
+        max_seconds_per_example:
+            The maximum number of seconds per example.
+        padding:
+            Select a strategy to pad the returned sequences (according to the model's
+            padding side and padding index) among:
+            * True or 'longest':
+                Pad to the longest sequence in the batch (or no padding if only a
+                single sequence if provided).
+            * 'max_length':
+                Pad to a maximum length specified with the argument max_length or to
+                the maximum acceptable input length for the model if that argument is
+                not provided.
+            * False or 'do_not_pad':
+                No padding (i.e., can output a batch with sequences of different
+                lengths).
+    """
+
+    processor: Processor
+    sample_rate: int
+    max_seconds_per_example: float
+    padding: bool | str
+    return_tensors: str = "pt"
+
+    def torch_call(self, features: list[dict]) -> BatchFeature:
+        """Collate the features.
+
+        Args:
+            features:
+                A list of feature dicts.
+
+        Returns:
+            BatchFeature:
+                A dictionary of the collated features.
+
+        Raises:
+            ValueError:
+                If the features do not contain either 'input_features' or 'audio' key.
+        """
+        if "input_features" in features[0]:
+            audio_features = [
+                dict(input_features=f["input_features"]) for f in features
+            ]
+        elif "audio" in features[0]:
+            audio_features = [dict(audio=f["audio"]["array"]) for f in features]
+        else:
+            raise ValueError(
+                "Features must contain either 'input_features' or 'audio' key."
+            )
+
+        # Get the batch
+        batch = self.processor.feature_extractor.pad(  # type: ignore[union-attr]
+            audio_features,
+            padding=self.padding,
+            return_tensors=self.return_tensors,
+            max_length=int(self.sample_rate * self.max_seconds_per_example),
+        )
+
+        # Get the tokenized label sequences
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+
+        # Pad the labels to max length
+        labels_batch = self.processor.tokenizer.pad(  # type: ignore[union-attr]
+            label_features,
+            padding=self.padding,
+            return_tensors=self.return_tensors,
+            max_length=min(self.processor.tokenizer.model_max_length, 512),  # type: ignore[union-attr]
+        )
+
+        # Replace padding with -100 to ignore loss correctly
+        labels = labels_batch["input_ids"].masked_fill(
+            labels_batch.attention_mask.ne(1), -100
+        )
+
+        # If bos token is appended in previous tokenization step, cut BOS token here as
+        # it's appended later anyway
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():  # type: ignore[union-attr]
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+
+        return batch

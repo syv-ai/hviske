@@ -117,9 +117,7 @@ def add_validations(
 
         predictions: list[str] = list()
         with (
-            tqdm(  # pyrefly: ignore[bad-context-manager]
-                total=len(split), desc="Transcribing"
-            ) as pbar,
+            tqdm(total=len(split), desc="Transcribing") as pbar,
             transformers_output_ignored(),
         ):
             for out in t.cast(Callable[..., Iterable[dict[str, str]]], transcriber)(

@@ -57,29 +57,29 @@ class ModelSetup(ABC):
         """
 
     @abstractmethod
-    def load_processor(self) -> Processor:
-        """Return the processor for the model."""
-
-    @abstractmethod
-    def load_model(self) -> PreTrainedModel:
-        """Return the pre-trained model."""
+    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
+        """Return the function used to compute the metrics."""
 
     @abstractmethod
     def load_data_collator(self) -> DataCollatorMixin:
         """Return the data collator."""
 
     @abstractmethod
-    def load_trainer_class(self) -> Type[Trainer]:
-        """Return the trainer class."""
+    def load_model(self) -> PreTrainedModel:
+        """Return the pre-trained model."""
 
     @abstractmethod
-    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
-        """Return the function used to compute the metrics."""
-
-    @abstractmethod
-    def load_training_arguments(self) -> TrainingArguments:
-        """Return the training arguments."""
+    def load_processor(self) -> Processor:
+        """Return the processor for the model."""
 
     @abstractmethod
     def load_saved(self) -> PreTrainedModelData:
         """Return the saved model data."""
+
+    @abstractmethod
+    def load_trainer_class(self) -> Type[Trainer]:
+        """Return the trainer class."""
+
+    @abstractmethod
+    def load_training_arguments(self) -> TrainingArguments:
+        """Return the training arguments."""
