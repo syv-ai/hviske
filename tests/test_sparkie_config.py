@@ -1,5 +1,6 @@
 """Regression tests for the production Sparkie bilingual preset."""
 
+import typing as t
 from pathlib import Path
 
 import pytest
@@ -313,7 +314,12 @@ def test_sparkie_publication_provenance_is_complete(
     config = _preset(monkeypatch)
     sources = training_sources_from_config(config=config)
     source_ids = {str(source["id"]) for source in sources}
-    assert set(config.training_dataset_ids).issubset(source_ids)
+    joined_ids = {
+        str(t.cast(dict[str, object], source["joined_transcript"])["dataset_id"])
+        for source in sources
+        if "joined_transcript" in source
+    }
+    assert set(config.training_dataset_ids).issubset(source_ids | joined_ids)
     assert {"local_vtt:drtv_local", "local_vtt:youtube_local"}.issubset(source_ids)
     assert all(
         all(
@@ -327,9 +333,15 @@ def test_sparkie_publication_provenance_is_complete(
         for source in sources
         if source["id"].startswith("local_vtt:")
     )
-    assert {
-        source["probability"] for source in sources if source["id"] == "syvai/p1"
-    } == {0.08}
+    p1_sources = [source for source in sources if source["id"] == "syvai/p1"]
+    assert len(p1_sources) == 1
+    assert p1_sources[0]["probability"] == 0.08
+    joined = t.cast(dict[str, object], p1_sources[0]["joined_transcript"])
+    assert joined["dataset_id"] == "syvai/p1-transcripts"
+    assert joined["revision"] == "transcript-revision"
+    assert joined["audio_join_column"] == "audio_id"
+    assert joined["transcript_join_column"] == "audio_id"
+    assert joined["transcript_text_column"] == "text"
 
 
 def test_sparkie_training_order_and_probabilities(
@@ -346,6 +358,20 @@ def test_sparkie_training_order_and_probabilities(
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
     assert sum(config.dataset_probabilities[:9]) == pytest.approx(0.6)
     assert sum(config.dataset_probabilities[9:]) == pytest.approx(0.4)
+    sources = training_sources_from_config(config=config)
+    assert sum(
+        float(t.cast(float, source["probability"])) for source in sources
+    ) == pytest.approx(1.0)
+    assert sum(
+        float(t.cast(float, source["probability"]))
+        for source in sources
+        if source["language"] == "da"
+    ) == pytest.approx(0.6)
+    assert sum(
+        float(t.cast(float, source["probability"]))
+        for source in sources
+        if source["language"] == "en"
+    ) == pytest.approx(0.4)
 
 
 def test_youtube_local_manifest_is_danish() -> None:

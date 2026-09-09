@@ -31,6 +31,10 @@ make check
 make test
 ```
 
+`make install` keeps the project and test environment on Python 3.11. It also
+provisions Python 3.12 for Funcsort and Slopo, whose commands run through
+explicit `uv tool run --python 3.12` environments.
+
 `make install` installs Python 3.11, syncs all extras, creates `.env`, installs
 pre-commit, and runs `pre-commit autoupdate`. It also updates `uv` when `uv` is
 already installed. These steps can change `.pre-commit-config.yaml` and global
@@ -63,9 +67,11 @@ Install FFmpeg and authenticate with Hugging Face using `HF_TOKEN`,
 need network access and enough storage for model and dataset caches.
 
 `make check` stages the working tree, runs all pre-commit hooks, and may rewrite
-and stage files. If a `llama-server` process is already running, it also runs Slopo;
-otherwise it reports the normal conditional skip. Ruff's configured hooks use `--fix`
-and `--unsafe-fixes`, so inspect `git diff` after the run. `make test` runs pytest
+and stage files. If a `llama-server` process is already running, it also runs Slopo
+in its explicit Python 3.12 tool environment; index, embed, and analyse failures
+are fatal. When no server is running, it reports the normal conditional skip.
+Ruff's configured hooks use `--fix` and `--unsafe-fixes`, so inspect `git diff` after
+the run. `make test` runs pytest
 and then `readme-cov`; the latter can rewrite `README.md`. Run a focused test with,
 for example, `uv run pytest tests/test_package.py`.
 

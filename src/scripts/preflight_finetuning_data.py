@@ -4,10 +4,12 @@ import argparse
 import collections.abc as c
 import json
 import logging
+import math
 import os
 import typing as t
 from pathlib import Path
 
+import soundfile
 from datasets import Dataset, IterableDataset, load_dataset
 from huggingface_hub import HfApi
 from hydra import compose, initialize_config_dir
@@ -144,11 +146,44 @@ def _preflight_local_manifest(source_name: str, manifest_path: Path) -> None:
     audio_path = Path(str(row["source_wav_path"])).expanduser()
     if not audio_path.is_file():
         raise ValueError(f"Missing audio referenced by {source_name}: {audio_path}")
-    start = float(t.cast(float | int | str, row["start"]))
-    end = float(t.cast(float | int | str, row["end"]))
-    duration = float(t.cast(float | int | str, row["duration"]))
-    if start < 0 or end <= start or duration <= 0:
+    try:
+        start = float(t.cast(float | int | str, row["start"]))
+        end = float(t.cast(float | int | str, row["end"]))
+        duration = float(t.cast(float | int | str, row["duration"]))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Invalid cue timing in the first {source_name} manifest row"
+        ) from error
+    if (
+        not all(math.isfinite(value) for value in (start, end, duration))
+        or start < 0
+        or end <= start
+        or duration <= 0
+    ):
         raise ValueError(f"Invalid cue timing in the first {source_name} manifest row")
+    try:
+        audio_info = soundfile.info(audio_path)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError(
+            f"Unreadable audio referenced by {source_name}: {audio_path}"
+        ) from error
+    sample_rate = float(audio_info.samplerate)
+    channels = int(audio_info.channels)
+    frames = int(audio_info.frames)
+    file_duration = float(audio_info.duration)
+    if (
+        not math.isfinite(sample_rate)
+        or sample_rate <= 0
+        or channels <= 0
+        or frames <= 0
+        or not math.isfinite(file_duration)
+        or file_duration <= 0
+    ):
+        raise ValueError(f"Invalid audio metadata in the first {source_name} row")
+    if end > file_duration or end * sample_rate > frames + 1:
+        raise ValueError(
+            f"Cue extends beyond audio referenced by {source_name}: {audio_path}"
+        )
     if not str(row["text"]).strip() or not str(row["language"]).strip():
         raise ValueError(
             f"Empty text or language in the first {source_name} manifest row"

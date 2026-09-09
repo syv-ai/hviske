@@ -1167,6 +1167,7 @@ dependencies = [
     { name = "python-dotenv", version = "1.2.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "python-dotenv", version = "1.2.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "requests" },
+    { name = "safetensors" },
     { name = "soundfile" },
     { name = "torch-audiomentations" },
     { name = "torchaudio" },
@@ -1200,9 +1201,11 @@ dev = [
     { name = "readme-coverage-badger" },
     { name = "ruff" },
     { name = "setuptools" },
-    { name = "slopo", marker = "python_full_version >= '3.12'" },
     { name = "ty" },
     { name = "vulture" },
+]
+quality = [
+    { name = "slopo", marker = "python_full_version >= '3.12'" },
 ]
 
 [package.metadata]
@@ -1228,6 +1231,7 @@ requires-dist = [
     { name = "pysubs2", specifier = ">=1.8.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "requests", specifier = ">=2.32.4" },
+    { name = "safetensors", specifier = ">=0.7.0" },
     { name = "samplerate", marker = "extra == 'demo'", specifier = ">=0.2.2" },
     { name = "soundfile", specifier = ">=0.13.1" },
     { name = "torch-audiomentations", specifier = ">=0.12.0" },
@@ -1250,10 +1254,10 @@ dev = [
     { name = "readme-coverage-badger", specifier = ">=0.1.2" },
     { name = "ruff", specifier = ">=0.7.1" },
     { name = "setuptools", specifier = ">=83.0.0" },
-    { name = "slopo", marker = "python_full_version >= '3.12'", specifier = ">=0.5.0" },
     { name = "ty", specifier = ">=0.0.40" },
     { name = "vulture", specifier = ">=2.16" },
 ]
+quality = [{ name = "slopo", marker = "python_full_version >= '3.12'", specifier = ">=0.5.0" }]
 
 [[package]]
 name = "hydra-core"
