@@ -14,7 +14,7 @@ dataset_probabilities:
   - 0.06060606 # ftspeech
   - 0.06060606 # nota
   - 0.06060606 # nst
-  - 0.07272727 # voxpopuli_da
+  - 0.07272728 # voxpopuli_da
   - 0.06956522 # peoples_speech_clean
   - 0.01739130 # ami_sdm
   - 0.01304348 # ami_ihm

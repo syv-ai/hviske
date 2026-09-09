@@ -1,7 +1,9 @@
-# Trainable Danish anchor checkpoint for the Olmix calibration matrix.
+# Trainable Danish anchor model for the Olmix calibration matrix.
 name: hviske-v5-tiny
 type: cohere
 pretrained_model_id: syvai/hviske-v5-tiny
+revision: 361051e8ed732798d68fcd5d5ec64fd4e39da40b
+trust_remote_code: true
 freeze_feature_encoder: false
 
 # Cohere prompt and audio settings.
@@ -12,6 +14,6 @@ punctuation: true
 sampling_rate: 16_000
 max_length: 256
 
-# The checkpoint has no published fine-tuning recipe; use the existing native
-# Cohere learning-rate scale as a conservative calibration proxy.
+# The checkpoint has no published fine-tuning recipe; use the existing Cohere
+# learning-rate scale as a conservative calibration proxy.
 learning_rate: 1.0e-5

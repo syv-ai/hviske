@@ -15,11 +15,11 @@ dataset_probabilities:
   - 0.02272727 # ftspeech
   - 0.02272727 # nota
   - 0.02272727 # nst
-  - 0.02727273 # voxpopuli_da
+  - 0.02727272 # voxpopuli_da
   - 0.20869565 # peoples_speech_clean
   - 0.05217391 # ami_sdm
   - 0.03913043 # ami_ihm
   - 0.05294118 # voxpopuli_en
   - 0.00588235 # librispeech_clean_train_100
   - 0.01470588 # librispeech_clean_train_360
-  - 0.02647059 # librispeech_other_train_500
+  - 0.02647060 # librispeech_other_train_500

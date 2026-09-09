@@ -69,6 +69,8 @@ class WhisperModelSetup(ModelSetup):
         with transformers_output_ignored():
             model = AutoModelForSpeechSeq2Seq.from_pretrained(
                 self.config.model.pretrained_model_id,
+                token=os.getenv("HUGGINGFACE_HUB_TOKEN"),
+                revision=self._revision(),
                 dropout=self.config.model.dropout,
                 activation_dropout=self.config.model.activation_dropout,
                 attention_dropout=self.config.model.attention_dropout,
@@ -108,10 +110,16 @@ class WhisperModelSetup(ModelSetup):
 
         return model
 
+    def _revision(self) -> str:
+        revision = self.config.model.get("revision")
+        return str(revision) if revision is not None else "main"
+
     def load_processor(self) -> WhisperProcessor:
         """Return the processor for the model."""
         processor_or_tup = WhisperProcessor.from_pretrained(
-            self.config.model.pretrained_model_id, language="Danish", task="transcribe"
+            self.config.model.pretrained_model_id,
+            token=os.getenv("HUGGINGFACE_HUB_TOKEN"),
+            revision=self._revision(),
         )
         assert isinstance(processor_or_tup, WhisperProcessor)
         self.processor = processor_or_tup
@@ -119,10 +127,18 @@ class WhisperModelSetup(ModelSetup):
         # Whisper tokenizers are misconfigured with a max_length that is too high, but
         # the correct max_length is stored in the generation config, so update it here.
         model_id = self.config.model.pretrained_model_id
-        generation_config = GenerationConfig.from_pretrained(model_id)
+        generation_config = GenerationConfig.from_pretrained(
+            model_id,
+            token=os.getenv("HUGGINGFACE_HUB_TOKEN"),
+            revision=self._revision(),
+        )
         max_length = generation_config.max_length
         if max_length is None:
-            hf_config = AutoConfig.from_pretrained(model_id)
+            hf_config = AutoConfig.from_pretrained(
+                model_id,
+                token=os.getenv("HUGGINGFACE_HUB_TOKEN"),
+                revision=self._revision(),
+            )
             max_length = int(hf_config.max_target_positions)
         self.processor.tokenizer.model_max_length = min(  # type: ignore[attr-defined]
             self.processor.tokenizer.model_max_length,  # type: ignore[attr-defined]
@@ -143,12 +159,18 @@ class WhisperModelSetup(ModelSetup):
             model_path = f"{self.config.hub_organisation}/{self.config.model_id}"
 
         processor: Processor
-        processor_or_tup = WhisperProcessor.from_pretrained(model_path, token=True)
+        processor_or_tup = WhisperProcessor.from_pretrained(
+            model_path,
+            token=os.getenv("HUGGINGFACE_HUB_TOKEN"),
+            revision=self._revision(),
+        )
         assert isinstance(processor_or_tup, WhisperProcessor)
         processor = processor_or_tup
 
         model_or_tup = WhisperForConditionalGeneration.from_pretrained(
-            model_path, token=True
+            model_path,
+            token=os.getenv("HUGGINGFACE_HUB_TOKEN"),
+            revision=self._revision(),
         )
         assert isinstance(model_or_tup, WhisperForConditionalGeneration)
         model = model_or_tup

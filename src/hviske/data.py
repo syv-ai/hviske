@@ -1250,6 +1250,10 @@ def process_example(
 
     Returns:
         The cleaned example.
+
+    Raises:
+        ValueError:
+            If Whisper processing has no language for the example.
     """
     doc = example[text_column]
 
@@ -1339,11 +1343,22 @@ def process_example(
         example[audio_column]["array"] = audio_array
         return example
 
-    # Cohere ASR needs the language prompt and transcript in the same processor call.
     example_language = (
         example.get(language_column) if language_column is not None else None
     ) or language
-    if example_language is not None and hasattr(processor, "get_decoder_prompt_ids"):
+    tokenizer = getattr(processor, "tokenizer", None)
+    set_prefix_tokens = getattr(tokenizer, "set_prefix_tokens", None)
+    is_whisper = callable(set_prefix_tokens)
+    if is_whisper:
+        if example_language is None:
+            raise ValueError(
+                "Whisper processing requires an ISO language for every example."
+            )
+        # Whisper's prefix is mutable processor state. Set it immediately before each
+        # example so a multilingual stream cannot inherit the previous example's prompt.
+        set_prefix_tokens(language=example_language, task="transcribe")
+    elif example_language is not None and hasattr(processor, "get_decoder_prompt_ids"):
+        # Cohere needs the language prompt and transcript in one processor call.
         processed = processor(
             audio_array,
             language=example_language,
@@ -1370,8 +1385,12 @@ def process_example(
     example[audio_feature_name] = audio_array
     example["num_seconds"] = len(example[audio_feature_name]) / sampling_rate
 
-    # Process the labels
-    example["labels"] = processor(text=example[text_column], truncation=True).input_ids
+    # Some remote processors require audio for every call, so tokenise labels through
+    # their tokenizer rather than invoking the processor with text alone.
+    label_processor = tokenizer if tokenizer is not None else processor
+    example["labels"] = label_processor(
+        text=example[text_column], truncation=True
+    ).input_ids
     example["input_length"] = len(example["labels"])
 
     return example

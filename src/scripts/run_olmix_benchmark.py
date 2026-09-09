@@ -16,7 +16,11 @@ from pathlib import Path
 
 MODELS = ("whisper-xxsmall", "hviske-v5-tiny")
 ANCHORS = ("olmix_baseline", "olmix_read_speech_heavy", "olmix_spontaneous_heavy")
-CHECKPOINTS = (250, 500, 1000, 2000, 3000)
+EVALUATION_STEPS = (250, 500, 1000, 2000, 3000)
+MODEL_REVISIONS = {
+    "whisper-xxsmall": "169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
+    "hviske-v5-tiny": "361051e8ed732798d68fcd5d5ec64fd4e39da40b",
+}
 FINETUNE_SCRIPT = "src/scripts/finetune_asr_model.py"
 LOGGER = logging.getLogger("olmix_benchmark")
 
@@ -46,7 +50,7 @@ def main() -> int:
                     anchor="olmix_baseline",
                     output_root=output_root,
                     max_steps=2,
-                    checkpoints=(2,),
+                    evaluation_steps=(2,),
                     run_kind="smoke",
                 )
     elif args.smoke:
@@ -60,7 +64,7 @@ def main() -> int:
             anchor=anchor,
             output_root=output_root,
             max_steps=2 if args.smoke else 3000,
-            checkpoints=(2,) if args.smoke else CHECKPOINTS,
+            evaluation_steps=(2,) if args.smoke else EVALUATION_STEPS,
             run_kind="smoke" if args.smoke else "matrix",
         )
     return 0
@@ -110,14 +114,14 @@ def _run_job(
     anchor: str,
     output_root: Path,
     max_steps: int,
-    checkpoints: tuple[int, ...],
+    evaluation_steps: tuple[int, ...],
     run_kind: str,
 ) -> None:
     run_id = _make_run_id(model=model, anchor=anchor, run_kind=run_kind)
     run_dir = output_root / run_id
     model_id = f"olmix-{model}-{anchor}-{run_id.rsplit('-', 1)[-1]}"
     models_dir = run_dir / "models"
-    run_dir.mkdir(parents=True)
+    run_dir.mkdir(parents=True, exist_ok=False)
     command = build_command(
         model=model,
         anchor=anchor,
@@ -125,7 +129,8 @@ def _run_job(
         models_dir=models_dir,
         hydra_run_dir=run_dir / "hydra",
         max_steps=max_steps,
-        checkpoints=checkpoints,
+        evaluation_steps=evaluation_steps,
+        metrics_path=run_dir / "evaluation_metrics.jsonl",
     )
     metadata: dict[str, object] = {
         "model": model,
@@ -135,7 +140,9 @@ def _run_job(
         "model_id": model_id,
         "run_dir": str(run_dir),
         "model_dir": str(models_dir / model_id),
-        "checkpoints": list(checkpoints),
+        "evaluation_metrics_path": str(run_dir / "evaluation_metrics.jsonl"),
+        "evaluation_steps": list(evaluation_steps),
+        "model_revision": MODEL_REVISIONS[model],
         "max_steps": max_steps,
         "validation_cap": 500,
         "commit": _git_commit(),
@@ -177,7 +184,9 @@ def _run_job(
                 "status": "failed",
                 "duration_seconds": time.monotonic() - started,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
-                "metrics": metrics,
+                "metrics": _read_metrics(
+                    path=run_dir / "evaluation_metrics.jsonl", fallback=metrics
+                ),
             }
         )
         _write_metadata(path=metadata_path, metadata=metadata)
@@ -187,7 +196,9 @@ def _run_job(
             "status": "completed",
             "duration_seconds": time.monotonic() - started,
             "finished_at": datetime.now(timezone.utc).isoformat(),
-            "metrics": metrics,
+            "metrics": _read_metrics(
+                path=run_dir / "evaluation_metrics.jsonl", fallback=metrics
+            ),
         }
     )
     _write_metadata(path=metadata_path, metadata=metadata)
@@ -226,6 +237,22 @@ def _make_run_id(*, model: str, anchor: str, run_kind: str) -> str:
     return f"{run_kind}-{model}-{anchor}-{timestamp}-{uuid.uuid4().hex[:8]}"
 
 
+def _read_metrics(
+    *, path: Path, fallback: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    if not path.exists():
+        return fallback
+    metrics: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("step"), int):
+            metrics.append(record)
+    return metrics
+
+
 def _write_metadata(*, path: Path, metadata: dict[str, object]) -> None:
     path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -240,7 +267,8 @@ def build_command(
     models_dir: Path,
     hydra_run_dir: Path,
     max_steps: int = 3000,
-    checkpoints: tuple[int, ...] = CHECKPOINTS,
+    evaluation_steps: tuple[int, ...] = EVALUATION_STEPS,
+    metrics_path: Path | None = None,
 ) -> list[str]:
     """Build a credential-free finetuning command for one calibration job.
 
@@ -251,8 +279,8 @@ def build_command(
     Returns:
         The complete subprocess command as argument tokens.
     """
-    checkpoint_override = "+evaluation_steps=[{}]".format(
-        ",".join(str(step) for step in checkpoints)
+    evaluation_override = "+evaluation_steps=[{}]".format(
+        ",".join(str(step) for step in evaluation_steps)
     )
     return [
         "uv",
@@ -267,9 +295,15 @@ def build_command(
         f"models_dir={models_dir.resolve()}",
         f"hydra.run.dir={hydra_run_dir.resolve()}",
         f"max_steps={max_steps}",
-        checkpoint_override,
+        evaluation_override,
+        *(
+            [f"+evaluation_metrics_path={metrics_path.resolve()}"]
+            if metrics_path is not None
+            else []
+        ),
         "eval_steps=1",
-        "save_steps=250",
+        f"save_steps={max_steps}",
+        "save_total_limit=1",
         "max_validation_samples_per_dataset=500",
         "push_to_hub=false",
         "create_pr=false",
