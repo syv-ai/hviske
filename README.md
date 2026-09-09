@@ -61,11 +61,15 @@ Here are some of the more important available keys:
   - `nota`
   - `nst`
   - `p1` (streaming audio plus configurable transcript Hub join)
+  - `peoples_speech_clean` (English People's Speech `clean` training split)
+  - `ami_sdm` and `ami_ihm` (English AMI training splits)
+  - `voxpopuli_en` (English VoxPopuli training split)
   - `librispeech_clean_train_100`, `librispeech_clean_train_360`, and
     `librispeech_other_train_500` (streaming English LibriSpeech)
-  - `common_voice_19_en` (streaming English Common Voice 19)
-  - `fleurs_en_us` (English FLEURS validation source)
   - `drtv_local` and `youtube_local` (local WAV/VTT manifests; both Danish)
+
+  FLEURS `en_us` is evaluation-only in the Sparkie preset and has no training config.
+  English Common Voice is not part of the production mix.
 - `dataset_probabilities`: In case you are finetuning on several datasets, you need to
   specify the probability of sampling each one. This is an array of probabilities that
   need to sum to 1. If not set, the datasets are sampled uniformly.
@@ -94,12 +98,14 @@ Dataset entries may set `language` to override the model-level Cohere prompt for
 that source. A Hub audio source can be joined to a compact transcript Hub dataset
 without downloading the audio by setting `transcript_dataset_id`,
 `transcript_subset`, `transcript_split`, `audio_join_column`,
-`transcript_join_column`, and `transcript_text_column`; optional `revision` and
-`transcript_revision` pin each side independently. The audio side remains streaming,
+`transcript_join_column`, and `transcript_text_column`. `revision` and
+`transcript_revision` pin each side independently; `trust_remote_code` and
+`transcript_trust_remote_code` default to false. The audio side remains streaming,
 while the transcript side is indexed in memory. Column names are deliberately
 configuration fields because private transcript schemas must be verified before use.
-The supplied `p1` config reads its three join names from `P1_AUDIO_JOIN_COLUMN`,
-`P1_TRANSCRIPT_JOIN_COLUMN`, and `P1_TRANSCRIPT_TEXT_COLUMN` environment variables.
+The supplied `p1` config requires `P1_TRANSCRIPT_REVISION`,
+`P1_AUDIO_JOIN_COLUMN`, `P1_TRANSCRIPT_JOIN_COLUMN`, and
+`P1_TRANSCRIPT_TEXT_COLUMN`.
 
 For local WAV/VTT data, first build a manifest without copying audio:
 
@@ -115,8 +121,16 @@ configuration. Training seeks and reads only each cue from the original WAV when
 is consumed; the manifest stores paths, offsets, text, IDs, durations, and language.
 
 The reproducible Sparkie bilingual preset is `config/sparkie_bilingual.yaml`. Resolve
-it with the existing fixed Hydra entry point using `--config-name sparkie_bilingual`.
-The complete operational procedure, including the private publication command, is in
+it with the existing fixed Hydra entry point using `--config-name sparkie_bilingual`,
+then run the bounded data preflight before stopping other Sparkie services:
+
+```bash
+uv run python src/scripts/preflight_finetuning_data.py \
+  --config-name sparkie_bilingual
+```
+
+The complete operational procedure, including smoke, pilot, full tmux run, monitoring,
+checkpoint retention, and the separate private publication command, is in
 [`docs/sparkie-bilingual-runbook.md`](docs/sparkie-bilingual-runbook.md).
 
 See all the finetuning options in the `config/asr_finetuning.yaml` file.

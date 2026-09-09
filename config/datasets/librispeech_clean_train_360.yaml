@@ -6,4 +6,5 @@ librispeech_clean_train_360:
   audio_column: audio
   filter_dataset: true
   language: en
-  revision: null
+  revision: 71cacbfb7e2354c4226d01e70d77d5fca3d04ba1
+  trust_remote_code: false

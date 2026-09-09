@@ -6,4 +6,5 @@ nst:
   audio_column: audio
   filter_dataset: true
   language: da
-  revision: null
+  revision: 0f14ad2005e0aab8f56cf3213b7689da1faf23c2
+  trust_remote_code: false

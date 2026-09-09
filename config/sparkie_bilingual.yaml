@@ -10,10 +10,13 @@ defaults:
     - ftspeech
     - nota
     - nst
+    - peoples_speech_clean
+    - ami_sdm
+    - ami_ihm
+    - voxpopuli_en
     - librispeech_clean_train_100
     - librispeech_clean_train_360
     - librispeech_other_train_500
-    - common_voice_19_en
   - experiment_tracking: wandb
   - override hydra/job_logging: custom
   - _self_
@@ -29,35 +32,42 @@ evaluation_datasets:
     text_column: text
     audio_column: audio
     language: da
-    revision: null
+    revision: 01f7c93c21fc9dec87fe9f7149c79569cc433f08
+    trust_remote_code: false
   - id: CoRal-project/coral-v3
     subset: conversation
     val_name: val
     text_column: text
     audio_column: audio
     language: da
-    revision: null
+    revision: 01f7c93c21fc9dec87fe9f7149c79569cc433f08
+    trust_remote_code: false
   - id: openslr/librispeech_asr
     subset: clean
     val_name: validation
     text_column: text
     audio_column: audio
     language: en
-    revision: null
+    revision: 71cacbfb7e2354c4226d01e70d77d5fca3d04ba1
+    trust_remote_code: false
   - id: openslr/librispeech_asr
     subset: other
     val_name: validation
     text_column: text
     audio_column: audio
     language: en
-    revision: null
+    revision: 71cacbfb7e2354c4226d01e70d77d5fca3d04ba1
+    trust_remote_code: false
   - id: google/fleurs
     subset: en_us
     val_name: validation
     text_column: raw_transcription
     audio_column: audio
     language: en
-    revision: null
+    revision: 70bb2e84b976b7e960aa89f1c648e09c59f894dd
+    trust_remote_code: false
+
+max_validation_samples_per_dataset: null
 
 min_seconds_per_example: 1.0
 max_seconds_per_example: 10.0
@@ -67,7 +77,7 @@ streaming: true
 cache_dir: null
 padding: longest
 
-# The first eight entries are Danish (60%); the final four are English (40%).
+# The first eight entries are Danish (60%); the final seven are English (40%).
 dataset_probabilities:
   - 0.075 # p1
   - 0.075 # drtv_local
@@ -77,10 +87,26 @@ dataset_probabilities:
   - 0.075 # ftspeech
   - 0.075 # nota
   - 0.075 # nst
-  - 0.1 # librispeech_clean_train_100
-  - 0.1 # librispeech_clean_train_360
-  - 0.1 # librispeech_other_train_500
-  - 0.1 # common_voice_19_en
+  - 0.16 # peoples_speech_clean
+  - 0.04 # ami_sdm
+  - 0.03 # ami_ihm
+  - 0.09 # voxpopuli_en
+  - 0.01 # librispeech_clean_train_100
+  - 0.025 # librispeech_clean_train_360
+  - 0.045 # librispeech_other_train_500
+
+# Exact source metadata for the separate private publication step.
+training_dataset_ids:
+  - syvai/p1
+  - syvai/p1-transcripts
+  - CoRal-project/coral-v3
+  - alexandrainst/ftspeech
+  - alexandrainst/nota
+  - alexandrainst/nst-da
+  - MLCommons/peoples_speech
+  - edinburghcstr/ami
+  - facebook/voxpopuli
+  - openslr/librispeech_asr
 
 model_id: hviske-v6
 models_dir: models
