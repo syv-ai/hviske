@@ -38,9 +38,9 @@ def finetune(config: DictConfig) -> None:
 
     model_setup: ModelSetup = load_model_setup(config=config)
     processor = model_setup.load_processor()
+    dataset = load_data_for_finetuning(config=config, processor=processor)
     processor.save_pretrained(save_directory=config.model_dir)
     model = model_setup.load_model()
-    dataset = load_data_for_finetuning(config=config, processor=processor)
 
     extracking_setup: ExTrackingSetup | None = None
     if config.enable_experiment_tracking and is_main_process:

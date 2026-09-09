@@ -1,13 +1,17 @@
 """Functions related to the data loading and processing."""
 
+import hashlib
 import io
+import json
 import logging
+import math
 import os
 import re
 import shutil
 import typing as t
 from collections.abc import Callable, Iterable, Sized
 from functools import partial
+from numbers import Number
 from pathlib import Path
 from typing import Any
 from unicodedata import normalize
@@ -40,6 +44,121 @@ from .utils import (
 )
 
 logger = logging.getLogger(__package__)
+
+
+def _validate_dataset_probabilities(
+    probabilities: Iterable[object], dataset_count: int
+) -> list[float]:
+    """Validate and normalise dataset sampling probabilities.
+
+    Args:
+        probabilities:
+            Candidate probability values.
+        dataset_count:
+            Number of datasets being interleaved.
+
+    Returns:
+        Validated probability values as floats.
+
+    Raises:
+        ValueError:
+            If the count, values, bounds, or total are invalid.
+    """
+    try:
+        values = list(probabilities)
+    except TypeError as error:
+        raise ValueError("Dataset probabilities must be an iterable") from error
+    if len(values) != dataset_count:
+        raise ValueError(
+            f"There are {dataset_count:,} datasets, but {len(values):,} "
+            "probabilities were provided"
+        )
+
+    validated: list[float] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, Number):
+            raise ValueError(
+                f"Dataset probability at index {index} must be a real number"
+            )
+        try:
+            probability = float(t.cast(t.SupportsFloat, value))
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Dataset probability at index {index} must be a real number"
+            ) from error
+        if not math.isfinite(probability) or not 0 <= probability <= 1:
+            raise ValueError(
+                f"Dataset probability at index {index} must be finite and in [0, 1]"
+            )
+        validated.append(probability)
+
+    total = math.fsum(validated)
+    if not math.isclose(total, 1.0, rel_tol=0, abs_tol=1e-8):
+        raise ValueError(f"Dataset probabilities must sum to 1, but sum to {total}")
+    return validated
+
+
+def _limit_validation_dataset(
+    dataset: IterableDataset, max_samples: int | None
+) -> IterableDataset:
+    """Apply a validation sample limit while the dataset is still iterable.
+
+    Args:
+        dataset:
+            Validation examples to limit.
+        max_samples:
+            Maximum number of examples, or ``None`` for no limit.
+
+    Returns:
+        The limited iterable dataset.
+    """
+    if max_samples is None:
+        return dataset
+    return dataset.take(max_samples)
+
+
+def _dataset_cache_identity(
+    dataset_id: str,
+    subset: str | None,
+    split: str,
+    revision: str | None,
+    purpose: str,
+    max_samples: int | None = None,
+) -> str:
+    """Build a stable cache identity for one dataset materialisation.
+
+    Args:
+        dataset_id:
+            Dataset repository or local identifier.
+        subset:
+            Dataset subset, if any.
+        split:
+            Dataset split.
+        revision:
+            Dataset revision, if any.
+        purpose:
+            Cache purpose, such as validation or evaluation.
+        max_samples (optional):
+            Materialisation limit, if one is applied.
+
+    Returns:
+        A filesystem-safe dataset identifier containing a canonical hash.
+    """
+    identity = json.dumps(
+        {
+            "dataset_id": dataset_id,
+            "max_samples": max_samples,
+            "purpose": purpose,
+            "revision": revision,
+            "split": split,
+            "subset": subset,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"{dataset_id.replace('/', '--')}-{digest}"
 
 
 def join_audio_and_transcripts(
@@ -225,6 +344,12 @@ def load_data_for_finetuning(
     # Note if we're on the main process, if we are running in a distributed setting
     is_main_process = os.getenv("RANK", "0") == "0"
 
+    probabilities = config.dataset_probabilities
+    if probabilities is not None:
+        probabilities = _validate_dataset_probabilities(
+            probabilities=probabilities, dataset_count=len(config.datasets)
+        )
+
     all_datasets: list[IterableDataset] | list[Dataset] = list()
     for dataset_name, dataset_config in config.datasets.items():
         if is_main_process:
@@ -297,9 +422,8 @@ def load_data_for_finetuning(
             with no_datasets_progress_bars():
                 ds = load_dataset(**kwargs)
 
-        assert isinstance(ds, Dataset | IterableDataset), (
-            f"Unsupported dataset type: {type(ds)}"
-        )
+        if not isinstance(ds, Dataset | IterableDataset):
+            raise ValueError(f"Unsupported dataset type: {type(ds)}")
 
         if not is_local_vtt and dataset_config.text_column != "text":
             ds = ds.rename_column(dataset_config.text_column, "text")
@@ -336,10 +460,15 @@ def load_data_for_finetuning(
             )
 
         if is_local_vtt:
+            if ds.features is None:
+                raise ValueError("Local VTT datasets must declare manifest features")
+            local_features = ds.features.copy()
+            local_features["audio"] = Audio(sampling_rate=config.model.sampling_rate)
             ds = ds.map(
                 function=partial(
                     decode_vtt_audio, sampling_rate=config.model.sampling_rate
-                )
+                ),
+                features=local_features,
             )
         elif dataset_config.filter_dataset:
             ds = filter_dataset(
@@ -362,7 +491,8 @@ def load_data_for_finetuning(
 
         all_datasets.append(ds)  # type: ignore[bad-argument-type]
 
-    assert len(all_datasets) > 0, "No datasets were loaded"
+    if len(all_datasets) == 0:
+        raise ValueError("No datasets were loaded")
 
     if len(all_datasets) > 1:
         if is_main_process:
@@ -376,20 +506,8 @@ def load_data_for_finetuning(
                     "not what you want."
                 )
 
-        probabilities = config.dataset_probabilities
         if probabilities is None:
             probabilities = [1 / len(all_datasets)] * len(all_datasets)
-            probabilities[-1] = 1 - sum(probabilities[:-1])
-        elif sum(probabilities) != 1:
-            raise ValueError(
-                f"Dataset probabilities must sum to 1, but sum to {sum(probabilities)}"
-            )
-
-        assert len(all_datasets) == len(probabilities), (
-            f"There are {len(all_datasets):,} datasets ({all_datasets}), but "
-            f"{len(probabilities):,} probabilities ({probabilities}), but these "
-            "should be equal!"
-        )
 
         train = interleave_datasets(
             datasets=all_datasets,  # type: ignore[bad-argument-type]
@@ -433,11 +551,16 @@ def load_data_for_finetuning(
 
         Returns:
             The loaded dataset.
+
+        Raises:
+            ValueError:
+                If the loaded dataset is not iterable.
         """
+        validation_split = dataset_config.val_name
         validation_kwargs: dict[str, Any] = {
             "path": dataset_config.id,
             "name": dataset_config.subset,
-            "split": dataset_config.val_name,
+            "split": validation_split,
             "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
             "streaming": True,
             "cache_dir": config.cache_dir,
@@ -447,11 +570,21 @@ def load_data_for_finetuning(
             validation_kwargs["revision"] = dataset_config.revision
         with no_datasets_progress_bars():
             val = load_dataset(**validation_kwargs)
-        assert isinstance(val, IterableDataset)
+        if not isinstance(val, IterableDataset):
+            raise ValueError(f"Unsupported validation dataset type: {type(val)}")
+        max_samples = config.get("max_validation_samples_per_dataset")
+        val = _limit_validation_dataset(dataset=val, max_samples=max_samples)
         val = convert_iterable_dataset_to_dataset(
             iterable_dataset=val,
-            split_name="val",
-            dataset_id=dataset_config.id.replace("/", "--") + "-validation",
+            split_name=validation_split,
+            dataset_id=_dataset_cache_identity(
+                dataset_id=dataset_config.id,
+                subset=dataset_config.get("subset"),
+                split=validation_split,
+                revision=dataset_config.get("revision"),
+                purpose="validation",
+                max_samples=max_samples,
+            ),
             cache_dir=config.cache_dir,
         )
         if dataset_config.text_column != "text":
@@ -522,6 +655,10 @@ def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
 
     Returns:
         A DatasetDict containing the validation and test datasets.
+
+    Raises:
+        ValueError:
+            If the loaded dataset cannot be streamed or materialised.
     """
     # Note if we're on the main process, if we are running in a distributed setting
     is_main_process = os.getenv("RANK", "0") == "0"
@@ -537,10 +674,15 @@ def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
         )
 
     eval_dataset_path = None
+    cache_identity = _dataset_cache_identity(
+        dataset_id=dataset_id,
+        subset=dataset_subset,
+        split=config.eval_split_name,
+        revision=dataset_revision,
+        purpose="evaluation",
+    )
     if config.cache_dir:
-        eval_dataset_path = (
-            Path(config.cache_dir) / "test-sets" / dataset_id.replace("/", "--")
-        )
+        eval_dataset_path = Path(config.cache_dir) / "test-sets" / cache_identity
         if eval_dataset_path.exists():
             return Dataset.load_from_disk(dataset_path=eval_dataset_path)
 
@@ -554,13 +696,18 @@ def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
         streaming=True,
         trust_remote_code=True,
     )
-    assert isinstance(dataset, IterableDataset)
+    if not isinstance(dataset, IterableDataset):
+        raise ValueError(f"Unsupported evaluation dataset type: {type(dataset)}")
     dataset = convert_iterable_dataset_to_dataset(
         iterable_dataset=dataset,
         split_name=config.eval_split_name,
+        dataset_id=(
+            f"test-sets/{cache_identity}" if eval_dataset_path is not None else None
+        ),
         cache_dir=config.cache_dir,
     )
-    assert isinstance(dataset, Dataset)
+    if not isinstance(dataset, Dataset):
+        raise ValueError(f"Unsupported materialised dataset type: {type(dataset)}")
     dataset = filter_dataset(
         dataset=dataset,
         audio_column=config.audio_column,
@@ -622,6 +769,10 @@ def filter_dataset(
 
     Returns:
         The filtered dataset.
+
+    Raises:
+        ValueError:
+            If the filtered dataset type is unsupported.
     """
     num_samples_before = len(dataset) if isinstance(dataset, Sized) else 0
 
@@ -648,9 +799,11 @@ def filter_dataset(
     ):
         filtered.info.features = dataset.info.features
     else:
-        assert isinstance(dataset, DatasetDict | IterableDatasetDict) and isinstance(
-            filtered, DatasetDict | IterableDatasetDict
-        )
+        if not (
+            isinstance(dataset, DatasetDict | IterableDatasetDict)
+            and isinstance(filtered, DatasetDict | IterableDatasetDict)
+        ):
+            raise ValueError(f"Unsupported filtered dataset type: {type(filtered)}")
         for split_name in dataset.keys():
             filtered[split_name].info.features = dataset[split_name].info.features
 
