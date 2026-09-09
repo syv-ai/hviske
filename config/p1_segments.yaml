@@ -1,5 +1,14 @@
-# Phase 1A contract configuration.  Every revision is immutable and complete.
-pipeline_version: p1-segmentation-1a
+# Phase 1C contract configuration. Every revision is immutable and complete.
+# Use mode=plan for a no-audio preflight; pilot and production are bounded builds.
+pipeline_version: p1-segmentation-1c
+mode: plan
+programme_limit: null
+source_file_id: null
+resume: true
+# Optional command-line overrides (for example max_source_bytes=100000000).
+max_source_bytes: null
+max_scratch_bytes: null
+shards_per_commit: null
 schema_version: p1-segments-v1
 
 source:
@@ -69,6 +78,7 @@ runtime:
   queue_slots: 1
   upload_concurrency: 1
   verification_concurrency: 1
+  device: cuda:0
   shards_per_commit: 8
   target_shard_bytes: 500000000
   target_private_repo: syvai/p1-segments
