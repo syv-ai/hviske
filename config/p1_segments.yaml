@@ -1,0 +1,78 @@
+# Phase 1A contract configuration.  Every revision is immutable and complete.
+pipeline_version: p1-segmentation-1a
+schema_version: p1-segments-v1
+
+source:
+  audio:
+    repository: syvai/p1
+    revision: 449b9c2294026df6d0d37538f279fdec03f565ff
+  transcripts:
+    repository: syvai/p1-transcripts
+    revision: 41132579816d86e889635f84f30511279f026359
+  join_key: file_id
+  text_column: transcript_text
+
+vad:
+  name: silero-vad
+  repository:
+    repository: snakers4/silero-vad
+    revision: 867c2aa692646a1f1de3e94a15c9dd9f614c0acb
+  model_blob: 5c6988d663950a93a5f0d6c38c2fe024653ec552b
+  license: MIT
+
+ctc:
+  name: ctc-segmentation
+  version: 1.7.4
+  source_commit: 69bd9b53b7b82ad926d35e7b280f957ed299a7db
+  sdist_sha256: 19d383ea5f22438ebb1699d72b22078b63f351a33fa50bedb19c14077ba6a116
+  license: Apache-2.0
+  model:
+    repository:
+      repository: NbAiLab/wav2vec2-large-danish-npsc-nst
+      revision: cc62398a83d2eb071f789dfaea019a9ff3211c6c
+    license: Apache-2.0
+
+anomaly_model:
+  repository:
+    repository: openai/whisper-small
+    revision: 973afd24965f72e36ca33b3055d56a652f456b4d
+  license: Apache-2.0
+
+normalisation:
+  version: p1-text-normalisation-1
+  unicode_form: NFC
+  case_folding: false
+  punctuation_removed: true
+  number_expansion: false
+  preserves_source_word_map: true
+
+segmentation:
+  minimum_duration_ms: 1000
+  target_minimum_duration_ms: 2000
+  target_maximum_duration_ms: 8000
+  maximum_duration_ms: 9999
+  maximum_drift_ms: 500
+  minimum_alignment_score: 0.0
+  minimum_vad_speech_ratio: 0.0
+
+output:
+  audio_format: flac
+  sampling_rate: 16000
+  channels: 1
+  shard_format: parquet
+
+runtime:
+  scratch_root: /scratch/syvai/p1-segmentation
+  max_source_bytes: 6197291423
+  max_scratch_bytes: 68719476736
+  workers: 1
+  queue_slots: 1
+  upload_concurrency: 1
+  verification_concurrency: 1
+  shards_per_commit: 8
+  target_shard_bytes: 500000000
+  target_private_repo: syvai/p1-segments
+
+# ctc-forced-aligner is intentionally excluded: its licence metadata is contradictory.
+excluded:
+  - ctc-forced-aligner

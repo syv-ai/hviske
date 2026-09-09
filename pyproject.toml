@@ -13,6 +13,7 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "accelerate>=1.9.0",
     "click>=8.2.1",
+    "ctc-segmentation==1.7.4",
     "datasets>=3.6.0,<4.0.0",
     "deepspeed>=0.17.4",
     "hydra-core>=1.1.1",
@@ -24,12 +25,14 @@ dependencies = [
     "progress>=1.6.1",
     "pycountry>=24.6.1",
     "pyctcdecode>=0.5.0",
+    "pydantic>=2.0",
     "pydub>=0.25.1",
     "pysubs2>=1.8.0",
     "python-dotenv>=1.2.2",
     "requests>=2.32.4",
     "safetensors>=0.7.0",
     "sentencepiece>=0.2.2",
+    "silero-vad>=6.2.1",
     "soundfile>=0.13.1",
     "torch-audiomentations>=0.12.0",
     "torchaudio>=2.6.0,<2.7.0",  # Upper bound for compatibility with audiomentations
