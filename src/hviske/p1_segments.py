@@ -10,6 +10,7 @@ from __future__ import annotations
 import collections.abc as c
 import hashlib
 import io
+import json
 import math
 import os
 import re
@@ -353,11 +354,10 @@ normalize_alignment_text = normalise_alignment_text
 
 
 class CTCEmissionsAlignmentAdapter:
-    """Adapt an injected emission provider to :class:`CTCBackend`.
+    """Adapt injected emissions to the reference ``ctc-segmentation`` algorithm.
 
-    No checkpoint or model is loaded by this class.  ``segmenter`` can be a
-    pinned ``ctc-segmentation`` implementation; the deterministic adapter is
-    used when it is omitted, which makes boundary logic testable offline.
+    No checkpoint or model is loaded by this class.  Emissions must be natural
+    logarithms of CTC probabilities; this is deliberately not a greedy decoder.
     """
 
     def __init__(
@@ -402,20 +402,109 @@ class CTCEmissionsAlignmentAdapter:
         Returns:
             Absolute alignment boundaries and backend score.
         """
-        del word_map, end_ms
+        del end_ms
         emissions = self._emissions_provider(audio, sampling_rate)
-        tokens = self._tokeniser(alignment_text)
+        words = alignment_text.split()
+        tokenised_words = [
+            tuple(int(token) for token in self._tokeniser(word)) for word in words
+        ]
         if self._segmenter is not None:
             return self._segmenter(
-                emissions, tokens, start_ms, self._frame_duration_ms, self._blank_id
+                emissions,
+                tokenised_words,
+                start_ms,
+                self._frame_duration_ms,
+                self._blank_id,
             )
-        return align_ctc_emissions(
+        return align_ctc_word_tokens(
             emissions=emissions,
-            token_ids=tokens,
+            tokenised_words=tokenised_words,
             start_ms=start_ms,
             frame_duration_ms=self._frame_duration_ms,
             blank_id=self._blank_id,
         )
+
+
+def align_ctc_word_tokens(
+    emissions: np.ndarray,
+    tokenised_words: c.Sequence[c.Sequence[int]],
+    start_ms: int,
+    frame_duration_ms: float,
+    blank_id: int = 0,
+) -> AlignmentResult:
+    """Align tokenised words with the pinned ctc-segmentation implementation.
+
+    Args:
+        emissions:
+            Frame-by-class log probabilities (not softmax probabilities).
+        tokenised_words:
+            CTC token IDs for each output word, in transcript order.
+        start_ms:
+            Absolute start of the local emission window.
+        frame_duration_ms:
+            Model index duration used by ctc-segmentation.
+        blank_id (optional):
+            CTC blank class. Defaults to 0.
+
+    Returns:
+        Absolute word boundaries, per-word minimum mean log probability, and
+        the overall minimum score.
+
+    Raises:
+        ValueError:
+            If emissions, token IDs, or the blank ID are invalid.
+    """
+    values = np.asarray(emissions, dtype=np.float32)
+    if values.ndim != 2 or values.shape[0] == 0:
+        raise ValueError("emissions must be a non-empty frame by class matrix")
+    if not tokenised_words or any(not word for word in tokenised_words):
+        raise ValueError("tokenised_words must contain non-empty words")
+    if blank_id < 0 or blank_id >= values.shape[1]:
+        raise ValueError("blank_id is outside the emissions class axis")
+    if not np.isfinite(values).all():
+        raise ValueError("emissions must contain finite log probabilities")
+    if any(
+        token < 0 or token >= values.shape[1]
+        for word in tokenised_words
+        for token in word
+    ):
+        raise ValueError("token ID is outside the emissions class axis")
+
+    import ctc_segmentation as ctc
+
+    config = ctc.CtcSegmentationParameters(
+        char_list=[str(index) for index in range(values.shape[1])],
+        blank=blank_id,
+        index_duration=frame_duration_ms / 1000.0,
+    )
+    config.update_excluded_characters()
+    text = [" ".join(str(token) for token in word) for word in tokenised_words]
+    ground_truth, utterance_starts = ctc.prepare_tokenized_text(config, text)
+    timings, char_probs, _ = ctc.ctc_segmentation(config, values, ground_truth)
+    segments = ctc.determine_utterance_segments(
+        config, utterance_starts, char_probs, timings, text
+    )
+    boundaries: list[tuple[int, int]] = []
+    scores: list[float] = []
+    for begin, end, score in segments:
+        # ctc-segmentation returns seconds on the local emission timeline;
+        # preserve its half-frame transition estimate before adding the window
+        # origin rather than silently snapping it to an integer frame.
+        boundaries.append(
+            (int(round(start_ms + begin * 1000.0)), int(round(start_ms + end * 1000.0)))
+        )
+        scores.append(float(score))
+    return AlignmentResult(
+        start_ms=boundaries[0][0],
+        end_ms=boundaries[-1][1],
+        score=min(scores),
+        score_type="ctc-segmentation:min_mean_log_probability",
+        word_boundaries=tuple(
+            (begin, end, score)
+            for (begin, end), score in zip(boundaries, scores, strict=True)
+        ),
+        raw_score_inputs=tuple(scores),
+    )
 
 
 def align_ctc_emissions(
@@ -425,62 +514,21 @@ def align_ctc_emissions(
     frame_duration_ms: float,
     blank_id: int = 0,
 ) -> AlignmentResult:
-    """Derive model-independent token spans from CTC emissions.
+    """Align each supplied token as one utterance using ctc-segmentation.
 
-    This deterministic adapter is also a safe test double for the pinned
-    ``ctc-segmentation`` backend.  Production callers may replace it with the
-    package's chunk scorer without changing the surrounding contracts.
+    The package's dynamic-programming table, backtracking, and minimum-window
+    mean-log-probability score are all used.  Token IDs are separate utterances
+    here so this low-level function is useful for focused, model-free tests.
 
     Returns:
-        Absolute token boundaries and the minimum token confidence.
-
-    Raises:
-        ValueError:
-            If emissions or token IDs are empty or have an invalid shape.
+        Alignment boundaries and ctc-segmentation scores.
     """
-    values = np.asarray(emissions)
-    if values.ndim != 2 or values.shape[0] == 0:
-        raise ValueError("emissions must be a non-empty frame by class matrix")
-    if not token_ids:
-        raise ValueError("token_ids must not be empty")
-    classes = np.argmax(values, axis=1)
-    spans: list[tuple[int, int, float]] = []
-    cursor = 0
-    frame_count = len(classes)
-    for token in token_ids:
-        locations: list[int] = []
-        while cursor < frame_count:
-            if int(classes[cursor]) == token:
-                locations.append(cursor)
-            cursor += 1
-            if (
-                locations
-                and cursor < frame_count
-                and int(classes[cursor]) not in (token, blank_id)
-            ):
-                break
-        if locations:
-            first, last = locations[0], locations[-1] + 1
-            score = float(np.mean(values[first:last, token]))
-        else:
-            first = last = cursor
-            score = 0.0
-        spans.append(
-            (
-                int(round(start_ms + first * frame_duration_ms)),
-                int(round(start_ms + last * frame_duration_ms)),
-                score,
-            )
-        )
-        if cursor >= frame_count:
-            cursor = frame_count
-    valid_scores = [score for _, _, score in spans]
-    return AlignmentResult(
-        start_ms=spans[0][0],
-        end_ms=spans[-1][1],
-        score=min(valid_scores),
-        word_boundaries=tuple(spans),
-        raw_score_inputs=tuple(valid_scores),
+    return align_ctc_word_tokens(
+        emissions=emissions,
+        tokenised_words=[(int(token),) for token in token_ids],
+        start_ms=start_ms,
+        frame_duration_ms=frame_duration_ms,
+        blank_id=blank_id,
     )
 
 
@@ -521,188 +569,6 @@ def form_candidate_segments(
 # Short aliases keep integration adapters readable without changing the protocol.
 CTCSegmentationAdapter = CTCEmissionsAlignmentAdapter
 CTCAlignmentAdapter = CTCEmissionsAlignmentAdapter
-
-
-class ShardWriter:
-    """Incremental atomic Parquet writer with bounded rotation."""
-
-    def __init__(
-        self,
-        output_dir: Path,
-        target_bytes: int = 500_000_000,
-        on_source_recoverable: c.Callable[[], None] | None = None,
-    ) -> None:
-        """Create a writer whose temporary files share the destination directory.
-
-        Args:
-            output_dir:
-                Directory receiving atomically renamed shards.
-            target_bytes:
-                Approximate rotation target in bytes.
-            on_source_recoverable:
-                Optional callback after close has fsynced every shard.
-
-        Raises:
-            ValueError:
-                If the target byte bound is not positive.
-        """
-        if target_bytes <= 0:
-            raise ValueError("target_bytes must be positive")
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.target_bytes = target_bytes
-        self._pending: list[OutputRow] = []
-        self._results: list[ShardWriteResult] = []
-        self._next_index = _next_shard_index(self.output_dir)
-        self._on_source_recoverable = on_source_recoverable
-        self._closed = False
-
-    def close(self) -> tuple[ShardWriteResult, ...]:
-        """Close the writer and return all fsync evidence.
-
-        Returns:
-            Evidence for every shard written by this writer.
-        """
-        if not self._closed:
-            if self._pending:
-                self._results.append(
-                    _write_one_shard(
-                        rows=self._pending,
-                        output_dir=self.output_dir,
-                        index=self._next_index,
-                    )
-                )
-                self._pending = []
-            self._closed = True
-            if self._results and all(result.fsynced for result in self._results):
-                if self._on_source_recoverable is not None:
-                    self._on_source_recoverable()
-        return tuple(self._results)
-
-    def append(self, row: OutputRow) -> ShardWriteResult | None:
-        """Append a row and rotate when the shard reaches its target.
-
-        Returns:
-            Fsync evidence when this append rotates a shard, otherwise ``None``.
-
-        Raises:
-            RuntimeError:
-                If the writer has already been closed.
-        """
-        if self._closed:
-            raise RuntimeError("cannot append to a closed shard writer")
-        self._pending.append(row)
-        if _table_size(self._pending) < self.target_bytes:
-            return None
-        result = _write_one_shard(
-            rows=self._pending, output_dir=self.output_dir, index=self._next_index
-        )
-        self._results.append(result)
-        self._next_index += 1
-        self._pending = []
-        return result
-
-
-def _next_shard_index(output_dir: Path) -> int:
-    indexes = [
-        int(match.group(1))
-        for path in output_dir.glob("part-*.parquet")
-        if (match := re.fullmatch(r"part-(\d+)\.parquet", path.name))
-    ]
-    return max(indexes, default=-1) + 1
-
-
-def _table_size(rows: c.Sequence[OutputRow]) -> int:
-    sink = pa.BufferOutputStream()
-    pq.write_table(_rows_table(rows), sink, compression="zstd")
-    return sink.getvalue().size
-
-
-def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
-    schema = pa.schema(
-        [
-            ("audio", pa.binary()),
-            ("audio_sha256", pa.string()),
-            ("text", pa.string()),
-            ("alignment_text", pa.string()),
-            ("alignment_word_map", pa.list_(pa.string())),
-            ("language", pa.string()),
-            ("segment_id", pa.string()),
-            ("source_file_id", pa.string()),
-            ("source_start_ms", pa.int64()),
-            ("source_end_ms", pa.int64()),
-            ("duration_ms", pa.int32()),
-            ("speaker_ids", pa.list_(pa.string())),
-            ("proposal_start_ms", pa.int64()),
-            ("proposal_end_ms", pa.int64()),
-            ("alignment_score", pa.float32()),
-            ("alignment_score_type", pa.string()),
-            ("start_drift_ms", pa.int32()),
-            ("end_drift_ms", pa.int32()),
-            ("vad_speech_ratio", pa.float32()),
-            ("alignment_backend", pa.string()),
-            ("pipeline_version", pa.string()),
-            ("pipeline_config_sha256", pa.string()),
-        ]
-    )
-    return pa.table(
-        {
-            "audio": [row.audio for row in rows],
-            "audio_sha256": [row.audio_sha256 for row in rows],
-            "text": [row.text for row in rows],
-            "alignment_text": [row.alignment_text for row in rows],
-            "alignment_word_map": [list(row.alignment_word_map) for row in rows],
-            "language": [row.language for row in rows],
-            "segment_id": [row.segment_id for row in rows],
-            "source_file_id": [row.source_file_id for row in rows],
-            "source_start_ms": [row.source_start_ms for row in rows],
-            "source_end_ms": [row.source_end_ms for row in rows],
-            "duration_ms": [row.duration_ms for row in rows],
-            "speaker_ids": [list(row.speaker_ids) for row in rows],
-            "proposal_start_ms": [row.proposal_start_ms for row in rows],
-            "proposal_end_ms": [row.proposal_end_ms for row in rows],
-            "alignment_score": [row.alignment_score for row in rows],
-            "alignment_score_type": [row.alignment_score_type for row in rows],
-            "start_drift_ms": [row.start_drift_ms for row in rows],
-            "end_drift_ms": [row.end_drift_ms for row in rows],
-            "vad_speech_ratio": [row.vad_speech_ratio for row in rows],
-            "alignment_backend": [row.alignment_backend for row in rows],
-            "pipeline_version": [row.pipeline_version for row in rows],
-            "pipeline_config_sha256": [row.pipeline_config_sha256 for row in rows],
-        },
-        schema=schema,
-    )
-
-
-def _write_one_shard(
-    rows: c.Sequence[OutputRow], output_dir: Path, index: int
-) -> ShardWriteResult:
-    final_path = output_dir / f"part-{index:05d}.parquet"
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{final_path.name}.", suffix=".tmp", dir=output_dir
-    )
-    os.close(fd)
-    temporary_path = Path(temporary_name)
-    try:
-        pq.write_table(_rows_table(rows), temporary_path, compression="zstd")
-        with temporary_path.open("rb") as handle:
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, final_path)
-        directory_fd = os.open(output_dir, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-        payload = final_path.read_bytes()
-        return ShardWriteResult(
-            path=final_path,
-            row_count=len(rows),
-            byte_size=len(payload),
-            sha256=hashlib.sha256(payload).hexdigest(),
-            fsynced=True,
-        )
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def _expand_danish_numbers(value: str) -> str:
@@ -810,6 +676,8 @@ def segment_programme(
     pipeline_version: str,
     pipeline_config_sha256: str,
     vad: VADBackend | None = None,
+    sampling_rate: int = 16000,
+    channels: int = 1,
 ) -> SegmentationResult:
     """Run bounded proposal, VAD, CTC, correction, filtering, and encoding.
 
@@ -820,8 +688,17 @@ def segment_programme(
         SourceValidationError:
             If source audio does not match its declared duration or timestamps fail.
     """
-    values = np.asarray(audio)
-    if values.ndim != 1 or values.size != source_duration_ms * 16:
+    try:
+        values = prepare_source_audio(
+            audio=audio, sampling_rate=sampling_rate, channels=channels
+        )
+    except ValueError as exc:
+        raise SourceValidationError(
+            "source audio cannot be downmixed and resampled",
+            category=RejectionCategory.MISSING_AUDIO,
+        ) from exc
+    expected_samples = source_duration_ms * 16
+    if values.size != expected_samples:
         raise SourceValidationError(
             "source audio length does not match its declared duration",
             category=RejectionCategory.MISSING_AUDIO,
@@ -848,7 +725,7 @@ def segment_programme(
         if not canonical.text:
             rejections.append((proposal.text, RejectionCategory.EMPTY_TEXT.value))
             continue
-        local_audio = np.asarray(audio)[
+        local_audio = values[
             proposal.proposal_start_ms * 16 : proposal.proposal_end_ms * 16
         ]
         first = ctc.align(
@@ -864,7 +741,7 @@ def segment_programme(
             first_alignment=first,
             maximum_drift_ms=segmentation.maximum_drift_ms,
             realign=lambda start, end: ctc.align(
-                audio=np.asarray(audio)[start * 16 : end * 16],
+                audio=values[start * 16 : end * 16],
                 alignment_text=canonical.text,
                 word_map=canonical.word_map,
                 start_ms=start,
@@ -888,7 +765,7 @@ def segment_programme(
         decision = make_output_row(
             proposal=proposal,
             alignment=final_alignment,
-            audio=np.asarray(audio),
+            audio=values,
             source_duration_ms=source_duration_ms,
             pipeline_version=pipeline_version,
             pipeline_config_sha256=pipeline_config_sha256,
@@ -1109,44 +986,334 @@ def decode_flac(payload: bytes) -> np.ndarray:
     return decoded[:, 0]
 
 
+def prepare_source_audio(
+    audio: np.ndarray, sampling_rate: int, channels: int
+) -> np.ndarray:
+    """Downmix declared-channel audio and resample it to mono 16 kHz.
+
+    Args:
+        audio:
+            PCM samples in frames-by-channels layout (or a mono vector).
+        sampling_rate:
+            Sampling rate declared by the source dataset.
+        channels:
+            Channel count declared by the source dataset.
+
+    Returns:
+        Float32 mono samples at exactly 16,000 Hz.
+
+    Raises:
+        ValueError:
+            If declarations and array shape disagree or the audio is empty.
+    """
+    if sampling_rate <= 0 or channels <= 0:
+        raise ValueError("sampling_rate and channels must be positive")
+    values = np.asarray(audio, dtype=np.float32)
+    if values.ndim == 1:
+        if channels != 1:
+            raise ValueError("declared channels do not match mono audio")
+    elif values.ndim == 2 and values.shape[1] == channels:
+        values = values.mean(axis=1, dtype=np.float32)
+    else:
+        raise ValueError("audio must be frames-by-channels with declared channels")
+    if values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("audio must be non-empty and finite")
+    if sampling_rate != 16000:
+        from scipy.signal import resample_poly
+
+        divisor = math.gcd(sampling_rate, 16000)
+        up = 16000 // divisor
+        down = sampling_rate // divisor
+        expected = round(values.size * 16000 / sampling_rate)
+        values = np.asarray(resample_poly(values, up, down), dtype=np.float32)
+        if len(values) < expected:
+            values = np.pad(values, (0, expected - len(values)))
+        values = values[:expected]
+    return values.astype(np.float32, copy=False)
+
+
+def validate_output_shard(path: Path) -> None:
+    """Validate a local shard's exact schema and every encoded audio row.
+
+    The validation intentionally decodes every payload: a Parquet footer and a
+    matching digest alone do not prove that the advertised Audio feature works.
+
+    Raises:
+        ValueError:
+            If the schema, encoded audio, digest, or duration is invalid.
+    """
+    parquet_file = pq.ParquetFile(path)
+    expected_schema = _rows_table([]).schema
+    if parquet_file.schema_arrow != expected_schema:
+        raise ValueError("Parquet schema does not match the P1 Audio contract")
+    for batch in parquet_file.iter_batches(batch_size=1):
+        for row in batch.to_pylist():
+            audio = row["audio"]
+            if not isinstance(audio, dict) or not isinstance(audio.get("bytes"), bytes):
+                raise ValueError("audio is not an HF Audio struct with embedded bytes")
+            payload = audio["bytes"]
+            decoded = decode_flac(payload)
+            if hashlib.sha256(payload).hexdigest() != row["audio_sha256"]:
+                raise ValueError("audio_sha256 does not match the encoded payload")
+            if len(decoded) != int(row["duration_ms"]) * 16:
+                raise ValueError("decoded audio length does not match duration_ms")
+            if row["source_end_ms"] - row["source_start_ms"] != row["duration_ms"]:
+                raise ValueError("source interval does not match duration_ms")
+
+
+def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
+    """Build one bounded row group with reconstructible HF Audio metadata.
+
+    Returns:
+        An Arrow table with the exact P1 output schema.
+    """
+    schema = pa.schema(
+        [
+            ("audio", pa.struct([("bytes", pa.binary()), ("path", pa.string())])),
+            ("audio_sha256", pa.string()),
+            ("text", pa.string()),
+            ("alignment_text", pa.string()),
+            ("alignment_word_map", pa.list_(pa.string())),
+            ("language", pa.string()),
+            ("segment_id", pa.string()),
+            ("source_file_id", pa.string()),
+            ("source_start_ms", pa.int64()),
+            ("source_end_ms", pa.int64()),
+            ("duration_ms", pa.int32()),
+            ("speaker_ids", pa.list_(pa.string())),
+            ("proposal_start_ms", pa.int64()),
+            ("proposal_end_ms", pa.int64()),
+            ("alignment_score", pa.float32()),
+            ("alignment_score_type", pa.string()),
+            ("start_drift_ms", pa.int32()),
+            ("end_drift_ms", pa.int32()),
+            ("vad_speech_ratio", pa.float32()),
+            ("alignment_backend", pa.string()),
+            ("pipeline_version", pa.string()),
+            ("pipeline_config_sha256", pa.string()),
+        ]
+    )
+    features = {
+        "audio": {"sampling_rate": 16000, "_type": "Audio"},
+        "audio_sha256": {"dtype": "string", "_type": "Value"},
+        "text": {"dtype": "string", "_type": "Value"},
+        "alignment_text": {"dtype": "string", "_type": "Value"},
+        "alignment_word_map": {
+            "feature": {"dtype": "string", "_type": "Value"},
+            "_type": "Sequence",
+        },
+        "language": {"dtype": "string", "_type": "Value"},
+        "segment_id": {"dtype": "string", "_type": "Value"},
+        "source_file_id": {"dtype": "string", "_type": "Value"},
+        "source_start_ms": {"dtype": "int64", "_type": "Value"},
+        "source_end_ms": {"dtype": "int64", "_type": "Value"},
+        "duration_ms": {"dtype": "int32", "_type": "Value"},
+        "speaker_ids": {
+            "feature": {"dtype": "string", "_type": "Value"},
+            "_type": "Sequence",
+        },
+        "proposal_start_ms": {"dtype": "int64", "_type": "Value"},
+        "proposal_end_ms": {"dtype": "int64", "_type": "Value"},
+        "alignment_score": {"dtype": "float32", "_type": "Value"},
+        "alignment_score_type": {"dtype": "string", "_type": "Value"},
+        "start_drift_ms": {"dtype": "int32", "_type": "Value"},
+        "end_drift_ms": {"dtype": "int32", "_type": "Value"},
+        "vad_speech_ratio": {"dtype": "float32", "_type": "Value"},
+        "alignment_backend": {"dtype": "string", "_type": "Value"},
+        "pipeline_version": {"dtype": "string", "_type": "Value"},
+        "pipeline_config_sha256": {"dtype": "string", "_type": "Value"},
+    }
+    schema = schema.with_metadata(
+        {b"huggingface": json.dumps({"info": {"features": features}}).encode()}
+    )
+    return pa.table(
+        {
+            "audio": [{"bytes": row.audio, "path": None} for row in rows],
+            "audio_sha256": [row.audio_sha256 for row in rows],
+            "text": [row.text for row in rows],
+            "alignment_text": [row.alignment_text for row in rows],
+            "alignment_word_map": [list(row.alignment_word_map) for row in rows],
+            "language": [row.language for row in rows],
+            "segment_id": [row.segment_id for row in rows],
+            "source_file_id": [row.source_file_id for row in rows],
+            "source_start_ms": [row.source_start_ms for row in rows],
+            "source_end_ms": [row.source_end_ms for row in rows],
+            "duration_ms": [row.duration_ms for row in rows],
+            "speaker_ids": [list(row.speaker_ids) for row in rows],
+            "proposal_start_ms": [row.proposal_start_ms for row in rows],
+            "proposal_end_ms": [row.proposal_end_ms for row in rows],
+            "alignment_score": [row.alignment_score for row in rows],
+            "alignment_score_type": [row.alignment_score_type for row in rows],
+            "start_drift_ms": [row.start_drift_ms for row in rows],
+            "end_drift_ms": [row.end_drift_ms for row in rows],
+            "vad_speech_ratio": [row.vad_speech_ratio for row in rows],
+            "alignment_backend": [row.alignment_backend for row in rows],
+            "pipeline_version": [row.pipeline_version for row in rows],
+            "pipeline_config_sha256": [row.pipeline_config_sha256 for row in rows],
+        },
+        schema=schema,
+    )
+
+
 def write_shards(
     rows: c.Iterable[OutputRow],
     output_dir: Path,
     target_bytes: int = 500_000_000,
     on_source_recoverable: c.Callable[[], None] | None = None,
 ) -> ShardBatchResult:
-    """Atomically rotate bounded Parquet shards and fsync their evidence.
-
-    The optional callback is invoked only after every shard has been renamed into
-    place and its directory entry fsynced.  A caller can therefore delete source
-    temporary bytes without coupling deletion to a later upload.
+    """Atomically rotate bounded Parquet shards using incremental row groups.
 
     Returns:
-        Shard evidence and whether all shard bytes are locally recoverable.
+        Durable evidence for every shard written.
+    """
+    writer = ShardWriter(
+        output_dir=output_dir,
+        target_bytes=target_bytes,
+        on_source_recoverable=on_source_recoverable,
+    )
+    for row in rows:
+        writer.append(row)
+    results = writer.close()
+    return ShardBatchResult(
+        shards=results,
+        source_recoverable=bool(results) and all(item.fsynced for item in results),
+    )
+
+
+class ShardWriter:
+    """Incremental atomic Parquet writer with bounded row-group memory."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        target_bytes: int = 500_000_000,
+        on_source_recoverable: c.Callable[[], None] | None = None,
+    ) -> None:
+        """Create a rotating writer which retains no completed rows in memory.
+
+        Raises:
+            ValueError:
+                If the target byte bound is not positive.
+        """
+        if target_bytes <= 0:
+            raise ValueError("target_bytes must be positive")
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.target_bytes = target_bytes
+        self._results: list[ShardWriteResult] = []
+        self._next_index = _next_shard_index(self.output_dir)
+        self._on_source_recoverable = on_source_recoverable
+        self._closed = False
+        self._writer: pq.ParquetWriter | None = None
+        self._temporary_path: Path | None = None
+        self._row_count = 0
+
+    def _finish_shard(self) -> ShardWriteResult:
+        """Close, fsync, rename, and stream-hash the active temporary shard.
+
+        Returns:
+            Durable evidence for the closed shard.
+        """
+        assert self._writer is not None
+        assert self._temporary_path is not None
+        self._writer.close()
+        self._writer = None
+        final_path = self.output_dir / f"part-{self._next_index:05d}.parquet"
+        with self._temporary_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(self._temporary_path, final_path)
+        directory_fd = os.open(self.output_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        result = ShardWriteResult(
+            path=final_path,
+            row_count=self._row_count,
+            byte_size=final_path.stat().st_size,
+            sha256=stream_sha256(final_path),
+            fsynced=True,
+        )
+        self._results.append(result)
+        self._next_index += 1
+        self._temporary_path = None
+        self._row_count = 0
+        return result
+
+    def append(self, row: OutputRow) -> ShardWriteResult | None:
+        """Append one row, rotating after the on-disk target is reached.
+
+        Returns:
+            Evidence when rotation occurs, otherwise ``None``.
+
+        Raises:
+            RuntimeError:
+                If this writer has already been closed.
+        """
+        if self._closed:
+            raise RuntimeError("cannot append to a closed shard writer")
+        if self._writer is None:
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=f".part-{self._next_index:05d}.",
+                suffix=".tmp",
+                dir=self.output_dir,
+            )
+            os.close(fd)
+            self._temporary_path = Path(temporary_name)
+            self._writer = pq.ParquetWriter(
+                self._temporary_path, _rows_table([row]).schema, compression="zstd"
+            )
+        self._writer.write_table(_rows_table([row]))
+        self._row_count += 1
+        if (
+            self._temporary_path is not None
+            and self._temporary_path.stat().st_size >= self.target_bytes
+        ):
+            return self._finish_shard()
+        return None
+
+    def close(self) -> tuple[ShardWriteResult, ...]:
+        """Close the active shard and return fsync evidence.
+
+        Returns:
+            Evidence for all shards created by this writer.
+        """
+        if not self._closed:
+            if self._writer is not None:
+                self._finish_shard()
+            self._closed = True
+            if self._results and all(result.fsynced for result in self._results):
+                if self._on_source_recoverable is not None:
+                    self._on_source_recoverable()
+        return tuple(self._results)
+
+
+def _next_shard_index(output_dir: Path) -> int:
+    indexes = [
+        int(match.group(1))
+        for path in output_dir.glob("part-*.parquet")
+        if (match := re.fullmatch(r"part-(\d+)\.parquet", path.name))
+    ]
+    return max(indexes, default=-1) + 1
+
+
+def stream_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Hash a file incrementally without retaining its payload.
+
+    Returns:
+        Lowercase SHA-256 digest.
 
     Raises:
         ValueError:
-            If the target byte bound is not positive.
+            If the chunk size is not positive.
     """
-    if target_bytes <= 0:
-        raise ValueError("target_bytes must be positive")
-    destination = Path(output_dir)
-    destination.mkdir(parents=True, exist_ok=True)
-    pending: list[OutputRow] = []
-    results: list[ShardWriteResult] = []
-    next_index = _next_shard_index(destination)
-    for row in rows:
-        pending.append(row)
-        if _table_size(pending) >= target_bytes:
-            results.append(_write_one_shard(pending, destination, next_index))
-            next_index += 1
-            pending = []
-    if pending:
-        results.append(_write_one_shard(pending, destination, next_index))
-    recoverable = bool(results) and all(result.fsynced for result in results)
-    if recoverable and on_source_recoverable is not None:
-        on_source_recoverable()
-    return ShardBatchResult(shards=tuple(results), source_recoverable=recoverable)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # These names describe the same operations in pipeline and test code.

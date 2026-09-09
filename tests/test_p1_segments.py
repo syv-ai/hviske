@@ -18,6 +18,9 @@ from hviske.p1_segments import (
     encode_flac,
     form_candidate_segments,
     normalise_alignment_text,
+    prepare_source_audio,
+    stream_sha256,
+    validate_output_shard,
     validate_raw_timestamps,
     write_shards,
 )
@@ -73,14 +76,16 @@ def words(*spans: tuple[str, int, int, str | None]) -> tuple[SourceWord, ...]:
 
 def test_ctc_emission_adapter_returns_token_boundaries() -> None:
     """Synthetic emissions prove model-free CTC boundary extraction."""
-    emissions = np.zeros((6, 3), dtype=np.float32)
-    emissions[:2, 1] = 1.0
-    emissions[3:5, 2] = 1.0
+    emissions = np.full((6, 3), -5.0, dtype=np.float32)
+    emissions[:2, 1] = 5.0
+    emissions[3:5, 2] = 5.0
+    emissions -= np.logaddexp.reduce(emissions, axis=1, keepdims=True)
     result = align_ctc_emissions(
         emissions=emissions, token_ids=(1, 2), start_ms=100, frame_duration_ms=10.0
     )
-    assert result.word_boundaries[0][:2] == (100, 120)
-    assert result.word_boundaries[1][:2] == (130, 150)
+    assert result.word_boundaries[0][:2] == (105, 125)
+    assert result.word_boundaries[1][:2] == (125, 145)
+    assert result.score_type == "ctc-segmentation:min_mean_log_probability"
 
 
 def test_danish_mapping_is_reversible() -> None:
@@ -231,6 +236,17 @@ def test_shards_rotate_and_callback_follows_fsync(tmp_path: Path) -> None:
     assert all(shard.fsynced for shard in result.shards)
     assert all(shard.evidence.sha256 == shard.sha256 for shard in result.shards)
     assert all(pq.read_table(shard.path).num_rows == 1 for shard in result.shards)
+    assert all(stream_sha256(shard.path) == shard.sha256 for shard in result.shards)
+    assert all(validate_output_shard(shard.path) is None for shard in result.shards)
+
+
+def test_source_audio_is_downmixed_and_resampled() -> None:
+    """Declared stereo 8 kHz input becomes finite mono 16 kHz audio."""
+    source = np.column_stack((np.ones(8_000), -np.ones(8_000))).astype(np.float32)
+    result = prepare_source_audio(audio=source, sampling_rate=8_000, channels=2)
+    assert result.shape == (16_000,)
+    assert result.dtype == np.float32
+    assert np.allclose(result, 0.0)
 
 
 def test_vad_ratio_and_edges() -> None:
