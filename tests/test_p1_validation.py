@@ -7,13 +7,17 @@ import typing as t
 from pathlib import Path
 
 from hviske.p1_validation import (
+    MetadataLedger,
+    PinnedHubClipRetriever,
     aggregate_rows,
     bounded_remote_aggregates,
     build_final_quality_report,
+    build_quality_report,
     check_duplicate_and_overlaps,
     create_blinded_audit_manifest,
     deterministic_deciles,
     normalised_wer,
+    persist_audit_candidates,
     review_one_clip,
     score_asr_anomalies,
     stratified_sample,
@@ -53,6 +57,48 @@ def _row(index: int, status: str = "accepted") -> dict[str, object]:
     }
 
 
+def test_blind_decision_is_persisted_without_status_or_audio(tmp_path: Path) -> None:
+    """The reviewer sees no segmentation label and the ledger stores scalars only."""
+    database = tmp_path / "audit.sqlite"
+    candidates = create_blinded_audit_manifest(
+        [{**_row(0), "parquet_path": "data/train/part.parquet", "row_locator": 0}],
+        accepted_quota=1,
+        rejected_quota=0,
+    )
+    assert persist_audit_candidates(database, candidates) == 1
+    ledger = MetadataLedger(database)
+    try:
+        seen: list[dict[str, object]] = []
+
+        class Retriever:
+            def retrieve(self, entry: t.Mapping[str, object]) -> bytes:
+                del entry
+                return b"clip"
+
+        def reviewer(_path: Path, entry: t.Mapping[str, object]) -> dict[str, object]:
+            seen.append(dict(entry))
+            return {
+                "audit_id": entry["audit_id"],
+                "decision": "accepted",
+                "independent_asr_anomaly": False,
+            }
+
+        result = review_one_clip(
+            candidates[0],
+            Retriever(),
+            reviewer,
+            temporary_root=tmp_path,
+            decision_store=ledger,
+        )
+        assert result["decision"] == "accepted"
+        assert "status" not in seen[0]
+        assert list(ledger.decision_rows())[0]["independent_asr_anomaly"] is False
+    finally:
+        ledger.close()
+    report = build_quality_report([_row(0)], database=database)
+    assert t.cast(dict[str, object], report["manual_audit"])["audited"] == 1
+
+
 def test_blinded_manifest_has_all_quotas_without_labels() -> None:
     """The audit manifest samples each quota without exposing its class."""
     records = [_row(0), _row(1, "rejected"), _row(2, "borderline")]
@@ -67,6 +113,23 @@ def test_blinded_manifest_has_all_quotas_without_labels() -> None:
         "segment-1",
         "segment-2",
     }
+
+
+def test_bounded_reservoir_does_not_retain_audio_or_grow() -> None:
+    """Representative selection keeps only its configured candidate reservoir."""
+    rows = (
+        {
+            **_row(index),
+            "parquet_path": "data/train/part-00000.parquet",
+            "row_locator": index,
+            "audio": b"must not be retained",
+        }
+        for index in range(10_000)
+    )
+    selected = stratified_sample(rows, sample_size=17, seed="bounded")
+
+    assert len(selected) == 17
+    assert all("audio" not in row and "waveform" not in row for row in selected)
 
 
 def test_deciles_and_strata_are_deterministic() -> None:
@@ -154,6 +217,44 @@ def test_one_item_review_deletes_audio(tmp_path: Path) -> None:
     assert result["decision"] == "accepted"
     assert seen and not seen[0].exists()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_pinned_hub_retriever_reads_one_embedded_row() -> None:
+    """A pinned fake Hub returns the addressed row, not a direct audio path."""
+    revision = "a" * 40
+    source = {
+        **_row(1),
+        "repository": "org/p1",
+        "revision": revision,
+        "parquet_path": "data/train/part-00000.parquet",
+        "row_locator": 1,
+        "audio": {"bytes": b"one clip"},
+    }
+    candidate = create_blinded_audit_manifest(
+        [source], accepted_quota=1, rejected_quota=0
+    )[0]
+
+    class FakeHub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def load_dataset(
+            self, repo_id: str, *, shard_path: str, revision: str, streaming: bool
+        ) -> list[dict[str, object]]:
+            assert (repo_id, shard_path, revision, streaming) == (
+                "org/p1",
+                "data/train/part-00000.parquet",
+                revision,
+                True,
+            )
+            return [
+                {**source, "row_locator": 0, "audio": {"bytes": b"other"}},
+                {**source, "row_locator": 1},
+            ]
+
+    fake = FakeHub()
+    retriever = PinnedHubClipRetriever(fake, repository="org/p1", revision=revision)
+    assert retriever.retrieve(candidate) == b"one clip"
 
 
 def test_remote_aggregate_is_bounded() -> None:

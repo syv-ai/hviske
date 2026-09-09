@@ -8,11 +8,17 @@ import logging
 import typing as t
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
+from hviske.p1_publish import HfApiAdapter
 from hviske.p1_validation import (
     ClipRetriever,
+    MetadataLedger,
+    PinnedHubClipRetriever,
     build_quality_report,
     create_blinded_audit_manifest,
     iter_bounded,
+    persist_audit_candidates,
     review_one_clip,
 )
 
@@ -38,9 +44,17 @@ def main() -> None:
     parser.add_argument("--sample-seed", default="0")
     parser.add_argument("--accepted-quota", type=int, default=200)
     parser.add_argument("--rejected-quota", type=int, default=100)
-    parser.add_argument("--borderline-quota", type=int, default=100)
+    parser.add_argument("--borderline-quota", type=int, default=0)
     parser.add_argument("--review-id", help="review exactly this manifest audit_id")
-    parser.add_argument("--audio-root", type=Path)
+    parser.add_argument(
+        "--hub-repo", help="pinned Hub dataset repository for one-item reviews"
+    )
+    parser.add_argument("--hub-revision", help="complete 40-character Hub commit SHA")
+    parser.add_argument(
+        "--audio-root",
+        type=Path,
+        help="optional local Parquet staging root for offline smoke tests",
+    )
     parser.add_argument(
         "--decision",
         choices=("accepted", "rejected", "borderline"),
@@ -73,6 +87,7 @@ def main() -> None:
             seed=args.sample_seed,
         )
         _write_json(args.manifest, manifest)
+        persist_audit_candidates(args.database, manifest)
 
 
 def _read_jsonl(path: Path) -> t.Iterator[dict[str, object]]:
@@ -87,9 +102,12 @@ def _read_jsonl(path: Path) -> t.Iterator[dict[str, object]]:
 
 
 def _run_review(args: argparse.Namespace) -> None:
-    if args.manifest is None or args.audio_root is None or args.decision is None:
+    if args.manifest is None or args.decision is None:
+        raise SystemExit("--review-id requires --manifest and --decision")
+    if args.audio_root is None and (args.hub_repo is None or args.hub_revision is None):
         raise SystemExit(
-            "--review-id requires --manifest, --audio-root, and --decision"
+            "--review-id requires --hub-repo and --hub-revision "
+            "(or an explicit --audio-root for offline smoke tests)"
         )
     raw_manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     if not isinstance(raw_manifest, list):
@@ -104,43 +122,82 @@ def _run_review(args: argparse.Namespace) -> None:
     )
     if entry is None:
         raise ValueError(f"unknown audit_id: {args.review_id}")
-    retriever = LocalClipRetriever(args.audio_root)
-    result = review_one_clip(
-        entry=t.cast(dict[str, object], entry),
-        retriever=retriever,
-        reviewer=lambda _path, item: {
-            "audit_id": item["audit_id"],
-            "decision": args.decision,
-        },
-    )
+    retriever: ClipRetriever
+    if args.audio_root is not None:
+        retriever = LocalClipRetriever(args.audio_root)
+    else:
+        retriever = PinnedHubClipRetriever(
+            HfApiAdapter(), repository=args.hub_repo, revision=args.hub_revision
+        )
+    store = _decision_store(args.database)
+    try:
+        result = review_one_clip(
+            entry=t.cast(dict[str, object], entry),
+            retriever=retriever,
+            reviewer=lambda _path, item: {
+                "audit_id": item["audit_id"],
+                "decision": args.decision,
+            },
+            decision_store=store,
+        )
+    finally:
+        store.close()
     logger.info("Blinded review recorded: %s", json.dumps(result, sort_keys=True))
 
 
 class LocalClipRetriever(ClipRetriever):
-    """Retrieve an audit clip from a local, explicitly supplied staging root."""
+    """Read one embedded-audio row from a local Parquet staging root.
+
+    This adapter exists only for offline smoke tests.  In particular, it does not
+    interpret a candidate's old-style ``remote_path`` as an audio file.
+    """
 
     def __init__(self, root: Path) -> None:
         """Initialise a retriever rooted at ``root``."""
         self.root = root.resolve()
 
-    def retrieve(self, entry: t.Mapping[str, object]) -> Path:
-        """Return a clip path while refusing paths outside the staging root.
+    def retrieve(self, entry: t.Mapping[str, object]) -> bytes:
+        """Read exactly one row from the candidate's local Parquet shard.
+
+        Returns:
+            Embedded audio bytes from the addressed row.
 
         Raises:
-            ValueError:
-                If the manifest path is missing or escapes the root.
             FileNotFoundError:
-                If the requested clip is absent.
+                If the shard or row is absent.
+            ValueError:
+                If the candidate is not a local Parquet locator or has no audio.
         """
-        raw_path = entry.get("remote_path")
-        if not isinstance(raw_path, str) or not raw_path:
-            raise ValueError("manifest entry has no local remote_path")
+        raw_path = entry.get("parquet_path")
+        if not isinstance(raw_path, str) or not raw_path.endswith(".parquet"):
+            raise ValueError("manifest entry has no local Parquet path")
         path = (self.root / raw_path).resolve()
-        if self.root not in path.parents:
-            raise ValueError("manifest path escapes the supplied audio root")
-        if not path.is_file():
+        if self.root not in path.parents or not path.is_file():
             raise FileNotFoundError(path)
-        return path
+        locator = entry.get("row_locator", 0)
+        if not isinstance(locator, int) or locator < 0:
+            raise ValueError("manifest row_locator must be a non-negative integer")
+        parquet = pq.ParquetFile(path)
+        for index, batch in enumerate(parquet.iter_batches(batch_size=1)):
+            if index != locator:
+                continue
+            row = batch.to_pylist()[0]
+            audio = row.get("audio", row.get("waveform"))
+            if isinstance(audio, bytes):
+                return audio
+            if isinstance(audio, dict) and isinstance(audio.get("bytes"), bytes):
+                return t.cast(bytes, audio["bytes"])
+            raise ValueError("Parquet row does not contain embedded audio bytes")
+        raise FileNotFoundError(f"Parquet row {locator} was not found")
+
+
+def _decision_store(database: Path) -> MetadataLedger:
+    """Open the metadata-only store used by one-item CLI reviews.
+
+    Returns:
+        An open validation ledger.
+    """
+    return MetadataLedger(database)
 
 
 def _write_json(path: Path, value: object) -> None:
