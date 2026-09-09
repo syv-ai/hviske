@@ -238,7 +238,9 @@ class WhisperModelSetup(ModelSetup):
             bf16=bf16,
             push_to_hub=False,
             eval_strategy="steps",
-            eval_steps=self.config.eval_steps,
+            eval_steps=(
+                1 if self.config.get("evaluation_steps") else self.config.eval_steps
+            ),
             save_steps=self.config.save_steps,
             save_strategy="no" if self.config.save_total_limit == 0 else "steps",
             logging_steps=self.config.logging_steps,

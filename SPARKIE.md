@@ -142,6 +142,68 @@ The preset retains at most three checkpoints. Stop the run if free disk space, G
 memory, temperatures, or repeated streaming failures become unsafe. Preserve enough
 free space for the next checkpoint and final model save.
 
+## Olmix anchor calibration matrix
+
+The Olmix benchmark is local-only and serial. It compares the two model configs
+`whisper-xxsmall` (`openai/whisper-tiny`) and `hviske-v5-tiny`
+(`syvai/hviske-v5-tiny`) against the production, read-speech-heavy, and
+spontaneous/conversational-heavy anchors. The anchors preserve the 16-source order,
+60/40 Danish/English split, and non-zero representation of every source. The
+launcher writes one unique directory per job containing `metadata.json`, `run.log`,
+and the model output. It records the commit, command, timings, and parsed evaluation
+metrics; no credentials are written.
+
+Run these commands inside the training container. The first command is deliberately
+credential-free: use the container's existing Hugging Face login rather than putting
+a token in an environment variable, command, or file.
+
+```bash
+docker exec -it hviske-sparkie bash
+cd /workspace/hviske
+uv sync --python 3.11 --all-extras
+uv run python src/scripts/finetune_asr_model.py \
+  --config-name sparkie_bilingual +anchors=olmix_baseline --cfg job
+uv run pytest tests/test_olmix_benchmark.py -q
+```
+
+Run both two-step model smokes in a detached tmux session and inspect their logs:
+
+```bash
+tmux new-session -d -s olmix-smoke \
+  'cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
+   --smoke --output-root runs/olmix'
+tmux attach -t olmix-smoke
+```
+
+After both smokes succeed, run the six jobs serially with `--skip-smoke`. If the
+matrix is launched without that flag, it repeats the two-model smoke immediately
+before the matrix. Each full job uses
+3,000 steps, caps every validation stream at 500 examples, evaluates at steps 250,
+500, 1,000, 2,000, and 3,000, and disables Hub publication and experiment tracking.
+
+```bash
+tmux new-session -d -s olmix-matrix \
+  'cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
+   --matrix --skip-smoke --output-root runs/olmix'
+tmux attach -t olmix-matrix
+tmux capture-pane -pt olmix-matrix:0 -S -200
+```
+
+For one selected calibration job, use the same launcher with `--model` and
+`--anchor`, for example:
+
+```bash
+tmux new-session -d -s olmix-read \
+  'cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
+   --model hviske-v5-tiny --anchor olmix_read_speech_heavy \
+   --output-root runs/olmix'
+```
+
+The requested checkpoints are non-uniform, so `eval_steps` alone cannot express
+this schedule. The launcher passes the schedule through `evaluation_steps`; the
+training callback suppresses evaluations at all other steps while retaining the
+existing Trainer/Hydra entry point.
+
 ## Explicit private publication
 
 Publish only after reviewing the selected pilot or full-run checkpoint. The separate
