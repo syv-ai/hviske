@@ -24,9 +24,12 @@ from datasets import (
     Audio,
     Dataset,
     DatasetDict,
+    Features,
     IterableDataset,
     IterableDatasetDict,
     NamedSplit,
+    Sequence,
+    Value,
     interleave_datasets,
     load_dataset,
 )
@@ -147,8 +150,50 @@ def _load_transcript_dataset(
 def _set_source_language(
     example: dict[str, Any], language: str | None
 ) -> dict[str, Any]:
-    example["language"] = language
+    example["language"] = language or ""
     return example
+
+
+def _standardise_training_dataset(
+    dataset: Dataset | IterableDataset, sampling_rate: int
+) -> Dataset | IterableDataset:
+    """Drop source metadata and cast a source to the interleave schema.
+
+    Args:
+        dataset:
+            Dataset to normalise.
+        sampling_rate:
+            Sampling rate for the shared audio feature.
+
+    Returns:
+        Dataset with the ``audio``, ``text`` and ``language`` columns.
+
+    Raises:
+        ValueError:
+            If a required training column is missing.
+    """
+    required_columns = {"audio", "text", "language"}
+    available_columns = set(dataset.column_names or [])
+    missing_columns = required_columns - available_columns
+    if missing_columns:
+        raise ValueError(
+            "Training dataset is missing columns: " + ", ".join(sorted(missing_columns))
+        )
+    features = _standard_training_features(sampling_rate=sampling_rate)
+    standardised = dataset.select_columns(["audio", "text", "language"]).cast(features)
+    if isinstance(standardised, IterableDataset):
+        standardised = standardised.map(function=lambda example: example)
+        standardised.info.features = features
+    return standardised
+
+
+def _standard_training_features(sampling_rate: int) -> Features:
+    """Return the exact schema shared by every training source."""
+    return Features(
+        audio=Audio(sampling_rate=sampling_rate),
+        text=Value("string"),
+        language=Value("string"),
+    )
 
 
 def _validate_dataset_probabilities(
@@ -261,7 +306,14 @@ def join_audio_and_transcripts(
         example["text"] = transcript_by_key[key]
         return example
 
-    return t.cast(Dataset | IterableDataset, audio_dataset.map(add_transcript))
+    if audio_dataset.features is None:
+        raise ValueError("Audio dataset must declare features")
+    joined_features = audio_dataset.features.copy()
+    joined_features["text"] = Value("string")
+    return t.cast(
+        Dataset | IterableDataset,
+        audio_dataset.map(add_transcript, features=joined_features),
+    )
 
 
 def _require_columns(
@@ -497,12 +549,17 @@ def load_data_for_finetuning(
             )
 
         if not is_local_vtt:
+            if ds.features is None:
+                raise ValueError("Hub datasets must declare features")
+            language_features = ds.features.copy()
+            language_features["language"] = Value("string")
             ds = ds.map(
                 function=partial(
                     _set_source_language,
                     language=dataset_config.get("language")
                     or getattr(config.model, "language", None),
-                )
+                ),
+                features=language_features,
             )
 
         if is_local_vtt:
@@ -517,6 +574,9 @@ def load_data_for_finetuning(
                 features=local_features,
             )
         elif dataset_config.filter_dataset:
+            ds = _standardise_training_dataset(
+                dataset=ds, sampling_rate=config.model.sampling_rate
+            )
             ds = filter_dataset(
                 dataset=ds,
                 audio_column="audio",
@@ -527,12 +587,8 @@ def load_data_for_finetuning(
                 num_proc=config.dataset_num_workers,
             )
 
-        ds = ds.remove_columns(
-            column_names=[
-                column
-                for column in ds.column_names or list()
-                if column not in ["audio", "text", "language"]
-            ]
+        ds = _standardise_training_dataset(
+            dataset=ds, sampling_rate=config.model.sampling_rate
         ).shuffle(seed=config.seed)
 
         all_datasets.append(ds)  # type: ignore[bad-argument-type]
@@ -857,19 +913,75 @@ def process_dataset(
         language_column=language_column,
         punctuation=punctuation,
     )
+    mapped_features = _processing_features(
+        processor=processor, remove_input_dataset_columns=remove_input_dataset_columns
+    )
     if isinstance(dataset, Dataset | DatasetDict):
         mapped = t.cast(Dataset | DatasetDict, dataset).map(
             function=map_fn,
             num_proc=num_proc,
             desc="Processing dataset",
             remove_columns=column_names if remove_input_dataset_columns else None,
+            features=mapped_features,
+        )
+    elif isinstance(dataset, IterableDataset):
+        mapped = dataset.map(
+            function=map_fn,
+            remove_columns=column_names if remove_input_dataset_columns else None,
+            features=mapped_features,
         )
     else:
-        mapped = t.cast(IterableDataset | IterableDatasetDict, dataset).map(
-            function=map_fn, remove_columns=column_names
+        iterable_dataset_dict = t.cast(IterableDatasetDict, dataset)
+        mapped = IterableDatasetDict(
+            {
+                split: split_dataset.map(
+                    function=map_fn,
+                    remove_columns=(
+                        column_names if remove_input_dataset_columns else None
+                    ),
+                    features=mapped_features,
+                )
+                for split, split_dataset in iterable_dataset_dict.items()
+            }
         )
 
     return t.cast(Data, mapped)
+
+
+def _processing_features(
+    processor: Callable | None, remove_input_dataset_columns: bool
+) -> Features | None:
+    """Describe stable map output features where the processor contract allows it.
+
+    Args:
+        processor:
+            Optional processor whose output schema is being mapped.
+        remove_input_dataset_columns:
+            Whether the map removes the source columns.
+
+    Returns:
+        Explicit output features when the processor contract is known, otherwise
+        ``None``.
+    """
+    if not remove_input_dataset_columns:
+        return None
+    if processor is None:
+        return None
+    if not hasattr(processor, "get_decoder_prompt_ids"):
+        return Features(
+            input_values=Sequence(Value("float64")),
+            labels=Sequence(Value("int64")),
+            input_length=Value("int64"),
+            num_seconds=Value("float64"),
+        )
+    return Features(
+        input_features=Sequence(Sequence(Value("float64"))),
+        attention_mask=Sequence(Value("int64")),
+        decoder_input_ids=Sequence(Value("int64")),
+        labels=Sequence(Value("int64")),
+        input_length=Value("int64"),
+        num_seconds=Value("float64"),
+    )
 
 
 def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
@@ -1117,12 +1229,14 @@ def process_example(
             punctuation=punctuation,
             sampling_rate=sampling_rate,
         )
-        example["input_features"] = processed["input_features"][0]
-        example["attention_mask"] = processed["attention_mask"][0]
-        example["decoder_input_ids"] = processed["decoder_input_ids"][0]
-        example["labels"] = processed["labels"][0]
-        example["input_length"] = len(example["labels"])
-        example["num_seconds"] = len(example["attention_mask"]) / 100
+        example["input_features"] = _to_python(processed["input_features"][0])
+        example["attention_mask"] = _to_python(processed["attention_mask"][0])
+        example["decoder_input_ids"] = _to_python(processed["decoder_input_ids"][0])
+        example["labels"] = _to_python(processed["labels"][0])
+        labels = t.cast(Sized, example["labels"])
+        attention_mask = t.cast(Sized, example["attention_mask"])
+        example["input_length"] = len(labels)
+        example["num_seconds"] = len(attention_mask) / 100
         return example
 
     # Process the audio for Whisper and Wav2Vec2.
@@ -1139,6 +1253,22 @@ def process_example(
     example["input_length"] = len(example["labels"])
 
     return example
+
+
+def _to_python(value: object) -> object:
+    """Convert tensor-like processor output to a serialisable Python value.
+
+    Args:
+        value:
+            Processor output value.
+
+    Returns:
+        A Python list when the value supports ``tolist``, otherwise the value itself.
+    """
+    if not hasattr(value, "tolist"):
+        return value
+    to_list = t.cast(Callable[[], object], getattr(value, "tolist"))
+    return to_list()
 
 
 def download_background_noises() -> None:
