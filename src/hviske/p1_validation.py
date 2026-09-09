@@ -268,7 +268,13 @@ def _validate_audit_locator(row: MetadataRow) -> tuple[str, int, str]:
 
 def _explicit_row_locator(row: MetadataRow) -> int | None:
     """Return the supplied Parquet row locator, without inventing one."""
-    for key in ("row_locator", "row_index", "parquet_row"):
+    for key in (
+        "row_locator",
+        "row_index",
+        "parquet_row",
+        "source_row_index",
+        "source_row_locator",
+    ):
         value = row.get(key)
         if isinstance(value, bool):
             continue
@@ -889,6 +895,10 @@ class MetadataLedger:
                 source_revision TEXT,
                 source_start_ms INTEGER,
                 source_end_ms INTEGER,
+                source_shard_path TEXT,
+                source_row_group INTEGER,
+                source_row_index INTEGER,
+                source_shard_byte_size INTEGER,
                 retrieved_at REAL
             );
             CREATE TABLE IF NOT EXISTS blind_decisions (
@@ -912,6 +922,10 @@ class MetadataLedger:
             ("audit_candidates", "source_revision", "TEXT"),
             ("audit_candidates", "source_start_ms", "INTEGER"),
             ("audit_candidates", "source_end_ms", "INTEGER"),
+            ("audit_candidates", "source_shard_path", "TEXT"),
+            ("audit_candidates", "source_row_group", "INTEGER"),
+            ("audit_candidates", "source_row_index", "INTEGER"),
+            ("audit_candidates", "source_shard_byte_size", "INTEGER"),
             ("audit_candidates", "retrieved_at", "REAL"),
             ("blind_decisions", "details_json", "TEXT NOT NULL DEFAULT '{}'"),
         ):
@@ -974,8 +988,9 @@ class MetadataLedger:
             (audit_id, segment_id, repository, revision, parquet_path,
              row_locator, stratum_json, metadata_sha256, audio_sha256,
              parquet_sha256, source_file_id, source_repository, source_revision,
-             source_start_ms, source_end_ms, retrieved_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             source_start_ms, source_end_ms, source_shard_path, source_row_group,
+             source_row_index, source_shard_byte_size, retrieved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _string(candidate, "audit_id") or "",
                 _string(candidate, "segment_id") or "",
@@ -992,6 +1007,10 @@ class MetadataLedger:
                 _string(candidate, "source_revision"),
                 _integer(candidate, "source_start_ms"),
                 _integer(candidate, "source_end_ms"),
+                _source_shard_path(candidate),
+                _integer(candidate, "source_row_group"),
+                _integer(candidate, "source_row_index", "source_row_locator"),
+                _integer(candidate, "source_shard_byte_size"),
                 None,
             ),
         )
@@ -1054,7 +1073,9 @@ class MetadataLedger:
             "SELECT audit_id, segment_id, repository, revision, parquet_path, "
             "row_locator, stratum_json, metadata_sha256, audio_sha256, "
             "parquet_sha256, source_file_id, source_repository, source_revision, "
-            "source_start_ms, source_end_ms FROM audit_candidates ORDER BY audit_id"
+            "source_start_ms, source_end_ms, source_shard_path, source_row_group, "
+            "source_row_index, source_shard_byte_size FROM audit_candidates "
+            "ORDER BY audit_id"
         )
         for values in cursor:
             yield {
@@ -1074,6 +1095,14 @@ class MetadataLedger:
                 **({"source_revision": values[12]} if values[12] else {}),
                 **({"source_start_ms": values[13]} if values[13] is not None else {}),
                 **({"source_end_ms": values[14]} if values[14] is not None else {}),
+                **({"source_shard_path": values[15]} if values[15] is not None else {}),
+                **({"source_row_group": values[16]} if values[16] is not None else {}),
+                **({"source_row_index": values[17]} if values[17] is not None else {}),
+                **(
+                    {"source_shard_byte_size": values[18]}
+                    if values[18] is not None
+                    else {}
+                ),
             }
 
     def close(self) -> None:
@@ -1226,6 +1255,13 @@ def _metadata_copy(row: MetadataRow) -> dict[str, object]:
         "remote_parquet_path",
         "shard_path",
         "source_parquet",
+        "source_shard_path",
+        "source_shard",
+        "source_parquet_path",
+        "source_row_group",
+        "source_row_index",
+        "source_row_locator",
+        "source_shard_byte_size",
         "parquet_sha256",
         "shard_sha256",
         "audio_sha256",
@@ -1233,6 +1269,8 @@ def _metadata_copy(row: MetadataRow) -> dict[str, object]:
         "row_locator",
         "row_index",
         "parquet_row",
+        "rejection_reason",
+        "reject_reason",
     }
     return {key: value for key, value in row.items() if key in allowed}
 
@@ -1269,6 +1307,28 @@ def _validate_candidate_locator(row: MetadataRow, status: str) -> None:
     end = _integer(row, "source_end_ms")
     if start is None or end is None or start < 0 or end <= start:
         raise ValueError(f"{status} candidates require a valid source interval")
+    shard_path = _source_shard_path(row)
+    row_group = _integer(row, "source_row_group")
+    if row_group is None:
+        row_group = 0
+    row_index = _integer(row, "source_row_index", "source_row_locator", "row_locator")
+    if shard_path is None or row_group is None or row_index is None:
+        raise ValueError(f"{status} candidates require an exact source row locator")
+    if not shard_path.lower().endswith(".parquet") or row_group < 0 or row_index < 0:
+        raise ValueError(f"{status} candidates have an invalid source row locator")
+
+
+def _source_shard_path(row: MetadataRow) -> str | None:
+    """Return the exact source Parquet path, including legacy aliases."""
+    value = _string(
+        row,
+        "source_shard_path",
+        "source_shard",
+        "source_parquet_path",
+        "source_parquet",
+        "parquet_path",
+    )
+    return value if value and value.lower().endswith(".parquet") else None
 
 
 def _has_source_locator(row: MetadataRow) -> bool:
@@ -1381,6 +1441,112 @@ def build_representative_audit_candidates(
     )
 
 
+class AuditReservoir:
+    """Crash-safe, corpus-wide reservoir for the bounded audit manifest.
+
+    The state file contains only the currently selected metadata records.  Each
+    update is written to a temporary sibling and atomically renamed, so a crash
+    cannot leave a half-written reservoir or an unbounded per-programme log.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        accepted_quota: int = 200,
+        rejected_quota: int = 100,
+        borderline_quota: int = 100,
+        seed: int | str = "p1",
+    ) -> None:
+        """Open a bounded reservoir, recovering its previous selection.
+
+        Raises:
+            ValueError:
+                If quotas or a recovered state file are invalid.
+        """
+        self.path = Path(path)
+        self.quotas = {
+            "accepted": accepted_quota,
+            "rejected": rejected_quota,
+            "borderline": borderline_quota,
+        }
+        if any(value < 0 for value in self.quotas.values()):
+            raise ValueError("audit quotas must not be negative")
+        self.seed = seed
+        self.rows: list[dict[str, object]] = []
+        if self.path.exists():
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(value, list) or not all(
+                isinstance(item, dict) for item in value
+            ):
+                raise ValueError("audit reservoir is not a JSON list of records")
+            self.rows = [t.cast(dict[str, object], item) for item in value]
+
+    def add(self, candidates: RowStream) -> None:
+        """Merge candidates and persist the bounded, stratified selection."""
+        combined_by_identity: dict[tuple[str, str], MetadataRow] = {}
+        for row in [*self.rows, *candidates]:
+            combined_by_identity[(_status(row), _identity(row))] = row
+        combined = list(combined_by_identity.values())
+        reservoirs = {
+            status: _StratifiedReservoir(quota) for status, quota in self.quotas.items()
+        }
+        for ordinal, row in enumerate(combined):
+            status = _status(row)
+            if status not in reservoirs or not self.quotas[status]:
+                continue
+            _validate_candidate_locator(row, status)
+            safe_row = _metadata_copy(row)
+            safe_row["_p1_metadata_sha256"] = _metadata_digest(row)
+            audio_digest = _audio_digest(row)
+            if audio_digest is not None:
+                safe_row["_p1_audio_sha256"] = audio_digest
+            reservoirs[status].add(
+                safe_row, seed=f"{self.seed}:{status}", ordinal=ordinal
+            )
+        self.rows = [
+            row
+            for status, reservoir in reservoirs.items()
+            for row in reservoir.rows()
+            if _status(row) == status
+        ]
+        self._write_state()
+
+    def finalise(self, path: Path | str) -> list[dict[str, object]]:
+        """Write the sole final blinded manifest after all commits are known.
+
+        Returns:
+            The metadata-only manifest records.
+        """
+        manifest = create_blinded_audit_manifest(
+            self.rows,
+            accepted_quota=self.quotas["accepted"],
+            rejected_quota=self.quotas["rejected"],
+            borderline_quota=self.quotas["borderline"],
+            seed=self.seed,
+        )
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            for candidate in manifest:
+                stream.write(json.dumps(candidate, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(destination)
+        return manifest
+
+    def _write_state(self) -> None:
+        """Atomically persist the bounded selection."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(self.rows, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(self.path)
+
+
 def create_blinded_audit_manifest(
     rows: RowStream,
     *,
@@ -1473,6 +1639,24 @@ def create_blinded_audit_manifest(
             source_revision=_string(row, "source_revision"),
             source_start_ms=_integer(row, "source_start_ms"),
             source_end_ms=_integer(row, "source_end_ms"),
+            source_shard_path=(
+                _source_shard_path(row) if status != "accepted" else None
+            ),
+            source_row_group=(
+                (_integer(row, "source_row_group") or 0)
+                if status != "accepted"
+                else None
+            ),
+            source_row_index=(
+                _integer(row, "source_row_index", "source_row_locator", "row_locator")
+                if status != "accepted"
+                else None
+            ),
+            source_shard_byte_size=(
+                _integer(row, "source_shard_byte_size")
+                if status != "accepted"
+                else None
+            ),
         )
         manifest.append(candidate.as_dict())
     return manifest
@@ -1502,6 +1686,10 @@ class AuditCandidate:
     source_revision: str | None = None
     source_start_ms: int | None = None
     source_end_ms: int | None = None
+    source_shard_path: str | None = None
+    source_row_group: int | None = None
+    source_row_index: int | None = None
+    source_shard_byte_size: int | None = None
 
     def __post_init__(self) -> None:
         """Reject durable records that cannot be retrieved later.
@@ -1535,6 +1723,22 @@ class AuditCandidate:
                 or self.source_end_ms <= self.source_start_ms
             ):
                 raise ValueError("source audit candidates require a valid interval")
+            if (
+                self.source_shard_path is None
+                or not self.source_shard_path.lower().endswith(".parquet")
+                or self.source_row_group is None
+                or self.source_row_group < 0
+                or self.source_row_index is None
+                or self.source_row_index < 0
+            ):
+                raise ValueError(
+                    "source audit candidates require an exact source row locator"
+                )
+            if (
+                self.source_shard_byte_size is not None
+                and self.source_shard_byte_size <= 0
+            ):
+                raise ValueError("source shard byte size must be positive")
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-compatible metadata record without the source label."""
@@ -1568,6 +1772,14 @@ class AuditCandidate:
             result["source_start_ms"] = self.source_start_ms
         if self.source_end_ms is not None:
             result["source_end_ms"] = self.source_end_ms
+        if self.source_shard_path is not None:
+            result["source_shard_path"] = self.source_shard_path
+        if self.source_row_group is not None:
+            result["source_row_group"] = self.source_row_group
+        if self.source_row_index is not None:
+            result["source_row_index"] = self.source_row_index
+        if self.source_shard_byte_size is not None:
+            result["source_shard_byte_size"] = self.source_shard_byte_size
         return result
 
 

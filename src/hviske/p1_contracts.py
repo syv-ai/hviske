@@ -338,6 +338,7 @@ class RejectionCategory(str, enum.Enum):
     """Stable categories for rejected programmes and proposals."""
 
     EMPTY_TEXT = "empty_text"
+    DURATION_OUT_OF_RANGE = "duration_out_of_range"
     INVALID_TIMESTAMPS = "invalid_timestamps"
     LOW_ALIGNMENT_SCORE = "low_alignment_score"
     EXCESSIVE_DRIFT = "excessive_drift"

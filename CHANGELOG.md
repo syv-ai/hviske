@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Harden P1 VAD framing, corpus-wide audit sampling, rejection completion,
+  local shard validation, source playback locators, and crash-safe recovery.
+
 ### Added
 
 - Add Phase 1A P1 segmentation contracts, pinned configuration, and deterministic

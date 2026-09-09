@@ -287,7 +287,7 @@ class HfP1Source:
         *,
         token: str | bool | None = True,
         local_root: Path | None = None,
-        max_source_object_bytes: int = 4_000_000_000,
+        max_source_object_bytes: int = 6_197_291_423,
         max_batch_rows: int = 1,
         max_batch_bytes: int = 64 * 1024 * 1024,
     ) -> None:

@@ -167,14 +167,18 @@ class SileroVADBackend(VADBackend):
         import torch
 
         values = np.asarray(audio, dtype=np.float32)
+        reset_states = getattr(self.model, "reset_states", None)
+        if callable(reset_states):
+            reset_states()
         probabilities: list[float] = []
         with torch.no_grad():
             for start in range(0, len(values), self.frame_size):
-                frame = torch.from_numpy(values[start : start + self.frame_size]).to(
-                    self.device
-                )
-                if not len(frame):
-                    continue
+                frame_values = values[start : start + self.frame_size]
+                if len(frame_values) < self.frame_size:
+                    frame_values = np.pad(
+                        frame_values, (0, self.frame_size - len(frame_values))
+                    )
+                frame = torch.from_numpy(frame_values).to(self.device)
                 model_call = t.cast(c.Callable[[object, int], object], self.model)
                 result = model_call(frame, sampling_rate)
                 probability = result[0] if isinstance(result, tuple) else result
@@ -182,27 +186,29 @@ class SileroVADBackend(VADBackend):
                 if tensor_probability.ndim:
                     tensor_probability = tensor_probability.reshape(-1)[0]
                 probabilities.append(float(tensor_probability.item()))
+        duration_ms = len(values) * 1000 // sampling_rate
         intervals: list[tuple[int, int]] = []
         start_frame: int | None = None
         for index, probability in enumerate(probabilities):
             if probability >= self.threshold and start_frame is None:
                 start_frame = index
             if probability < self.threshold and start_frame is not None:
-                intervals.append(
-                    (
-                        start_frame * self.frame_size * 1000 // sampling_rate,
-                        index * self.frame_size * 1000 // sampling_rate,
-                    )
+                start_ms = min(
+                    duration_ms, start_frame * self.frame_size * 1000 // sampling_rate
                 )
+                end_ms = min(
+                    duration_ms, index * self.frame_size * 1000 // sampling_rate
+                )
+                if end_ms > start_ms:
+                    intervals.append((start_ms, end_ms))
                 start_frame = None
         if start_frame is not None:
-            intervals.append(
-                (
-                    start_frame * self.frame_size * 1000 // sampling_rate,
-                    len(values) * 1000 // sampling_rate,
-                )
+            start_ms = min(
+                duration_ms, start_frame * self.frame_size * 1000 // sampling_rate
             )
-        return VADSignal(tuple(intervals), len(values) * 1000 // sampling_rate)
+            if duration_ms > start_ms:
+                intervals.append((start_ms, duration_ms))
+        return VADSignal(tuple(intervals), duration_ms)
 
 
 def make_silero_vad(

@@ -45,8 +45,8 @@ def test_batch_verifies_every_path_and_streams_every_shard(tmp_path: Path) -> No
     """Every shard is checked remotely and opened in streaming mode."""
     first = tmp_path / "one.parquet"
     second = tmp_path / "two.parquet"
-    first.write_bytes(b"first shard")
-    second.write_bytes(b"second shard")
+    write_valid_shard(first)
+    write_valid_shard(second)
     hub = MemoryHub()
     samples: list[str] = []
 
@@ -60,14 +60,14 @@ def test_batch_verifies_every_path_and_streams_every_shard(tmp_path: Path) -> No
         "org/p1",
         "batch-001",
         [
-            LocalShard(first, "shards/one.parquet", 3),
-            LocalShard(second, "shards/two.parquet", 4),
+            LocalShard(first, "shards/one.parquet", 1),
+            LocalShard(second, "shards/two.parquet", 1),
         ],
         validator=validate,
     )
 
     assert evidence.commit_id == "a" * 40
-    assert evidence.row_count == 7
+    assert evidence.row_count == 2
     assert samples == ["shards/one.parquet", "shards/two.parquet"]
     assert hub.streamed == [
         "shards/one.parquet",
@@ -222,6 +222,37 @@ def make_card() -> str:
     )
 
 
+def write_valid_shard(path: Path) -> None:
+    """Write one contract-valid shard for publisher integration tests."""
+    payload_stream = io.BytesIO()
+    sf.write(payload_stream, np.zeros(160, dtype=np.float32), 16_000, format="FLAC")
+    payload = payload_stream.getvalue()
+    row = OutputRow(
+        audio=payload,
+        audio_sha256=hashlib.sha256(payload).hexdigest(),
+        text="hej",
+        alignment_text="hej",
+        alignment_word_map=("hej",),
+        segment_id="a" * 64,
+        source_file_id="source",
+        source_start_ms=0,
+        source_end_ms=10,
+        duration_ms=10,
+        speaker_ids=(),
+        proposal_start_ms=0,
+        proposal_end_ms=10,
+        alignment_score=1.0,
+        alignment_score_type="test",
+        start_drift_ms=0,
+        end_drift_ms=0,
+        vad_speech_ratio=1.0,
+        alignment_backend="test",
+        pipeline_version="test",
+        pipeline_config_sha256="b" * 64,
+    )
+    pq.write_table(_rows_table([row]), path)
+
+
 def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
     """A batch that would reach 100 Hub operations is refused."""
     shards = []
@@ -236,7 +267,7 @@ def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
 def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> None:
     """A failed verification leaves a committed ledger record for recovery."""
     path = tmp_path / "one.parquet"
-    path.write_bytes(b"data")
+    write_valid_shard(path)
     database = tmp_path / "ledger.sqlite"
     hub = MemoryHub()
     with Ledger(database) as ledger:
@@ -244,8 +275,8 @@ def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> 
         ledger.register_shard(
             "shard",
             path="one.parquet",
-            sha256=hashlib.sha256(b"data").hexdigest(),
-            byte_size=4,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            byte_size=path.stat().st_size,
             row_count=1,
             batch_id="batch",
         )
@@ -278,7 +309,7 @@ def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> 
 def test_digest_failure_retains_local_artefacts(tmp_path: Path) -> None:
     """A digest mismatch never invokes a purge."""
     path = tmp_path / "one.parquet"
-    path.write_bytes(b"local")
+    write_valid_shard(path)
     hub = MemoryHub(corrupt_stream=True)
     with pytest.raises(VerificationError):
         publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
@@ -290,7 +321,7 @@ def test_exposed_digest_avoids_remote_download() -> None:
     """An exposed SHA-256 avoids streaming Parquet payloads."""
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "one.parquet"
-        path.write_bytes(b"data")
+        write_valid_shard(path)
         hub = MemoryHub(expose_digest=True)
         publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
         assert not hub.streamed
@@ -328,7 +359,7 @@ def test_initialisation_commits_card_and_attributes_privately() -> None:
 def test_invalid_commit_is_not_accepted(tmp_path: Path) -> None:
     """Branches and abbreviated commit identifiers cannot be captured."""
     path = tmp_path / "one.parquet"
-    path.write_bytes(b"data")
+    write_valid_shard(path)
     hub = MemoryHub(commit_id="main")
     with pytest.raises(VerificationError):
         publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
@@ -395,7 +426,7 @@ def test_missing_repository_is_created_private_before_initialisation() -> None:
 def test_post_commit_privacy_failure_stops_before_verification(tmp_path: Path) -> None:
     """A visibility incident stops before path or dataset verification."""
     path = tmp_path / "one.parquet"
-    path.write_bytes(b"local")
+    write_valid_shard(path)
     hub = MemoryHub(flip_public=True)
     with pytest.raises(PrivacyError):
         publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
@@ -414,7 +445,7 @@ def test_public_or_unknown_visibility_aborts_before_commit() -> None:
 def test_purge_requires_and_follows_durable_verification(tmp_path: Path) -> None:
     """Purging is impossible before, and happens after, durable recording."""
     path = tmp_path / "one.parquet"
-    path.write_bytes(b"data")
+    write_valid_shard(path)
     events: list[str] = []
     with pytest.raises(PublicationError):
         publish_batch(
@@ -465,7 +496,7 @@ def test_remote_digest_stream_does_not_retain_shard_bytes() -> None:
 def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
     """Publishing never overwrites a path owned by an existing publication."""
     path = tmp_path / "one.parquet"
-    path.write_bytes(b"data")
+    write_valid_shard(path)
     hub = MemoryHub(existing_paths=("one.parquet",))
     with pytest.raises(AllowListError, match="collision"):
         publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
@@ -475,7 +506,7 @@ def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
 def test_stream_decode_failure_retains_the_pending_batch(tmp_path: Path) -> None:
     """An empty streaming shard cannot trigger local purging."""
     path = tmp_path / "one.parquet"
-    path.write_bytes(b"local")
+    write_valid_shard(path)
     hub = MemoryHub(decode_empty=True)
     purged = False
 

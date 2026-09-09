@@ -14,11 +14,34 @@ from hviske.p1_pipeline import (
     P1PreflightError,
     PipelineSettings,
     _native_candidates,
+    _unlink_recovered,
     preflight_pipeline,
     run_pipeline,
 )
 from hviske.p1_source import SourcePlan, SourceShard
 from tests.test_p1_publish import MemoryHub
+
+
+def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
+    """Partial unlink recovery tolerates missing files and protects replacements."""
+    good = tmp_path / "good.parquet"
+    replaced = tmp_path / "replaced.parquet"
+    good.write_bytes(b"good")
+    replaced.write_bytes(b"new content")
+
+    _unlink_recovered(
+        (good, replaced, tmp_path / "missing.parquet"),
+        expected={
+            good: (
+                4,
+                "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            ),
+            replaced: (3, "0" * 64),
+        },
+    )
+
+    assert not good.exists()
+    assert replaced.exists()
 
 
 def test_existing_scratch_is_included_in_hard_budget(tmp_path: Path) -> None:

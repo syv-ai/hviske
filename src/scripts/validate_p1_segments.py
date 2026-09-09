@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 import soundfile as sf
 
 from hviske.p1_publish import HfApiAdapter
-from hviske.p1_source import HfP1Source, SourceShard
+from hviske.p1_source import AudioPointer, HfP1Source, SourceShard
 from hviske.p1_validation import (
     ClipRetriever,
     MetadataLedger,
@@ -253,8 +253,6 @@ def _source_clip_callback(entry: t.Mapping[str, object]) -> bytes:
         A temporary-review FLAC payload.
 
     Raises:
-        FileNotFoundError:
-            If the source file identifier is absent from the pinned source.
         ValueError:
             If the source locator or decoded payload is invalid.
     """
@@ -269,34 +267,37 @@ def _source_clip_callback(entry: t.Mapping[str, object]) -> bytes:
         raise ValueError("source audit entry has no source file identifier")
     if not isinstance(start, int) or not isinstance(end, int):
         raise ValueError("source audit entry has an incomplete interval")
-    source = HfP1Source(audio_repository=repository)
-    for raw in source.list_audio_shards(revision=revision):
-        raw_path = raw.get("path")
-        raw_size = raw.get("size")
-        if not isinstance(raw_path, str) or not isinstance(raw_size, int):
-            raise ValueError("source shard metadata is invalid")
-        shard = SourceShard(
-            path=raw_path,
-            byte_size=raw_size,
-            revision=revision,
-            oid=t.cast(str | None, raw.get("oid")),
-        )
-        for pointer in source.iter_programme_pointers(shard=shard):
-            if pointer.file_id != file_id:
-                continue
-            audio = source.fetch_audio(pointer=pointer)
-            if not isinstance(audio.value, np.ndarray):
-                raise ValueError("source audio did not decode to samples")
-            first = max(0, start * audio.sampling_rate // 1000)
-            last = min(audio.value.shape[0], end * audio.sampling_rate // 1000)
-            if last <= first:
-                raise ValueError("source interval is empty")
-            output = io.BytesIO()
-            sf.write(
-                output, audio.value[first:last], audio.sampling_rate, format="FLAC"
-            )
-            return output.getvalue()
-    raise FileNotFoundError(f"source file_id not found: {file_id}")
+    shard_path = entry.get(
+        "source_shard_path", entry.get("source_shard", entry.get("source_parquet_path"))
+    )
+    row_group = entry.get("source_row_group", 0)
+    row_index = entry.get("source_row_index", entry.get("source_row_locator"))
+    shard_size = entry.get("source_shard_byte_size")
+    if not isinstance(shard_path, str) or not shard_path.endswith(".parquet"):
+        raise ValueError("source audit entry has no exact source shard")
+    if not isinstance(row_group, int) or row_group < 0:
+        raise ValueError("source audit entry has no source row group")
+    if not isinstance(row_index, int) or row_index < 0:
+        raise ValueError("source audit entry has no source row")
+    if not isinstance(shard_size, int) or shard_size <= 0:
+        raise ValueError("source audit entry has no source shard size")
+    source = HfP1Source(
+        audio_repository=repository, max_source_object_bytes=6_197_291_423
+    )
+    shard = SourceShard(path=shard_path, byte_size=shard_size, revision=revision)
+    pointer = AudioPointer(
+        file_id=file_id, shard=shard, row_group=row_group, row_index=row_index
+    )
+    audio = source.fetch_audio(pointer=pointer)
+    if not isinstance(audio.value, np.ndarray):
+        raise ValueError("source audio did not decode to samples")
+    first = max(0, start * audio.sampling_rate // 1000)
+    last = min(audio.value.shape[0], end * audio.sampling_rate // 1000)
+    if last <= first:
+        raise ValueError("source interval is empty")
+    output = io.BytesIO()
+    sf.write(output, audio.value[first:last], audio.sampling_rate, format="FLAC")
+    return output.getvalue()
 
 
 if __name__ == "__main__":
