@@ -16,6 +16,7 @@ from hviske.cohere import (
     CohereASRTranscriber,
     CohereModelSetup,
     CohereSeq2SeqTrainer,
+    RemoteCohereAsrProcessor,
     get_asr_call_kwargs,
     load_asr_transcriber,
 )
@@ -107,6 +108,34 @@ class _Tokenizer:
 class _Processor:
     tokenizer = _Tokenizer()
     feature_extractor = _FeatureExtractor()
+
+
+def test_cohere_collator_pads_remote_features_on_final_axis() -> None:
+    """Length-backed remote features are padded as ``[mel, time]``."""
+    processor = t.cast(Processor, _Processor())
+    collator = DataCollatorCohereWithPadding(processor=processor, padding="longest")
+    features = [
+        {
+            "input_features": torch.ones(2, 3),
+            "length": 3,
+            "decoder_input_ids": [10, 11],
+            "labels": [20],
+        },
+        {
+            "input_features": torch.full((2, 2), 2.0),
+            "length": 2,
+            "decoder_input_ids": [10, 11],
+            "labels": [21],
+        },
+    ]
+    batch = collator(features)
+    assert batch["input_features"].shape == (2, 2, 3)
+    assert batch["input_features"][1, :, 2].tolist() == [0.0, 0.0]
+    assert batch["length"].tolist() == [3, 2]
+    assert batch["decoder_input_ids"].shape == (2, 3)
+    assert batch["decoder_attention_mask"].tolist() == [[1, 1, 1], [1, 1, 1]]
+    assert batch["labels"].shape == (2, 3)
+    assert batch["prompt_length"].tolist() == [2, 2]
 
 
 def test_cohere_collator_truncates_transcripts_to_model_limit() -> None:
@@ -359,3 +388,53 @@ def test_native_loading_disables_remote_code(monkeypatch: pytest.MonkeyPatch) ->
     setup.load_model()
     assert processor_loader.call_args.kwargs["trust_remote_code"] is False
     assert model_loader.call_args.kwargs["trust_remote_code"] is False
+
+
+def test_remote_cohere_output_is_normalised_for_training() -> None:
+    """Remote features gain prompt IDs and separately tokenised labels."""
+
+    class _RemoteTokenizer(_Tokenizer):
+        def __call__(self, **kwargs: object) -> dict[str, list[int]]:
+            assert kwargs["text"] == "hello"
+            return {"input_ids": [20, 21]}
+
+    class _RemoteProcessor:
+        tokenizer = _RemoteTokenizer()
+        feature_extractor = object()
+
+        def __call__(self, **kwargs: object) -> dict[str, torch.Tensor]:
+            assert kwargs["sampling_rate"] == 16_000
+            return {
+                "input_features": torch.zeros(1, 128, 3),
+                "length": torch.tensor([2]),
+            }
+
+    processor = RemoteCohereAsrProcessor(processor=_RemoteProcessor())
+    output = processor(
+        audio=np.zeros(16_000), language="da", text="hello", sampling_rate=16_000
+    )
+    input_features = t.cast(torch.Tensor, output["input_features"])
+    length = t.cast(torch.Tensor, output["length"])
+    decoder_input_ids = t.cast(torch.Tensor, output["decoder_input_ids"])
+    assert input_features.shape == (1, 128, 3)
+    assert length.tolist() == [2]
+    assert decoder_input_ids.tolist() == [[2, 3, 4, 5, 6, 6, 7, 9, 10, 11]]
+    assert output["labels"] == [[20, 21]]
+
+
+def test_remote_cohere_prompt_ids_use_individual_special_tokens() -> None:
+    """Remote prompts use the same token sequence as native Cohere."""
+    processor = object.__new__(RemoteCohereAsrProcessor)
+    processor.tokenizer = _Tokenizer()
+    assert processor.get_decoder_prompt_ids(language="da") == [
+        2,
+        3,
+        4,
+        5,
+        6,
+        6,
+        7,
+        9,
+        10,
+        11,
+    ]

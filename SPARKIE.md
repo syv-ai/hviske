@@ -110,7 +110,7 @@ Start with a two-step smoke:
 
 ```bash
 # Stop qwen38-ar now, immediately before launching this session.
-tmux new -s hviske-smoke \
+tmux new-session -d -s hviske-smoke \
   'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_steps=2 save_steps=2 eval_steps=2 max_validation_samples_per_dataset=32'
 ```
 
@@ -118,7 +118,7 @@ Inspect the resolved log, GPU memory, and checkpoint before running a bounded 2,
 pilot. Publication remains disabled in the preset.
 
 ```bash
-tmux new -s hviske-pilot \
+tmux new-session -d -s hviske-pilot \
   'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_steps=2000 max_validation_samples_per_dataset=256'
 ```
 
@@ -126,11 +126,14 @@ Review pilot loss, validation metrics, throughput, checkpoint resumption, and di
 Only then launch the approved full run:
 
 ```bash
-tmux new -s hviske-v6 \
+tmux new-session -d -s hviske-v6 \
   'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_validation_samples_per_dataset=1000'
 ```
 
-Monitor with:
+These command-only sessions exit when the job finishes. Attach or capture logs while a
+job is running; completed ephemeral sessions are not available afterwards.
+
+Monitor a running job with:
 
 ```bash
 tmux attach -t hviske-v6
@@ -170,10 +173,10 @@ uv run python src/scripts/finetune_asr_model.py \
 uv run pytest tests/test_olmix_benchmark.py -q
 ```
 
-Run both two-step model smokes in an interactive tmux session and inspect their logs:
+Run both two-step model smokes in detached tmux sessions and inspect them while they run:
 
 ```bash
-tmux new-session -s olmix-smoke \
+tmux new-session -d -s olmix-smoke \
   'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
    --smoke --output-root runs/olmix'
 ```
@@ -185,9 +188,10 @@ before the matrix. Each full job uses
 500, 1,000, 2,000, and 3,000, and disables Hub publication and experiment tracking.
 
 ```bash
-tmux new-session -s olmix-matrix \
+tmux new-session -d -s olmix-matrix \
   'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
    --matrix --skip-smoke --output-root runs/olmix'
+# Capture while the job is running; the shell exits and the ephemeral session ends on completion.
 tmux capture-pane -pt olmix-matrix:0 -S -200
 ```
 
@@ -195,7 +199,7 @@ For one selected calibration job, use the same launcher with `--model` and
 `--anchor`, for example:
 
 ```bash
-tmux new-session -s olmix-read \
+tmux new-session -d -s olmix-read \
   'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
    --model hviske-v5-tiny --anchor olmix_read_speech_heavy \
    --output-root runs/olmix'

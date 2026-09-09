@@ -129,15 +129,24 @@ class DataCollatorCohereWithPadding(DataCollatorMixin):
         if any("decoder_input_ids" not in feature for feature in features):
             raise ValueError("Cohere features must contain decoder prompt IDs.")
 
-        audio_features = []
-        for feature in features:
-            audio_feature = {"input_features": feature["input_features"]}
-            if "attention_mask" in feature:
-                audio_feature["attention_mask"] = feature["attention_mask"]
-            audio_features.append(audio_feature)
-        batch = self.processor.feature_extractor.pad(
-            audio_features, padding=self.padding, return_tensors=self.return_tensors
-        )
+        if "length" in features[0]:
+            if any("length" not in feature for feature in features):
+                raise ValueError(
+                    "All Cohere features must use the same audio contract."
+                )
+            batch = _pad_length_backed_features(
+                features=features, return_tensors=self.return_tensors
+            )
+        else:
+            audio_features = []
+            for feature in features:
+                audio_feature = {"input_features": feature["input_features"]}
+                if "attention_mask" in feature:
+                    audio_feature["attention_mask"] = feature["attention_mask"]
+                audio_features.append(audio_feature)
+            batch = self.processor.feature_extractor.pad(
+                audio_features, padding=self.padding, return_tensors=self.return_tensors
+            )
 
         eos_token_id = self.processor.tokenizer.eos_token_id
         decoder_features: list[dict[str, list[int]]] = []
@@ -203,6 +212,40 @@ def _as_int_list(values: object) -> list[int]:
     if not isinstance(values, c.Iterable):
         raise TypeError("Expected an integer or iterable of integers")
     return [int(value) for value in values]
+
+
+def _pad_length_backed_features(
+    features: list[dict], return_tensors: str
+) -> BatchFeature:
+    """Pad remote Cohere ``[mel, time]`` features on their time axis.
+
+    Args:
+        features:
+            Remote Cohere examples with mel features and frame lengths.
+        return_tensors:
+            Tensor format requested by the collator.
+
+    Returns:
+        A batch containing final-axis-padded features and stacked lengths.
+
+    Raises:
+        ValueError:
+            If feature shapes are not compatible for batching.
+    """
+    tensors = [torch.as_tensor(feature["input_features"]) for feature in features]
+    if any(tensor.ndim != 2 for tensor in tensors):
+        raise ValueError("Length-backed Cohere features must have shape [mel, time].")
+    mel_bins = tensors[0].shape[0]
+    if any(tensor.shape[0] != mel_bins for tensor in tensors):
+        raise ValueError("Length-backed Cohere features must share mel bins.")
+    max_time = max(tensor.shape[1] for tensor in tensors)
+    padded = torch.zeros((len(tensors), mel_bins, max_time), dtype=tensors[0].dtype)
+    lengths = []
+    for index, (tensor, feature) in enumerate(zip(tensors, features, strict=True)):
+        padded[index, :, : tensor.shape[1]] = tensor
+        lengths.append(int(feature["length"]))
+    batch = BatchFeature({"input_features": padded, "length": torch.tensor(lengths)})
+    return batch.convert_to_tensors(return_tensors)
 
 
 @dataclass
