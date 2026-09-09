@@ -17,8 +17,10 @@ from hviske.p1_validation import (
     PinnedHubClipRetriever,
     build_quality_report,
     create_blinded_audit_manifest,
+    export_clip_for_review,
     iter_bounded,
     persist_audit_candidates,
+    play_audio,
     review_one_clip,
 )
 
@@ -59,6 +61,14 @@ def main() -> None:
         "--decision",
         choices=("accepted", "rejected", "borderline"),
         help="explicit decision for the one-item review",
+    )
+    parser.add_argument(
+        "--player", help="local player command and arguments; never run through a shell"
+    )
+    parser.add_argument(
+        "--export-audio",
+        type=Path,
+        help="retrieve one clip for controlled non-playing review; records no decision",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -102,8 +112,13 @@ def _read_jsonl(path: Path) -> t.Iterator[dict[str, object]]:
 
 
 def _run_review(args: argparse.Namespace) -> None:
-    if args.manifest is None or args.decision is None:
-        raise SystemExit("--review-id requires --manifest and --decision")
+    if args.manifest is None:
+        raise SystemExit("--review-id requires --manifest")
+    if (args.decision is None) == (args.export_audio is None):
+        raise SystemExit(
+            "choose exactly one of --decision (playing review) or --export-audio "
+            "(non-playing review)"
+        )
     if args.audio_root is None and (args.hub_repo is None or args.hub_revision is None):
         raise SystemExit(
             "--review-id requires --hub-repo and --hub-revision "
@@ -129,16 +144,27 @@ def _run_review(args: argparse.Namespace) -> None:
         retriever = PinnedHubClipRetriever(
             HfApiAdapter(), repository=args.hub_repo, revision=args.hub_revision
         )
+    candidate = t.cast(dict[str, object], entry)
+    if args.export_audio is not None:
+        destination = export_clip_for_review(
+            entry=candidate, retriever=retriever, destination=args.export_audio
+        )
+        logger.info(
+            "Exported one retrieved clip for controlled review: %s", destination
+        )
+        return
+
     store = _decision_store(args.database)
     try:
         result = review_one_clip(
-            entry=t.cast(dict[str, object], entry),
+            entry=candidate,
             retriever=retriever,
             reviewer=lambda _path, item: {
                 "audit_id": item["audit_id"],
                 "decision": args.decision,
             },
             decision_store=store,
+            player=lambda path: play_audio(path, args.player),
         )
     finally:
         store.close()
