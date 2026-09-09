@@ -1,9 +1,0 @@
-fleurs_en_us:
-  id: google/fleurs
-  subset: en_us
-  train_name: train
-  text_column: raw_transcription
-  audio_column: audio
-  filter_dataset: true
-  language: en
-  revision: null

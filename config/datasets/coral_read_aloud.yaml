@@ -6,4 +6,5 @@ coral_read_aloud:
   audio_column: audio
   filter_dataset: true
   language: da
-  revision: null
+  revision: 01f7c93c21fc9dec87fe9f7149c79569cc433f08
+  trust_remote_code: false

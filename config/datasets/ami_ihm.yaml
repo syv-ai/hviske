@@ -1,0 +1,10 @@
+ami_ihm:
+  id: edinburghcstr/ami
+  subset: ihm
+  train_name: train
+  text_column: text
+  audio_column: audio
+  filter_dataset: true
+  language: en
+  revision: 46f28f2503e2ec48f8867a84eef356c70476beab
+  trust_remote_code: false

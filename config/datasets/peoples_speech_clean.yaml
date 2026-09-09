@@ -1,0 +1,10 @@
+peoples_speech_clean:
+  id: MLCommons/peoples_speech
+  subset: clean
+  train_name: train
+  text_column: text
+  audio_column: audio
+  filter_dataset: true
+  language: en
+  revision: f10597c5d3d3a63f8b6827701297c3afdf178272
+  trust_remote_code: false

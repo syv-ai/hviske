@@ -228,6 +228,7 @@ def _load_transcript_dataset(
     split: str,
     revision: str | None,
     cache_dir: str | None,
+    trust_remote_code: bool = False,
 ) -> Dataset:
     """Load the compact transcript side without streaming.
 
@@ -245,7 +246,7 @@ def _load_transcript_dataset(
         "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
         "streaming": False,
         "cache_dir": cache_dir,
-        "trust_remote_code": True,
+        "trust_remote_code": trust_remote_code,
     }
     if revision is not None:
         kwargs["revision"] = revision
@@ -415,7 +416,7 @@ def load_data_for_finetuning(
                     True if transcript_dataset_id is not None else config.streaming
                 ),
                 "cache_dir": config.cache_dir,
-                "trust_remote_code": True,
+                "trust_remote_code": dataset_config.get("trust_remote_code", False),
             }
             if dataset_config.get("revision") is not None:
                 kwargs["revision"] = dataset_config.revision
@@ -441,6 +442,9 @@ def load_data_for_finetuning(
                 split=dataset_config.get("transcript_split", "train"),
                 revision=dataset_config.get("transcript_revision"),
                 cache_dir=config.cache_dir,
+                trust_remote_code=dataset_config.get(
+                    "transcript_trust_remote_code", False
+                ),
             )
             ds = join_audio_and_transcripts(
                 audio_dataset=ds,
@@ -564,7 +568,7 @@ def load_data_for_finetuning(
             "token": os.getenv("HUGGINGFACE_HUB_TOKEN", True),
             "streaming": True,
             "cache_dir": config.cache_dir,
-            "trust_remote_code": True,
+            "trust_remote_code": dataset_config.get("trust_remote_code", False),
         }
         if dataset_config.get("revision") is not None:
             validation_kwargs["revision"] = dataset_config.revision
@@ -694,7 +698,7 @@ def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
         token=os.getenv("HUGGINGFACE_HUB_TOKEN", True),
         cache_dir=config.cache_dir,
         streaming=True,
-        trust_remote_code=True,
+        trust_remote_code=config.get("trust_remote_code", False),
     )
     if not isinstance(dataset, IterableDataset):
         raise ValueError(f"Unsupported evaluation dataset type: {type(dataset)}")
