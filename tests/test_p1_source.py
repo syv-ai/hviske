@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import sqlite3
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import soundfile as sf
 
 from hviske.p1_source import (
     HfP1Source,
@@ -27,6 +29,32 @@ def test_audio_parser_accepts_array_and_sampling_rate_metadata() -> None:
     )
     assert isinstance(audio.value, np.ndarray)
     assert audio.sampling_rate == 48_000
+
+
+def test_audio_parser_decodes_genuine_48khz_flac_native_shape() -> None:
+    """Embedded FLAC is decoded at its declared rate before later processing."""
+    native = np.column_stack(
+        (np.linspace(-1.0, 1.0, 96), np.linspace(1.0, -1.0, 96))
+    ).astype(np.float32)
+    payload = io.BytesIO()
+    sf.write(payload, native, 48_000, format="FLAC", subtype="PCM_16")
+
+    audio = parse_audio_row(
+        {
+            "file_id": "x",
+            "audio": {
+                "bytes": payload.getvalue(),
+                "sampling_rate": 48_000,
+                "channels": 2,
+            },
+        }
+    )
+
+    assert isinstance(audio.value, np.ndarray)
+    assert audio.value.shape == native.shape
+    assert audio.sampling_rate == 48_000
+    assert audio.channels == 2
+    assert np.allclose(audio.value[:, 0], native[:, 0], atol=1 / 32_768)
 
 
 def test_discovery_projects_out_audio_column(tmp_path: Path) -> None:

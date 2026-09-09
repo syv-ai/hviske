@@ -9,7 +9,12 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from hviske.p1_contracts import NormalisationContract, SegmentationContract, SourceWord
+from hviske.p1_contracts import (
+    NormalisationContract,
+    SegmentationContract,
+    SourceWord,
+    annotate_source_words,
+)
 from hviske.p1_segments import (
     AlignmentResult,
     VADSignal,
@@ -72,6 +77,26 @@ def words(*spans: tuple[str, int, int, str | None]) -> tuple[SourceWord, ...]:
         SourceWord(text=text, start_ms=start, end_ms=end, speaker_id=speaker)
         for text, start, end, speaker in spans
     )
+
+
+def test_candidates_preserve_verbatim_source_separators() -> None:
+    """Candidate text keeps repeated spaces and newlines out of the aligner map."""
+    source_text = "Hej,  verden!\nIgen"
+    source_words = annotate_source_words(
+        [
+            SourceWord(text="Hej,", start_ms=0, end_ms=1_000),
+            SourceWord(text="verden!", start_ms=1_000, end_ms=2_000),
+            SourceWord(text="Igen", start_ms=2_000, end_ms=3_000),
+        ],
+        source_text,
+    )
+    proposal = form_candidate_segments(
+        words=source_words, source_file_id="source", contract=segmentation_contract()
+    )[0]
+
+    assert proposal.text == "Hej,  verden!"
+    assert source_words[1].separator_text == "  "
+    assert source_words[2].separator_text == "\n"
 
 
 def test_ctc_emission_adapter_returns_token_boundaries() -> None:
@@ -168,6 +193,39 @@ def test_malformed_timestamps_are_rejected() -> None:
             ],
             programme_duration_ms=1_000,
         )
+
+
+def test_pilot_mean_log_probability_threshold_is_config_shaped() -> None:
+    """The permissive pilot threshold accepts plausible and rejects poor scores."""
+    from hviske.p1_segments import make_output_row
+
+    contract = segmentation_contract()
+    contract = contract.model_copy(update={"minimum_alignment_score": -10.0})
+    proposal = form_candidate_segments(
+        words=words(("hej", 0, 2_000, None)), source_file_id="source", contract=contract
+    )[0]
+    audio = np.zeros(32_000, dtype=np.float32)
+    accepted = make_output_row(
+        proposal=proposal,
+        alignment=AlignmentResult(0, 2_000, -9.5),
+        audio=audio,
+        source_duration_ms=2_000,
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+        segmentation=contract,
+    )
+    rejected = make_output_row(
+        proposal=proposal,
+        alignment=AlignmentResult(0, 2_000, -10.5),
+        audio=audio,
+        source_duration_ms=2_000,
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+        segmentation=contract,
+    )
+
+    assert accepted.row is not None
+    assert rejected.rejection == "low_alignment_score"
 
 
 def test_segment_ids_are_config_sensitive() -> None:

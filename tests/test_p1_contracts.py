@@ -14,6 +14,8 @@ from hviske.p1_contracts import (
     RepositoryRevision,
     SegmentationContract,
     SourceCoordinates,
+    SourceProgramme,
+    SourceWord,
     VADContract,
     canonical_json,
     pipeline_config_sha256,
@@ -143,3 +145,22 @@ def test_revisions_reject_mutable_or_incomplete_coordinates() -> None:
         RepositoryRevision(repository="syvai/p1", revision="main")
     with pytest.raises(ValueError, match="complete 40-character"):
         RepositoryRevision(repository="syvai/p1", revision=AUDIO_REVISION[:-1])
+
+
+def test_source_contract_records_verbatim_character_spans() -> None:
+    """Programme validation records separators without altering source text."""
+    programme = SourceProgramme(
+        file_id="programme",
+        duration_ms=3_000,
+        words=(
+            SourceWord(text="Hej,", start_ms=0, end_ms=1_000),
+            SourceWord(text="verden!", start_ms=1_000, end_ms=2_000),
+        ),
+        transcript_text="Hej,  verden!",
+    )
+
+    assert programme.words[0].source_span is not None
+    assert programme.words[0].source_span.start == 0
+    assert programme.words[1].separator_text == "  "
+    assert programme.words[1].separator_span is not None
+    assert programme.transcript_text == "Hej,  verden!"

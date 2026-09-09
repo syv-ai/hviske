@@ -634,7 +634,7 @@ def _proposals_for_speaker_run(
                 word_end_index=end,
                 proposal_start_ms=selected[0].start_ms,
                 proposal_end_ms=selected[-1].end_ms,
-                text=" ".join(word.text for word in selected),
+                text=_reconstruct_source_text(selected),
                 speaker_ids=tuple(
                     dict.fromkeys(
                         word.speaker_id
@@ -650,6 +650,22 @@ def _proposals_for_speaker_run(
 
 def _punctuation_boundary(text: str) -> bool:
     return bool(re.search(r"[.!?;:]$", text.rstrip()))
+
+
+def _reconstruct_source_text(words: c.Sequence[SourceWord]) -> str:
+    """Reconstruct candidate text from source separators without re-spacing it.
+
+    Returns:
+        The exact source spelling when spans are available, otherwise a legacy
+        space-separated representation.
+    """
+    if not words:
+        return ""
+    if all(word.source_span is not None for word in words):
+        return words[0].text + "".join(
+            word.separator_text + word.text for word in words[1:]
+        )
+    return " ".join(word.text for word in words)
 
 
 def _vad_boundary(vad: VADSignal | None, left_end: int, right_start: int) -> bool:
@@ -677,7 +693,7 @@ def segment_programme(
     pipeline_config_sha256: str,
     vad: VADBackend | None = None,
     sampling_rate: int = 16000,
-    channels: int = 1,
+    channels: int | None = None,
 ) -> SegmentationResult:
     """Run bounded proposal, VAD, CTC, correction, filtering, and encoding.
 
@@ -987,7 +1003,7 @@ def decode_flac(payload: bytes) -> np.ndarray:
 
 
 def prepare_source_audio(
-    audio: np.ndarray, sampling_rate: int, channels: int
+    audio: np.ndarray, sampling_rate: int, channels: int | None = None
 ) -> np.ndarray:
     """Downmix declared-channel audio and resample it to mono 16 kHz.
 
@@ -1006,16 +1022,19 @@ def prepare_source_audio(
         ValueError:
             If declarations and array shape disagree or the audio is empty.
     """
-    if sampling_rate <= 0 or channels <= 0:
+    if sampling_rate <= 0 or (channels is not None and channels <= 0):
         raise ValueError("sampling_rate and channels must be positive")
     values = np.asarray(audio, dtype=np.float32)
     if values.ndim == 1:
-        if channels != 1:
-            raise ValueError("declared channels do not match mono audio")
-    elif values.ndim == 2 and values.shape[1] == channels:
-        values = values.mean(axis=1, dtype=np.float32)
+        actual_channels = 1
+    elif values.ndim == 2:
+        actual_channels = values.shape[1]
     else:
-        raise ValueError("audio must be frames-by-channels with declared channels")
+        raise ValueError("audio must be frames-by-channels")
+    if channels is not None and actual_channels != channels:
+        raise ValueError("declared channels do not match audio")
+    if actual_channels > 1:
+        values = values.mean(axis=1, dtype=np.float32)
     if values.size == 0 or not np.isfinite(values).all():
         raise ValueError("audio must be non-empty and finite")
     if sampling_rate != 16000:
