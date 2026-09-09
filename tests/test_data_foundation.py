@@ -168,6 +168,52 @@ def test_exact_row_filters_fail_for_missing_features() -> None:
         _filter_dataset_rows(dataset=dataset, filters={"source": "voxpopuli"})
 
 
+def test_join_rejects_duplicate_transcript_keys() -> None:
+    """A duplicate index key cannot silently overwrite a transcript."""
+    audio = IterableDataset.from_generator(
+        lambda: iter([{"key": "one"}]), features=Features(key=Value("string"))
+    )
+    transcripts = Dataset.from_list(
+        [
+            {"transcript_key": "one", "words": "Et"},
+            {"transcript_key": "one", "words": "To"},
+        ]
+    )
+    with pytest.raises(ValueError, match="Duplicate transcript key"):
+        join_audio_and_transcripts(
+            audio_dataset=audio,
+            transcript_dataset=transcripts,
+            audio_join_column="key",
+            transcript_join_column="transcript_key",
+            transcript_text_column="words",
+        )
+
+
+@pytest.mark.parametrize(
+    ("audio_key", "transcript_key", "message"),
+    [
+        ("missing", "present", "No transcript"),
+        ("one", ["one"], "hashable"),
+        (1, "one", "type"),
+    ],
+)
+def test_join_rejects_invalid_first_audio_key(
+    audio_key: object, transcript_key: object, message: str
+) -> None:
+    """A preflight join rejects mismatches, unhashable keys, and type errors."""
+    audio = Dataset.from_list([{"key": audio_key}])
+    transcripts = Dataset.from_list([{"transcript_key": transcript_key, "words": "Et"}])
+    with pytest.raises(ValueError, match=message):
+        joined = join_audio_and_transcripts(
+            audio_dataset=audio,
+            transcript_dataset=transcripts,
+            audio_join_column="key",
+            transcript_join_column="transcript_key",
+            transcript_text_column="words",
+        )
+        next(iter(joined))
+
+
 def test_join_validates_configured_columns() -> None:
     """Join configuration errors are reported before consuming audio."""
     with pytest.raises(ValueError, match="Missing audio dataset columns"):
@@ -178,6 +224,22 @@ def test_join_validates_configured_columns() -> None:
             transcript_join_column="id",
             transcript_text_column="text",
         )
+
+
+def test_joined_audio_consumes_a_matching_transcript() -> None:
+    """The first streamed audio example receives its indexed transcript."""
+    audio = IterableDataset.from_generator(
+        lambda: iter([{"key": "one"}]), features=Features(key=Value("string"))
+    )
+    transcripts = Dataset.from_list([{"transcript_key": "one", "words": "Et"}])
+    joined = join_audio_and_transcripts(
+        audio_dataset=audio,
+        transcript_dataset=transcripts,
+        audio_join_column="key",
+        transcript_join_column="transcript_key",
+        transcript_text_column="words",
+    )
+    assert next(iter(joined))["text"] == "Et"
 
 
 def test_local_and_hub_iterable_datasets_can_be_interleaved(tmp_path: Path) -> None:

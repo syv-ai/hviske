@@ -82,9 +82,10 @@ Here are some of the more important available keys:
   Hub. `private_only` hard-fails public destinations and verifies Hub visibility before
   and after upload. The production Sparkie preset keeps publication off during training;
   use its separate `publish_private_model.py` command after review. Publication stages
-  only recognised top-level model, tokenizer and processor artefacts, and records the
-  exact training dataset IDs supplied with `--training-dataset-id` in a bilingual
-  internal-use model card. Trainer automatic pushes remain disabled.
+  only a complete reloadable Cohere package and a strict provenance model card. The
+  command resolves the preset automatically, including Hub revisions and source
+  probabilities; local manifest paths are never included. Trainer automatic pushes
+  remain disabled.
 - `enable_experiment_tracking`: Whether training monitoring during training should be
   enabled. Defaults to false. You can also set `experiment_tracking` to either `wandb`
   or `mlflow` to specify which experiment tracking tool to use (`wandb` is used by
@@ -131,6 +132,10 @@ then run the bounded data preflight before stopping other Sparkie services:
 uv run python src/scripts/preflight_finetuning_data.py \
   --config-name sparkie_bilingual
 ```
+
+The production preset caps validation materialisation at 1,000 examples per dataset.
+Use `max_validation_samples_per_dataset=32` for a two-step smoke, `=256` for a pilot,
+and `=1000` for the long run; the smoke must never materialise full validation.
 
 The complete operational procedure, including smoke, pilot, full tmux run, monitoring,
 checkpoint retention, and the separate private publication command, is in

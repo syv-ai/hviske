@@ -31,8 +31,8 @@ export P1_TRANSCRIPT_TEXT_COLUMN=<p1-transcript-text-column>
 ```
 
 All four values are required. The p1 audio side remains streaming; the bounded
-preflight also streams the transcript side, while training indexes the compact
-transcript side for the join.
+preflight builds the complete compact transcript index and consumes one joined audio
+example, while training uses the same index-plus-streamed-audio join path.
 
 ## Fixed production mix
 
@@ -83,9 +83,10 @@ uv run python src/scripts/build_vtt_manifest.py \
 Run the preflight while `qwen38-ar` is still serving. It resolves every required
 environment variable, checks Hub authentication and gated model access, validates all
 pinned dataset coordinates and schemas, validates each local manifest and its first
-referenced WAV, and consumes at most one streamed row per training, transcript, and
-validation source. It does not load the ASR model, download background noise, or start
-training.
+referenced WAV, and consumes one joined P1 example. It does not prove complete P1 audio
+key coverage without scanning the full 1.9 TB audio stream; the compact transcript index
+is intentionally built in memory. It does not load the ASR model, download background
+noise, or start training.
 
 ```bash
 uv run python src/scripts/finetune_asr_model.py \
@@ -110,7 +111,7 @@ Start with a two-step smoke:
 ```bash
 # Stop qwen38-ar now, immediately before launching this session.
 tmux new -s hviske-smoke \
-  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_steps=2 save_steps=2 eval_steps=2'
+  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_steps=2 save_steps=2 eval_steps=2 max_validation_samples_per_dataset=32'
 ```
 
 Inspect the resolved log, GPU memory, and checkpoint before running a bounded 2,000-step
@@ -118,7 +119,7 @@ pilot. Publication remains disabled in the preset.
 
 ```bash
 tmux new -s hviske-pilot \
-  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_steps=2000'
+  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_steps=2000 max_validation_samples_per_dataset=256'
 ```
 
 Review pilot loss, validation metrics, throughput, checkpoint resumption, and disk use.
@@ -126,7 +127,7 @@ Only then launch the approved full run:
 
 ```bash
 tmux new -s hviske-v6 \
-  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual'
+  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_validation_samples_per_dataset=1000'
 ```
 
 Monitor with:
@@ -145,28 +146,17 @@ free space for the next checkpoint and final model save.
 
 Publish only after reviewing the selected pilot or full-run checkpoint. The separate
 command requires `--private`, refuses a public destination, verifies private visibility
-before and after upload, and stages only recognised model, tokeniser, processor, and
-model-card files. Trainer-side publication remains disabled.
-
-Supply the complete set of Hub-backed training sources as model-card metadata. The two
-local Danish manifest sources must additionally be described in the model-card review;
-their audio and manifests must never be uploaded.
+immediately before and after the single staged upload, and stages only a complete
+reloadable Cohere package plus a strict model card. Trainer-side publication remains
+disabled. It resolves the preset automatically, including both local Danish manifest
+sources (without their paths), every Hub source, revisions, splits, languages,
+probabilities, licence, base model, and evaluation status. A reviewed card may be
+supplied only after it has been checked against that metadata; local audio and manifests
+must never be uploaded.
 
 ```bash
 uv run python src/scripts/publish_private_model.py \
-  models/hviske-v6 syvai/hviske-v6 \
-  --finetuned-from CohereLabs/cohere-transcribe-03-2026 \
-  --language da --language en --private \
-  --training-dataset-id syvai/p1 \
-  --training-dataset-id syvai/p1-transcripts \
-  --training-dataset-id CoRal-project/coral-v3 \
-  --training-dataset-id alexandrainst/ftspeech \
-  --training-dataset-id alexandrainst/nota \
-  --training-dataset-id alexandrainst/nst-da \
-  --training-dataset-id MLCommons/peoples_speech \
-  --training-dataset-id edinburghcstr/ami \
-  --training-dataset-id facebook/voxpopuli \
-  --training-dataset-id openslr/librispeech_asr \
+  models/hviske-v6 syvai/hviske-v6 --private \
   --evaluation-status 'Pilot and full-run evaluation reviewed before publication.'
 ```
 

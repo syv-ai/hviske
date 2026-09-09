@@ -68,7 +68,7 @@ evaluation_datasets:
     revision: 70bb2e84b976b7e960aa89f1c648e09c59f894dd
     trust_remote_code: false
 
-max_validation_samples_per_dataset: null
+max_validation_samples_per_dataset: 1000
 
 min_seconds_per_example: 1.0
 max_seconds_per_example: 10.0

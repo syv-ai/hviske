@@ -119,6 +119,7 @@ def _load_transcript_dataset(
     revision: str | None,
     cache_dir: str | None,
     trust_remote_code: bool = False,
+    dataset_loader: Callable[..., object] = load_dataset,
 ) -> Dataset:
     """Load the compact transcript side without streaming.
 
@@ -141,10 +142,16 @@ def _load_transcript_dataset(
     if revision is not None:
         kwargs["revision"] = revision
     with no_datasets_progress_bars():
-        dataset = load_dataset(**kwargs)
-    if not isinstance(dataset, Dataset):
-        raise ValueError("The transcript dataset must be a non-streaming Dataset")
-    return dataset
+        dataset = dataset_loader(**kwargs)
+    if isinstance(dataset, Dataset):
+        return dataset
+    try:
+        rows = list(t.cast(Iterable[object], dataset))
+    except TypeError as error:
+        raise ValueError("The transcript dataset must be iterable") from error
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError("The transcript dataset rows must be mappings")
+    return Dataset.from_list(t.cast(list[dict[str, object]], rows))
 
 
 def _set_source_language(
@@ -289,9 +296,13 @@ def join_audio_and_transcripts(
         dataset_name="transcript",
     )
     transcript_by_key: dict[object, str] = {}
+    key_type: type[object] | None = None
     for raw_row in transcript_dataset:
         row = t.cast(dict[str, Any], raw_row)
         key = row[transcript_join_column]
+        _validate_join_key(key=key, expected_type=key_type, side="transcript")
+        if key_type is None:
+            key_type = type(key)
         if key in transcript_by_key:
             raise ValueError(f"Duplicate transcript key: {key!r}")
         text = row[transcript_text_column]
@@ -301,6 +312,7 @@ def join_audio_and_transcripts(
 
     def add_transcript(example: dict[str, Any]) -> dict[str, Any]:
         key = example[audio_join_column]
+        _validate_join_key(key=key, expected_type=key_type, side="audio")
         if key not in transcript_by_key:
             raise ValueError(f"No transcript found for audio key: {key!r}")
         example["text"] = transcript_by_key[key]
@@ -323,6 +335,26 @@ def _require_columns(
     missing = sorted(set(columns) - available)
     if missing:
         raise ValueError(f"Missing {dataset_name} dataset columns: {missing}")
+
+
+def _validate_join_key(
+    key: object, expected_type: type[object] | None, side: str
+) -> None:
+    """Validate that a join key can be indexed and has the expected type.
+
+    Raises:
+        ValueError:
+            If the key is unhashable or has an incompatible type.
+    """
+    try:
+        hash(key)
+    except TypeError as error:
+        raise ValueError(f"The {side} join key must be hashable: {key!r}") from error
+    if expected_type is not None and type(key) is not expected_type:
+        raise ValueError(
+            f"The {side} join key has type {type(key).__name__}, expected "
+            f"{expected_type.__name__}"
+        )
 
 
 # Dictionary that contains characters to be converted (from the key to the value). Some
