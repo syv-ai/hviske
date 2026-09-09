@@ -546,48 +546,101 @@ def _validate_model_package(source: Path) -> None:
     missing = [name for name in required if not _regular_file(source / name)]
     if missing:
         raise ValueError("Cohere package is missing: " + ", ".join(sorted(missing)))
-    try:
-        config = json.loads((source / "config.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError("Cohere config.json is not valid JSON") from error
-    if not isinstance(config, dict):
-        raise ValueError("Cohere config.json must contain an object")
+    documents: dict[str, dict[str, object]] = {}
+    for name in required:
+        try:
+            document = json.loads((source / name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Cohere {name} is not valid JSON") from error
+        if not isinstance(document, dict):
+            raise ValueError(f"Cohere {name} must contain an object")
+        documents[name] = document
+    if documents["config.json"].get("model_type") != "cohere_asr":
+        raise ValueError("Cohere config.json has the wrong model_type")
+    preprocessor = documents["preprocessor_config.json"]
+    if preprocessor.get("feature_extractor_type") != "CohereAsrFeatureExtractor":
+        raise ValueError("Cohere preprocessor config has the wrong feature extractor")
+    if (
+        not isinstance(preprocessor.get("sampling_rate"), int)
+        or preprocessor["sampling_rate"] <= 0
+    ):
+        raise ValueError("Cohere preprocessor config has an invalid sampling rate")
+    if (
+        documents["processor_config.json"].get("processor_class")
+        != "CohereAsrProcessor"
+    ):
+        raise ValueError("Cohere processor config has the wrong processor_class")
+    tokenizer = documents["tokenizer_config.json"]
+    if tokenizer.get("tokenizer_class") != "CohereTokenizer":
+        raise ValueError("Cohere tokenizer config has the wrong tokenizer_class")
     if not any(_regular_file(source / name) for name in _TOKENIZER_FILES):
         raise ValueError("Cohere package is missing tokenizer vocabulary/model files")
-    if _regular_file(source / "model.safetensors") or _regular_file(
-        source / "pytorch_model.bin"
-    ):
-        return
-    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
-        index_path = source / index_name
-        if not _regular_file(index_path):
-            continue
-        try:
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"Malformed sharded weight index: {index_name}") from error
-        weight_map = index.get("weight_map") if isinstance(index, dict) else None
-        if (
-            not isinstance(weight_map, dict)
-            or not weight_map
-            or not all(
-                isinstance(name, str)
-                and _SHARDED_MODEL_ARTEFACT.fullmatch(name)
-                and _regular_file(source / name)
-                for name in weight_map.values()
-            )
-        ):
-            raise ValueError(f"Incomplete sharded weight index: {index_name}")
-        return
-    raise ValueError(
-        "Cohere package needs model.safetensors, pytorch_model.bin, or a complete "
-        "sharded weight index"
+
+    single = source / "model.safetensors"
+    index_path = source / "model.safetensors.index.json"
+    shard_paths = sorted(
+        path
+        for path in source.iterdir()
+        if _SHARDED_MODEL_ARTEFACT.fullmatch(path.name)
+        and path.suffix == ".safetensors"
     )
+    if _regular_file(single) and (shard_paths or _regular_file(index_path)):
+        raise ValueError("Cohere package contains conflicting weight layouts")
+    if _regular_file(single):
+        _validate_safetensors_file(single)
+        return
+    if not _regular_file(index_path):
+        raise ValueError("Cohere package needs model.safetensors or a complete index")
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Malformed sharded weight index") from error
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if (
+        not isinstance(weight_map, dict)
+        or not weight_map
+        or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in weight_map.items()
+        )
+    ):
+        raise ValueError("Malformed sharded weight index")
+    referenced = set(weight_map.values())
+    if any(
+        Path(name).name != name
+        or not _SHARDED_MODEL_ARTEFACT.fullmatch(name)
+        or not _regular_file(source / name)
+        for name in referenced
+    ):
+        raise ValueError("Incomplete sharded weight index")
+    if set(path.name for path in shard_paths) != referenced:
+        raise ValueError("Sharded weight files do not match the index")
+    for shard_name in sorted(referenced):
+        _validate_safetensors_file(source / shard_name)
 
 
 def _regular_file(path: Path) -> bool:
     """Return whether a path is a regular, non-symlink file."""
     return path.is_file() and not path.is_symlink()
+
+
+def _validate_safetensors_file(path: Path) -> None:
+    """Read safetensors metadata without materialising tensor data.
+
+    Raises:
+        ValueError:
+            If the file is not a readable safetensors file.
+    """
+    try:
+        from safetensors import SafetensorError, safe_open
+
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            if not handle.keys():
+                raise ValueError(f"Safetensors file is empty: {path.name}")
+            for tensor_name in handle.keys():
+                handle.get_slice(tensor_name)
+    except (OSError, RuntimeError, SafetensorError, ValueError) as error:
+        raise ValueError(f"Invalid safetensors weights: {path.name}") from error
 
 
 def _stage_model_card(
@@ -627,19 +680,7 @@ def _stage_model_card(
         destination.write_text(card, encoding="utf-8")
         return
     source_lines = "\n".join(
-        "- "
-        + "; ".join(
-            f"{key}: {source[key]}"
-            for key in (
-                "id",
-                "source",
-                "subset",
-                "split",
-                "revision",
-                "probability",
-                "language",
-            )
-        )
+        "- " + "; ".join(f"{key}: {source[key]}" for key in source)
         for source in training_sources
     )
     dataset_lines = "\n".join(f"- {dataset_id}" for dataset_id in training_dataset_ids)
@@ -668,6 +709,12 @@ def _validate_training_sources(
             If a configured dataset is missing or metadata is incomplete.
     """
     ids = {str(source.get("id")) for source in training_sources}
+    for source in training_sources:
+        joined_transcript = source.get("joined_transcript")
+        if isinstance(joined_transcript, dict):
+            dataset_id = joined_transcript.get("dataset_id")
+            if dataset_id is not None:
+                ids.add(str(dataset_id))
     missing = sorted(set(training_dataset_ids) - ids)
     if missing:
         raise ValueError("Model-card provenance misses datasets: " + ", ".join(missing))

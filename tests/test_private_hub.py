@@ -4,8 +4,10 @@ import typing as t
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
+from safetensors.numpy import save_file
 from transformers.trainer import Trainer
 
 import hviske.utils as utils
@@ -86,17 +88,35 @@ def _minimal_cohere_package(
     folder: Path, *, weights: bool = True, processor: bool = True
 ) -> None:
     """Create the smallest package accepted by the Cohere publication gate."""
-    (folder / "config.json").write_text("{}", encoding="utf-8")
+    (folder / "config.json").write_text(
+        '{"model_type": "cohere_asr"}', encoding="utf-8"
+    )
     if processor:
-        for name in (
-            "preprocessor_config.json",
-            "processor_config.json",
-            "tokenizer_config.json",
-            "tokenizer.json",
-        ):
-            (folder / name).write_text("{}", encoding="utf-8")
+        (folder / "preprocessor_config.json").write_text(
+            '{"feature_extractor_type": "CohereAsrFeatureExtractor", '
+            '"sampling_rate": 16000}',
+            encoding="utf-8",
+        )
+        (folder / "processor_config.json").write_text(
+            '{"processor_class": "CohereAsrProcessor"}', encoding="utf-8"
+        )
+        (folder / "tokenizer_config.json").write_text(
+            '{"tokenizer_class": "CohereTokenizer"}', encoding="utf-8"
+        )
+        (folder / "tokenizer.json").write_text("{}", encoding="utf-8")
     if weights:
-        (folder / "model.safetensors").write_bytes(b"weights")
+        save_file(
+            {"audio_projection.weight": np.ones((1, 1), dtype=np.float32)},
+            folder / "model.safetensors",
+        )
+
+
+def test_publication_rejects_corrupt_weights(tmp_path: Path) -> None:
+    """Corrupt single-file weights cannot pass the publication gate."""
+    _minimal_cohere_package(tmp_path, weights=False)
+    (tmp_path / "model.safetensors").write_bytes(b"not safetensors")
+    with pytest.raises(ValueError, match="Invalid safetensors"):
+        utils._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_empty_or_card_only_package(tmp_path: Path) -> None:
@@ -110,7 +130,7 @@ def test_publication_rejects_malformed_sharded_index(tmp_path: Path) -> None:
     """A broken sharded index cannot masquerade as a complete weight set."""
     _minimal_cohere_package(tmp_path, weights=False)
     (tmp_path / "model.safetensors.index.json").write_text("[]", encoding="utf-8")
-    with pytest.raises(ValueError, match="Incomplete sharded"):
+    with pytest.raises(ValueError, match="Malformed sharded"):
         utils._validate_model_package(tmp_path)
 
 
@@ -121,10 +141,34 @@ def test_publication_rejects_missing_processor(tmp_path: Path) -> None:
         utils._validate_model_package(tmp_path)
 
 
+def test_publication_rejects_missing_shard(tmp_path: Path) -> None:
+    """Every shard named by an index must exist and be valid."""
+    _minimal_cohere_package(tmp_path, weights=False)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"encoder.weight": "model-00001-of-00002.safetensors", '
+        '"decoder.weight": "model-00002-of-00002.safetensors"}}',
+        encoding="utf-8",
+    )
+    save_file(
+        {"encoder.weight": np.ones((1, 1), dtype=np.float32)},
+        tmp_path / "model-00001-of-00002.safetensors",
+    )
+    with pytest.raises(ValueError, match="Incomplete sharded"):
+        utils._validate_model_package(tmp_path)
+
+
 def test_publication_rejects_missing_weights(tmp_path: Path) -> None:
     """Processor metadata alone is not a reloadable model."""
     _minimal_cohere_package(tmp_path, weights=False)
     with pytest.raises(ValueError, match="needs model"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_wrong_model_type(tmp_path: Path) -> None:
+    """A package for a different model family cannot be published as Cohere."""
+    _minimal_cohere_package(tmp_path)
+    (tmp_path / "config.json").write_text('{"model_type": "whisper"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="wrong model_type"):
         utils._validate_model_package(tmp_path)
 
 
@@ -155,20 +199,9 @@ def test_publish_fails_if_visibility_changes_after_upload(
 
 def _populate_model_output(folder: Path) -> None:
     """Create allowed and forbidden files in a trainer output directory."""
-    for name in (
-        "config.json",
-        "preprocessor_config.json",
-        "model.safetensors",
-        "model-00001-of-00002.safetensors",
-        "model.safetensors.index.json",
-        "tokenizer_config.json",
-        "vocab.json",
-        "merges.txt",
-        "processor_config.json",
-        "chat_template.jinja",
-    ):
+    _minimal_cohere_package(folder)
+    for name in ("vocab.json", "merges.txt", "chat_template.jinja"):
         (folder / name).write_text("model", encoding="utf-8")
-    (folder / "config.json").write_text("{}", encoding="utf-8")
     for name in (
         "arbitrary.json",
         "manifest.jsonl",
@@ -242,8 +275,7 @@ def test_publish_stages_exact_top_level_allowlist(
             "config.json",
             "preprocessor_config.json",
             "model.safetensors",
-            "model-00001-of-00002.safetensors",
-            "model.safetensors.index.json",
+            "tokenizer.json",
             "tokenizer_config.json",
             "vocab.json",
             "merges.txt",

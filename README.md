@@ -14,7 +14,8 @@ Author and maintainer:
 ## Installation
 
 1. Run `make install`, which installs `uv` (if it isn't already installed), sets up a
-   virtual environment and all Python dependencies therein.
+   Python 3.11 virtual environment and all project dependencies therein. It also
+   provisions Python 3.12 for the Funcsort and Slopo quality tools.
 2. Run `source .venv/bin/activate` to activate the virtual environment.
 3. Run `make` to see a list of available commands.
 

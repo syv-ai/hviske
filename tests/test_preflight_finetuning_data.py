@@ -4,17 +4,72 @@ import collections.abc as c
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
+import soundfile
 from datasets import Dataset
 from omegaconf import OmegaConf
 
-from scripts.preflight_finetuning_data import preflight_finetuning_data
+from scripts.preflight_finetuning_data import (
+    _preflight_local_manifest,
+    preflight_finetuning_data,
+)
+
+
+def test_local_preflight_accepts_valid_wav(tmp_path: Path) -> None:
+    """A readable WAV with an in-bounds cue passes."""
+    _preflight_local_manifest("local", _write_local_manifest(tmp_path))
+
+
+def _write_local_manifest(
+    tmp_path: Path, *, start: float = 0.0, end: float = 0.5
+) -> Path:
+    """Write a one-row local manifest for audio preflight tests.
+
+    Returns:
+        The generated manifest path.
+    """
+    audio_path = tmp_path / "audio.wav"
+    soundfile.write(audio_path, np.zeros(16_000, dtype=np.float32), 16_000)
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "source_wav_path": str(audio_path),
+                "start": start,
+                "end": end,
+                "text": "hej",
+                "id": "local-1",
+                "duration": end - start,
+                "language": "da",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def test_local_preflight_rejects_cue_beyond_eof(tmp_path: Path) -> None:
+    """A cue extending beyond the WAV is rejected."""
+    manifest_path = _write_local_manifest(tmp_path, end=2.0)
+    with pytest.raises(ValueError, match="extends beyond audio"):
+        _preflight_local_manifest("local", manifest_path)
+
+
+def test_local_preflight_rejects_zero_byte_wav(tmp_path: Path) -> None:
+    """A zero-byte WAV is rejected before training starts."""
+    manifest_path = _write_local_manifest(tmp_path)
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"")
+    with pytest.raises(ValueError, match="Unreadable audio"):
+        _preflight_local_manifest("local", manifest_path)
 
 
 def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
     """Audio and validation stay bounded while transcripts are fully indexed."""
     audio_path = tmp_path / "audio.wav"
-    audio_path.touch()
+    soundfile.write(audio_path, np.zeros(16_000, dtype=np.float32), 16_000)
     manifest_path = tmp_path / "manifest.jsonl"
     manifest_path.write_text(
         json.dumps(

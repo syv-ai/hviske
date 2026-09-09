@@ -89,35 +89,48 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
     for index, (source_name, source_config) in enumerate(config.datasets.items()):
         is_local = source_config.get("type") == "local_vtt"
         source_id = f"local_vtt:{source_name}" if is_local else str(source_config.id)
-        sources.append(
-            {
-                "id": source_id,
-                "source": str(source_name),
-                "subset": str(source_config.get("subset") or "none"),
-                "split": str(source_config.get("train_name", "train")),
-                "revision": (
-                    "local-manifest" if is_local else str(source_config.get("revision"))
-                ),
-                "probability": probabilities[index],
-                "language": str(source_config.get("language") or "unspecified"),
-            }
-        )
+        source: dict[str, object] = {
+            "id": source_id,
+            "source": str(source_name),
+            "subset": str(source_config.get("subset") or "none"),
+            "split": str(source_config.get("train_name", "train")),
+            "revision": (
+                "local-manifest" if is_local else str(source_config.get("revision"))
+            ),
+            "probability": probabilities[index],
+            "language": str(source_config.get("language") or "unspecified"),
+        }
         transcript_id = source_config.get("transcript_dataset_id")
         if transcript_id is not None:
-            sources.append(
-                {
-                    "id": str(transcript_id),
-                    "source": f"{source_name} transcripts",
-                    "subset": str(source_config.get("transcript_subset") or "none"),
-                    "split": str(source_config.get("transcript_split", "train")),
-                    "revision": str(source_config.transcript_revision),
-                    "probability": probabilities[index],
-                    "language": str(source_config.get("language") or "unspecified"),
-                }
-            )
+            transcript_metadata = {
+                "dataset_id": str(transcript_id),
+                "subset": str(source_config.get("transcript_subset") or "none"),
+                "split": str(source_config.get("transcript_split", "train")),
+                "revision": str(source_config.transcript_revision),
+                "join_column": str(source_config.transcript_join_column),
+                "text_column": str(source_config.transcript_text_column),
+            }
+            source["audio"] = {
+                "dataset_id": source_id,
+                "revision": source["revision"],
+                "join_column": str(source_config.audio_join_column),
+            }
+            source["transcript"] = transcript_metadata
+            source["joined_transcript"] = {
+                **transcript_metadata,
+                "audio_join_column": str(source_config.audio_join_column),
+                "transcript_join_column": str(source_config.transcript_join_column),
+                "transcript_text_column": str(source_config.transcript_text_column),
+            }
+            source["relationship"] = "audio joined to transcript by configured columns"
+        sources.append(source)
 
     configured_ids = {str(dataset_id) for dataset_id in config.training_dataset_ids}
     derived_ids = {str(source["id"]) for source in sources}
+    for source in sources:
+        joined_transcript = source.get("joined_transcript")
+        if isinstance(joined_transcript, dict):
+            derived_ids.add(str(joined_transcript["dataset_id"]))
     missing = configured_ids - derived_ids
     if missing:
         raise ValueError(
