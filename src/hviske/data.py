@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import typing as t
-from collections.abc import Callable, Iterable, Sized
+from collections.abc import Callable, Iterable, Mapping, Sized
 from functools import partial
 from numbers import Number
 from pathlib import Path
@@ -520,6 +520,12 @@ def load_data_for_finetuning(
         if not isinstance(ds, Dataset | IterableDataset):
             raise ValueError(f"Unsupported dataset type: {type(ds)}")
 
+        row_filters = dataset_config.get("filters")
+        if row_filters is not None:
+            ds = _filter_dataset_rows(
+                dataset=ds, filters=t.cast(Mapping[str, object], row_filters)
+            )
+
         if not is_local_vtt and dataset_config.text_column != "text":
             ds = ds.rename_column(dataset_config.text_column, "text")
         if not is_local_vtt and dataset_config.audio_column != "audio":
@@ -746,6 +752,90 @@ def load_data_for_finetuning(
         dataset[split_name] = split
 
     return dataset
+
+
+def _filter_dataset_rows(dataset: Data, filters: Mapping[str, object]) -> Data:
+    """Keep rows whose configured columns match exact scalar values.
+
+    Args:
+        dataset:
+            The dataset to filter.
+        filters:
+            Mapping from feature names to the exact values to retain.
+
+    Returns:
+        The filtered dataset with its original explicit features.
+
+    Raises:
+        ValueError:
+            If a filter column is not present in the dataset features.
+    """
+    if isinstance(dataset, Dataset | IterableDataset):
+        return t.cast(
+            Data, _filter_dataset_rows_from_split(dataset=dataset, filters=filters)
+        )
+    if isinstance(dataset, DatasetDict):
+        return t.cast(
+            Data,
+            DatasetDict(
+                {
+                    split_name: _filter_dataset_rows_from_split(
+                        dataset=split_dataset, filters=filters
+                    )
+                    for split_name, split_dataset in dataset.items()
+                }
+            ),
+        )
+    if isinstance(dataset, IterableDatasetDict):
+        return t.cast(
+            Data,
+            IterableDatasetDict(
+                {
+                    split_name: _filter_dataset_rows_from_split(
+                        dataset=split_dataset, filters=filters
+                    )
+                    for split_name, split_dataset in dataset.items()
+                }
+            ),
+        )
+    raise ValueError(f"Unsupported dataset type: {type(dataset)}")
+
+
+def _filter_dataset_rows_from_split(
+    dataset: Dataset | IterableDataset, filters: Mapping[str, object]
+) -> Dataset | IterableDataset:
+    """Filter one dataset split while retaining its declared feature schema.
+
+    Args:
+        dataset:
+            The dataset split to filter.
+        filters:
+            Mapping from feature names to the exact values to retain.
+
+    Returns:
+        The filtered dataset with its original explicit features.
+
+    Raises:
+        ValueError:
+            If the dataset has no declared features or a filter column is missing.
+    """
+    if dataset.features is None:
+        raise ValueError("Cannot apply row filters without declared dataset features")
+    missing_columns = [column for column in filters if column not in dataset.features]
+    if missing_columns:
+        raise ValueError(
+            "Cannot apply row filters; missing dataset features: "
+            + ", ".join(missing_columns)
+        )
+
+    original_features = dataset.features
+    filtered = dataset.filter(
+        function=lambda row: all(
+            row[column] == expected_value for column, expected_value in filters.items()
+        )
+    )
+    filtered.info.features = original_features
+    return filtered
 
 
 def filter_dataset(

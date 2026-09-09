@@ -17,6 +17,7 @@ TRAINING_NAMES = [
     "ftspeech",
     "nota",
     "nst",
+    "voxpopuli_da",
     "peoples_speech_clean",
     "ami_sdm",
     "ami_ihm",
@@ -34,6 +35,7 @@ TRAINING_IDS = [
     "alexandrainst/ftspeech",
     "alexandrainst/nota",
     "alexandrainst/nst-da",
+    "syvai/danish-asr-unified",
     "MLCommons/peoples_speech",
     "edinburghcstr/ami",
     "edinburghcstr/ami",
@@ -43,14 +45,15 @@ TRAINING_IDS = [
     "openslr/librispeech_asr",
 ]
 TRAINING_PROBABILITIES = [
-    0.075,
-    0.075,
-    0.075,
-    0.075,
-    0.075,
-    0.075,
-    0.075,
-    0.075,
+    0.08,
+    0.10,
+    0.07,
+    0.04,
+    0.10,
+    0.05,
+    0.05,
+    0.05,
+    0.06,
     0.16,
     0.04,
     0.03,
@@ -99,6 +102,13 @@ def test_sparkie_dataset_coordinates_and_revisions(
         "ftspeech": ("alexandrainst/ftspeech", None, "train", "sentence", "audio"),
         "nota": ("alexandrainst/nota", None, "train", "text", "audio"),
         "nst": ("alexandrainst/nst-da", None, "train", "text", "audio"),
+        "voxpopuli_da": (
+            "syvai/danish-asr-unified",
+            "default",
+            "train",
+            "text",
+            "audio",
+        ),
         "peoples_speech_clean": (
             "MLCommons/peoples_speech",
             "clean",
@@ -155,6 +165,7 @@ def test_sparkie_dataset_coordinates_and_revisions(
         "ftspeech": "e1b7096db63c7d996a8220b13780a547a88a9af0",
         "nota": "acd1ad2389426f84fc3cb812c52d3d5dde5c7ce3",
         "nst": "0f14ad2005e0aab8f56cf3213b7689da1faf23c2",
+        "voxpopuli_da": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
         "peoples_speech_clean": "f10597c5d3d3a63f8b6827701297c3afdf178272",
         "ami_sdm": "46f28f2503e2ec48f8867a84eef356c70476beab",
         "ami_ihm": "46f28f2503e2ec48f8867a84eef356c70476beab",
@@ -180,6 +191,12 @@ def test_sparkie_dataset_coordinates_and_revisions(
         dataset.get("trust_remote_code", False) is False
         for dataset in datasets.values()
     )
+    assert dict(datasets.voxpopuli_da.filters) == {"source": "voxpopuli"}
+    assert [
+        name
+        for name, dataset in datasets.items()
+        if dataset.get("id") == "syvai/danish-asr-unified"
+    ] == ["voxpopuli_da"]
 
 
 def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
@@ -251,6 +268,7 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
         "alexandrainst/ftspeech",
         "alexandrainst/nota",
         "alexandrainst/nst-da",
+        "syvai/danish-asr-unified",
         "MLCommons/peoples_speech",
         "edinburghcstr/ami",
         "facebook/voxpopuli",
@@ -270,8 +288,8 @@ def test_sparkie_training_order_and_probabilities(
     ] == TRAINING_IDS
     assert list(config.dataset_probabilities) == TRAINING_PROBABILITIES
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
-    assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.6)
-    assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
+    assert sum(config.dataset_probabilities[:9]) == pytest.approx(0.6)
+    assert sum(config.dataset_probabilities[9:]) == pytest.approx(0.4)
 
 
 def test_youtube_local_manifest_is_danish() -> None:

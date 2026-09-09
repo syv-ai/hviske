@@ -10,6 +10,7 @@ defaults:
     - ftspeech
     - nota
     - nst
+    - voxpopuli_da
     - peoples_speech_clean
     - ami_sdm
     - ami_ihm
@@ -77,16 +78,17 @@ streaming: true
 cache_dir: null
 padding: longest
 
-# The first eight entries are Danish (60%); the final seven are English (40%).
+# The first nine entries are Danish (60%); the final seven are English (40%).
 dataset_probabilities:
-  - 0.075 # p1
-  - 0.075 # drtv_local
-  - 0.075 # youtube_local
-  - 0.075 # coral_read_aloud
-  - 0.075 # coral_conversation
-  - 0.075 # ftspeech
-  - 0.075 # nota
-  - 0.075 # nst
+  - 0.08 # p1
+  - 0.10 # drtv_local
+  - 0.07 # youtube_local
+  - 0.04 # coral_read_aloud
+  - 0.10 # coral_conversation
+  - 0.05 # ftspeech
+  - 0.05 # nota
+  - 0.05 # nst
+  - 0.06 # voxpopuli_da
   - 0.16 # peoples_speech_clean
   - 0.04 # ami_sdm
   - 0.03 # ami_ihm
@@ -103,6 +105,7 @@ training_dataset_ids:
   - alexandrainst/ftspeech
   - alexandrainst/nota
   - alexandrainst/nst-da
+  - syvai/danish-asr-unified
   - MLCommons/peoples_speech
   - edinburghcstr/ami
   - facebook/voxpopuli
