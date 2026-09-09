@@ -101,6 +101,31 @@ def test_olmix_anchor_composition_preserves_sources_and_language_totals(
     assert sum(probabilities) == Decimal("1.00")
     assert sum(probabilities[:9]) == Decimal("0.60")
     assert sum(probabilities[9:]) == Decimal("0.40")
+    danish_read = sum(probabilities[index] for index in (0, 3, 5, 6, 7, 8))
+    danish_conversational = sum(probabilities[index] for index in (1, 2, 4))
+    english_read = sum(probabilities[index] for index in (12, 13, 14, 15))
+    english_conversational = sum(probabilities[index] for index in (9, 10, 11))
+    if anchor != "olmix_baseline":
+        expected = {
+            "olmix_read_speech_heavy": (
+                Decimal("0.40"),
+                Decimal("0.20"),
+                Decimal("0.30"),
+                Decimal("0.10"),
+            ),
+            "olmix_spontaneous_heavy": (
+                Decimal("0.15"),
+                Decimal("0.45"),
+                Decimal("0.10"),
+                Decimal("0.30"),
+            ),
+        }
+        assert (
+            danish_read,
+            danish_conversational,
+            english_read,
+            english_conversational,
+        ) == expected[anchor]
     assert all(probability > 0 for probability in config.dataset_probabilities)
 
 

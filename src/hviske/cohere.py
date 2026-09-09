@@ -39,7 +39,7 @@ from .data_collators import (
     DataCollatorCohereWithPadding,
     DataCollatorSpeechSeq2SeqWithPadding,
 )
-from .data_models import ModelSetup, PreTrainedModelData
+from .data_models import ModelSetup, PreTrainedModelData, Processor
 from .utils import transformers_output_ignored
 
 logger = logging.getLogger(__package__)
@@ -126,21 +126,11 @@ class CohereModelSetup(ModelSetup):
         self,
     ) -> DataCollatorCohereWithPadding | DataCollatorSpeechSeq2SeqWithPadding:
         """Return the data collator for the selected Cohere implementation."""
-        if self._uses_remote_code():
-            return DataCollatorSpeechSeq2SeqWithPadding(
-                processor=self.processor,
-                sample_rate=self.config.model.sampling_rate,
-                max_seconds_per_example=self.config.max_seconds_per_example,
-                padding=self.config.padding,
-            )
         return DataCollatorCohereWithPadding(
             processor=self.processor,
             padding=self.config.padding,
             max_length=self.config.model.max_length,
         )
-
-    def _uses_remote_code(self) -> bool:
-        return bool(self.config.model.get("trust_remote_code", False))
 
     def load_model(self) -> CohereAsrForConditionalGeneration:
         """Load the configured Cohere ASR model.
@@ -213,6 +203,9 @@ class CohereModelSetup(ModelSetup):
             kwargs["revision"] = str(revision)
         return kwargs
 
+    def _uses_remote_code(self) -> bool:
+        return bool(self.config.model.get("trust_remote_code", False))
+
     def load_processor(self) -> CohereAsrProcessor:
         """Load the configured Cohere processor.
 
@@ -228,6 +221,7 @@ class CohereModelSetup(ModelSetup):
                 self.config.model.pretrained_model_id, **self._pretrained_kwargs()
             )
             self._validate_remote_processor(processor)
+            processor = RemoteCohereAsrProcessor(processor=processor)
         else:
             processor = CohereAsrProcessor.from_pretrained(
                 self.config.model.pretrained_model_id,
@@ -273,6 +267,7 @@ class CohereModelSetup(ModelSetup):
                 model_path, **self._pretrained_kwargs()
             )
             self._validate_remote_processor(processor)
+            processor = RemoteCohereAsrProcessor(processor=processor)
             model = AutoModelForSpeechSeq2Seq.from_pretrained(
                 model_path, **self._pretrained_kwargs()
             )
@@ -303,19 +298,21 @@ class CohereModelSetup(ModelSetup):
                     "The saved checkpoint did not contain a native Cohere model."
                 )
         return PreTrainedModelData(
-            processor=processor,
+            processor=t.cast(Processor, processor),
             model=model,
             data_collator=DataCollatorCohereWithPadding(
-                processor=processor,
+                processor=t.cast(Processor, processor),
                 padding=self.config.padding,
                 max_length=self.config.model.max_length,
             ),
-            compute_metrics=partial(compute_error_rate_metrics, processor=processor),
+            compute_metrics=partial(
+                compute_error_rate_metrics, processor=t.cast(Processor, processor)
+            ),
         )
 
     def load_trainer_class(self) -> Type[Trainer]:
-        """Return the trainer for the selected Cohere implementation."""
-        return Seq2SeqTrainer if self._uses_remote_code() else CohereSeq2SeqTrainer
+        """Return the prompt-aware Cohere trainer."""
+        return CohereSeq2SeqTrainer
 
     def load_training_arguments(self) -> TrainingArguments:
         """Build the common training configuration for Cohere.
@@ -395,6 +392,105 @@ class CohereModelSetup(ModelSetup):
             ddp_find_unused_parameters=False,
             accelerator_config=AcceleratorConfig(dispatch_batches=False).to_dict(),
         )
+
+
+class RemoteCohereAsrProcessor:
+    """Adapt the revision-pinned remote processor to the Cohere training API.
+
+    The checkpoint's remote processor only extracts audio features and tokenises
+    text.  Its model nevertheless expects the Cohere decoder prompt, so keeping
+    that prompt construction here avoids relying on remote processor behaviour or
+    tokenising a concatenated string (which splits special tokens incorrectly).
+    """
+
+    uses_length = True
+
+    def __init__(self, processor: object) -> None:
+        """Wrap a remote processor.
+
+        Args:
+            processor:
+                The processor loaded from the checkpoint.
+        """
+        self._processor = processor
+        self.feature_extractor = getattr(processor, "feature_extractor")
+        self.tokenizer = getattr(processor, "tokenizer")
+
+    def __call__(
+        self,
+        audio: object,
+        language: str,
+        text: str | None = None,
+        punctuation: bool = True,
+        sampling_rate: int | None = None,
+        **kwargs: object,
+    ) -> t.MutableMapping[str, object]:
+        """Extract remote features and add native-style prompt and labels.
+
+        Args:
+            audio:
+                Audio waveform accepted by the remote processor.
+            language:
+                ISO language code used to construct the decoder prompt.
+            text (optional):
+                Transcript to tokenise as labels. Defaults to ``None``.
+            punctuation (optional):
+                Whether punctuation should be enabled. Defaults to ``True``.
+            sampling_rate (optional):
+                Audio sampling rate. Defaults to ``None``.
+            **kwargs:
+                Additional feature-extractor arguments.
+
+        Returns:
+            Remote audio features with Cohere prompt IDs and optional labels.
+        """
+        process = t.cast(Callable[..., object], self._processor)
+        processed = t.cast(
+            t.MutableMapping[str, object],
+            process(audio=audio, sampling_rate=sampling_rate, **kwargs),
+        )
+        prompt_ids = self.get_decoder_prompt_ids(
+            language=language, punctuation=punctuation
+        )
+        batch_size = len(t.cast(t.Sized, processed["input_features"]))
+        processed["decoder_input_ids"] = torch.tensor(
+            [prompt_ids] * batch_size, dtype=torch.long
+        )
+        if text is not None:
+            tokenise = t.cast(
+                Callable[..., t.MutableMapping[str, object]], self.tokenizer
+            )
+            tokenised = tokenise(text=text, truncation=True)
+            token_ids = t.cast(
+                list[int] | list[list[int]] | torch.Tensor, tokenised["input_ids"]
+            )
+            if isinstance(token_ids, torch.Tensor):
+                if token_ids.ndim == 1:
+                    token_ids = token_ids.unsqueeze(0)
+            elif token_ids and isinstance(token_ids[0], int):
+                token_ids = [token_ids]
+            processed["labels"] = token_ids
+        return processed
+
+    def get_decoder_prompt_ids(
+        self, language: str, punctuation: bool = True
+    ) -> list[int]:
+        """Build the exact prompt expected by the Cohere decoder.
+
+        Returns:
+            The decoder prompt token IDs.
+        """
+        return CohereAsrProcessor.get_decoder_prompt_ids(
+            t.cast(CohereAsrProcessor, self), language=language, punctuation=punctuation
+        )
+
+    def __getattr__(self, name: str) -> object:
+        """Delegate decoding and persistence helpers to the remote processor.
+
+        Returns:
+            The delegated remote processor attribute.
+        """
+        return getattr(self._processor, name)
 
 
 class CohereSeq2SeqTrainer(Seq2SeqTrainer):

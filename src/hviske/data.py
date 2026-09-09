@@ -1096,14 +1096,18 @@ def _processing_features(
             input_length=Value("int64"),
             num_seconds=Value("float64"),
         )
-    return Features(
-        input_features=Sequence(Sequence(Value("float64"))),
-        attention_mask=Sequence(Value("int64")),
-        decoder_input_ids=Sequence(Value("int64")),
-        labels=Sequence(Value("int64")),
-        input_length=Value("int64"),
-        num_seconds=Value("float64"),
-    )
+    feature_schema: dict[str, object] = {
+        "input_features": Sequence(Sequence(Value("float64"))),
+        "decoder_input_ids": Sequence(Value("int64")),
+        "labels": Sequence(Value("int64")),
+        "input_length": Value("int64"),
+        "num_seconds": Value("float64"),
+    }
+    if getattr(processor, "uses_length", False):
+        feature_schema["length"] = Value("int64")
+    else:
+        feature_schema["attention_mask"] = Sequence(Value("int64"))
+    return Features(**feature_schema)
 
 
 def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
@@ -1367,13 +1371,21 @@ def process_example(
             sampling_rate=sampling_rate,
         )
         example["input_features"] = _to_python(processed["input_features"][0])
-        example["attention_mask"] = _to_python(processed["attention_mask"][0])
+        if "attention_mask" in processed:
+            example["attention_mask"] = _to_python(processed["attention_mask"][0])
+            frame_count = len(t.cast(Sized, example["attention_mask"]))
+        elif "length" in processed:
+            example["length"] = _to_python(processed["length"][0])
+            frame_count = int(t.cast(int | float, example["length"]))
+        else:
+            raise ValueError(
+                "Prompt-aware processor must return attention_mask or length."
+            )
         example["decoder_input_ids"] = _to_python(processed["decoder_input_ids"][0])
         example["labels"] = _to_python(processed["labels"][0])
         labels = t.cast(Sized, example["labels"])
-        attention_mask = t.cast(Sized, example["attention_mask"])
         example["input_length"] = len(labels)
-        example["num_seconds"] = len(attention_mask) / 100
+        example["num_seconds"] = frame_count / 100
         return example
 
     # Process the audio for Whisper and Wav2Vec2.

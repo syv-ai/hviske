@@ -6,8 +6,8 @@
 # Within each language/style domain, production proportions are retained so
 # this changes only emphasis.
 dataset_probabilities:
-  - 0.09696970 # p1
-  - 0.07407407 # drtv_local
+  - 0.09696969 # p1
+  - 0.07407408 # drtv_local
   - 0.05185185 # youtube_local
   - 0.04848485 # coral_read_aloud
   - 0.07407407 # coral_conversation
