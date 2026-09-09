@@ -459,8 +459,8 @@ def publish_model_folder(
             Structured source provenance for the model card.
         reviewed_model_card (optional):
             A reviewed README to use instead of the generated card.
-        finetuned_from_revision (optional):
-            Immutable revision of the base model.
+        finetuned_from_revision:
+            Immutable revision of the base model. Required for publication.
 
     Returns:
         The model-file upload commit information.
@@ -472,6 +472,9 @@ def publish_model_folder(
     validate_private_only_config({"private_only": True, "private": private})
     if not training_sources:
         raise ValueError("Structured training-source provenance is required")
+    _validate_base_model_metadata(
+        finetuned_from=finetuned_from, finetuned_from_revision=finetuned_from_revision
+    )
     _validate_training_sources(
         training_sources=training_sources,
         training_dataset_ids=training_dataset_ids or [],
@@ -617,23 +620,31 @@ def _validate_model_package(source: Path) -> None:
     shard_tensors: dict[str, set[str]] = {}
     for shard_name in sorted(referenced):
         shard_tensors[shard_name] = _validate_safetensors_file(source / shard_name)
-    for tensor_name, shard_name in weight_map.items():
-        if tensor_name not in shard_tensors[shard_name]:
+    for shard_name, actual_tensors in shard_tensors.items():
+        expected_tensors = {
+            tensor_name
+            for tensor_name, assigned_shard in weight_map.items()
+            if assigned_shard == shard_name
+        }
+        missing = expected_tensors - actual_tensors
+        if missing:
+            tensor_name = sorted(missing)[0]
             raise ValueError(
                 f"Sharded index maps {tensor_name!r} to a shard without that tensor"
             )
-    indexed_tensors = set(weight_map)
-    unindexed = {
-        tensor_name
-        for tensors in shard_tensors.values()
-        for tensor_name in tensors
-        if tensor_name not in indexed_tensors
-    }
-    if unindexed:
-        raise ValueError(
-            "Sharded weight files contain unindexed tensors: "
-            + ", ".join(sorted(unindexed))
-        )
+        extra = actual_tensors - expected_tensors
+        if extra:
+            indexed_tensors = set(weight_map)
+            unindexed = extra - indexed_tensors
+            if unindexed:
+                raise ValueError(
+                    "Sharded weight files contain unindexed tensors: "
+                    + ", ".join(sorted(unindexed))
+                )
+            raise ValueError(
+                f"Sharded tensor set does not match index for {shard_name}: "
+                + ", ".join(sorted(extra))
+            )
 
 
 def _regular_file(path: Path) -> bool:
@@ -681,19 +692,26 @@ def _stage_model_card(
         ValueError:
             If a reviewed card is not a safe, complete provenance record.
     """
+    _validate_base_model_metadata(
+        finetuned_from=finetuned_from, finetuned_from_revision=finetuned_from_revision
+    )
     if reviewed_model_card is not None:
         if not _regular_file(reviewed_model_card):
             raise ValueError("Reviewed model card must be a regular file")
         card = reviewed_model_card.read_text(encoding="utf-8")
         forbidden = ("manifest_path", "source_wav_path", "HF_TOKEN", "HUGGINGFACE")
-        required_markers = ("license: openrail", "base_model:", "private", "internal")
+        card_lower = card.lower()
+        required_markers = ("license: openrail", "private", "internal")
+        frontmatter = _read_model_card_frontmatter(card)
         if (
             any(
                 str(value) not in card
                 for source in training_sources
                 for value in source.values()
             )
-            or any(marker not in card for marker in required_markers)
+            or any(marker not in card_lower for marker in required_markers)
+            or frontmatter.get("base_model") != finetuned_from
+            or frontmatter.get("base_model_revision") != finetuned_from_revision
             or any(marker in card for marker in forbidden)
             or re.search(r"(?:^|\s)/(?:Users|home|private|tmp|var)/", card)
         ):
@@ -726,6 +744,52 @@ def _stage_model_card(
         f"{source_lines}\n\n## Evaluation status\n\n{evaluation_status}\n",
         encoding="utf-8",
     )
+
+
+def _read_model_card_frontmatter(card: str) -> dict[str, str]:
+    """Read scalar metadata from a model card's YAML frontmatter.
+
+    Returns:
+        The parsed base model metadata, or an empty dictionary for invalid
+        frontmatter.
+    """
+    lines = card.splitlines()
+    if len(lines) < 3 or lines[0].strip() != "---":
+        return {}
+    try:
+        end = next(
+            index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"
+        )
+    except StopIteration:
+        return {}
+    metadata: dict[str, str] = {}
+    for line in lines[1:end]:
+        key, separator, value = line.partition(":")
+        if separator and key.strip() in {"base_model", "base_model_revision"}:
+            field = key.strip()
+            if field in metadata:
+                return {}
+            metadata[field] = value.strip().strip("'\"")
+    return metadata
+
+
+def _validate_base_model_metadata(
+    finetuned_from: str, finetuned_from_revision: str | None
+) -> None:
+    """Require the immutable base model identity used by publication.
+
+    Raises:
+        ValueError:
+            If the base model ID or pinned revision is missing.
+    """
+    if (
+        not finetuned_from.strip()
+        or not finetuned_from_revision
+        or not finetuned_from_revision.strip()
+    ):
+        raise ValueError(
+            "Publication requires an exact base model and pinned base model revision"
+        )
 
 
 def _validate_training_sources(
@@ -852,6 +916,7 @@ def push_model_to_hub(
     model_card_languages: list[str] | None = None,
     training_dataset_ids: list[str] | None = None,
     evaluation_status: str = "Not evaluated.",
+    finetuned_from_revision: str | None = None,
 ) -> CommitInfo | None:
     """Upload a filtered model artefact set to the Hugging Face Hub.
 
@@ -886,6 +951,8 @@ def push_model_to_hub(
             Exact Hub dataset identifiers used for training.
         evaluation_status (optional):
             Short evaluation-status statement for the model card.
+        finetuned_from_revision:
+            Immutable revision of the base model. Required for publication.
 
     Returns:
         The commit information, or None if the process is not the main process.
@@ -933,6 +1000,7 @@ def push_model_to_hub(
             model_card_languages=languages,
             training_dataset_ids=training_dataset_ids or [],
             evaluation_status=evaluation_status,
+            finetuned_from_revision=finetuned_from_revision,
         )
         if requires_private:
             assert api is not None
@@ -956,6 +1024,7 @@ def _write_model_card(
     model_card_languages: list[str],
     training_dataset_ids: list[str],
     evaluation_status: str,
+    finetuned_from_revision: str | None,
 ) -> None:
     """Write a backwards-compatible minimal card for trainer publication."""
     sources: list[dict[str, object]] = [
@@ -978,7 +1047,7 @@ def _write_model_card(
         training_sources=sources,
         evaluation_status=evaluation_status,
         reviewed_model_card=None,
-        finetuned_from_revision=None,
+        finetuned_from_revision=finetuned_from_revision,
     )
 
 

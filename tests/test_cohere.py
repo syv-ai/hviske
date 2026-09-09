@@ -2,6 +2,7 @@
 
 import contextlib
 import typing as t
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -226,6 +227,27 @@ def test_model_factory_dispatches_cohere() -> None:
     assert isinstance(load_model_setup(config), CohereModelSetup)
 
 
+def test_native_cohere_dispatch_omits_revision_for_fine_tuned_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generic remote loader does not inherit the base Cohere revision."""
+    config_loader = MagicMock(return_value=SimpleNamespace(model_type="cohere_asr"))
+    processor_loader = MagicMock(spec=CohereAsrProcessor)
+    model_loader = MagicMock(spec=CohereAsrForConditionalGeneration)
+    model_loader.return_value.to.return_value = model_loader.return_value
+    monkeypatch.setattr("hviske.cohere.AutoConfig.from_pretrained", config_loader)
+    monkeypatch.setattr(CohereAsrProcessor, "from_pretrained", processor_loader)
+    monkeypatch.setattr(
+        CohereAsrForConditionalGeneration, "from_pretrained", model_loader
+    )
+    load_asr_transcriber(
+        model_id="org/fine-tuned", no_lm=False, device=torch.device("cpu")
+    )
+    assert "revision" not in config_loader.call_args.kwargs
+    assert "revision" not in processor_loader.call_args.kwargs
+    assert "revision" not in model_loader.call_args.kwargs
+
+
 def test_native_cohere_dispatch_omits_whisper_generation_kwargs() -> None:
     """Native Cohere entry points must not pass Whisper language/task kwargs."""
     transcriber = object.__new__(CohereASRTranscriber)
@@ -368,3 +390,84 @@ def test_native_loading_disables_remote_code(monkeypatch: pytest.MonkeyPatch) ->
         model_loader.call_args.kwargs["revision"]
         == "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
     )
+
+
+def test_saved_local_cohere_load_omits_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Local saved checkpoints never receive a Hub revision."""
+    processor = object.__new__(CohereAsrProcessor)
+    model = MagicMock(spec=CohereAsrForConditionalGeneration)
+    model.config = SimpleNamespace(use_cache=True)
+    processor_loader = MagicMock(return_value=processor)
+    model_loader = MagicMock(return_value=model)
+    monkeypatch.setattr(CohereAsrProcessor, "from_pretrained", processor_loader)
+    monkeypatch.setattr(
+        CohereAsrForConditionalGeneration, "from_pretrained", model_loader
+    )
+    config = OmegaConf.create(
+        {
+            "model": {"max_length": 256},
+            "model_dir": str(tmp_path),
+            "hub_organisation": "org",
+            "model_id": "fine-tuned",
+            "padding": "longest",
+        }
+    )
+    CohereModelSetup(config=config).load_saved(revision="ignored-for-local")
+    assert "revision" not in processor_loader.call_args.kwargs
+    assert "revision" not in model_loader.call_args.kwargs
+
+
+def test_saved_remote_cohere_load_accepts_explicit_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly pinned fine-tuned revision reaches both Hub loads."""
+    processor = object.__new__(CohereAsrProcessor)
+    model = MagicMock(spec=CohereAsrForConditionalGeneration)
+    model.config = SimpleNamespace(use_cache=True)
+    processor_loader = MagicMock(return_value=processor)
+    model_loader = MagicMock(return_value=model)
+    monkeypatch.setattr(CohereAsrProcessor, "from_pretrained", processor_loader)
+    monkeypatch.setattr(
+        CohereAsrForConditionalGeneration, "from_pretrained", model_loader
+    )
+    config = OmegaConf.create(
+        {
+            "model": {"max_length": 256},
+            "model_dir": "/path/that/does/not/exist",
+            "hub_organisation": "org",
+            "model_id": "fine-tuned",
+            "padding": "longest",
+        }
+    )
+    CohereModelSetup(config=config).load_saved(revision="saved-sha")
+    assert processor_loader.call_args.kwargs["revision"] == "saved-sha"
+    assert model_loader.call_args.kwargs["revision"] == "saved-sha"
+
+
+def test_saved_remote_cohere_load_omits_base_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fine-tuned Hub repository is not loaded at the base revision."""
+    processor = object.__new__(CohereAsrProcessor)
+    model = MagicMock(spec=CohereAsrForConditionalGeneration)
+    model.config = SimpleNamespace(use_cache=True)
+    processor_loader = MagicMock(return_value=processor)
+    model_loader = MagicMock(return_value=model)
+    monkeypatch.setattr(CohereAsrProcessor, "from_pretrained", processor_loader)
+    monkeypatch.setattr(
+        CohereAsrForConditionalGeneration, "from_pretrained", model_loader
+    )
+    config = OmegaConf.create(
+        {
+            "model": {"max_length": 256},
+            "model_dir": "/path/that/does/not/exist",
+            "hub_organisation": "org",
+            "model_id": "fine-tuned",
+            "padding": "longest",
+        }
+    )
+    CohereModelSetup(config=config).load_saved()
+    assert "revision" not in processor_loader.call_args.kwargs
+    assert "revision" not in model_loader.call_args.kwargs

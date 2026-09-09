@@ -116,4 +116,5 @@ def finetune(config: DictConfig) -> None:
                     else "Not evaluated: no validation set was configured."
                 )
             ),
+            finetuned_from_revision=config.model.get("revision"),
         )

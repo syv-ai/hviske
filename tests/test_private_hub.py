@@ -27,6 +27,34 @@ class FakeRepositoryNotFoundError(Exception):
     """Hub repository-not-found error for the mocked API."""
 
 
+def test_model_card_requires_pinned_base_metadata(tmp_path: Path) -> None:
+    """Generated cards cannot omit the exact base model revision."""
+    with pytest.raises(ValueError, match="pinned base model revision"):
+        utils._stage_model_card(
+            destination=tmp_path / "README.md",
+            finetuned_from="org/base-model",
+            model_card_languages=["da", "en"],
+            training_dataset_ids=["org/dataset"],
+            training_sources=[_source("org/dataset")],
+            evaluation_status="Not evaluated.",
+            reviewed_model_card=None,
+            finetuned_from_revision=None,
+        )
+
+
+def _source(dataset_id: str) -> dict[str, object]:
+    """Return complete provenance metadata for publication tests."""
+    return {
+        "id": dataset_id,
+        "source": dataset_id,
+        "subset": "none",
+        "split": "train",
+        "revision": "sha256-test",
+        "probability": 1.0,
+        "language": "da",
+    }
+
+
 def test_private_only_creates_missing_repository_as_private(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -169,6 +197,31 @@ def test_publication_rejects_empty_or_card_only_package(tmp_path: Path) -> None:
         utils._validate_model_package(tmp_path)
 
 
+def test_publication_rejects_expected_tensor_duplicated_into_another_shard(
+    tmp_path: Path,
+) -> None:
+    """A tensor assigned to one shard cannot also appear in another shard."""
+    _minimal_cohere_package(tmp_path, weights=False)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"encoder.weight": "model-00001-of-00002.safetensors", '
+        '"decoder.weight": "model-00002-of-00002.safetensors"}}',
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "encoder.weight": np.ones((1, 1), dtype=np.float32),
+            "decoder.weight": np.ones((1, 1), dtype=np.float32),
+        },
+        tmp_path / "model-00001-of-00002.safetensors",
+    )
+    save_file(
+        {"decoder.weight": np.ones((1, 1), dtype=np.float32)},
+        tmp_path / "model-00002-of-00002.safetensors",
+    )
+    with pytest.raises(ValueError, match="tensor set does not match"):
+        utils._validate_model_package(tmp_path)
+
+
 def test_publication_rejects_malformed_sharded_index(tmp_path: Path) -> None:
     """A broken sharded index cannot masquerade as a complete weight set."""
     _minimal_cohere_package(tmp_path, weights=False)
@@ -204,6 +257,26 @@ def test_publication_rejects_missing_weights(tmp_path: Path) -> None:
     """Processor metadata alone is not a reloadable model."""
     _minimal_cohere_package(tmp_path, weights=False)
     with pytest.raises(ValueError, match="needs model"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_per_shard_tensor_set_mismatch(tmp_path: Path) -> None:
+    """Each shard must contain exactly its assigned tensor set."""
+    _minimal_cohere_package(tmp_path, weights=False)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"encoder.weight": "model-00001-of-00002.safetensors", '
+        '"decoder.weight": "model-00002-of-00002.safetensors"}}',
+        encoding="utf-8",
+    )
+    save_file(
+        {"decoder.weight": np.ones((1, 1), dtype=np.float32)},
+        tmp_path / "model-00001-of-00002.safetensors",
+    )
+    save_file(
+        {"encoder.weight": np.ones((1, 1), dtype=np.float32)},
+        tmp_path / "model-00002-of-00002.safetensors",
+    )
+    with pytest.raises(ValueError, match="shard without that tensor"):
         utils._validate_model_package(tmp_path)
 
 
@@ -270,6 +343,7 @@ def test_publish_fails_if_visibility_changes_after_upload(
             folder_path=tmp_path,
             repo_id="syvai/hviske-v6",
             finetuned_from="org/base-model",
+            finetuned_from_revision="base-revision",
             private=True,
             model_card_languages=["da", "en"],
             training_dataset_ids=["org/dataset"],
@@ -302,19 +376,6 @@ def _populate_model_output(folder: Path) -> None:
     (folder / "symlink.safetensors").symlink_to(folder / "model.safetensors")
 
 
-def _source(dataset_id: str) -> dict[str, object]:
-    """Return complete provenance metadata for publication tests."""
-    return {
-        "id": dataset_id,
-        "source": dataset_id,
-        "subset": "none",
-        "split": "train",
-        "revision": "sha256-test",
-        "probability": 1.0,
-        "language": "da",
-    }
-
-
 def test_publish_stages_exact_top_level_allowlist(
     monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -341,6 +402,7 @@ def test_publish_stages_exact_top_level_allowlist(
         folder_path=tmp_path,
         repo_id="syvai/hviske-v6",
         finetuned_from="CohereLabs/cohere-transcribe-03-2026",
+        finetuned_from_revision="b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
         private=True,
         model_card_languages=["da", "en"],
         training_dataset_ids=["CoRal-project/coral-v3"],
@@ -407,6 +469,7 @@ def test_push_stages_once_and_disables_trainer_push(
         private=True,
         private_only=True,
         training_dataset_ids=["org/private-dataset"],
+        finetuned_from_revision="base-revision",
     )
 
     assert len(uploads) == 1
@@ -414,3 +477,46 @@ def test_push_stages_once_and_disables_trainer_push(
     assert "recording.wav" not in uploads[0]
     assert trainer.args.push_to_hub is False
     assert api.info_calls == 3
+
+
+def test_reviewed_model_card_requires_exact_base_metadata(tmp_path: Path) -> None:
+    """Reviewed cards must carry matching base model and revision frontmatter."""
+    for name, metadata in (
+        ("missing", "base_model: org/base-model\n"),
+        ("wrong", "base_model: org/other-model\nbase_model_revision: base-revision\n"),
+        ("correct", "base_model: org/base-model\nbase_model_revision: base-revision\n"),
+    ):
+        card = tmp_path / f"{name}.md"
+        card.write_text(
+            f"---\nlicense: openrail\n{metadata}---\n\n"
+            "# Private internal checkpoint\n\n"
+            "org/dataset none train sha256-test 1.0 da\n",
+            encoding="utf-8",
+        )
+        destination = tmp_path / f"staged-{name}.md"
+        if name == "correct":
+            utils._stage_model_card(
+                destination=destination,
+                finetuned_from="org/base-model",
+                model_card_languages=["da", "en"],
+                training_dataset_ids=["org/dataset"],
+                training_sources=[_source("org/dataset")],
+                evaluation_status="Not evaluated.",
+                reviewed_model_card=card,
+                finetuned_from_revision="base-revision",
+            )
+            assert destination.read_text(encoding="utf-8") == card.read_text(
+                encoding="utf-8"
+            )
+        else:
+            with pytest.raises(ValueError, match="safe complete provenance"):
+                utils._stage_model_card(
+                    destination=destination,
+                    finetuned_from="org/base-model",
+                    model_card_languages=["da", "en"],
+                    training_dataset_ids=["org/dataset"],
+                    training_sources=[_source("org/dataset")],
+                    evaluation_status="Not evaluated.",
+                    reviewed_model_card=card,
+                    finetuned_from_revision="base-revision",
+                )
