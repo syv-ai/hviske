@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import typing as t
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
+import soundfile as sf
 
 from hviske.p1_contracts import (
     NormalisationContract,
@@ -27,6 +29,7 @@ from hviske.p1_segments import (
     form_candidate_segments,
     normalise_alignment_text,
     prepare_source_audio,
+    segment_programme,
     stream_sha256,
     validate_output_shard,
     validate_raw_timestamps,
@@ -363,6 +366,42 @@ def test_source_audio_is_downmixed_and_resampled() -> None:
     assert result.shape == (16_000,)
     assert result.dtype == np.float32
     assert np.allclose(result, 0.0)
+
+
+def test_tail_duration_normalises_accepted_resampling_edges() -> None:
+    """A 1001 ms tail always encodes exactly 16,016 target samples."""
+
+    class CTC:
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, alignment_text, word_map, sampling_rate
+            return AlignmentResult(start_ms=start_ms, end_ms=end_ms, score=1.0)
+
+    for frame_count in (16_008, 16_016):
+        result = segment_programme(
+            words=(SourceWord(text="tail", start_ms=0, end_ms=1_001),),
+            audio=np.zeros(frame_count, dtype=np.float32),
+            source_file_id="source",
+            source_duration_ms=1_001,
+            segmentation=segmentation_contract(),
+            normalisation=NormalisationContract(version="test"),
+            ctc=CTC(),
+            pipeline_version="test",
+            pipeline_config_sha256=CONFIG_DIGEST,
+        )
+
+        assert len(result.rows) == 1
+        row = result.rows[0]
+        decoded, _ = sf.read(io.BytesIO(row.audio), dtype="float32")
+        assert row.duration_ms == 1_001
+        assert decoded.shape == (16_016,)
 
 
 def test_vad_ratio_and_edges() -> None:

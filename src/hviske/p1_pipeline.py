@@ -50,6 +50,7 @@ from hviske.p1_source import (
     _AUDIO_POINTER_METADATA_MAX_BYTES,
     AudioPointer,
     ParsedTranscript,
+    TranscriptOverAudio,
     TranscriptPointer,
     _scalar_metadata,
 )
@@ -1238,6 +1239,17 @@ def _process_native_programmes(
             ledger.start_processing(programme_id)
             try:
                 transcript = source.fetch_transcript(transcript_pointer)
+            except TranscriptOverAudio:
+                _reject_native_programme(
+                    ledger=ledger,
+                    report=report,
+                    log=log,
+                    programme_id=programme_id,
+                    source_file_id=file_id,
+                    reason=RejectionCategory.TRANSCRIPT_OVER_AUDIO.value,
+                )
+                purge_source_temporary(getattr(source, "last_temporary", None))
+                continue
             except InvalidSourceTimestamp:
                 _reject_native_programme(
                     ledger=ledger,
@@ -1389,7 +1401,11 @@ def _process_native_programmes(
                 continue
             enforce_scratch_cap(settings)
             try:
-                audio = _decoded_native_audio(parsed_audio, file_id=file_id)
+                audio = _decoded_native_audio(
+                    parsed_audio,
+                    file_id=file_id,
+                    max_decoded_audio_bytes=settings.max_decoded_audio_bytes,
+                )
                 duration = _decoded_duration_ms(
                     audio=audio,
                     sampling_rate=int(getattr(parsed_audio, "sampling_rate", 0)),
@@ -1421,6 +1437,17 @@ def _process_native_programmes(
                 _validate_native_timestamps(
                     words=transcript.words, duration_ms=duration
                 )
+            except TranscriptOverAudio:
+                _reject_native_programme(
+                    ledger=ledger,
+                    report=report,
+                    log=log,
+                    programme_id=programme_id,
+                    source_file_id=file_id,
+                    reason=RejectionCategory.TRANSCRIPT_OVER_AUDIO.value,
+                )
+                purge_source_temporary(getattr(source, "last_temporary", None))
+                continue
             except InvalidSourceTimestamp:
                 _reject_native_programme(
                     ledger=ledger,
@@ -1637,8 +1664,14 @@ def _decoded_duration_ms(*, audio: np.ndarray, sampling_rate: int) -> int:
     return (int(frames) * 1000 + sampling_rate // 2) // sampling_rate
 
 
-def _decoded_native_audio(parsed_audio: object, *, file_id: str) -> np.ndarray:
-    """Decode a native source payload through the source contract.
+def _decoded_native_audio(
+    parsed_audio: object, *, file_id: str, max_decoded_audio_bytes: int
+) -> np.ndarray:
+    """Decode and validate one native audio payload under the pipeline cap.
+
+    The source adapter is not trusted to enforce the bound: callers may inject a
+    predecoded ``ParsedAudio`` object, and compressed bytes may be returned by a
+    custom adapter. The final float32 array is therefore checked independently.
 
     Returns:
         A decoded source array; resampling is performed by ``segment_programme``.
@@ -1646,9 +1679,15 @@ def _decoded_native_audio(parsed_audio: object, *, file_id: str) -> np.ndarray:
     Raises:
         TypeError:
             If the source did not return a parsed array payload.
+        ValueError:
+            If the configured cap is not positive or the array shape is invalid.
+        DecodedAudioTooLarge:
+            If the decoded PCM exceeds the configured cap.
     """
-    from hviske.p1_source import ParsedAudio, parse_audio_row
+    from hviske.p1_source import DecodedAudioTooLarge, ParsedAudio, parse_audio_row
 
+    if max_decoded_audio_bytes <= 0:
+        raise ValueError("max_decoded_audio_bytes must be positive")
     if not isinstance(parsed_audio, ParsedAudio):
         raise TypeError("native source must return ParsedAudio")
     value = parsed_audio.value
@@ -1663,11 +1702,23 @@ def _decoded_native_audio(parsed_audio: object, *, file_id: str) -> np.ndarray:
                 },
             },
             expected_file_id=file_id,
+            max_decoded_audio_bytes=max_decoded_audio_bytes,
         )
         value = parsed_audio.value
     if not isinstance(value, np.ndarray):
         raise TypeError("native source audio must decode to an ndarray")
-    return np.asarray(value, dtype=np.float32)
+    if value.ndim not in (1, 2) or (value.ndim == 2 and value.shape[1] <= 0):
+        raise ValueError("native source audio has an invalid shape")
+    if value.size <= 0 or value.nbytes > max_decoded_audio_bytes:
+        raise DecodedAudioTooLarge("native source audio exceeds the configured limit")
+    decoded = np.asarray(value, dtype=np.float32)
+    if decoded.ndim not in (1, 2) or (decoded.ndim == 2 and decoded.shape[1] <= 0):
+        raise ValueError("native source audio has an invalid shape")
+    if decoded.size <= 0 or decoded.nbytes > max_decoded_audio_bytes:
+        raise DecodedAudioTooLarge("native source audio exceeds the configured limit")
+    if not np.isfinite(decoded).all():
+        raise ValueError("native source audio must be finite")
+    return decoded
 
 
 def _local_shard_from_record(record: object) -> object:
@@ -2009,8 +2060,9 @@ def _validate_native_timestamps(
 
     Raises:
         InvalidSourceTimestamp:
-            If a word is malformed, overlaps a previous word, or exceeds the decoded
-            programme duration.
+            If a word is malformed or overlaps a previous word.
+        TranscriptOverAudio:
+            If a word endpoint exceeds the decoded programme duration.
     """
     from hviske.p1_source import InvalidSourceTimestamp
 
@@ -2026,9 +2078,10 @@ def _validate_native_timestamps(
             or start < 0
             or end <= start
             or start < previous_end
-            or (duration_ms is not None and end > duration_ms)
         ):
             raise InvalidSourceTimestamp("source word timeline is invalid")
+        if duration_ms is not None and end > duration_ms:
+            raise TranscriptOverAudio("source word endpoint exceeds decoded audio")
         previous_end = end
 
 

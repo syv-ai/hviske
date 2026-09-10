@@ -168,6 +168,10 @@ class TranscriptIndexRejection:
     row_index: int
 
 
+class TranscriptOverAudio(InvalidSourceTimestamp):
+    """Raised when a valid transcript endpoint exceeds decoded source audio."""
+
+
 class _RemoteRowPointerMixin:
     """Provide one implementation for immutable remote row coordinates."""
 
@@ -1417,6 +1421,8 @@ def parse_transcript_row(
             If the row or one of its timed words is malformed.
         InvalidSourceTimestamp:
             If timed words cannot form a non-overlapping timeline.
+        TranscriptOverAudio:
+            If a timed word endpoint exceeds ``programme_duration_ms``.
     """
     file_id = _file_id(row)
     if file_id is None or (
@@ -1494,7 +1500,7 @@ def parse_transcript_row(
         if start < previous_end:
             raise InvalidSourceTimestamp(f"word {position} has an invalid span")
         if programme_duration_ms is not None and end > programme_duration_ms:
-            raise InvalidSourceTimestamp(f"word {position} lies outside source audio")
+            raise TranscriptOverAudio(f"word {position} lies outside source audio")
         previous_end = end
         timed_source_starts.append(source_start)
         speaker = raw.get("speaker_id", raw.get("speaker"))
@@ -1571,6 +1577,7 @@ __all__ = [
     "InvalidSourceRecord",
     "InvalidSourceTimestamp",
     "P1Source",
+    "TranscriptOverAudio",
     "ParsedAudio",
     "ParsedTranscript",
     "SourceError",

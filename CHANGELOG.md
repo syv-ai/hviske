@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Normalise accepted P1 audio to the deterministic millisecond-duration sample
+  boundary, enforce the configured decoded-audio cap for compressed and injected
+  arrays, and classify transcript endpoints beyond decoded audio separately from
+  structural timestamp defects.
 - Bound generic compressed-audio expansion by inspecting libsndfile headers and
   enforcing a configurable 2 GiB decoded float32 PCM cap before allocation; derive
   source duration from decoded frames, and validate transcript bounds against that
