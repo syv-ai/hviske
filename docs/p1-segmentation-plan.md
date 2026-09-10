@@ -35,8 +35,10 @@ bytes first and the frame count plus sampling rate supplies the authoritative
 programme duration. Transcript bounds are checked against that decoded duration.
 
 The source coordinates, alignment backend, model revision, normalisation rules, and
-pipeline version form the reproducibility identity. A change to any of them requires a
-new derived dataset revision and new deterministic segment identifiers.
+pipeline version form the reproducibility identity. The current implementation is
+`p1-segmentation-6`; it rejects proposal-duration and CTC-path-infeasible candidates
+before alignment. A change to any of these items requires a new derived dataset
+revision and new deterministic segment identifiers.
 
 ## Output contract
 
@@ -197,7 +199,8 @@ This catches clock drift and transcript insertions or omissions separately.
 Keep both raw backend scores and derived quality signals. A segment is publishable
 only when all of these gates pass:
 
-- decoded duration is above Hviske's minimum and below 10 seconds;
+- proposal and decoded duration are at least the configured minimum and below the
+  configured maximum (the maximum remains an exclusive bound);
 - text is non-empty and contains at least one trainable character;
 - timestamps are ordered and within the decoded source duration;
 - CTC alignment confidence exceeds the pilot threshold;
@@ -210,13 +213,18 @@ only when all of these gates pass:
 - `segment_id` is unique.
 
 The `ctc-segmentation` reference implementation scores an utterance from minima over
-chunk-level means of aligned frame probabilities. Store the exact backend, formula, revision,
-and raw inputs needed to interpret a score. These scales are not interchangeable;
-choose thresholds from the P1 pilot rather than copying a value across backends.
+chunk-level means of aligned frame probabilities. Before invoking its dynamic
+programming routine, compare the emission-frame count with the prepared ground-truth
+path length (which includes separator and repeated-token transitions). Reject an
+infeasible proposal as `ctc_alignment_failed`; this is a terminal data condition, not
+a model or programming failure. Store the exact backend, formula, revision, and raw
+inputs needed to interpret a score. These scales are not interchangeable; choose
+thresholds from the P1 pilot rather than copying a value across backends.
 
 Do not silently repair unsupported or mismatched text. Record rejection categories
-such as `empty_text`, `invalid_timestamps`, `low_alignment_score`, `excessive_drift`,
-`low_speech_ratio`, `speaker_overlap`, `boundary_clipping`, and `decode_error`.
+such as `empty_text`, `duration_out_of_range`, `ctc_alignment_failed`,
+`invalid_timestamps`, `low_alignment_score`, `excessive_drift`, `low_speech_ratio`,
+`speaker_overlap`, `boundary_clipping`, and `decode_error`.
 
 ## Bounded processing and publication
 
