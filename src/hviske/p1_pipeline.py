@@ -28,6 +28,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from hviske.p1_contracts import (
+    OUTPUT_SCHEMA,
     P1_RUNTIME_CONTRACT,
     CanonicalIdentityManifest,
     CTCContract,
@@ -47,7 +48,13 @@ from hviske.p1_contracts import (
     validate_p1_runtime_contract,
 )
 from hviske.p1_ledger import Ledger
-from hviske.p1_segments import CTCBackend, VADBackend, segment_programme, write_shards
+from hviske.p1_segments import (
+    CTCBackend,
+    TimestampAlignmentBackend,
+    VADBackend,
+    segment_programme,
+    write_shards,
+)
 from hviske.p1_source import (
     _AUDIO_POINTER_METADATA_KEY,
     _AUDIO_POINTER_METADATA_MAX_BYTES,
@@ -90,6 +97,7 @@ class PipelineSettings:
     source_audio_revision: str
     source_transcript_repository: str
     source_transcript_revision: str
+    alignment_method: str
     ctc_model_repository: str
     ctc_model_revision: str
     anomaly_model_repository: str
@@ -110,6 +118,10 @@ class PipelineSettings:
 
         Returns:
             Resolved pipeline settings with a canonical digest.
+
+        Raises:
+            ValueError:
+                If the v7 runtime, output schema, or immutable identity is invalid.
         """
         config_object = (
             config if isinstance(config, DictConfig) else OmegaConf.create(config)
@@ -138,6 +150,9 @@ class PipelineSettings:
         manifest = CanonicalIdentityManifest(
             schema_version=str(root["schema_version"]),
             pipeline_version=str(root["pipeline_version"]),
+            alignment_method=str(
+                root.get("alignment_method", "timestamp-native:p1-transcripts.words")
+            ),
             source=SourceCoordinates.model_validate(source),
             vad=VADContract(
                 name=str(vad_raw["name"]),
@@ -189,13 +204,19 @@ class PipelineSettings:
         validate_p1_runtime_contract(
             pipeline_version=manifest.pipeline_version,
             ctc=manifest.ctc,
+            alignment_method=manifest.alignment_method,
             normalisation=manifest.normalisation,
             dataset_license=manifest.dataset_license,
         )
+        if manifest.schema_version != OUTPUT_SCHEMA.schema_version:
+            raise ValueError("P1 output schema version must be p1-segments-v2")
+        if manifest.output.schema != OUTPUT_SCHEMA:
+            raise ValueError("P1 output schema must match the active v7 schema")
         digest = pipeline_config_sha256(manifest)
         return cls(
             mode=str(root.get("mode", "build")),
             pipeline_version=str(root["pipeline_version"]),
+            alignment_method=manifest.alignment_method,
             scratch_root=Path(str(runtime["scratch_root"])).expanduser().resolve(),
             max_source_bytes=_as_int(max_source),
             max_scratch_bytes=_as_int(max_scratch),
@@ -502,7 +523,9 @@ def directory_size(root: Path) -> int:
     )
 
 
-def target_privacy(hub: object | None, repo_id: str) -> dict[str, object]:
+def target_privacy(
+    hub: object | None, repo_id: str, expected_digest: str | None = None
+) -> dict[str, object]:
     """Report target access while allowing a missing target during planning.
 
     Returns:
@@ -526,12 +549,46 @@ def target_privacy(hub: object | None, repo_id: str) -> dict[str, object]:
         if isinstance(info, dict)
         else getattr(info, "private", None)
     )
+    contract_v7 = _target_card_is_v7(
+        hub=hub, repo_id=repo_id, expected_digest=expected_digest
+    )
     return {
         "checked": True,
         "present": True,
         "private": private is True,
+        "contract_v7": contract_v7,
         "repo_id": repo_id,
     }
+
+
+def _target_card_is_v7(
+    *, hub: object | None, repo_id: str, expected_digest: str | None
+) -> bool:
+    """Check the remote card without retaining its text in pipeline state.
+
+    Returns:
+        Whether the remote card proves the active v7 identity.
+    """
+    reader = getattr(hub, "stream_file", None)
+    if not callable(reader):
+        return False
+    try:
+        payload = b"".join(
+            reader(repo_id, "README.md", repo_type="dataset", revision="main")
+        )
+        card = payload.decode("utf-8")
+    except Exception:
+        return False
+    required = (
+        "pipeline_version: p1-segmentation-7",
+        "timestamp-native:p1-transcripts.words",
+        "p1-segments-v2",
+    )
+    if not all(marker in card for marker in required):
+        return False
+    return expected_digest is None or (
+        f"pipeline_config_sha256: {expected_digest}" in card
+    )
 
 
 def _run_native_pipeline(
@@ -1513,14 +1570,23 @@ def _process_native_programmes(
                 words=tuple(transcript.words),
                 transcript_text=transcript.text,
             )
-            if vad is None:
-                logger.info("P1 model stage: loading VAD backend")
-                vad = make_silero_vad(settings)
-                logger.info("P1 model stage: VAD backend ready")
-            if ctc is None:
-                logger.info("P1 model stage: loading CTC backend")
-                ctc = make_ctc_backend(settings)
-                logger.info("P1 model stage: CTC backend ready")
+            if settings.alignment_method == "timestamp-native:p1-transcripts.words":
+                # P1 v7 deliberately consumes the source word timestamps.  Keep the
+                # generic model-backed path below intact for future datasets, but do
+                # not even construct its backends for the active source.
+                active_vad = None
+                active_ctc: CTCBackend = TimestampAlignmentBackend()
+            else:
+                if vad is None:
+                    logger.info("P1 model stage: loading VAD backend")
+                    vad = make_silero_vad(settings)
+                    logger.info("P1 model stage: VAD backend ready")
+                if ctc is None:
+                    logger.info("P1 model stage: loading CTC backend")
+                    ctc = make_ctc_backend(settings)
+                    logger.info("P1 model stage: CTC backend ready")
+                active_vad = vad
+                active_ctc = ctc
             result = segment_programme(
                 words=programme.words,
                 audio=audio,
@@ -1528,10 +1594,10 @@ def _process_native_programmes(
                 source_duration_ms=programme.duration_ms,
                 segmentation=settings.segmentation,
                 normalisation=settings.normalisation,
-                ctc=ctc,
+                ctc=active_ctc,
                 pipeline_version=settings.pipeline_version,
                 pipeline_config_sha256=settings.pipeline_digest,
-                vad=vad,
+                vad=active_vad,
                 sampling_rate=parsed_audio.sampling_rate,
                 channels=parsed_audio.channels,
                 source_locator={
@@ -1835,8 +1901,20 @@ def publish_pending(
     Raises:
         ValueError:
             If the batch has no local shards.
+        P1PreflightError:
+            If the target card does not prove the active v7 contract.
     """
     from hviske.p1_publish import HubClient, LocalShard, publish_batch
+
+    if settings.alignment_method == "timestamp-native:p1-transcripts.words":
+        if not _target_card_is_v7(
+            hub=hub,
+            repo_id=settings.target_private_repo,
+            expected_digest=settings.pipeline_digest,
+        ):
+            raise P1PreflightError(
+                "refusing payload commit: target card is not the P1 v7 contract"
+            )
 
     shards = t.cast(c.Sequence[LocalShard], pending)
     try:
@@ -1951,6 +2029,10 @@ def publish_pending(
             if ledger.programme(programme_id).state is _state("verified"):
                 ledger.transition_programme(programme_id, _state("purged"))
     return evidence
+
+
+class P1PreflightError(RuntimeError):
+    """Raised when a safety gate fails before source audio retrieval."""
 
 
 def _record_audit_candidates(
@@ -2142,10 +2224,6 @@ def enforce_scratch_cap(settings: PipelineSettings) -> None:
     """
     if directory_size(settings.scratch_root) > settings.max_scratch_bytes:
         raise P1PreflightError("scratch hard cap exceeded")
-
-
-class P1PreflightError(RuntimeError):
-    """Raised when a safety gate fails before source audio retrieval."""
 
 
 def make_ctc_backend(settings: PipelineSettings) -> CTCBackend:
@@ -2347,7 +2425,14 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
         permitted_use="Private commercial data preparation and model training only.",
         private_access_terms="Access is restricted to authorised syv.ai members.",
         alignment_method=(
-            "Pinned Silero VAD and CoRal Røst-v3 Wav2Vec2 CTC segmentation; "
+            "pipeline_version: p1-segmentation-7; "
+            "alignment_method: timestamp-native:p1-transcripts.words; "
+            f"pipeline_config_sha256: {settings.pipeline_digest}; "
+            "Source word timestamps from syvai/p1-transcripts/words are authoritative; "
+            "boundaries are the first timed word start and last timed word end; "
+            "no VAD, CTC, acoustic score, drift, model, or CUDA evidence is used. "
+            "Legacy pinned Silero VAD and CoRal Røst-v3 Wav2Vec2 CTC metadata remains "
+            "retained for future datasets; "
             f"the {P1_RUNTIME_CONTRACT.roest_tokenizer_case} Roest tokenizer uses "
             f"{P1_RUNTIME_CONTRACT.normalisation_unicode_form} case-folded canonical "
             f"alignment text ({P1_RUNTIME_CONTRACT.normalisation_version}), with "
@@ -2362,12 +2447,15 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
             f"CTC model is {P1_RUNTIME_CONTRACT.roest_license}/OpenRAIL-M metadata, "
             "not Apache-2.0. Roest model weights are internal and are not distributed."
         ),
-        field_schema="p1-segments-v1 OutputRow schema.",
-        known_limitations="Pilot thresholds and anomaly statistics require review.",
+        field_schema=(
+            "p1-segments-v2 OutputRow schema; alignment_score, drift, and VAD "
+            "evidence are nullable and not applicable to timestamp-native rows."
+        ),
+        known_limitations="Timestamp quality is limited by the source word timestamps.",
         rejection_policy=(
-            "Invalid, empty, short or overlong proposals, CTC-infeasible alignment "
-            "windows, low-confidence, and undecodable programmes are recorded in "
-            "the ledger; unexpected model and programming failures remain fatal."
+            "Invalid, empty, short or overlong timestamp proposals, source timeline "
+            "defects, speaker mixing, and undecodable programmes are recorded in the "
+            "ledger; unexpected source and programming failures remain fatal."
         ),
         source_revisions=json.dumps(
             {
@@ -2451,7 +2539,16 @@ def preflight_pipeline(
     }
     # The source plan has already resolved both immutable repository revisions.
     source_revision_ok = True
-    model_revision_ok = check_model_revisions(source, settings.model_revisions)
+    timestamp_native = settings.alignment_method == (
+        "timestamp-native:p1-transcripts.words"
+    )
+    # The v7 path has no model or device dependency.  In particular, do not call
+    # the legacy revision verifier: it may inspect Hub model metadata and VAD blobs.
+    model_revision_ok = (
+        True
+        if timestamp_native
+        else check_model_revisions(source, settings.model_revisions)
+    )
     required = calculate_scratch_requirement(
         settings=settings,
         maximum_source_bytes=maximum_source_bytes,
@@ -2469,8 +2566,12 @@ def preflight_pipeline(
         raise P1PreflightError(
             f"insufficient free space: need {required}, have {free_bytes}"
         )
-    target = target_privacy(hub, settings.target_private_repo)
-    cuda = cuda_status(settings.device)
+    target = target_privacy(hub, settings.target_private_repo, settings.pipeline_digest)
+    cuda = (
+        {"checked": False, "reason": "not_applicable:timestamp-native"}
+        if timestamp_native
+        else cuda_status(settings.device)
+    )
     checks = {
         "source_revisions": source_revision_ok,
         "model_revisions": model_revision_ok,
@@ -2479,8 +2580,11 @@ def preflight_pipeline(
         "scratch_quota": scratch_bytes <= settings.max_scratch_bytes,
         "scratch_budget": scratch_bytes + required <= settings.max_scratch_bytes,
         "source_object_cap": maximum_source_bytes <= settings.max_source_bytes,
-        "cuda_device_checked": bool(cuda.get("checked", False)),
+        "cuda_device_checked": (
+            True if timestamp_native else bool(cuda.get("checked", False))
+        ),
         "target_checked": bool(target.get("checked", False)),
+        "target_contract_v7": bool(target.get("contract_v7", False)),
     }
     if not source_revision_ok:
         raise P1PreflightError("source revision is not available at the pinned SHA")
@@ -2488,6 +2592,12 @@ def preflight_pipeline(
         raise P1PreflightError("model revision is not available at the pinned SHA")
     if settings.mode != "plan" and not target.get("private", False):
         raise P1PreflightError("target repository is not demonstrably private")
+    if settings.mode not in {"plan", "initialise"} and not target.get(
+        "contract_v7", False
+    ):
+        raise P1PreflightError(
+            "target card does not prove the P1 v7 timestamp-native contract"
+        )
     return PreflightReport(
         mode=settings.mode,
         selected_programmes=selected_programmes,

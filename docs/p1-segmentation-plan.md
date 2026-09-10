@@ -34,11 +34,12 @@ metadata is only a planning hint: for embedded compressed audio, libsndfile deco
 bytes first and the frame count plus sampling rate supplies the authoritative
 programme duration. Transcript bounds are checked against that decoded duration.
 
-The source coordinates, alignment backend, model revision, normalisation rules, and
-pipeline version form the reproducibility identity. The current implementation is
-`p1-segmentation-6`; it rejects proposal-duration and CTC-path-infeasible candidates
-before alignment. A change to any of these items requires a new derived dataset
-revision and new deterministic segment identifiers.
+The source coordinates, alignment method, retained legacy pins, normalisation rules,
+output schema, and pipeline version form the reproducibility identity. The active
+implementation is `p1-segmentation-7` with method
+`timestamp-native:p1-transcripts.words`. A change to any of these items requires a
+new derived dataset revision and new deterministic segment identifiers. Existing v6
+outputs are not mixed with v7 and will be deleted and recreated remotely.
 
 ## Output contract
 
@@ -57,30 +58,32 @@ Each `train` row has these fields:
 | `language` | string | Always `da`. |
 | `segment_id` | string | Deterministic content and provenance identifier. |
 | `source_file_id` | string | P1 programme join key. |
-| `source_start_ms` | int64 | Final clip start in the source programme. |
-| `source_end_ms` | int64 | Final clip end in the source programme. |
+| `source_start_ms` | int64 | Exact first timed-word start in the source programme. |
+| `source_end_ms` | int64 | Exact last timed-word end in the source programme. |
 | `source_duration_ms` | int64 | Authoritative decoded source-programme duration. |
 | `duration_ms` | int32 | Exact decoded clip duration. |
 | `speaker_ids` | list[string] | Speakers represented in the clip. |
 | `proposal_start_ms` | int64 | Start from the supplied word timestamps. |
 | `proposal_end_ms` | int64 | End from the supplied word timestamps. |
-| `alignment_score` | float32 | Backend-specific segment confidence. |
-| `alignment_score_type` | string | Pinned score algorithm and scale. |
-| `start_drift_ms` | int32 | Final start minus proposal start. |
-| `end_drift_ms` | int32 | Final end minus proposal end. |
-| `vad_speech_ratio` | float32 | Fraction of the final clip classified as speech. |
-| `alignment_backend` | string | Pinned aligner and model identity. |
-| `pipeline_version` | string | Human-readable segmentation-contract version. |
+| `alignment_score` | float32, nullable | Acoustic confidence; null for timestamp-native rows. |
+| `alignment_score_type` | string | `not_applicable:source_timestamps` for v7 rows. |
+| `start_drift_ms` | int32, nullable | Null for timestamp-native rows. |
+| `end_drift_ms` | int32, nullable | Null for timestamp-native rows. |
+| `vad_speech_ratio` | float32, nullable | Null because v7 does not run VAD. |
+| `alignment_backend` | string | `timestamp-native` for v7 rows. |
+| `alignment_method` | string | `timestamp-native:p1-transcripts.words`. |
+| `pipeline_version` | string | `p1-segmentation-7`. |
 | `pipeline_config_sha256` | string | Digest of the complete identity manifest. |
 
 Do not include credentials, cache paths, machine names, or transient job identifiers.
 Preserve enough provenance to reproduce or audit every segment.
 
-First build a canonical identity manifest containing source and code revisions, VAD and
-aligner code and model revisions, text normalisation, segmentation and quality
-thresholds, output encoding, and schema version. Serialise it with UTF-8, Unicode NFC,
-sorted keys, no insignificant whitespace, JSON escaping, and exact numeric types. Store
-its SHA-256 digest as `pipeline_config_sha256`.
+First build a canonical identity manifest containing source and code revisions, the
+active timestamp method, retained legacy VAD/CTC/model pins, text normalisation,
+segmentation thresholds, output encoding, and schema version. Serialise it with UTF-8,
+Unicode NFC, sorted keys, no insignificant whitespace, JSON escaping, and exact numeric
+types. Store its SHA-256 digest as `pipeline_config_sha256`. The target card must
+repeat the v7 method, schema, and digest before any payload commit.
 
 Build `segment_id` from a second canonical JSON object containing that digest,
 `source_file_id`, final integer millisecond boundaries, and exact published `text`.
@@ -107,20 +110,13 @@ Normalise timestamps into one monotonic millisecond timebase. Reject a programme
 before alignment when timestamps are missing, non-finite, outside the audio duration,
 or substantially non-monotonic. Record the exact rejection reason in the ledger.
 
-Create a canonical `alignment_text` separately from the verbatim training text. Record
-a reversible mapping from every retained alignment unit to its exact owned source-text
-chunk. The mapping
-must make case folding, punctuation removal, number expansion, unsupported characters,
-and optional romanisation auditable. The pinned Roest tokenizer is lowercase-only, so
-P1 normalisation version 5 requires case folding for canonical CTC text. Published
-`text`, source spans, and the word map remain verbatim and case-preserving; never infer
-published text by reversing aligner normalisation. Untimed and zero-duration lexical
-records use bounded, per-transcript ownership lookahead: leading and interior text
-belongs to the following positive-duration word, while terminal text belongs to the
-final previous word. Ownership is accepted only when its speaker evidence is
-consistent with that anchor; a missing token speaker is accepted between two
-same-speaker anchors. Zero-duration points at either closed gap boundary are valid.
-Owned lexical text remains in both the exact candidate text and canonical CTC text.
+For v7, the positive-duration records in the source `words` feature are the alignment
+units. The exact candidate `text` remains verbatim and retains all separator,
+untimed, and zero-duration ownership. Leading and interior text belongs to the
+following positive-duration word, while terminal text belongs to the final previous
+word; ownership is accepted only with speaker-consistent bounded lookahead. No
+normalisation, VAD, CTC, acoustic score, drift correction, or model loading occurs on
+this path. The generic canonical CTC path remains in the codebase for future datasets.
 
 ### Form candidate segments
 
@@ -128,9 +124,8 @@ Build candidates from consecutive words with these rules:
 
 - Target speech-bearing clips between 2 and 8 seconds.
 - Enforce a final duration below 10 seconds, never equal to 10 seconds.
-- Prefer punctuation, speaker changes, and VAD silence as boundaries.
-- Do not cross a speaker change unless the pilot proves that the supplied speaker
-  labels are too noisy to use safely.
+- Prefer punctuation and source timestamp gaps as boundaries.
+- Never cross a speaker change.
 - Do not split a word or duplicate a word across adjacent candidates.
 - Add bounded context around each proposal for alignment, but remove it from the
   published clip.
@@ -139,16 +134,18 @@ Build candidates from consecutive words with these rules:
 The exact target duration, context, and silence thresholds are pilot parameters, not
 hard-coded assumptions. Store them in a versioned configuration file.
 
-### Refine with VAD and CTC alignment
+### Timestamp-native alignment
 
-Run a pinned, offline VAD model over the programme once. Use VAD to snap proposal
-edges to nearby silence and reject low-speech-coverage clips. VAD is a boundary and
-speech-coverage signal, not a transcript, music, or noise classifier. Apply any music
-or noise rejection through a separate pinned heuristic or classifier validated in the
-pilot.
+The active v7 path uses no refinement model. It accepts each speaker-safe candidate
+when its duration is in the half-open range 1,000 ms <= duration < 10,000 ms and
+publishes boundaries exactly at the first timed word start and last timed word end.
+The source audio clock is authoritative, and the terminal source word endpoint is
+validated against decoded audio before segmentation.
 
-Refine and verify each local candidate with a Danish-capable CTC forced aligner. The
-implementation uses the pinned `ctc-segmentation` source and the
+The following legacy VAD and CTC material is retained unchanged for future datasets;
+it is not constructed, verified, or invoked by v7. Refine and verify each local
+candidate with a Danish-capable CTC forced aligner only when implementing that future
+path. The legacy implementation uses the pinned `ctc-segmentation` source and the
 [`CoRal-project/roest-v3-wav2vec2-315m`](https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m)
 checkpoint at `beb3e790246d6b9dec1df596b0b21d5c42f4d99c`. Its
 `Wav2Vec2ForCTC`/`wav2vec2` configuration has a 16 kHz processor and a 320-sample
@@ -203,10 +200,9 @@ only when all of these gates pass:
   configured maximum of 10,000 ms (the maximum remains an exclusive bound);
 - text is non-empty and contains at least one trainable character;
 - timestamps are ordered and within the decoded source duration;
-- CTC alignment confidence exceeds the pilot threshold;
-- proposal-to-final drift is within the pilot limit;
-- VAD speech ratio exceeds the pilot threshold;
-- boundary speech clipping is below the pilot threshold;
+- timestamp boundaries are the exact first/last timed word endpoints;
+- source word ownership is complete, contiguous, speaker-safe, and terminally valid;
+- acoustic, drift, and VAD fields are null rather than fabricated for v7;
 - no word is duplicated or dropped within an accepted contiguous transcript region;
 - speaker-overlap and music heuristics pass;
 - FLAC encoding and a fresh 16 kHz mono decode succeed;

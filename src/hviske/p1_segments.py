@@ -37,39 +37,8 @@ from .p1_contracts import (
 )
 
 
-@dataclass(frozen=True)
-class AlignmentResult:
-    """CTC boundaries and score for one candidate.
-
-    Boundaries are absolute programme-relative milliseconds.  ``word_boundaries``
-    contains optional absolute spans and scores for the normalised units.
-    """
-
-    start_ms: int
-    end_ms: int
-    score: float
-    score_type: str = "ctc-segmentation:min_chunk_mean"
-    word_boundaries: tuple[tuple[int, int, float], ...] = ()
-    raw_score_inputs: tuple[float, ...] = ()
-
-
 class CTCAlignmentInfeasible(ValueError):
     """Raised when an emission window cannot represent the CTC target path."""
-
-
-class CTCBackend(t.Protocol):
-    """Injectable CTC forced-alignment implementation."""
-
-    def align(
-        self,
-        audio: np.ndarray,
-        alignment_text: str,
-        word_map: tuple[str, ...],
-        start_ms: int,
-        end_ms: int,
-        sampling_rate: int,
-    ) -> AlignmentResult:
-        """Align one local candidate and return absolute boundaries."""
 
 
 @dataclass(frozen=True)
@@ -78,8 +47,8 @@ class CandidateDecision:
 
     row: OutputRow | None
     rejection: str | None = None
-    start_drift_ms: int = 0
-    end_drift_ms: int = 0
+    start_drift_ms: int | None = None
+    end_drift_ms: int | None = None
     correction_count: int = 0
 
 
@@ -130,6 +99,61 @@ class ShardBatchResult:
 
     shards: tuple[ShardWriteResult, ...]
     source_recoverable: bool
+
+
+@dataclass(frozen=True)
+class AlignmentResult:
+    """CTC boundaries and score for one candidate.
+
+    Boundaries are absolute programme-relative milliseconds.  ``word_boundaries``
+    contains optional absolute spans and scores for the normalised units.
+    """
+
+    start_ms: int
+    end_ms: int
+    score: float | None
+    score_type: str = "ctc-segmentation:min_chunk_mean"
+    word_boundaries: tuple[tuple[int, int, float], ...] = ()
+    raw_score_inputs: tuple[float, ...] = ()
+
+
+class CTCBackend(t.Protocol):
+    """Injectable CTC forced-alignment implementation."""
+
+    def align(
+        self,
+        audio: np.ndarray,
+        alignment_text: str,
+        word_map: tuple[str, ...],
+        start_ms: int,
+        end_ms: int,
+        sampling_rate: int,
+    ) -> AlignmentResult:
+        """Align one local candidate and return absolute boundaries."""
+
+
+class TimestampAlignmentBackend:
+    """Use the source transcript's positive-duration word timestamps directly."""
+
+    alignment_method = "timestamp-native:p1-transcripts.words"
+
+    def align(
+        self,
+        audio: np.ndarray,
+        alignment_text: str,
+        word_map: tuple[str, ...],
+        start_ms: int,
+        end_ms: int,
+        sampling_rate: int,
+    ) -> AlignmentResult:
+        """Return the exact source interval without inspecting acoustic features."""
+        del audio, alignment_text, word_map, sampling_rate
+        return AlignmentResult(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            score=None,
+            score_type="not_applicable:source_timestamps",
+        )
 
 
 class UnsupportedAlignmentText(ValueError):
@@ -799,7 +823,11 @@ def segment_programme(
     channels: int | None = None,
     source_locator: c.Mapping[str, object] | None = None,
 ) -> SegmentationResult:
-    """Run bounded proposal, VAD, CTC, correction, filtering, and encoding.
+    """Run bounded proposal, optional legacy alignment, filtering, and encoding.
+
+    ``TimestampAlignmentBackend`` is the active P1 v7 backend. It returns the
+    proposal's source word endpoints and deliberately supplies no acoustic evidence.
+    The injectable VAD/CTC path remains available for future datasets.
 
     Returns:
         Accepted rows, rejection categories, and correction evidence.
@@ -882,38 +910,58 @@ def segment_programme(
         ):
             reject(proposal, RejectionCategory.DURATION_OUT_OF_RANGE.value)
             continue
-        canonical = normalise_alignment_text(
-            words=validated[proposal.word_start_index : proposal.word_end_index],
-            contract=normalisation,
+        timestamp_native = getattr(ctc, "alignment_method", None) == (
+            "timestamp-native:p1-transcripts.words"
         )
-        if not canonical.text:
-            reject(proposal, RejectionCategory.EMPTY_TEXT.value)
-            continue
+        if timestamp_native:
+            alignment_text = proposal.text
+            selected_words = validated[
+                proposal.word_start_index : proposal.word_end_index
+            ]
+            alignment_word_map = tuple(
+                word.separator_text
+                + word.text
+                + (word.trailing_text if index == len(selected_words) - 1 else "")
+                for index, word in enumerate(selected_words)
+            )
+        else:
+            canonical = normalise_alignment_text(
+                words=validated[proposal.word_start_index : proposal.word_end_index],
+                contract=normalisation,
+            )
+            if not canonical.text:
+                reject(proposal, RejectionCategory.EMPTY_TEXT.value)
+                continue
+            alignment_text = canonical.text
+            alignment_word_map = canonical.word_map
         local_audio = values[
             proposal.proposal_start_ms * 16 : proposal.proposal_end_ms * 16
         ]
         try:
             first = ctc.align(
                 audio=local_audio,
-                alignment_text=canonical.text,
-                word_map=canonical.word_map,
+                alignment_text=alignment_text,
+                word_map=alignment_word_map,
                 start_ms=proposal.proposal_start_ms,
                 end_ms=proposal.proposal_end_ms,
                 sampling_rate=16000,
             )
-            final_alignment, applied = correct_drift_once(
-                proposal=proposal,
-                first_alignment=first,
-                maximum_drift_ms=segmentation.maximum_drift_ms,
-                realign=lambda start, end: ctc.align(
-                    audio=values[start * 16 : end * 16],
-                    alignment_text=canonical.text,
-                    word_map=canonical.word_map,
-                    start_ms=start,
-                    end_ms=end,
-                    sampling_rate=16000,
-                ),
-            )
+            if timestamp_native:
+                final_alignment, applied = first, 0
+            else:
+                final_alignment, applied = correct_drift_once(
+                    proposal=proposal,
+                    first_alignment=first,
+                    maximum_drift_ms=segmentation.maximum_drift_ms,
+                    realign=lambda start, end: ctc.align(
+                        audio=values[start * 16 : end * 16],
+                        alignment_text=alignment_text,
+                        word_map=alignment_word_map,
+                        start_ms=start,
+                        end_ms=end,
+                        sampling_rate=16000,
+                    ),
+                )
         except UnsupportedAlignmentText:
             reject(proposal, RejectionCategory.UNSUPPORTED_TEXT.value)
             continue
@@ -921,7 +969,7 @@ def segment_programme(
             reject(proposal, RejectionCategory.CTC_ALIGNMENT_FAILED.value)
             continue
         correction_count += applied
-        if vad_signal is not None:
+        if vad_signal is not None and not timestamp_native:
             snapped_start, snapped_end = vad_signal.snap_edges(
                 start_ms=final_alignment.start_ms, end_ms=final_alignment.end_ms
             )
@@ -941,10 +989,15 @@ def segment_programme(
             pipeline_version=pipeline_version,
             pipeline_config_sha256=pipeline_config_sha256,
             segmentation=segmentation,
-            vad_signal=vad_signal,
-            alignment_backend=type(ctc).__name__,
-            alignment_text=canonical.text,
-            alignment_word_map=canonical.word_map,
+            vad_signal=None if timestamp_native else vad_signal,
+            alignment_backend=(
+                "timestamp-native" if timestamp_native else type(ctc).__name__
+            ),
+            alignment_method=(
+                "timestamp-native:p1-transcripts.words" if timestamp_native else None
+            ),
+            alignment_text=alignment_text,
+            alignment_word_map=alignment_word_map,
         )
         if decision.row is None:
             reject(proposal, decision.rejection or "rejected")
@@ -1036,6 +1089,7 @@ def make_output_row(
     segmentation: SegmentationContract,
     vad_signal: VADSignal | None = None,
     alignment_backend: str = "ctc-segmentation",
+    alignment_method: str | None = None,
     alignment_text: str | None = None,
     alignment_word_map: tuple[str, ...] | None = None,
 ) -> CandidateDecision:
@@ -1066,9 +1120,14 @@ def make_output_row(
         return CandidateDecision(
             row=None, rejection=RejectionCategory.UNSUPPORTED_TEXT.value
         )
-    drift_start = final_start - proposal.proposal_start_ms
-    drift_end = final_end - proposal.proposal_end_ms
-    if max(abs(drift_start), abs(drift_end)) > segmentation.maximum_drift_ms:
+    timestamp_native = alignment_method == "timestamp-native:p1-transcripts.words"
+    drift_start = None if timestamp_native else final_start - proposal.proposal_start_ms
+    drift_end = None if timestamp_native else final_end - proposal.proposal_end_ms
+    if (
+        drift_start is not None
+        and drift_end is not None
+        and max(abs(drift_start), abs(drift_end)) > segmentation.maximum_drift_ms
+    ):
         return CandidateDecision(
             row=None,
             rejection=RejectionCategory.EXCESSIVE_DRIFT.value,
@@ -1076,16 +1135,20 @@ def make_output_row(
             end_drift_ms=drift_end,
         )
     if (
-        not math.isfinite(alignment.score)
-        or alignment.score < segmentation.minimum_alignment_score
+        not timestamp_native
+        and alignment.score is not None
+        and (
+            not math.isfinite(alignment.score)
+            or alignment.score < segmentation.minimum_alignment_score
+        )
     ):
         return CandidateDecision(
             row=None, rejection=RejectionCategory.LOW_ALIGNMENT_SCORE.value
         )
     ratio = (
-        1.0 if vad_signal is None else vad_signal.speech_ratio(final_start, final_end)
+        None if vad_signal is None else vad_signal.speech_ratio(final_start, final_end)
     )
-    if ratio < segmentation.minimum_vad_speech_ratio:
+    if ratio is not None and ratio < segmentation.minimum_vad_speech_ratio:
         return CandidateDecision(
             row=None, rejection=RejectionCategory.LOW_SPEECH_RATIO.value
         )
@@ -1123,13 +1186,16 @@ def make_output_row(
         speaker_ids=proposal.speaker_ids,
         proposal_start_ms=proposal.proposal_start_ms,
         proposal_end_ms=proposal.proposal_end_ms,
-        alignment_score=float(alignment.score),
+        alignment_score=(None if alignment.score is None else float(alignment.score)),
         alignment_score_type=alignment.score_type,
         start_drift_ms=drift_start,
         end_drift_ms=drift_end,
-        vad_speech_ratio=float(ratio),
+        vad_speech_ratio=None if ratio is None else float(ratio),
         alignment_backend=alignment_backend,
         pipeline_version=pipeline_version,
+        alignment_method=(
+            alignment_method if alignment_method is not None else "ctc-segmentation"
+        ),
         pipeline_config_sha256=pipeline_config_sha256,
     )
     return CandidateDecision(
@@ -1274,6 +1340,22 @@ def validate_output_shard(path: Path) -> None:
                 raise ValueError("decoded audio length does not match duration_ms")
             if row["source_end_ms"] - row["source_start_ms"] != row["duration_ms"]:
                 raise ValueError("source interval does not match duration_ms")
+            if row.get("pipeline_version") == "p1-segmentation-7":
+                if row.get("alignment_method") != (
+                    "timestamp-native:p1-transcripts.words"
+                ):
+                    raise ValueError(
+                        "v7 row does not declare timestamp-native alignment"
+                    )
+                if (
+                    row.get("source_start_ms") != row.get("proposal_start_ms")
+                    or row.get("source_end_ms") != row.get("proposal_end_ms")
+                    or row.get("alignment_score") is not None
+                    or row.get("start_drift_ms") is not None
+                    or row.get("end_drift_ms") is not None
+                    or row.get("vad_speech_ratio") is not None
+                ):
+                    raise ValueError("v7 row contains non-native alignment evidence")
 
 
 def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
@@ -1305,6 +1387,7 @@ def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
             ("end_drift_ms", pa.int32()),
             ("vad_speech_ratio", pa.float32()),
             ("alignment_backend", pa.string()),
+            ("alignment_method", pa.string()),
             ("pipeline_version", pa.string()),
             ("pipeline_config_sha256", pa.string()),
         ]
@@ -1337,6 +1420,7 @@ def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
         "end_drift_ms": {"dtype": "int32", "_type": "Value"},
         "vad_speech_ratio": {"dtype": "float32", "_type": "Value"},
         "alignment_backend": {"dtype": "string", "_type": "Value"},
+        "alignment_method": {"dtype": "string", "_type": "Value"},
         "pipeline_version": {"dtype": "string", "_type": "Value"},
         "pipeline_config_sha256": {"dtype": "string", "_type": "Value"},
     }
@@ -1366,6 +1450,7 @@ def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
             "end_drift_ms": [row.end_drift_ms for row in rows],
             "vad_speech_ratio": [row.vad_speech_ratio for row in rows],
             "alignment_backend": [row.alignment_backend for row in rows],
+            "alignment_method": [row.alignment_method for row in rows],
             "pipeline_version": [row.pipeline_version for row in rows],
             "pipeline_config_sha256": [row.pipeline_config_sha256 for row in rows],
         },

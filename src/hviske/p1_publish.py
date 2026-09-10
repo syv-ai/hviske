@@ -1005,6 +1005,22 @@ def _validate_row(row: object, shard_path: str) -> None:
         raise VerificationError(f"source duration is inconsistent: {shard_path}")
     if decoded.shape[0] != duration * 16:
         raise VerificationError(f"decoded duration is inconsistent: {shard_path}")
+    if row.get("pipeline_version") == "p1-segmentation-7":
+        if row.get("alignment_method") != "timestamp-native:p1-transcripts.words":
+            raise VerificationError(
+                f"v7 row does not declare timestamp-native alignment: {shard_path}"
+            )
+        if (
+            row.get("source_start_ms") != row.get("proposal_start_ms")
+            or row.get("source_end_ms") != row.get("proposal_end_ms")
+            or row.get("alignment_score") is not None
+            or row.get("start_drift_ms") is not None
+            or row.get("end_drift_ms") is not None
+            or row.get("vad_speech_ratio") is not None
+        ):
+            raise VerificationError(
+                f"v7 row contains non-native alignment evidence: {shard_path}"
+            )
 
 
 def _manifest_bytes(
