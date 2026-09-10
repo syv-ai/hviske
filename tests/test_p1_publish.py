@@ -471,6 +471,16 @@ def test_initialisation_commits_card_and_attributes_privately() -> None:
     assert hub.privacy_checks >= 3
 
 
+def test_initialisation_refuses_existing_generation_payload() -> None:
+    """Initialisation cannot relabel an existing payload as v7 metadata."""
+    hub = MemoryHub(existing_paths=("data/v6.parquet",))
+
+    with pytest.raises(PublicationError, match="data or unknown payload"):
+        initialise_private_dataset(hub, "org/p1", card=make_card())
+
+    assert hub.commits == []
+
+
 def test_invalid_commit_is_not_accepted(tmp_path: Path) -> None:
     """Branches returned by publication cannot be captured."""
     path = tmp_path / "one.parquet"

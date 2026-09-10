@@ -34,9 +34,9 @@ metadata is only a planning hint: for embedded compressed audio, libsndfile deco
 bytes first and the frame count plus sampling rate supplies the authoritative
 programme duration. Transcript bounds are checked against that decoded duration.
 
-The source coordinates, alignment method, retained legacy pins, normalisation rules,
-output schema, and pipeline version form the reproducibility identity. The active
-implementation is `p1-segmentation-7` with method
+The source coordinates, timestamp method, normalisation rules, output schema, and
+pipeline version form the reproducibility identity. The active implementation is
+`p1-segmentation-7` with method
 `timestamp-native:p1-transcripts.words`. A change to any of these items requires a
 new derived dataset revision and new deterministic segment identifiers. Existing v6
 outputs are not mixed with v7 and will be deleted and recreated remotely.
@@ -65,22 +65,23 @@ Each `train` row has these fields:
 | `speaker_ids` | list[string] | Speakers represented in the clip. |
 | `proposal_start_ms` | int64 | Start from the supplied word timestamps. |
 | `proposal_end_ms` | int64 | End from the supplied word timestamps. |
-| `alignment_score` | float32, nullable | Acoustic confidence; null for timestamp-native rows. |
+| `alignment_score` | float32, nullable | Always null for timestamp-native rows. |
 | `alignment_score_type` | string | `not_applicable:source_timestamps` for v7 rows. |
 | `start_drift_ms` | int32, nullable | Null for timestamp-native rows. |
 | `end_drift_ms` | int32, nullable | Null for timestamp-native rows. |
-| `vad_speech_ratio` | float32, nullable | Null because v7 does not run VAD. |
+| `vad_speech_ratio` | float32, nullable | Always null for v7. |
 | `alignment_backend` | string | `timestamp-native` for v7 rows. |
 | `alignment_method` | string | `timestamp-native:p1-transcripts.words`. |
 | `pipeline_version` | string | `p1-segmentation-7`. |
-| `pipeline_config_sha256` | string | Digest of the complete identity manifest. |
+| `pipeline_config_sha256` | string | Digest of the active v7 identity manifest. |
 
 Do not include credentials, cache paths, machine names, or transient job identifiers.
 Preserve enough provenance to reproduce or audit every segment.
 
-First build a canonical identity manifest containing source and code revisions, the
-active timestamp method, retained legacy VAD/CTC/model pins, text normalisation,
-segmentation thresholds, output encoding, and schema version. Serialise it with UTF-8,
+First build a canonical identity manifest containing the immutable source revisions,
+active timestamp method, text normalisation, segmentation thresholds, output encoding,
+and schema version. Model-backed alignment metadata is outside the v7 identity.
+Serialise it with UTF-8,
 Unicode NFC, sorted keys, no insignificant whitespace, JSON escaping, and exact numeric
 types. Store its SHA-256 digest as `pipeline_config_sha256`. The target card must
 repeat the v7 method, schema, and digest before any payload commit.
@@ -115,8 +116,8 @@ units. The exact candidate `text` remains verbatim and retains all separator,
 untimed, and zero-duration ownership. Leading and interior text belongs to the
 following positive-duration word, while terminal text belongs to the final previous
 word; ownership is accepted only with speaker-consistent bounded lookahead. No
-normalisation, VAD, CTC, acoustic score, drift correction, or model loading occurs on
-this path. The generic canonical CTC path remains in the codebase for future datasets.
+secondary alignment evidence or model loading occurs on this path. Generic
+model-backed alignment code remains available only for future datasets.
 
 ### Form candidate segments
 
@@ -142,8 +143,10 @@ publishes boundaries exactly at the first timed word start and last timed word e
 The source audio clock is authoritative, and the terminal source word endpoint is
 validated against decoded audio before segmentation.
 
-The following legacy VAD and CTC material is retained unchanged for future datasets;
-it is not constructed, verified, or invoked by v7. Refine and verify each local
+### Future model-backed alignment (inactive)
+
+The following generic material is retained unchanged for future datasets; it is not
+constructed, verified, or invoked by v7. Refine and verify each local
 candidate with a Danish-capable CTC forced aligner only when implementing that future
 path. The legacy implementation uses the pinned `ctc-segmentation` source and the
 [`CoRal-project/roest-v3-wav2vec2-315m`](https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m)
@@ -180,7 +183,7 @@ choice
 because it adds lexicon and acoustic-model maintenance without using the supplied word
 timestamps.
 
-### Correct drift once
+### Future alignment: correct drift once (inactive)
 
 Compare CTC word boundaries with the supplied proposals inside each programme window.
 If high-confidence anchor words show a consistent offset or linear drift, fit a robust
@@ -193,8 +196,7 @@ This catches clock drift and transcript insertions or omissions separately.
 
 ### Score and filter
 
-Keep both raw backend scores and derived quality signals. A segment is publishable
-only when all of these gates pass:
+A timestamp-native segment is publishable only when all of these gates pass:
 
 - proposal and decoded duration are at least the configured minimum and below the
   configured maximum of 10,000 ms (the maximum remains an exclusive bound);
@@ -202,11 +204,13 @@ only when all of these gates pass:
 - timestamps are ordered and within the decoded source duration;
 - timestamp boundaries are the exact first/last timed word endpoints;
 - source word ownership is complete, contiguous, speaker-safe, and terminally valid;
-- acoustic, drift, and VAD fields are null rather than fabricated for v7;
+- score, drift, and other secondary-evidence fields are null rather than fabricated;
 - no word is duplicated or dropped within an accepted contiguous transcript region;
 - speaker-overlap and music heuristics pass;
 - FLAC encoding and a fresh 16 kHz mono decode succeed;
 - `segment_id` is unique.
+
+### Future alignment: model-backed scoring (inactive)
 
 The `ctc-segmentation` reference implementation scores an utterance from minima over
 chunk-level means of aligned frame probabilities. Before invoking its dynamic
@@ -274,8 +278,7 @@ On restart:
 
 - bind and validate the pipeline digest before constructing models or selecting new
   programmes; an incompatible populated ledger is rejected without mutation;
-- recover sharded and committed publication states before constructing VAD/CTC or
-  retrieving new audio;
+- recover sharded and committed publication states before retrieving new audio;
 - reset abandoned `processing` rows to `retryable`;
 - reuse complete local shards only when their digests match the ledger;
 - query the remote commit before re-uploading a `committed` shard;
@@ -285,9 +288,9 @@ On restart:
 Selection retains the exact audio row pointer discovered by the metadata scan and
 joins it to the disk-backed transcript pointer. Processing first performs structural
 transcript checks: empty, untimed, ambiguous, malformed, and invalid-timestamp
-records are terminal rejections before audio retrieval and model construction. A
+records are terminal rejections before audio retrieval. A
 qualified transcript then permits bounded audio decoding. Transcript-versus-audio
-duration validation happens after that decode and before VAD or CTC work; the decoded
+duration validation happens after that decode; the decoded
 audio is the duration authority, not a declared metadata duration. Unexpected failures
 before sharding are categorised as retryable; publication failures leave durable
 sharded/committed evidence unchanged so a restart can resume the exact bytes and
@@ -376,7 +379,7 @@ P1 training must load the derived segmented dataset directly.
 - Reconfirm both immutable source revisions and schemas.
 - Measure source object-size and duration maxima without downloading the full split.
 - Confirm target repository ownership, privacy, licence wording, and storage quota.
-- Select candidate VAD and CTC models whose licences permit the intended use.
+- Keep any model-backed alignment design isolated from the active v7 pipeline.
 - Define the scratch budget and failure policy.
 
 **Gate:** no audio processing starts until privacy, licensing, storage, and bounded
@@ -479,9 +482,9 @@ segmented P1 dataset.
 
 ## Evidence to retain
 
-Retain only:
+Retain only for the active v7 dataset:
 
-- source, model, and code revisions, including the CTC licence designation and URL;
+- immutable source revisions and code/configuration identity;
 - the pinned CoRal-v3 dataset-licence template revision and digest, the exact
   licensor-identity-only adaptation, and the target `LICENSE` digest. The byte/text
   replacement preserves the template's wrapping exactly except for the target identity:
@@ -498,10 +501,8 @@ Retain only:
   Rosenvængets Allé 11, 1. tv, 2100 København Ø, Denmark
   ```
 
-- versioned configuration and normalisation rules, including the CTC architecture,
-  sampling rate, convolution stride, vocabulary size, blank, and delimiter IDs; the
-  pipeline digest covers the lowercase-only Roest compatibility invariant,
-  `p1-text-normalisation-5` case-folding, and
+- versioned configuration and normalisation rules; the active pipeline digest covers
+  the timestamp method, `p1-text-normalisation-5` rules, and
   `speaker-consistent-following-word-with-terminal-suffix-v5` source-text ownership;
 - metadata-only SQLite ledger and batch manifests;
 - shard paths, sizes, row counts, SHA-256 digests, and Hub commit IDs;

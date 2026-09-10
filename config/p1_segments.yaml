@@ -1,5 +1,4 @@
-# Phase 1C contract configuration. Every revision is immutable and complete.
-# P1 v7 is timestamp-native; the VAD/CTC pins below remain legacy evidence only.
+# Phase 1C contract configuration. Active v7 identity is source-timestamp based.
 # Use mode=plan for a Hub-metadata-only preflight; initialise creates the private
 # target card, while pilot and production are bounded builds.
 pipeline_version: p1-segmentation-7
@@ -24,50 +23,57 @@ source:
   join_key: file_id
   text_column: transcript_text
 
-vad:
-  name: silero-vad
-  repository:
-    repository: snakers4/silero-vad
-    revision: 867c2aa692646a1f1de3e94a15c9dd9f614c0acb
-  model_path: src/silero_vad/data/silero_vad.jit
-  model_blob: 5c6988d663950a93a5f0d6c38c2fe024653ec552
-  model_sha256: e1122837f4154c511485fe0b9c64455f7b929c96fbb8d79fbdb336383ebd3720
-  license: MIT
-
-ctc:
-  name: ctc-segmentation
-  version: 1.7.4
-  source_commit: 69bd9b53b7b82ad926d35e7b280f957ed299a7db
-  sdist_sha256: 19d383ea5f22438ebb1699d72b22078b63f351a33fa50bedb19c14077ba6a116
-  license: Apache-2.0
-  model:
+# Model-backed alignment material is retained only for a future pipeline. It is
+# deliberately outside the active v7 identity and is never inspected by v7.
+future_alignment:
+  vad:
+    name: silero-vad
     repository:
-      repository: CoRal-project/roest-v3-wav2vec2-315m
-      revision: beb3e790246d6b9dec1df596b0b21d5c42f4d99c
-    license: openrail
-    license_url: https://huggingface.co/Alvenir/coral-1-whisper-large/resolve/a6c1e24d9f10e6289607a1ba32341b68e8660688/LICENSE
-    license_repository: Alvenir/coral-1-whisper-large
-    license_revision: a6c1e24d9f10e6289607a1ba32341b68e8660688
-    license_sha256: f575b6361ff69b52388967f69219f0cc7f9ae91f96482e5ad038261b2728799e
-    model_card_url: https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m/resolve/beb3e790246d6b9dec1df596b0b21d5c42f4d99c/README.md
-    model_card_sha256: 64b3a837fdcb580eeebe31d457113f0a84b200ca90ac5fe1f27475d8fc257cfb
-    license_notes: >-
-      Roest model-card metadata is openrail; its pinned card describes a custom
-      OpenRAIL-M licence. P1 uses the checkpoint for ASR alignment only. Model
-      weights are internal and are not distributed by this dataset.
-    architecture: Wav2Vec2ForCTC
-    model_type: wav2vec2
-    # The pinned processor/preprocessor metadata is authoritative for input rate.
-    frame_stride_samples: 320
-    vocab_size: 46
-    blank_token_id: 45
-    word_delimiter_token_id: 36
+      repository: snakers4/silero-vad
+      revision: 867c2aa692646a1f1de3e94a15c9dd9f614c0acb
+    model_path: src/silero_vad/data/silero_vad.jit
+    model_blob: 5c6988d663950a93a5f0d6c38c2fe024653ec552
+    model_sha256: e1122837f4154c511485fe0b9c64455f7b929c96fbb8d79fbdb336383ebd3720
+    license: MIT
 
-anomaly_model:
-  repository:
-    repository: openai/whisper-small
-    revision: 973afd24965f72e36ca33b3055d56a652f456b4d
-  license: Apache-2.0
+  ctc:
+    name: ctc-segmentation
+    version: 1.7.4
+    source_commit: 69bd9b53b7b82ad926d35e7b280f957ed299a7db
+    sdist_sha256: 19d383ea5f22438ebb1699d72b22078b63f351a33fa50bedb19c14077ba6a116
+    license: Apache-2.0
+    model:
+      repository:
+        repository: CoRal-project/roest-v3-wav2vec2-315m
+        revision: beb3e790246d6b9dec1df596b0b21d5c42f4d99c
+      license: openrail
+      license_url: https://huggingface.co/Alvenir/coral-1-whisper-large/resolve/a6c1e24d9f10e6289607a1ba32341b68e8660688/LICENSE
+      license_repository: Alvenir/coral-1-whisper-large
+      license_revision: a6c1e24d9f10e6289607a1ba32341b68e8660688
+      license_sha256: f575b6361ff69b52388967f69219f0cc7f9ae91f96482e5ad038261b2728799e
+      model_card_url: https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m/resolve/beb3e790246d6b9dec1df596b0b21d5c42f4d99c/README.md
+      model_card_sha256: 64b3a837fdcb580eeebe31d457113f0a84b200ca90ac5fe1f27475d8fc257cfb
+      license_notes: >-
+        Roest model-card metadata is openrail; its pinned card describes a custom
+        OpenRAIL-M licence. P1 uses the checkpoint for ASR alignment only. Model
+        weights are internal and are not distributed by this dataset.
+      architecture: Wav2Vec2ForCTC
+      model_type: wav2vec2
+      # The pinned processor/preprocessor metadata is authoritative for input rate.
+      frame_stride_samples: 320
+      vocab_size: 46
+      blank_token_id: 45
+      word_delimiter_token_id: 36
+
+  anomaly_model:
+    repository:
+      repository: openai/whisper-small
+      revision: 973afd24965f72e36ca33b3055d56a652f456b4d
+    license: Apache-2.0
+
+  # A future model-backed alignment must resolve this licensing issue first.
+  excluded:
+    - ctc-forced-aligner
 
 normalisation:
   version: p1-text-normalisation-5
@@ -84,7 +90,7 @@ segmentation:
   target_maximum_duration_ms: 8000
   maximum_duration_ms: 10000
   maximum_drift_ms: 500
-  # Retained for the generic CTC/VAD path; v7 does not use these thresholds.
+  # Retained for future model-backed alignment; v7 does not use these thresholds.
   minimum_alignment_score: -10.0
   minimum_vad_speech_ratio: 0.0
 
@@ -122,12 +128,8 @@ runtime:
   # 2 GiB covers the observed ~58-minute, 48 kHz mono P1 programme as float32
   # PCM while bounding compressed-audio expansion before libsndfile allocation.
   max_decoded_audio_bytes: 2147483648
-  # Retained for generic future datasets; v7 never probes or initialises CUDA.
-  device: cuda:0
+  # The active timestamp-native pipeline has no device dependency.
+  device: cpu
   shards_per_commit: 8
   target_shard_bytes: 500000000
   target_private_repo: syvai/p1-segments
-
-# ctc-forced-aligner is intentionally excluded: its licence metadata is contradictory.
-excluded:
-  - ctc-forced-aligner

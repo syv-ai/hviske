@@ -80,7 +80,7 @@ def build_dataset_card(
     known_limitations: str,
     rejection_policy: str,
     source_revisions: str,
-    model_revisions: str,
+    model_revisions: str | None = None,
     dataset_license: str | None = None,
 ) -> str:
     """Build the required metadata-only private P1 dataset card.
@@ -102,8 +102,9 @@ def build_dataset_card(
             Policy and categories for rejected material.
         source_revisions:
             Immutable source dataset revisions.
-        model_revisions:
-            Immutable VAD, CTC, and other model revisions.
+        model_revisions (optional):
+            Immutable model revisions for a model-backed future alignment.
+            Timestamp-native cards omit this section.
         dataset_license (optional):
             Immutable target dataset licence provenance.
 
@@ -119,8 +120,9 @@ def build_dataset_card(
         "Known limitations": known_limitations,
         "Rejection policy": rejection_policy,
         "Source revisions": source_revisions,
-        "Model revisions": model_revisions,
     }
+    if model_revisions is not None:
+        values["Model revisions"] = model_revisions
     if dataset_license is None:
         dataset_license = json.dumps(
             {
@@ -415,8 +417,8 @@ def initialise_private_dataset(
 
     Raises:
         PublicationError:
-            If the card or target licence contains credentials, or the licence digest
-            is not the pinned target digest.
+            If metadata is unsafe, the licence is not pinned, or the target tree is
+            not pristine metadata-only v7 state.
     """
     _assert_safe_metadata(card, token=token)
     _assert_safe_metadata(gitattributes, token=token)
@@ -437,6 +439,7 @@ def initialise_private_dataset(
         )
         info = api.repo_info(repo_id=repo_id, repo_type="dataset")
     _assert_private(info, repo_id)
+    _assert_initialise_target_is_safe(api, repo_id, card)
 
     with tempfile.TemporaryDirectory(prefix="hviske-p1-card-") as directory:
         root = Path(directory)
@@ -458,6 +461,98 @@ def initialise_private_dataset(
         )
         _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     return _commit_sha(commit)
+
+
+def _assert_initialise_target_is_safe(api: HubClient, repo_id: str, card: str) -> None:
+    """Reject target trees that could contain an earlier generation payload.
+
+    Raises:
+        PublicationError:
+            If the tree cannot be inspected or contains data, unknown files, or
+            incompatible metadata.
+    """
+    try:
+        paths = tuple(
+            str(path)
+            for path in api.list_repo_files(
+                repo_id=repo_id, repo_type="dataset", revision="main"
+            )
+        )
+    except Exception as error:
+        raise PublicationError(
+            "cannot inspect the private target tree before initialisation"
+        ) from error
+
+    allowed_metadata = {"README.md", ".gitattributes", "LICENSE"}
+    unexpected = sorted(set(paths) - allowed_metadata)
+    if unexpected:
+        raise PublicationError(
+            "refusing to initialise a target containing data or unknown payload: "
+            + ", ".join(unexpected)
+        )
+    if "README.md" not in paths:
+        if "LICENSE" in paths:
+            try:
+                existing_license = b"".join(
+                    api.stream_file(
+                        repo_id, "LICENSE", repo_type="dataset", revision="main"
+                    )
+                )
+            except Exception as error:
+                raise PublicationError(
+                    "cannot inspect the existing target licence before initialisation"
+                ) from error
+            if hashlib.sha256(existing_license).hexdigest() != (
+                P1_RUNTIME_CONTRACT.dataset_license_target_sha256
+            ):
+                raise PublicationError(
+                    "existing target licence is not the pinned dataset licence"
+                )
+        return
+    try:
+        existing_card = b"".join(
+            api.stream_file(repo_id, "README.md", repo_type="dataset", revision="main")
+        ).decode("utf-8")
+    except Exception as error:
+        raise PublicationError(
+            "cannot inspect the existing target card before initialisation"
+        ) from error
+    required = (
+        "pipeline_version: p1-segmentation-7",
+        "timestamp-native:p1-transcripts.words",
+        "p1-segments-v2",
+    )
+    if not all(marker in existing_card for marker in required):
+        raise PublicationError(
+            "refusing to overwrite a target card without the compatible v7 identity"
+        )
+    expected_digest = re.search(r"pipeline_config_sha256: ([0-9a-f]{64})", card)
+    actual_digest = re.search(r"pipeline_config_sha256: ([0-9a-f]{64})", existing_card)
+    if expected_digest is not None and (
+        actual_digest is None or actual_digest.group(1) != expected_digest.group(1)
+    ):
+        raise PublicationError("existing target card has a different v7 identity")
+    if re.search(r"\b(?:vad|ctc|roest|whisper|silero)\b", existing_card, re.I):
+        raise PublicationError(
+            "existing target card contains inactive model provenance"
+        )
+    if "LICENSE" in paths:
+        try:
+            existing_license = b"".join(
+                api.stream_file(
+                    repo_id, "LICENSE", repo_type="dataset", revision="main"
+                )
+            )
+        except Exception as error:
+            raise PublicationError(
+                "cannot inspect the existing target licence before initialisation"
+            ) from error
+        if hashlib.sha256(existing_license).hexdigest() != (
+            P1_RUNTIME_CONTRACT.dataset_license_target_sha256
+        ):
+            raise PublicationError(
+                "existing target licence is not the pinned dataset licence"
+            )
 
 
 def _assert_private(info: object, repo_id: str) -> None:
@@ -1009,6 +1104,12 @@ def _validate_row(row: object, shard_path: str) -> None:
         if row.get("alignment_method") != "timestamp-native:p1-transcripts.words":
             raise VerificationError(
                 f"v7 row does not declare timestamp-native alignment: {shard_path}"
+            )
+        if row.get("alignment_backend") != "timestamp-native":
+            raise VerificationError(f"v7 row has a non-native backend: {shard_path}")
+        if row.get("alignment_score_type") != "not_applicable:source_timestamps":
+            raise VerificationError(
+                f"v7 row has an applicable score type: {shard_path}"
             )
         if (
             row.get("source_start_ms") != row.get("proposal_start_ms")

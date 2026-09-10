@@ -16,7 +16,7 @@ import soundfile as sf
 from omegaconf import DictConfig, OmegaConf
 
 from hviske.p1_ledger import Ledger
-from hviske.p1_pipeline import run_pipeline
+from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
 from hviske.p1_segments import AlignmentResult, VADSignal
 from hviske.p1_source import (
     AudioPointer,
@@ -26,6 +26,28 @@ from hviske.p1_source import (
     SourceShard,
 )
 from tests.test_p1_publish import MemoryHub
+
+
+class VerifyFailHub(MemoryHub):
+    """Hub fake that fails during remote digest verification."""
+
+    def stream_file(
+        self, repo_id: str, path: str, *, repo_type: str, revision: str
+    ) -> list[bytes]:
+        """Fail before the publisher is allowed to purge local files.
+
+        Returns:
+            README bytes during preflight; never returns verification bytes.
+
+        Raises:
+            RuntimeError:
+                When a shard is streamed for remote verification.
+        """
+        if path == "README.md":
+            return super().stream_file(
+                repo_id, path, repo_type=repo_type, revision=revision
+            )
+        raise RuntimeError("simulated verification failure")
 
 
 def test_allocation_failure_never_leaves_programme_sharded(
@@ -43,7 +65,7 @@ def test_allocation_failure_never_leaves_programme_sharded(
         run_pipeline(
             config=config(tmp_path, mode="build"),
             source=source,
-            hub=MemoryHub(),
+            hub=prepared_hub(tmp_path),
             ctc=FakeCtc(),
             vad=FakeVad(),
         )
@@ -184,13 +206,21 @@ def config(tmp_path: Path, mode: str = "plan") -> DictConfig:
     return cast(DictConfig, value)
 
 
+def prepared_hub(tmp_path: Path) -> MemoryHub:
+    """Return a fake target initialised with the active v7 metadata card."""
+    hub = MemoryHub()
+    settings = PipelineSettings.from_config(config(tmp_path, mode="build"))
+    initialise_target(hub=hub, settings=settings)
+    return hub
+
+
 def test_build_decodes_flac_and_purges_only_verified_output(tmp_path: Path) -> None:
     """A native build uses FLAC bytes and purges after publisher verification."""
     source = FakeSource()
     report = run_pipeline(
         config=config(tmp_path, mode="build"),
         source=source,
-        hub=MemoryHub(),
+        hub=prepared_hub(tmp_path),
         ctc=FakeCtc(),
         vad=FakeVad(),
     )
@@ -222,8 +252,10 @@ def test_quality_rejection_is_terminal_and_keeps_source_audit_locator(
     """A fully decoded but rejected programme is not retried or published."""
     source = FakeSource()
     build_config = config(tmp_path, mode="build")
-    build_config.segmentation.minimum_alignment_score = 2.0
+    build_config.segmentation.minimum_duration_ms = 5_000
+    build_config.segmentation.target_minimum_duration_ms = 5_000
     hub = MemoryHub()
+    initialise_target(hub=hub, settings=PipelineSettings.from_config(build_config))
 
     report = run_pipeline(
         config=build_config, source=source, hub=hub, ctc=FakeCtc(), vad=FakeVad()
@@ -233,8 +265,8 @@ def test_quality_rejection_is_terminal_and_keeps_source_audit_locator(
         tmp_path / "scratch" / "ledger.sqlite", reset_processing=False
     ) as ledger:
         assert ledger.programme("p1-programme-1").state.value == "rejected"
-    assert report.rejection_counts["low_alignment_score"] == 1
-    assert not hub.commits
+    assert report.rejection_counts["duration_out_of_range"] == 1
+    assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
     manifest = (tmp_path / "scratch" / "audit-candidates.jsonl").read_text()
     assert '"source_shard_path": "data/audio.parquet"' in manifest
     assert '"source_row_index": 0' in manifest
@@ -247,11 +279,16 @@ import os
 import sys
 from pathlib import Path
 from hviske.p1_ledger import Ledger
-from hviske.p1_pipeline import run_pipeline
+from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
 from tests.test_build_p1_segments import FakeCtc, FakeSource, FakeVad, config
 from tests.test_p1_publish import MemoryHub
 
 root = Path(sys.argv[1])
+hub = MemoryHub()
+initialise_target(
+    hub=hub,
+    settings=PipelineSettings.from_config(config(root, mode="build")),
+)
 original = Ledger.allocate_batch_with_shards
 
 def crash(self, *args, **kwargs):
@@ -262,7 +299,7 @@ Ledger.allocate_batch_with_shards = crash
 run_pipeline(
     config=config(root, mode="build"),
     source=FakeSource(),
-    hub=MemoryHub(),
+    hub=hub,
     ctc=FakeCtc(),
     vad=FakeVad(),
 )
@@ -277,15 +314,20 @@ run_pipeline(
     recovery_code = """
 import sys
 from pathlib import Path
-from hviske.p1_pipeline import run_pipeline
+from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
 from tests.test_build_p1_segments import FakeCtc, FakeSource, FakeVad, config
 from tests.test_p1_publish import MemoryHub
 
 root = Path(sys.argv[1])
+hub = MemoryHub()
+initialise_target(
+    hub=hub,
+    settings=PipelineSettings.from_config(config(root, mode="build")),
+)
 run_pipeline(
     config=config(root, mode="build"),
     source=FakeSource(),
-    hub=MemoryHub(),
+    hub=hub,
     ctc=FakeCtc(),
     vad=FakeVad(),
 )
@@ -301,7 +343,7 @@ run_pipeline(
     run_pipeline(
         config=config(control_root, mode="build"),
         source=FakeSource(),
-        hub=MemoryHub(),
+        hub=prepared_hub(tmp_path),
         ctc=FakeCtc(),
         vad=FakeVad(),
     )
@@ -325,7 +367,7 @@ def test_unlimited_production_counts_consumed_candidates_without_ids(
     report = run_pipeline(
         config=production_config,
         source=source,
-        hub=MemoryHub(),
+        hub=prepared_hub(tmp_path),
         ctc=FakeCtc(),
         vad=FakeVad(),
     )
@@ -352,7 +394,7 @@ def test_verification_failure_retains_local_shard(tmp_path: Path) -> None:
         run_pipeline(
             config=config(tmp_path, mode="build"),
             source=source,
-            hub=VerifyFailHub(),
+            hub=prepared_verify_hub(tmp_path),
             ctc=FakeCtc(),
             vad=FakeVad(),
         )
@@ -382,17 +424,10 @@ def test_verification_failure_retains_local_shard(tmp_path: Path) -> None:
         assert Path(shard.local_path).is_file()
 
 
-class VerifyFailHub(MemoryHub):
-    """Hub fake that fails during remote digest verification."""
-
-    def stream_file(
-        self, repo_id: str, path: str, *, repo_type: str, revision: str
-    ) -> list[bytes]:
-        """Fail before the publisher is allowed to purge local files.
-
-        Raises:
-            RuntimeError:
-                Always, to simulate a remote verification failure.
-        """
-        del repo_id, path, repo_type, revision
-        raise RuntimeError("simulated verification failure")
+def prepared_verify_hub(tmp_path: Path) -> VerifyFailHub:
+    """Return an initialised target whose later verification fails."""
+    hub = MemoryHub()
+    settings = PipelineSettings.from_config(config(tmp_path, mode="build"))
+    initialise_target(hub=hub, settings=settings)
+    hub.__class__ = VerifyFailHub
+    return cast(VerifyFailHub, hub)
