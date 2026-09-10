@@ -598,13 +598,19 @@ class HfP1Source:
             )
             effective_batch_size = self._batch_size(batch_size)
             for row_group in range(parquet.num_row_groups):
+                row_index = 0
                 for batch in parquet.iter_batches(
                     row_groups=[row_group],
                     columns=columns,
                     batch_size=effective_batch_size,
                 ):
                     _check_batch_bytes(batch, self.max_batch_bytes)
-                    yield from batch.to_pylist()
+                    for raw_row in batch.to_pylist():
+                        row = dict(raw_row)
+                        row["source_row_group"] = row_group
+                        row["source_row_index"] = row_index
+                        yield row
+                        row_index += 1
 
     def _batch_size(self, requested: int) -> int:
         if requested <= 0:
