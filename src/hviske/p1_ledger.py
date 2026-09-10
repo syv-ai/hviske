@@ -29,8 +29,9 @@ from .p1_contracts import (
     valid_ledger_transition,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _SEQUENCE_TABLE = "ledger_sequences"
+_METADATA_TABLE = "ledger_metadata"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _FORBIDDEN_KEYS = {
@@ -151,15 +152,28 @@ class Ledger:
             default because a new connection represents a restarted worker.
     """
 
-    def __init__(self, path: str | Path, *, reset_processing: bool = True) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        pipeline_digest: str | None = None,
+        reset_processing: bool = True,
+    ) -> None:
         """Open or create a durable ledger.
 
         Args:
             path:
                 SQLite database path.
+            pipeline_digest (optional):
+                Expected identity of the pipeline using this ledger. An empty ledger
+                is bound to this digest; a populated legacy ledger is accepted only
+                when all its records already use it.
             reset_processing (optional):
                 Whether to reset processing rows on open. Defaults to True.
         """
+        if pipeline_digest is not None:
+            self._validate_digest(pipeline_digest, "pipeline_digest")
+        self.pipeline_digest: str | None = pipeline_digest
         self.path = Path(path) if str(path) != ":memory:" else Path(":memory:")
         database = str(path)
         self._connection = sqlite3.connect(database, isolation_level=None, timeout=30)
@@ -169,9 +183,18 @@ class Ledger:
         if database != ":memory:":
             self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.execute("PRAGMA synchronous = FULL")
-        self._migrate()
-        if reset_processing:
-            self.reset_abandoned_processing()
+        try:
+            self._migrate()
+            self._bind_pipeline_digest(pipeline_digest)
+            if reset_processing:
+                self.reset_abandoned_processing()
+        except BaseException:
+            self._connection.close()
+            raise
+
+    def close(self) -> None:
+        """Close the database connection."""
+        self._connection.close()
 
     def __enter__(self) -> Ledger:
         """Return this ledger for a context-managed session."""
@@ -185,10 +208,6 @@ class Ledger:
     ) -> None:
         """Close the ledger after leaving a context-managed session."""
         self.close()
-
-    def close(self) -> None:
-        """Close the database connection."""
-        self._connection.close()
 
     def allocate_batch_with_shards(
         self,
@@ -270,6 +289,7 @@ class Ledger:
                 connection, "programmes", "programme_id", programme_id
             )
             pipeline_digest = str(programme["pipeline_digest"])
+            self._ensure_pipeline_digest(connection, pipeline_digest)
             if LedgerState(programme["state"]) not in {
                 LedgerState.DISCOVERED,
                 LedgerState.PROCESSING,
@@ -439,6 +459,7 @@ class Ledger:
         revisions = self._metadata_json(source_revisions)
         now = self._now()
         with self.transaction() as connection:
+            self._ensure_pipeline_digest(connection, pipeline_digest)
             existing = connection.execute(
                 "SELECT * FROM programmes WHERE programme_id = ?", (programme_id,)
             ).fetchone()
@@ -730,6 +751,7 @@ class Ledger:
         self._validate_nonnegative(duration_ms, "duration_ms")
         now = self._now()
         with self.transaction() as connection:
+            self._ensure_pipeline_digest(connection, pipeline_digest)
             existing = connection.execute(
                 "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
             ).fetchone()
@@ -1052,8 +1074,9 @@ class Ledger:
         """Ask a remote store whether a committed batch already exists.
 
         The hook receives ``(commit_id, publication_paths)`` and must return a
-        boolean. A missing commit makes the batch retryable; a present commit is
-        left committed for the normal verification step.
+        boolean. A present commit is left committed for the normal verification
+        step. A missing commit is recorded as an unresolved incident; it never
+        makes already-sharded or committed work retryable.
 
         Returns:
             Whether the immutable remote commit exists.
@@ -1076,14 +1099,14 @@ class Ledger:
         with self.transaction() as connection:
             connection.execute(
                 """UPDATE batches SET remote_checked_at = ?, remote_present = ?,
-                updated_at = ? WHERE batch_id = ?""",
-                (now, int(present), now, batch_id),
-            )
-        if not present:
-            self.transition_batch(
-                batch_id,
-                LedgerState.RETRYABLE,
-                last_error="remote commit was not found",
+                last_error = ?, updated_at = ? WHERE batch_id = ?""",
+                (
+                    now,
+                    int(present),
+                    None if present else "remote commit was not found",
+                    now,
+                    batch_id,
+                ),
             )
         return present
 
@@ -1462,6 +1485,81 @@ class Ledger:
 
     get_batch = batch
 
+    def _bind_pipeline_digest(self, expected: str | None) -> None:
+        """Bind this ledger to one pipeline identity before workers can mutate it.
+
+        Raises:
+            EvidenceError:
+                If stored records contain conflicting or unexpected digests.
+        """
+        with self.transaction() as connection:
+            metadata = connection.execute(
+                f"SELECT value FROM {_METADATA_TABLE} WHERE key = 'pipeline_digest'"
+            ).fetchone()
+            bound = None if metadata is None else str(metadata[0])
+            if bound is not None:
+                self._validate_digest(bound, "pipeline_digest")
+            stored = {
+                str(row[0])
+                for row in connection.execute(
+                    """SELECT pipeline_digest FROM programmes
+                    UNION SELECT pipeline_digest FROM batches"""
+                )
+            }
+            if len(stored) > 1:
+                raise EvidenceError("ledger contains multiple pipeline digests")
+            stored_digest = next(iter(stored), None)
+            if bound is not None and stored_digest not in {None, bound}:
+                raise EvidenceError("ledger metadata disagrees with stored digests")
+            if expected is not None and stored_digest not in {None, expected}:
+                raise EvidenceError("ledger records use a different pipeline digest")
+            if expected is not None and bound not in {None, expected}:
+                raise EvidenceError("ledger is bound to a different pipeline digest")
+            target = expected or bound or stored_digest
+            if target is not None and bound is None:
+                connection.execute(
+                    f"INSERT INTO {_METADATA_TABLE} (key, value) VALUES (?, ?)",
+                    ("pipeline_digest", target),
+                )
+        self.pipeline_digest = target
+
+    @staticmethod
+    def _validate_digest(value: object, name: str) -> None:
+        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+            raise EvidenceError(f"{name} must be lowercase SHA-256 hex")
+
+    def _ensure_pipeline_digest(
+        self, connection: sqlite3.Connection, pipeline_digest: str
+    ) -> None:
+        """Ensure an insert uses the ledger's singleton pipeline identity.
+
+        Raises:
+            EvidenceError:
+                If the digest differs from the identity already bound to the ledger.
+        """
+        self._validate_digest(pipeline_digest, "pipeline_digest")
+        row = connection.execute(
+            f"SELECT value FROM {_METADATA_TABLE} WHERE key = 'pipeline_digest'"
+        ).fetchone()
+        bound = None if row is None else str(row[0])
+        if bound is not None and bound != pipeline_digest:
+            raise EvidenceError("ledger is bound to a different pipeline digest")
+        if bound is None:
+            stored = {
+                str(item[0])
+                for item in connection.execute(
+                    """SELECT pipeline_digest FROM programmes
+                    UNION SELECT pipeline_digest FROM batches"""
+                )
+            }
+            if stored and stored != {pipeline_digest}:
+                raise EvidenceError("ledger records use a different pipeline digest")
+            connection.execute(
+                f"INSERT INTO {_METADATA_TABLE} (key, value) VALUES (?, ?)",
+                ("pipeline_digest", pipeline_digest),
+            )
+        self.pipeline_digest = pipeline_digest
+
     @staticmethod
     def _fields_from_evidence(
         evidence: Mapping[str, object] | None, fields: Mapping[str, object]
@@ -1603,6 +1701,14 @@ class Ledger:
                     "ON audit_candidates(batch_id, candidate_id)"
                 )
                 connection.execute("PRAGMA user_version = 2")
+            if version < 3:
+                connection.execute(
+                    f"""CREATE TABLE IF NOT EXISTS {_METADATA_TABLE} (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )"""
+                )
+                connection.execute("PRAGMA user_version = 3")
 
     @staticmethod
     def _publication_path(value: str) -> str:
@@ -1719,8 +1825,6 @@ class Ledger:
         if target == LedgerState.PROCESSING:
             updates["attempts"] = int(row["attempts"]) + 1
             updates["processing_started_at"] = now
-        if target == LedgerState.RETRYABLE:
-            updates["commit_id"] = None
         if target == LedgerState.COMMITTED:
             updates["remote_checked_at"] = None
             updates["remote_present"] = None
@@ -2000,11 +2104,6 @@ class Ledger:
         if target == LedgerState.PURGED:
             updates["purge_time"] = now
         return updates
-
-    @staticmethod
-    def _validate_digest(value: object, name: str) -> None:
-        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
-            raise EvidenceError(f"{name} must be lowercase SHA-256 hex")
 
     @staticmethod
     def _validate_identifier(value: object, name: str) -> None:

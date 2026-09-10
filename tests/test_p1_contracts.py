@@ -135,6 +135,8 @@ def test_ledger_transition_contract() -> None:
     assert valid_ledger_transition(LedgerState.DISCOVERED, LedgerState.PROCESSING)
     assert valid_ledger_transition(LedgerState.PROCESSING, LedgerState.RETRYABLE)
     assert valid_ledger_transition(LedgerState.COMMITTED, LedgerState.VERIFIED)
+    assert not valid_ledger_transition(LedgerState.SHARDED, LedgerState.RETRYABLE)
+    assert not valid_ledger_transition(LedgerState.COMMITTED, LedgerState.RETRYABLE)
     assert not valid_ledger_transition(LedgerState.VERIFIED, LedgerState.PROCESSING)
     assert not valid_ledger_transition(LedgerState.PURGED, LedgerState.PROCESSING)
 
