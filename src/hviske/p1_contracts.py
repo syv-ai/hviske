@@ -565,6 +565,7 @@ class CanonicalIdentityManifest(ContractModel):
     normalisation: NormalisationContract
     segmentation: SegmentationContract
     output: OutputEncodingContract
+    max_decoded_audio_bytes: StrictInt = Field(default=2 * 1024**3, gt=0)
 
 
 def canonical_json(value: object) -> str:

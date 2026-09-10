@@ -254,13 +254,15 @@ On restart:
 - resume from the first state lacking durable evidence.
 
 Selection retains the exact audio row pointer discovered by the metadata scan and
-joins it to the disk-backed transcript pointer. Processing fetches and qualifies the
-transcript first: empty, untimed, ambiguous, malformed, invalid-timestamp, and
-transcript-over-audio records are terminal metadata-only rejections and do not load
-models or retrieve audio. Only a qualified transcript permits audio retrieval and
-lazy VAD/CTC construction. Unexpected failures before sharding are categorised as
-retryable; publication failures leave durable sharded/committed evidence unchanged so
-a restart can resume the exact bytes and commit.
+joins it to the disk-backed transcript pointer. Processing first performs structural
+transcript checks: empty, untimed, ambiguous, malformed, and invalid-timestamp
+records are terminal rejections before audio retrieval and model construction. A
+qualified transcript then permits bounded audio decoding. Transcript-versus-audio
+duration validation happens after that decode and before VAD or CTC work; the decoded
+audio is the duration authority, not a declared metadata duration. Unexpected failures
+before sharding are categorised as retryable; publication failures leave durable
+sharded/committed evidence unchanged so a restart can resume the exact bytes and
+commit.
 
 ### Private repository setup
 

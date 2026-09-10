@@ -86,6 +86,9 @@ runtime:
   # Keep projected source access bounded to a modest Arrow batch.
   source_max_batch_rows: 1024
   source_max_batch_bytes: 67108864
+  # 2 GiB covers the observed ~58-minute, 48 kHz mono P1 programme as float32
+  # PCM while bounding compressed-audio expansion before libsndfile allocation.
+  max_decoded_audio_bytes: 2147483648
   device: cuda:0
   shards_per_commit: 8
   target_shard_bytes: 500000000

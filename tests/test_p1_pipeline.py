@@ -153,6 +153,26 @@ def _pipeline_test_report(selected_programmes: int = 0) -> BuildReport:
     return BuildReport(preflight=preflight, selected_programmes=selected_programmes)
 
 
+def test_decoded_audio_cap_is_configured_and_identity_bound(tmp_path: Path) -> None:
+    """Changing the decoded PCM cap changes the pipeline identity."""
+    first = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+    config = pipeline_config(tmp_path, mode="build")
+    config.runtime.max_decoded_audio_bytes = first.max_decoded_audio_bytes // 2
+    second = PipelineSettings.from_config(config)
+
+    assert first.max_decoded_audio_bytes == 2 * 1024**3
+    assert first.pipeline_digest != second.pipeline_digest
+
+
+def pipeline_config(tmp_path: Path, mode: str = "plan") -> DictConfig:
+    """Return a small test-owned pipeline configuration."""
+    config = OmegaConf.load("config/p1_segments.yaml")
+    config.mode = mode
+    config.runtime.scratch_root = str(tmp_path / "scratch")
+    config.runtime.device = "cpu"
+    return cast(DictConfig, config)
+
+
 def test_decoded_duration_overrun_is_invalid_timestamp_before_alignment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -203,20 +223,11 @@ def test_decoded_duration_overrun_is_invalid_timestamp_before_alignment(
 
 
 def _pipeline_test_candidate(
-    declared_duration_ms: int = 1_000,
+    declared_duration_ms: object = 1_000,
 ) -> list[tuple[str, object, object]]:
     """Return one metadata-only candidate for direct native-programme tests."""
     shard = type("Shard", (), {"path": "source/part.parquet", "byte_size": 1_000})()
     return [("file-1", {"duration_ms": declared_duration_ms}, (shard, object()))]
-
-
-def pipeline_config(tmp_path: Path, mode: str = "plan") -> DictConfig:
-    """Return a small test-owned pipeline configuration."""
-    config = OmegaConf.load("config/p1_segments.yaml")
-    config.mode = mode
-    config.runtime.scratch_root = str(tmp_path / "scratch")
-    config.runtime.device = "cpu"
-    return cast(DictConfig, config)
 
 
 def test_decoded_duration_replaces_declared_metadata_duration(
@@ -278,7 +289,7 @@ def test_decoded_duration_replaces_declared_metadata_duration(
 def test_empty_timed_words_precede_ambiguous_source_text(tmp_path: Path) -> None:
     """Lexical text with no timed words stops before ambiguity classification."""
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
-    candidate = _pipeline_test_candidate()
+    candidate = _pipeline_test_candidate(declared_duration_ms="not-a-duration")
 
     class Source:
         last_temporary = None
@@ -310,6 +321,7 @@ def test_empty_timed_words_precede_ambiguous_source_text(tmp_path: Path) -> None
         )
         record = ledger.programme("p1-file-1")
 
+    assert record.source_duration_ms is None
     assert record.last_error == "no_timed_words"
     assert report.rejection_counts == {"no_timed_words": 1}
 
