@@ -13,6 +13,7 @@ import hashlib
 import importlib
 import itertools
 import json
+import logging
 import os
 import shutil
 import time
@@ -42,6 +43,10 @@ from hviske.p1_contracts import (
 )
 from hviske.p1_ledger import Ledger
 from hviske.p1_segments import CTCBackend, VADBackend, segment_programme, write_shards
+
+logger = logging.getLogger(__name__)
+
+_PROGRESS_INTERVAL = 10_000
 
 
 @dataclass(frozen=True)
@@ -153,7 +158,7 @@ class PipelineSettings:
             verification_concurrency=_as_int(
                 runtime.get("verification_concurrency", 1)
             ),
-            source_max_batch_rows=_as_int(runtime.get("source_max_batch_rows", 1)),
+            source_max_batch_rows=_as_int(runtime.get("source_max_batch_rows", 1024)),
             source_max_batch_bytes=_as_int(
                 runtime.get("source_max_batch_bytes", 64 * 1024 * 1024)
             ),
@@ -522,11 +527,14 @@ def _run_native_pipeline(
 
     index_path = scratch / "transcript-pointers.sqlite"
     index_builder = getattr(source, "build_transcript_index")
-    index = index_builder(
-        revision=settings.source_transcript_revision,
-        path=index_path,
-        objects=plan.transcript_objects,
-    )
+    index_kwargs: dict[str, object] = {
+        "revision": settings.source_transcript_revision,
+        "path": index_path,
+        "objects": plan.transcript_objects,
+    }
+    if settings.source_file_id is not None:
+        index_kwargs["source_file_id"] = settings.source_file_id
+    index = index_builder(**index_kwargs)
     candidates = _native_candidates(
         source=source,
         shards=shards,
@@ -541,10 +549,15 @@ def _run_native_pipeline(
         report.preflight = dataclasses.replace(
             report.preflight, selected_programmes=len(candidates)
         )
+        logger.info("P1 selection complete: %d programmes selected", len(candidates))
     if vad is None:
+        logger.info("P1 model stage: loading VAD backend")
         vad = make_silero_vad(settings)
+        logger.info("P1 model stage: VAD backend ready")
     if ctc is None:
+        logger.info("P1 model stage: loading CTC backend")
         ctc = make_ctc_backend(settings)
+        logger.info("P1 model stage: CTC backend ready")
     ledger_path = scratch / "ledger.sqlite"
     with Ledger(ledger_path) as ledger:
         _recover_native_batches(
@@ -605,61 +618,147 @@ def _native_candidates(
     pilot: bool,
     log: MetadataLog,
 ) -> c.Iterable[tuple[str, object, object]]:
-    """Select source pointers with a bounded, multi-axis pilot reservoir.
+    """Select source pointers with bounded metadata-only scans.
 
-    Metadata is projected by the source adapter.  Pilot mode makes two metadata-only
-    passes: the first selects required strata through the shared validation sampler,
-    and the second resolves only those identifiers to source pointers.  No corpus-sized
-    object or Parquet row is retained.
+    A requested source file is resolved in one targeted audio metadata scan.  Without
+    one, pilot mode makes its deliberate deterministic two-pass sample.  Missing
+    transcript evidence is aggregated per scan so the event log does not retain every
+    unmatched identifier.
 
     Returns:
         A bounded list or a streaming iterator of source pointers.
     """
+    from hviske.p1_source import SourceSelectionError
+
+    metadata_iterator = getattr(source, "iter_programme_metadata")
+
+    def make_candidate(
+        *, row: Mapping[str, object], shard: object, file_id: str, pointer: object
+    ) -> tuple[str, object, object]:
+        safe = {
+            key: value
+            for key, value in row.items()
+            if key.casefold()
+            not in {
+                "audio",
+                "text",
+                "transcript",
+                "transcript_text",
+                "words",
+                "word_timestamps",
+                "timestamps",
+            }
+            and isinstance(value, (str, int, float, bool, type(None)))
+        }
+        safe["id"] = file_id
+        for key, value in getattr(pointer, "metadata", ()):
+            try:
+                safe.setdefault(key, json.loads(value))
+            except (TypeError, ValueError):
+                continue
+        return file_id, safe, (shard, pointer)
+
+    def targeted() -> list[tuple[str, object, object]]:
+        target_id = t.cast(str, source_file_id)
+        rows_scanned = 0
+        shards_scanned = 0
+        for shard in shards:
+            shards_scanned += 1
+            for raw in metadata_iterator(shard=shard):
+                rows_scanned += 1
+                if rows_scanned % _PROGRESS_INTERVAL == 0:
+                    logger.info(
+                        "Audio metadata scan progress: %d rows across %d shards",
+                        rows_scanned,
+                        shards_scanned,
+                    )
+                row = as_mapping(raw)
+                file_id = row.get("file_id")
+                if file_id != target_id:
+                    continue
+                pointer = getattr(index, "get")(target_id)
+                if pointer is None:
+                    raise SourceSelectionError(
+                        "requested source_file_id has no valid joined "
+                        "transcript pointer"
+                    )
+                logger.info(
+                    "Audio metadata selection complete: 1 programme after %d rows",
+                    rows_scanned,
+                )
+                return [
+                    make_candidate(
+                        row=row, shard=shard, file_id=target_id, pointer=pointer
+                    )
+                ]
+            if shards_scanned % 10 == 0:
+                logger.info(
+                    "Audio metadata shard scan progress: %d shards, %d rows",
+                    shards_scanned,
+                    rows_scanned,
+                )
+        logger.info(
+            "Audio metadata selection complete: %d shards, %d rows, no target",
+            shards_scanned,
+            rows_scanned,
+        )
+        raise SourceSelectionError(
+            "requested source_file_id was not found in audio metadata"
+        )
+
+    if source_file_id is not None:
+        return targeted()
 
     def stream() -> c.Iterator[tuple[str, object, object]]:
         seen: set[str] = set()
-        metadata_iterator = getattr(source, "iter_programme_metadata")
-        for shard in shards:
-            for raw in metadata_iterator(shard=shard):
-                row = as_mapping(raw)
-                file_id = row.get("file_id")
-                if not isinstance(file_id, str) or not file_id or file_id in seen:
-                    continue
-                if source_file_id is not None and file_id != source_file_id:
-                    continue
-                pointer = getattr(index, "get")(file_id)
-                if pointer is None:
-                    log.write(
-                        {
-                            "event": "programme_rejection",
-                            "source_file_id": file_id,
-                            "reason": "missing_transcript",
-                        }
-                    )
-                    continue
-                seen.add(file_id)
-                safe = {
-                    key: value
-                    for key, value in row.items()
-                    if key.casefold()
-                    not in {
-                        "audio",
-                        "text",
-                        "transcript",
-                        "transcript_text",
-                        "words",
-                        "word_timestamps",
-                        "timestamps",
-                    }
-                    and isinstance(value, (str, int, float, bool, type(None)))
-                }
-                safe["id"] = file_id
-                for key, value in getattr(pointer, "metadata", ()):
-                    try:
-                        safe.setdefault(key, json.loads(value))
-                    except (TypeError, ValueError):
+        rows_scanned = 0
+        shards_scanned = 0
+        missing_transcript_count = 0
+        try:
+            for shard in shards:
+                shards_scanned += 1
+                for raw in metadata_iterator(shard=shard):
+                    rows_scanned += 1
+                    if rows_scanned % _PROGRESS_INTERVAL == 0:
+                        logger.info(
+                            "Audio metadata scan progress: %d rows across %d shards",
+                            rows_scanned,
+                            shards_scanned,
+                        )
+                    row = as_mapping(raw)
+                    file_id = row.get("file_id")
+                    if not isinstance(file_id, str) or not file_id or file_id in seen:
                         continue
-                yield file_id, safe, (shard, pointer)
+                    seen.add(file_id)
+                    pointer = getattr(index, "get")(file_id)
+                    if pointer is None:
+                        missing_transcript_count += 1
+                        continue
+                    yield make_candidate(
+                        row=row, shard=shard, file_id=file_id, pointer=pointer
+                    )
+                if shards_scanned % 10 == 0:
+                    logger.info(
+                        "Audio metadata shard scan progress: %d shards, %d rows",
+                        shards_scanned,
+                        rows_scanned,
+                    )
+        finally:
+            if missing_transcript_count:
+                log.write(
+                    {
+                        "event": "programme_rejection_summary",
+                        "reason": "missing_transcript",
+                        "count": missing_transcript_count,
+                    }
+                )
+            logger.info(
+                "Audio metadata selection complete: %d rows, %d shards, "
+                "%d missing transcripts",
+                rows_scanned,
+                shards_scanned,
+                missing_transcript_count,
+            )
 
     if programme_limit is None:
         return stream()
@@ -677,6 +776,9 @@ def _native_candidates(
     selected_ids = {str(row["id"]) for row in selected_rows}
     selected = [candidate for candidate in stream() if candidate[0] in selected_ids]
     selected.sort(key=lambda item: item[0])
+    logger.info(
+        "Audio metadata selection complete: %d programmes selected", len(selected)
+    )
     return selected
 
 
@@ -721,7 +823,10 @@ def _process_native_programmes(
     from hviske.p1_ledger import ShardAllocation
     from hviske.p1_source import InvalidSourceTimestamp
 
-    for file_id, metadata, locator in candidates:
+    for programme_number, (file_id, metadata, locator) in enumerate(
+        candidates, start=1
+    ):
+        logger.info("Programme %d start", programme_number)
         report.max_in_flight = max(report.max_in_flight, 1)
         shard, transcript_pointer = t.cast(tuple[object, object], locator)
         programme_id = f"p1-{file_id}"
@@ -745,6 +850,9 @@ def _process_native_programmes(
         if state == "rejected" or (
             settings.resume and state in {"purged", "verified", "sharded"}
         ):
+            logger.info(
+                "Programme %d terminal outcome: skipped (%s)", programme_number, state
+            )
             continue
         try:
             started = time.monotonic()
@@ -783,6 +891,10 @@ def _process_native_programmes(
                     reason=RejectionCategory.INVALID_TIMESTAMPS.value,
                 )
                 purge_source_temporary(getattr(source, "last_temporary", None))
+                logger.info(
+                    "Programme %d terminal outcome: rejected (invalid timestamps)",
+                    programme_number,
+                )
                 continue
             programme = SourceProgramme(
                 file_id=file_id,
@@ -873,6 +985,11 @@ def _process_native_programmes(
                             "reason": next(iter(reason_counts)),
                         }
                     )
+                    logger.info(
+                        "Programme %d terminal outcome: rejected (%s)",
+                        programme_number,
+                        next(iter(reason_counts)),
+                    )
                     continue
                 raise ValueError("programme produced no publication shard")
             allocations = tuple(
@@ -924,6 +1041,7 @@ def _process_native_programmes(
                 audit_reservoir=audit_reservoir,
             )
             report.processed += 1
+            logger.info("Programme %d terminal outcome: accepted", programme_number)
         except InvalidSourceTimestamp:
             _reject_native_programme(
                 ledger=ledger,
@@ -934,6 +1052,10 @@ def _process_native_programmes(
                 reason=RejectionCategory.INVALID_TIMESTAMPS.value,
             )
             purge_source_temporary(getattr(source, "last_temporary", None))
+            logger.info(
+                "Programme %d terminal outcome: rejected (invalid timestamps)",
+                programme_number,
+            )
             continue
         except Exception as exc:
             category = _safe_exception_category(exc)
@@ -948,6 +1070,9 @@ def _process_native_programmes(
                     "source_file_id": file_id,
                     "reason": category,
                 }
+            )
+            logger.info(
+                "Programme %d terminal outcome: error (%s)", programme_number, category
             )
             raise
         finally:

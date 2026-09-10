@@ -82,8 +82,8 @@ runtime:
   queue_slots: 1
   upload_concurrency: 1
   verification_concurrency: 1
-  # Keep projected source access bounded to one small Arrow batch.
-  source_max_batch_rows: 1
+  # Keep projected source access bounded to a modest Arrow batch.
+  source_max_batch_rows: 1024
   source_max_batch_bytes: 67108864
   device: cuda:0
   shards_per_commit: 8

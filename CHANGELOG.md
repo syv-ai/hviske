@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Increase P1 projected metadata batches to 1,024 rows while retaining the 64 MiB
+  hard byte bound and audio-column projection, add targeted source selection, aggregate
+  missing-transcript evidence, and expose safe periodic pipeline progress.
 - Preserve zero-duration P1 transcript text while omitting only non-spacing timed
   tokens, classify invalid source timestamps as terminal rejections, and abort
   unexpectedly failed programmes with safe retryable ledger evidence.

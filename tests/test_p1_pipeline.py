@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import io
+import json
 import logging
 from pathlib import Path
 from typing import cast
@@ -110,6 +111,40 @@ class MetadataSource:
             audio_shards=(SourceShard("data/audio.parquet", 10),),
             transcript_objects=(("data/transcripts.parquet", 10, None),),
         )
+
+
+def test_missing_transcripts_are_aggregated_without_ids(tmp_path: Path) -> None:
+    """Missing transcript evidence contains only an aggregate count."""
+
+    class Source:
+        def iter_programme_metadata(self, **_: object) -> object:
+            yield from ({"file_id": "missing-a"}, {"file_id": "missing-b"})
+
+    class Index:
+        def get(self, _: str) -> None:
+            return None
+
+    events = tmp_path / "events.jsonl"
+    candidates = _native_candidates(
+        source=Source(),
+        shards=(SourceShard("audio.parquet", 10),),
+        index=Index(),
+        programme_limit=None,
+        source_file_id=None,
+        pilot=False,
+        log=MetadataLog(events),
+    )
+    assert list(candidates) == []
+    records = [json.loads(line) for line in events.read_text().splitlines()]
+    assert records == [
+        {
+            "count": 2,
+            "event": "programme_rejection_summary",
+            "reason": "missing_transcript",
+        }
+    ]
+    assert "missing-a" not in events.read_text()
+    assert "missing-b" not in events.read_text()
 
 
 def test_overlong_transcript_is_a_terminal_invalid_timestamp_rejection(
@@ -316,6 +351,38 @@ def test_plan_verifies_github_vad_and_hub_models(
     assert [item[0] for item in calls] == ["github", "hub", "hub"]
 
 
+def test_progress_logs_do_not_include_source_identifiers_or_paths(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Operational progress reports counts, not source URLs or paths."""
+    target = "https://source.invalid/audio.parquet?signature=secret"
+
+    class Source:
+        def iter_programme_metadata(self, **_: object) -> object:
+            yield {"file_id": target}
+
+    class Index:
+        def get(self, file_id: str) -> object | None:
+            return object() if file_id == target else None
+
+    with caplog.at_level(logging.INFO, logger="hviske.p1_pipeline"):
+        candidates = _native_candidates(
+            source=Source(),
+            shards=(SourceShard("private/audio.parquet", 10),),
+            index=Index(),
+            programme_limit=None,
+            source_file_id=target,
+            pilot=False,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+        )
+    assert len(list(candidates)) == 1
+    progress = " ".join(record.getMessage() for record in caplog.records)
+    assert "selection complete" in progress
+    assert target not in progress
+    assert "signature=secret" not in progress
+    assert "private/audio.parquet" not in progress
+
+
 def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
     """Partial unlink recovery tolerates missing files and protects replacements."""
     good = tmp_path / "good.parquet"
@@ -336,6 +403,36 @@ def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
 
     assert not good.exists()
     assert replaced.exists()
+
+
+def test_targeted_selection_stops_after_matching_audio_metadata(tmp_path: Path) -> None:
+    """A requested programme is found without scanning later source rows."""
+
+    class Source:
+        def __init__(self) -> None:
+            self.rows_seen = 0
+
+        def iter_programme_metadata(self, **_: object) -> object:
+            for file_id in ("before", "wanted", "after"):
+                self.rows_seen += 1
+                yield {"file_id": file_id, "duration_ms": 1}
+
+    class Index:
+        def get(self, file_id: str) -> object | None:
+            return object() if file_id == "wanted" else None
+
+    source = Source()
+    candidates = _native_candidates(
+        source=source,
+        shards=(SourceShard("audio.parquet", 10),),
+        index=Index(),
+        programme_limit=None,
+        source_file_id="wanted",
+        pilot=False,
+        log=MetadataLog(tmp_path / "events.jsonl"),
+    )
+    assert [candidate[0] for candidate in candidates] == ["wanted"]
+    assert source.rows_seen == 2
 
 
 def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
