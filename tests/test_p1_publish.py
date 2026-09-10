@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 from huggingface_hub import CommitInfo, HfFileSystem
-from huggingface_hub.utils import RepositoryNotFoundError
+from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
 from hviske.p1_contracts import LedgerState, OutputRow, ShardEvidence
 from hviske.p1_ledger import Ledger
@@ -84,6 +84,7 @@ class MemoryHub:
     """Small in-memory Hub fake that records every operation."""
 
     private: object = True
+    sha: str | None = None
     commit_id: str = "a" * 40
     expose_digest: bool = False
     flip_public: bool = False
@@ -96,6 +97,7 @@ class MemoryHub:
         """Initialise the fake's mutable repository state."""
         self.files: dict[str, bytes] = {}
         self.commits: list[tuple[str, ...]] = []
+        self.parent_commits: list[str | None] = []
         self.privacy_checks = 0
         self.streamed: list[str] = []
         self.loaded: list[tuple[str, bool]] = []
@@ -116,6 +118,7 @@ class MemoryHub:
             Fake commit metadata.
         """
         operations = tuple(operations)
+        self.parent_commits.append(parent_commit)
         self.commits.append(tuple(operation.path_in_repo for operation in operations))
         for operation in operations:
             self.files[operation.path_in_repo] = operation.path.read_bytes()
@@ -180,7 +183,7 @@ class MemoryHub:
                     status_code=404, request=httpx.Request("GET", "https://hub.test")
                 ),
             )
-        return SimpleNamespace(private=self.private)
+        return SimpleNamespace(private=self.private, sha=self.sha)
 
     def stream_file(
         self, repo_id: str, path: str, *, repo_type: str, revision: str
@@ -358,6 +361,35 @@ def test_digest_failure_retains_local_artefacts(tmp_path: Path) -> None:
         publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
     assert path.exists()
     assert (tmp_path / "manifests" / "batch.json").exists()
+
+
+def test_empty_repository_uses_no_head_api_semantics() -> None:
+    """An empty Hub target lists at no revision and commits with no parent."""
+    hub = EmptyRepoHub()
+    commit = initialise_private_dataset(hub, "org/p1", card=make_card())
+    assert commit == "a" * 40
+    assert hub.parent_commits == [None]
+
+
+class EmptyRepoHub(MemoryHub):
+    """Hub fake whose empty repository has no addressable default revision."""
+
+    def list_repo_files(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> c.Iterable[str]:
+        """Expose the Hub's no-head listing behaviour.
+
+        Raises:
+            RevisionNotFoundError:
+                Always, because this fake represents an empty repository.
+        """
+        assert revision is None
+        raise RevisionNotFoundError(
+            "empty repository",
+            response=httpx.Response(
+                status_code=404, request=httpx.Request("GET", "https://hub.test")
+            ),
+        )
 
 
 def test_exposed_digest_avoids_remote_download() -> None:
@@ -600,6 +632,123 @@ def test_purge_requires_and_follows_durable_verification(tmp_path: Path) -> None
     assert evidence.state.value == "purged"
     assert events[-2:] == ["durable", "purge"]
     assert not path.exists()
+
+
+def test_racing_competitor_cannot_overwrite_or_lose_ledger_batch(
+    tmp_path: Path,
+) -> None:
+    """A stale parent aborts publication and leaves a batch resumable."""
+    path = tmp_path / "one.parquet"
+    write_valid_shard(path)
+    competitor_bytes = b"competitor owns this path"
+    hub = RacingHub("one.parquet", competitor_bytes)
+    database = tmp_path / "ledger.sqlite"
+
+    with Ledger(database) as ledger:
+        ledger.register_batch("batch", pipeline_digest="a" * 64)
+        ledger.register_shard(
+            "shard",
+            path="one.parquet",
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            byte_size=path.stat().st_size,
+            row_count=1,
+            batch_id="batch",
+        )
+        ledger.transition_batch("batch", LedgerState.PROCESSING)
+        ledger.transition_batch("batch", LedgerState.SHARDED)
+
+        with pytest.raises(RuntimeError, match="stale parent"):
+            publish_batch(
+                hub,
+                "org/p1",
+                "batch",
+                [LocalShard(path, "one.parquet", 1)],
+                ledger=ledger,
+            )
+
+        assert hub.revisions == ["b" * 40]
+        assert hub.parents == ["b" * 40]
+        assert hub.files["one.parquet"] == competitor_bytes
+        assert ledger.batch("batch").state is LedgerState.SHARDED
+        assert ledger.batch("batch").commit_id is None
+        with pytest.raises(AllowListError, match="collision"):
+            publish_batch(
+                hub,
+                "org/p1",
+                "batch",
+                [LocalShard(path, "one.parquet", 1)],
+                ledger=ledger,
+            )
+        assert ledger.batch("batch").state is LedgerState.SHARDED
+        assert hub.files["one.parquet"] == competitor_bytes
+
+
+class RacingHub(MemoryHub):
+    """Hub fake that races a competing commit after an immutable listing."""
+
+    def __init__(self, race_path: str, race_bytes: bytes) -> None:
+        """Set up a fake with a colliding competitor path."""
+        super().__init__()
+        self.head = "b" * 40
+        self.race_path = race_path
+        self.race_bytes = race_bytes
+        self.race = True
+        self.parents: list[str | None] = []
+        self.revisions: list[str | None] = []
+
+    def create_commit(
+        self,
+        repo_id: str,
+        operations: c.Iterable[UploadOperation],
+        *,
+        repo_type: str,
+        commit_message: str,
+        parent_commit: str | None = None,
+    ) -> object:
+        """Reject stale parents instead of applying their operations.
+
+        Returns:
+            Fake commit metadata.
+
+        Raises:
+            RuntimeError:
+                If the requested parent is no longer the current head.
+        """
+        self.parents.append(parent_commit)
+        if parent_commit != self.head:
+            raise RuntimeError("stale parent")
+        result = super().create_commit(
+            repo_id,
+            operations,
+            repo_type=repo_type,
+            commit_message=commit_message,
+            parent_commit=parent_commit,
+        )
+        self.head = self.commit_id
+        return result
+
+    def list_repo_files(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> c.Iterable[str]:
+        """Return the old immutable snapshot before racing a competitor."""
+        self.revisions.append(revision)
+        snapshot = tuple(self.files) + self.existing_paths
+        if self.race:
+            self.race = False
+            self.files[self.race_path] = self.race_bytes
+            self.head = "c" * 40
+        return snapshot
+
+    def repo_info(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> object:
+        """Expose the current branch head to the publisher.
+
+        Returns:
+            Fake repository metadata.
+        """
+        self.privacy_checks += 1
+        return SimpleNamespace(private=self.private, sha=self.head)
 
 
 def test_remote_digest_stream_does_not_retain_shard_bytes() -> None:
