@@ -669,8 +669,8 @@ def _native_candidates(
 
     Audio pointers are discovered during selection and retained in each candidate.  A
     build therefore never has to rescan a source shard to locate an already selected
-    programme.  Pilot selection intentionally retains its deterministic two-pass
-    reservoir behaviour.
+    programme.  Pilot selection samples bounded metadata and reconstructs only the
+    selected candidates from their retained scalar locators.
 
     Returns:
         A bounded list or streaming iterator of joined source candidates.
@@ -681,7 +681,7 @@ def _native_candidates(
     metadata_iterator = getattr(source, "iter_programme_metadata", None)
 
     def safe_metadata(
-        row: Mapping[str, object], pointer: object, file_id: str
+        row: Mapping[str, object], pointer: object, file_id: str, shard_index: int
     ) -> dict[str, object]:
         forbidden = {
             "audio",
@@ -708,9 +708,29 @@ def _native_candidates(
             if isinstance(decoded, (str, int, float, bool, type(None))):
                 safe.setdefault(key, decoded)
         safe["id"] = file_id
+        shard = getattr(pointer, "shard", None)
+        if isinstance(shard_index, int) and shard_index >= 0:
+            safe["source_shard_index"] = shard_index
+        shard_path = getattr(shard, "path", None)
+        if isinstance(shard_path, str):
+            safe["source_shard_path"] = shard_path
+        shard_byte_size = getattr(shard, "byte_size", None)
+        if isinstance(shard_byte_size, int) and not isinstance(shard_byte_size, bool):
+            safe["source_shard_byte_size"] = shard_byte_size
+        shard_revision = getattr(shard, "revision", None)
+        if isinstance(shard_revision, str):
+            safe["source_revision"] = shard_revision
+        row_group = getattr(pointer, "row_group", None)
+        if isinstance(row_group, int) and not isinstance(row_group, bool):
+            safe["source_row_group"] = row_group
+        row_index = getattr(pointer, "row_index", None)
+        if isinstance(row_index, int) and not isinstance(row_index, bool):
+            safe["source_row_index"] = row_index
         return t.cast(dict[str, object], safe)
 
-    def candidate_from_pointer(pointer: object) -> NativeCandidate | None:
+    def candidate_from_pointer(
+        pointer: object, shard_index: int
+    ) -> NativeCandidate | None:
         file_id = getattr(pointer, "file_id", None)
         if not isinstance(file_id, str) or not file_id:
             return None
@@ -727,13 +747,13 @@ def _native_candidates(
             )
         return NativeCandidate(
             file_id=file_id,
-            metadata=safe_metadata({}, pointer, file_id),
+            metadata=safe_metadata({}, pointer, file_id, shard_index),
             audio_pointer=pointer,
             transcript_pointer=transcript_pointer,
         )
 
     def metadata_candidate(
-        raw: object, shard: object, row_index: int
+        raw: object, shard: object, shard_index: int, row_index: int
     ) -> NativeCandidate | None:
         row = as_mapping(raw)
         file_id = row.get("file_id")
@@ -742,15 +762,29 @@ def _native_candidates(
         transcript_pointer = getattr(index, "get")(file_id)
         if transcript_pointer is None:
             return None
+        metadata_row_group = row.get("source_row_group", 0)
+        if (
+            not isinstance(metadata_row_group, int)
+            or isinstance(metadata_row_group, bool)
+            or metadata_row_group < 0
+        ):
+            metadata_row_group = 0
+        metadata_row_index = row.get("source_row_index", row_index)
+        if (
+            not isinstance(metadata_row_index, int)
+            or isinstance(metadata_row_index, bool)
+            or metadata_row_index < 0
+        ):
+            metadata_row_index = row_index
         pointer = AudioPointer(
             file_id=file_id,
             shard=t.cast(SourceShard, shard),
-            row_group=0,
-            row_index=row_index,
+            row_group=metadata_row_group,
+            row_index=metadata_row_index,
         )
         return NativeCandidate(
             file_id=file_id,
-            metadata=safe_metadata(row, pointer, file_id),
+            metadata=safe_metadata(row, pointer, file_id, shard_index),
             audio_pointer=pointer,
             transcript_pointer=transcript_pointer,
         )
@@ -773,13 +807,13 @@ def _native_candidates(
                 next_progress += _PROGRESS_INTERVAL
 
         try:
-            for shard in shards:
+            for shard_index, shard in enumerate(shards):
                 shards_scanned += 1
                 if callable(pointer_iterator):
                     for pointer in pointer_iterator(shard=shard):
                         rows_scanned += 1
                         emit_progress()
-                        candidate = candidate_from_pointer(pointer)
+                        candidate = candidate_from_pointer(pointer, shard_index)
                         if candidate is None:
                             file_id = getattr(pointer, "file_id", None)
                             if isinstance(file_id, str) and file_id:
@@ -793,7 +827,9 @@ def _native_candidates(
                     for row_index, raw in enumerate(metadata_iterator(shard=shard)):
                         rows_scanned += 1
                         emit_progress()
-                        candidate = metadata_candidate(raw, shard, row_index)
+                        candidate = metadata_candidate(
+                            raw, shard, shard_index, row_index
+                        )
                         if candidate is None:
                             file_id = as_mapping(raw).get("file_id")
                             if isinstance(file_id, str) and file_id:
@@ -840,14 +876,78 @@ def _native_candidates(
     from hviske.p1_validation import stratified_sample
 
     selected_rows = stratified_sample(
-        (candidate.metadata for candidate in stream(emit_summary=False)),
+        (candidate.metadata for candidate in stream()),
         sample_size=programme_limit,
         seed="p1-pilot",
     )
-    selected_ids = {str(row["id"]) for row in selected_rows}
-    selected = [
-        candidate for candidate in stream() if candidate.file_id in selected_ids
-    ]
+
+    def selected_candidate(row: Mapping[str, object]) -> NativeCandidate:
+        file_id = row.get("id")
+        shard_index = row.get("source_shard_index")
+        row_group = row.get("source_row_group")
+        row_index = row.get("source_row_index")
+        if (
+            not isinstance(file_id, str)
+            or not file_id
+            or not isinstance(shard_index, int)
+            or isinstance(shard_index, bool)
+            or not 0 <= shard_index < len(shards)
+            or not isinstance(row_group, int)
+            or isinstance(row_group, bool)
+            or row_group < 0
+            or not isinstance(row_index, int)
+            or isinstance(row_index, bool)
+            or row_index < 0
+        ):
+            raise SourceSelectionError("selected audio metadata has no valid locator")
+        shard = t.cast(SourceShard, shards[shard_index])
+        shard_path = row.get("source_shard_path")
+        if isinstance(shard_path, str) and shard_path != shard.path:
+            raise SourceSelectionError("selected audio metadata locator disagrees")
+        transcript_pointer = getattr(index, "get")(file_id)
+        if transcript_pointer is None:
+            raise SourceSelectionError("selected programme has no transcript pointer")
+        pointer_metadata = ()
+        if callable(pointer_iterator):
+            pointer_metadata = tuple(
+                sorted(
+                    (key, json.dumps(value, ensure_ascii=False, sort_keys=True))
+                    for key, value in row.items()
+                    if key.casefold()
+                    in {
+                        "broadcaster",
+                        "creator_affiliation",
+                        "duration",
+                        "duration_ms",
+                        "genre",
+                        "genre_sub",
+                        "language",
+                        "month",
+                        "platform",
+                        "show",
+                        "speaker_count",
+                        "split",
+                        "title",
+                        "year",
+                    }
+                    and isinstance(value, (str, int, float, bool, type(None)))
+                )
+            )
+        pointer = AudioPointer(
+            file_id=file_id,
+            shard=shard,
+            row_group=row_group,
+            row_index=row_index,
+            metadata=pointer_metadata,
+        )
+        return NativeCandidate(
+            file_id=file_id,
+            metadata=dict(row),
+            audio_pointer=pointer,
+            transcript_pointer=transcript_pointer,
+        )
+
+    selected = [selected_candidate(row) for row in selected_rows]
     selected.sort(key=lambda candidate: candidate.file_id)
     logger.info(
         "Audio metadata selection complete: %d programmes selected", len(selected)

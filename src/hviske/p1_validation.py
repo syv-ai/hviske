@@ -355,6 +355,7 @@ def _metadata_copy(row: MetadataRow) -> dict[str, object]:
         "source_parquet",
         "source_shard_path",
         "source_shard",
+        "source_shard_index",
         "source_parquet_path",
         "source_row_group",
         "source_row_index",

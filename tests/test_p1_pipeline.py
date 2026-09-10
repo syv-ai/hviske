@@ -45,6 +45,7 @@ from hviske.p1_source import (
     harden_p1_logging,
     parse_transcript_row,
 )
+from hviske.p1_validation import stratified_sample
 from tests.test_p1_publish import MemoryHub
 
 
@@ -456,6 +457,68 @@ def test_parser_timestamp_failure_is_invalid_timestamp_rejection(
 
     assert record.last_error == "invalid_timestamps"
     assert report.rejection_counts == {"invalid_timestamps": 1}
+
+
+def test_pilot_scans_each_shard_once_and_recovers_exact_pointers(
+    tmp_path: Path,
+) -> None:
+    """Pilot selection keeps bounded locators from its single metadata pass."""
+    shards = (SourceShard("audio-a.parquet", 10), SourceShard("audio-b.parquet", 20))
+    pointers = tuple(
+        AudioPointer(
+            f"programme-{index}",
+            shards[index // 4],
+            index % 4,
+            index + 10,
+            (("duration_ms", json.dumps(1_000 + index)),),
+        )
+        for index in range(8)
+    )
+
+    class Source:
+        def __init__(self) -> None:
+            self.shards_opened: list[str] = []
+
+        def iter_programme_metadata(self, **_: object) -> object:
+            raise AssertionError("pilot must not make a second metadata pass")
+
+        def iter_programme_pointers(self, *, shard: SourceShard) -> object:
+            self.shards_opened.append(shard.path)
+            return iter(pointer for pointer in pointers if pointer.shard == shard)
+
+    class Index:
+        def get(self, _: str) -> object:
+            return object()
+
+    source = Source()
+    expected = stratified_sample(
+        [
+            {"id": pointer.file_id, "duration_ms": 1_000 + index}
+            for index, pointer in enumerate(pointers)
+        ],
+        sample_size=3,
+        seed="p1-pilot",
+    )
+    candidates = _native_candidates(
+        source=source,
+        shards=shards,
+        index=Index(),
+        programme_limit=3,
+        source_file_id=None,
+        pilot=True,
+        log=MetadataLog(tmp_path / "events.jsonl"),
+    )
+
+    assert source.shards_opened == [shard.path for shard in shards]
+    assert [candidate.file_id for candidate in candidates] == sorted(
+        str(row["id"]) for row in expected
+    )
+    recovered = {candidate.file_id: candidate.audio_pointer for candidate in candidates}
+    assert all(
+        recovered[pointer.file_id] == pointer
+        for pointer in pointers
+        if pointer.file_id in recovered
+    )
 
 
 def test_pilot_selection_is_bounded_and_not_first_rows(tmp_path: Path) -> None:

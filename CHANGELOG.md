@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Reduce deterministic P1 pilot selection to one audio metadata pass by retaining only
+  bounded scalar row locators and reconstructing selected audio pointers from the plan.
 - Increase P1 projected metadata batches to 1,024 rows while retaining the 64 MiB
   hard byte bound and audio-column projection, add targeted source selection, aggregate
   missing-transcript evidence, and expose safe periodic pipeline progress.
