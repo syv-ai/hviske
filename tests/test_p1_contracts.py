@@ -16,6 +16,7 @@ from hviske.p1_contracts import (
     SegmentationContract,
     SourceCoordinates,
     SourceProgramme,
+    SourceTextSpan,
     SourceWord,
     VADContract,
     canonical_json,
@@ -205,3 +206,40 @@ def test_source_contract_records_verbatim_character_spans() -> None:
     assert programme.words[1].separator_span is not None
     assert programme.words[-1].trailing_text == ""
     assert programme.transcript_text == "Hej,  verden!"
+
+
+def test_source_contract_rejects_inconsistent_character_spans() -> None:
+    """Annotated source offsets must identify their declared word text."""
+    with pytest.raises(ValueError, match="not present at its source offset"):
+        SourceProgramme(
+            file_id="programme",
+            duration_ms=3_000,
+            words=(
+                SourceWord(
+                    text="Hej",
+                    start_ms=0,
+                    end_ms=1_000,
+                    source_span=SourceTextSpan(start=1, end=4),
+                ),
+            ),
+            transcript_text="Hej verden",
+        )
+
+
+def test_source_contract_rejects_partial_character_spans() -> None:
+    """A partial source annotation cannot silently fall back to lexical matching."""
+    with pytest.raises(ValueError, match="present for every source word"):
+        SourceProgramme(
+            file_id="programme",
+            duration_ms=3_000,
+            words=(
+                SourceWord(
+                    text="Hej",
+                    start_ms=0,
+                    end_ms=1_000,
+                    source_span=SourceTextSpan(start=0, end=3),
+                ),
+                SourceWord(text="verden", start_ms=1_000, end_ms=2_000),
+            ),
+            transcript_text="Hej verden",
+        )
