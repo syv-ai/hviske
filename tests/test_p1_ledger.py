@@ -133,6 +133,52 @@ def add_batch(ledger: Ledger, batch_id: str = "batch-1") -> None:
     ledger.attach_shard(batch_id, "shard-1")
 
 
+def test_incompatible_legacy_migration_rolls_back_every_schema_change(
+    tmp_path: Path,
+) -> None:
+    """A failed legacy bind leaves the database byte-for-byte unchanged."""
+    database = tmp_path / "legacy.sqlite"
+    with Ledger(database) as ledger:
+        add_programme(ledger)
+
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE ledger_metadata")
+    connection.execute("PRAGMA user_version = 2")
+    connection.commit()
+    before_schema = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+    ).fetchall()
+    before_user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    connection.close()
+    before_bytes = database.read_bytes()
+
+    with pytest.raises(EvidenceError, match="different pipeline digest"):
+        Ledger(database, pipeline_digest="b" * 64)
+
+    assert database.read_bytes() == before_bytes
+    connection = sqlite3.connect(database)
+    assert (
+        connection.execute("PRAGMA user_version").fetchone()[0] == before_user_version
+    )
+    assert (
+        connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        == before_schema
+    )
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+    ).fetchall() == [
+        ("audit_candidates",),
+        ("batches",),
+        ("ledger_sequences",),
+        ("programmes",),
+        ("shards",),
+        ("sqlite_sequence",),
+    ]
+    connection.close()
+
+
 def test_ledger_binds_one_pipeline_digest_before_mutation(tmp_path: Path) -> None:
     """A restart with a different pipeline identity cannot alter the ledger."""
     database = tmp_path / "ledger.sqlite"

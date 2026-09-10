@@ -269,7 +269,7 @@ class BuildReport:
         """Return metadata-only run evidence."""
         return {
             "preflight": self.preflight.as_dict(),
-            "selected_file_ids": list(self.selected_file_ids),
+            "selected_programmes": len(self.selected_file_ids),
             "processed": self.processed,
             "rejected": self.rejected,
             "accepted_segments": self.accepted_segments,
@@ -762,12 +762,25 @@ def _native_candidates(
         rows_scanned = 0
         shards_scanned = 0
         missing_transcript_count = 0
+        next_progress = _PROGRESS_INTERVAL
+
+        def emit_progress() -> None:
+            nonlocal next_progress
+            while rows_scanned >= next_progress:
+                logger.info(
+                    "Audio metadata scan progress: %d rows across %d shards",
+                    rows_scanned,
+                    shards_scanned,
+                )
+                next_progress += _PROGRESS_INTERVAL
+
         try:
             for shard in shards:
                 shards_scanned += 1
                 if callable(pointer_iterator):
                     for pointer in pointer_iterator(shard=shard):
                         rows_scanned += 1
+                        emit_progress()
                         candidate = candidate_from_pointer(pointer)
                         if candidate is None:
                             file_id = getattr(pointer, "file_id", None)
@@ -781,6 +794,7 @@ def _native_candidates(
                 elif callable(metadata_iterator):
                     for row_index, raw in enumerate(metadata_iterator(shard=shard)):
                         rows_scanned += 1
+                        emit_progress()
                         candidate = metadata_candidate(raw, shard, row_index)
                         if candidate is None:
                             file_id = as_mapping(raw).get("file_id")
@@ -791,12 +805,6 @@ def _native_candidates(
                             continue
                         seen.add(candidate.file_id)
                         yield candidate
-                if rows_scanned % _PROGRESS_INTERVAL == 0:
-                    logger.info(
-                        "Audio metadata scan progress: %d rows across %d shards",
-                        rows_scanned,
-                        shards_scanned,
-                    )
         finally:
             if emit_summary and missing_transcript_count:
                 log.write(
@@ -936,6 +944,17 @@ def _process_native_programmes(
             ledger.start_processing(programme_id)
             try:
                 transcript = source.fetch_transcript(transcript_pointer)
+            except InvalidSourceTimestamp:
+                _reject_native_programme(
+                    ledger=ledger,
+                    report=report,
+                    log=log,
+                    programme_id=programme_id,
+                    source_file_id=file_id,
+                    reason=RejectionCategory.INVALID_TIMESTAMPS.value,
+                )
+                purge_source_temporary(getattr(source, "last_temporary", None))
+                continue
             except InvalidSourceRecord:
                 _reject_native_programme(
                     ledger=ledger,
@@ -1011,6 +1030,17 @@ def _process_native_programmes(
                 )
                 purge_source_temporary(getattr(source, "last_temporary", None))
                 continue
+            if not words and not legacy_empty_result:
+                _reject_native_programme(
+                    ledger=ledger,
+                    report=report,
+                    log=log,
+                    programme_id=programme_id,
+                    source_file_id=file_id,
+                    reason=RejectionCategory.NO_TIMED_WORDS.value,
+                )
+                purge_source_temporary(getattr(source, "last_temporary", None))
+                continue
             ambiguous = getattr(transcript, "ambiguous_source_text_records", 0)
             if ambiguous:
                 _reject_native_programme(
@@ -1020,17 +1050,6 @@ def _process_native_programmes(
                     programme_id=programme_id,
                     source_file_id=file_id,
                     reason=RejectionCategory.AMBIGUOUS_SOURCE_TEXT.value,
-                )
-                purge_source_temporary(getattr(source, "last_temporary", None))
-                continue
-            if not words and not legacy_empty_result:
-                _reject_native_programme(
-                    ledger=ledger,
-                    report=report,
-                    log=log,
-                    programme_id=programme_id,
-                    source_file_id=file_id,
-                    reason=RejectionCategory.NO_TIMED_WORDS.value,
                 )
                 purge_source_temporary(getattr(source, "last_temporary", None))
                 continue
