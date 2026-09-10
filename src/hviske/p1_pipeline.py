@@ -253,7 +253,7 @@ class PreflightReport:
 
 @dataclass
 class BuildReport:
-    """Bounded run counters and preflight evidence."""
+    """Run counters and preflight evidence."""
 
     preflight: PreflightReport
     selected_programmes: int
@@ -559,10 +559,6 @@ def _run_native_pipeline(
             log=log,
         )
         if isinstance(candidates, list):
-            report.selected_programmes = len(candidates)
-            report.preflight = dataclasses.replace(
-                report.preflight, selected_programmes=len(candidates)
-            )
             logger.info(
                 "P1 selection complete: %d programmes selected", len(candidates)
             )
@@ -901,6 +897,12 @@ def _process_native_programmes(
     from hviske.p1_source import InvalidSourceRecord, InvalidSourceTimestamp
 
     for programme_number, candidate in enumerate(candidates, start=1):
+        # Count at consumption time so skipped and retryable candidates are included
+        # without pre-counting bounded lists or retaining source identifiers.
+        report.selected_programmes += 1
+        report.preflight = dataclasses.replace(
+            report.preflight, selected_programmes=report.selected_programmes
+        )
         logger.info("Programme %d start", programme_number)
         report.max_in_flight = max(report.max_in_flight, 1)
         if isinstance(candidate, NativeCandidate):

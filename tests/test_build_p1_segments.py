@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections.abc as c
+import dataclasses
 import io
 import subprocess
 import sys
@@ -197,6 +198,7 @@ def test_build_decodes_flac_and_purges_only_verified_output(tmp_path: Path) -> N
     assert source.audio_calls == 1
     assert report.max_in_flight == 1
     assert report.processed == 1
+    assert report.selected_programmes == 1
     assert not list((tmp_path / "scratch" / "staging").rglob("*.parquet"))
     audit = (tmp_path / "scratch" / "audit-candidates.jsonl").read_text()
     assert '"parquet_path": "data/train/p1-programme-1-00000.parquet"' in audit
@@ -311,6 +313,36 @@ run_pipeline(
     assert sorted(recovery_manifest.splitlines()) == sorted(
         control_manifest.splitlines()
     )
+
+
+def test_unlimited_production_counts_consumed_candidates_without_ids(
+    tmp_path: Path,
+) -> None:
+    """Streaming production reports each consumed candidate without source IDs."""
+    source = FakeSource()
+    production_config = config(tmp_path, mode="production")
+    production_config.programme_limit = None
+    report = run_pipeline(
+        config=production_config,
+        source=source,
+        hub=MemoryHub(),
+        ctc=FakeCtc(),
+        vad=FakeVad(),
+    )
+
+    payload = report.as_dict()
+    dataclass_payload = dataclasses.asdict(report)
+    representations = (repr(report), repr(dataclass_payload), repr(payload))
+    preflight_payload = cast(dict[str, object], payload["preflight"])
+
+    assert report.processed == 1
+    assert report.selected_programmes == 1
+    assert report.preflight.selected_programmes == 1
+    assert payload["selected_programmes"] == 1
+    assert preflight_payload["selected_programmes"] == 1
+    assert dataclass_payload["selected_programmes"] == 1
+    assert dataclass_payload["preflight"]["selected_programmes"] == 1
+    assert all("programme-1" not in value for value in representations)
 
 
 def test_verification_failure_retains_local_shard(tmp_path: Path) -> None:
