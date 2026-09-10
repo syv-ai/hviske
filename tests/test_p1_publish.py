@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
-from huggingface_hub import HfFileSystem
+from huggingface_hub import CommitInfo, HfFileSystem
 from huggingface_hub.utils import RepositoryNotFoundError
 
 from hviske.p1_contracts import LedgerState, OutputRow, ShardEvidence
@@ -30,6 +30,7 @@ from hviske.p1_publish import (
     PublicationError,
     UploadOperation,
     VerificationError,
+    _commit_sha,
     _stream_remote,
     build_dataset_card,
     initialise_private_dataset,
@@ -306,6 +307,38 @@ def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> 
         assert ledger.batch("batch").state is LedgerState.VERIFIED
 
 
+def test_commit_sha_prefers_commit_info_oid_and_accepts_plain_sha() -> None:
+    """CommitInfo URLs do not hide their immutable object identifiers."""
+    commit = CommitInfo(
+        commit_url="https://huggingface.co/commit/main",
+        commit_message="",
+        commit_description="",
+        oid="a" * 40,
+    )
+    assert _commit_sha(commit) == "a" * 40
+    assert _commit_sha("b" * 40) == "b" * 40
+
+
+@pytest.mark.parametrize(
+    "commit",
+    [
+        "main",
+        "a" * 39,
+        "a" * 41,
+        CommitInfo(
+            commit_url="https://huggingface.co/commit/main",
+            commit_message="",
+            commit_description="",
+            oid="main",
+        ),
+    ],
+)
+def test_commit_sha_rejects_non_sha_values(commit: object) -> None:
+    """Branches, abbreviated SHAs, and invalid CommitInfo metadata are refused."""
+    with pytest.raises(VerificationError):
+        _commit_sha(commit)
+
+
 def test_digest_failure_retains_local_artefacts(tmp_path: Path) -> None:
     """A digest mismatch never invokes a purge."""
     path = tmp_path / "one.parquet"
@@ -357,7 +390,7 @@ def test_initialisation_commits_card_and_attributes_privately() -> None:
 
 
 def test_invalid_commit_is_not_accepted(tmp_path: Path) -> None:
-    """Branches and abbreviated commit identifiers cannot be captured."""
+    """Branches returned by publication cannot be captured."""
     path = tmp_path / "one.parquet"
     write_valid_shard(path)
     hub = MemoryHub(commit_id="main")

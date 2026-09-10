@@ -430,9 +430,9 @@ def _value(value: object, *names: str) -> object:
 
 
 def _commit_sha(commit: object) -> str:
-    value = (
-        commit if isinstance(commit, str) else _value(commit, "commit_id", "oid", "sha")
-    )
+    value = _value(commit, "commit_id", "oid", "sha")
+    if value is None and type(commit) is str:
+        value = commit
     if not isinstance(value, str) or not _COMMIT_SHA.fullmatch(value):
         raise VerificationError("Hub did not return a complete immutable commit SHA")
     return value
