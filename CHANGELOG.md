@@ -22,6 +22,10 @@
   recovery can publish and resolve the audit manifest.
 - Bind P1 ledgers to one pipeline digest and make sharded and committed publication
   states restart-safe without retryable downgrades or premature local purging.
+- Bump the P1 pipeline identity and reject incompatible populated ledgers before work;
+  discover immutable audio pointers during bounded selection, qualify transcripts before
+  audio or model work, and classify deterministic source defects without leaking IDs,
+  payloads, URLs, or exception details in operational output.
 
 ### Added
 
