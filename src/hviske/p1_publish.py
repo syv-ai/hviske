@@ -147,7 +147,7 @@ def build_dataset_card(
     return (
         "---\n"
         "license: other\n"
-        "license_name: Custom P1 dataset licence\n"
+        "license_name: p1-dataset-license\n"
         "license_link: LICENSE\n"
         "---\n\n"
         "# P1 segmented Danish speech\n\n"

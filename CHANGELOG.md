@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Use a Hub-valid lowercase slug for the private P1 dataset licence metadata.
 - Pin the P1 DATASET licence URL and bytes to the CoRal-v3 source revision, adapt
   only the exact two-line licensor identity for syv.ai, and initialise the private
   target atomically with its card, `.gitattributes`, and `LICENSE`.

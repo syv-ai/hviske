@@ -230,6 +230,7 @@ def test_card_contains_required_terms_and_no_credentials() -> None:
     card = make_card()
     assert "No public redistribution grant" not in card
     assert "license: other" in card
+    assert "license_name: p1-dataset-license" in card
     assert "license_link: LICENSE" in card
     assert "subject to [LICENSE](LICENSE)" in card
     assert (
