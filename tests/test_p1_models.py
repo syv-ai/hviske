@@ -74,7 +74,7 @@ def _roest_contract_objects() -> tuple[SimpleNamespace, SimpleNamespace]:
     model_config = SimpleNamespace(
         architectures=["Wav2Vec2ForCTC"],
         model_type="wav2vec2",
-        sampling_rate=16000,
+        # The pinned Roest config.json omits sampling_rate; the processor owns it.
         conv_stride=[5, 2, 2, 2, 2, 2, 2],
         inputs_to_logits_ratio=320,
         vocab_size=46,

@@ -118,7 +118,8 @@ def make_manifest() -> CanonicalIdentityManifest:
                 ),
                 license="openrail",
                 license_url=(
-                    "https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE"
+                    "https://huggingface.co/Alvenir/coral-1-whisper-large/resolve/"
+                    "a6c1e24d9f10e6289607a1ba32341b68e8660688/LICENSE"
                 ),
                 architecture="Wav2Vec2ForCTC",
                 model_type="wav2vec2",

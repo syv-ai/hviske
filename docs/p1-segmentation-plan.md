@@ -143,16 +143,18 @@ implementation uses the pinned `ctc-segmentation` source and the
 [`CoRal-project/roest-v3-wav2vec2-315m`](https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m)
 checkpoint at `beb3e790246d6b9dec1df596b0b21d5c42f4d99c`. Its
 `Wav2Vec2ForCTC`/`wav2vec2` configuration has a 16 kHz processor and a 320-sample
-convolution stride (20 ms). The pipeline derives and validates that frame duration
-from the loaded configuration rather than trusting a free default.
+convolution stride (20 ms); its pinned `config.json` does not declare a sampling
+rate. The processor/preprocessor metadata is authoritative for the input clock, and
+the pipeline derives and validates frame duration from it. A model sampling-rate
+field, when present, is only an additional consistency check.
 
-The model card metadata designates the model `openrail`, and its prose describes a
-custom OpenRAIL-M licence. The licence URL recorded in the pipeline metadata is
-[the model card's referenced licence](https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE);
-it permits commercial use with restrictions on speech synthesis and biometric
-identification. P1 uses the checkpoint for ASR alignment only; it is not labelled
-Apache-2.0. Its 46-token vocabulary includes digits, Danish letters, blank/pad token
-45, and word delimiter `|` at token 36. A model is eligible only when:
+The model card at the pinned model revision designates the model `openrail`, and its
+prose describes a custom OpenRAIL-M licence. The pipeline pins both that model-card
+revision and digest, plus the immutable revision and digest of the underlying
+referenced licence. P1 uses the checkpoint for ASR alignment only; Roest weights are
+internal and are not distributed. It is not labelled Apache-2.0. Its 46-token
+vocabulary includes digits, Danish letters, blank/pad token 45, and word delimiter
+`|` at token 36. A model is eligible only when:
 
 - its exact Hub revision can be pinned;
 - its declared licence permits this private commercial data-preparation use;
@@ -285,10 +287,13 @@ metadata immediately before and after every data commit and every metadata or ca
 update. Abort before sending bytes when `private is not True`; treat a post-commit
 privacy failure as an incident and stop all further processing.
 
-The dataset card must describe source provenance, permitted use, private-access terms,
-alignment method, field schema, known limitations, rejection policy, source and model
-revisions, and the absence of a public redistribution grant. Confirm the organisation
-has enough private storage for the pilot estimate before the full run.
+The dataset card must use the custom `other` licence metadata, link to the committed
+`LICENSE`, and describe source provenance, permitted use, private-access terms,
+alignment method, field schema, known limitations, rejection policy, and immutable
+source, model, and target-licence provenance. Access, use, and distribution are subject
+to `LICENSE`.
+Confirm the organisation has enough private storage for the pilot estimate before the
+full run.
 
 Use the existing authenticated Hub session. Do not place a token in a command, tmux
 history, environment dump, log, repository file, or dataset metadata.
@@ -460,6 +465,8 @@ segmented P1 dataset.
 Retain only:
 
 - source, model, and code revisions, including the CTC licence designation and URL;
+- the pinned CoRal-v3 dataset-licence template revision and digest, the exact
+  licensor-identity-only adaptation, and the target `LICENSE` digest;
 - versioned configuration and normalisation rules, including the CTC architecture,
   sampling rate, convolution stride, vocabulary size, blank, and delimiter IDs; the
   pipeline digest covers the lowercase-only Roest compatibility invariant and

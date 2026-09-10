@@ -50,6 +50,11 @@ class P1RuntimeContract:
     roest_revision: str
     roest_license: str
     roest_license_url: str
+    roest_license_repository: str
+    roest_license_revision: str
+    roest_license_sha256: str
+    roest_model_card_url: str
+    roest_model_card_sha256: str
     roest_license_meaning: str
     roest_architecture: str
     roest_model_type: str
@@ -68,6 +73,14 @@ class P1RuntimeContract:
     normalisation_punctuation_removed: bool
     normalisation_number_expansion: bool
     normalisation_preserves_source_word_map: bool
+    dataset_license_template_repository: str
+    dataset_license_template_revision: str
+    dataset_license_template_url: str
+    dataset_license_template_sha256: str
+    dataset_license_template_bytes: int
+    dataset_license_adaptation: str
+    dataset_license_target_path: str
+    dataset_license_target_sha256: str
 
 
 P1_RUNTIME_CONTRACT = P1RuntimeContract(
@@ -83,12 +96,25 @@ P1_RUNTIME_CONTRACT = P1RuntimeContract(
     roest_revision="beb3e790246d6b9dec1df596b0b21d5c42f4d99c",
     roest_license="openrail",
     roest_license_url=(
-        "https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE"
+        "https://huggingface.co/Alvenir/coral-1-whisper-large/resolve/"
+        "a6c1e24d9f10e6289607a1ba32341b68e8660688/LICENSE"
+    ),
+    roest_license_repository="Alvenir/coral-1-whisper-large",
+    roest_license_revision="a6c1e24d9f10e6289607a1ba32341b68e8660688",
+    roest_license_sha256=(
+        "f575b6361ff69b52388967f69219f0cc7f9ae91f96482e5ad038261b2728799e"
+    ),
+    roest_model_card_url=(
+        "https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m/resolve/"
+        "beb3e790246d6b9dec1df596b0b21d5c42f4d99c/README.md"
+    ),
+    roest_model_card_sha256=(
+        "64b3a837fdcb580eeebe31d457113f0a84b200ca90ac5fe1f27475d8fc257cfb"
     ),
     roest_license_meaning=(
-        "Model card metadata is openrail; the card describes a custom OpenRAIL-M "
-        "licence permitting commercial use with restrictions on speech synthesis "
-        "and biometric identification. P1 uses the model for ASR alignment only."
+        "Roest model-card metadata is openrail; its pinned card describes a custom "
+        "OpenRAIL-M licence. P1 uses the checkpoint for ASR alignment only. Model "
+        "weights are internal and are not distributed by this dataset."
     ),
     roest_architecture="Wav2Vec2ForCTC",
     roest_model_type="wav2vec2",
@@ -107,6 +133,24 @@ P1_RUNTIME_CONTRACT = P1RuntimeContract(
     normalisation_punctuation_removed=True,
     normalisation_number_expansion=False,
     normalisation_preserves_source_word_map=True,
+    dataset_license_template_repository="CoRal-project/coral-v3",
+    dataset_license_template_revision=("01f7c93c21fc9dec87fe9f7149c79569cc433f08"),
+    dataset_license_template_url=(
+        "https://huggingface.co/datasets/CoRal-project/coral-v3/raw/main/LICENSE"
+    ),
+    dataset_license_template_sha256=(
+        "ee93c98df9a894464d1c042b66c6039543776c463d06d1a6e93f176e08ca67bd"
+    ),
+    dataset_license_template_bytes=14112,
+    dataset_license_adaptation=(
+        "Replace only 'Alexandra Instituttet A/S, Åbogade 34, 8200 Aarhus N, "
+        "Denmark' with 'syv.ai ApS, Rosenvængets Allé 11, 1. tv, 2100 København Ø, "
+        "Denmark'; preserve all other terms and the Aarhus arbitration clause."
+    ),
+    dataset_license_target_path="LICENSE",
+    dataset_license_target_sha256=(
+        "3c657d8d41bfbe131e2e24afd52004b1ddc10e4438edd97725c9df187ec5aa6f"
+    ),
 )
 
 
@@ -114,6 +158,33 @@ class ContractModel(BaseModel):
     """Base class for immutable, strict pipeline contracts."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class DatasetLicenseContract(ContractModel):
+    """Immutable source and adaptation identity for the target data licence."""
+
+    template_repository: StrictStr
+    template_revision: StrictStr
+    template_url: StrictStr
+    template_sha256: StrictStr
+    template_bytes: StrictInt = Field(gt=0)
+    adaptation: StrictStr
+    target_path: StrictStr
+    target_sha256: StrictStr
+
+    @field_validator("template_sha256", "target_sha256")
+    @classmethod
+    def _digest_is_immutable(cls, value: str) -> str:
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("licence digest must be lowercase SHA-256 hex")
+        return value
+
+    @field_validator("template_revision")
+    @classmethod
+    def _revision_is_immutable(cls, value: str) -> str:
+        if not _COMMIT_PATTERN.fullmatch(value):
+            raise ValueError("licence template revision must be a complete SHA")
+        return value
 
 
 class OutputField(ContractModel):
@@ -495,6 +566,11 @@ class ModelContract(ContractModel):
     repository: RepositoryRevision
     license: StrictStr
     license_url: StrictStr | None = None
+    license_repository: StrictStr | None = None
+    license_revision: StrictStr | None = None
+    license_sha256: StrictStr | None = None
+    model_card_url: StrictStr | None = None
+    model_card_sha256: StrictStr | None = None
     license_notes: StrictStr | None = None
     architecture: StrictStr | None = None
     model_type: StrictStr | None = None
@@ -503,6 +579,20 @@ class ModelContract(ContractModel):
     vocab_size: StrictInt | None = None
     blank_token_id: StrictInt | None = None
     word_delimiter_token_id: StrictInt | None = None
+
+    @field_validator("license_sha256", "model_card_sha256")
+    @classmethod
+    def _optional_digest_is_immutable(cls, value: str | None) -> str | None:
+        if value is not None and not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("licence metadata digest must be lowercase SHA-256 hex")
+        return value
+
+    @field_validator("license_revision")
+    @classmethod
+    def _optional_revision_is_immutable(cls, value: str | None) -> str | None:
+        if value is not None and not _COMMIT_PATTERN.fullmatch(value):
+            raise ValueError("licence metadata revision must be a complete SHA")
+        return value
 
 
 class CTCContract(ContractModel):
@@ -516,7 +606,8 @@ class CTCContract(ContractModel):
     model: ModelContract
 
     @field_validator("sdist_sha256")
-    def _sdist_digest_is_immutable(value: str) -> str:
+    @classmethod
+    def _sdist_digest_is_immutable(cls, value: str) -> str:
         if not _SHA256_PATTERN.fullmatch(value):
             raise ValueError("sdist_sha256 must be lowercase SHA-256 hex")
         return value
@@ -637,6 +728,21 @@ class VADContract(ContractModel):
         return value
 
 
+def _default_dataset_license() -> DatasetLicenseContract:
+    """Return the repository's immutable target dataset licence identity."""
+    contract = P1_RUNTIME_CONTRACT
+    return DatasetLicenseContract(
+        template_repository=contract.dataset_license_template_repository,
+        template_revision=contract.dataset_license_template_revision,
+        template_url=contract.dataset_license_template_url,
+        template_sha256=contract.dataset_license_template_sha256,
+        template_bytes=contract.dataset_license_template_bytes,
+        adaptation=contract.dataset_license_adaptation,
+        target_path=contract.dataset_license_target_path,
+        target_sha256=contract.dataset_license_target_sha256,
+    )
+
+
 class CanonicalIdentityManifest(ContractModel):
     """Complete identity manifest used to derive the pipeline digest."""
 
@@ -649,6 +755,9 @@ class CanonicalIdentityManifest(ContractModel):
     normalisation: NormalisationContract
     segmentation: SegmentationContract
     output: OutputEncodingContract
+    dataset_license: DatasetLicenseContract = Field(
+        default_factory=_default_dataset_license
+    )
     max_decoded_audio_bytes: StrictInt = Field(default=2 * 1024**3, gt=0)
 
 
@@ -752,7 +861,11 @@ def valid_ledger_transition(current: LedgerState, target: LedgerState) -> bool:
 
 
 def validate_p1_runtime_contract(
-    *, pipeline_version: str, ctc: CTCContract, normalisation: NormalisationContract
+    *,
+    pipeline_version: str,
+    ctc: CTCContract,
+    normalisation: NormalisationContract,
+    dataset_license: DatasetLicenseContract | None = None,
 ) -> None:
     """Reject configuration that diverges from the active P1 contract.
 
@@ -763,6 +876,8 @@ def validate_p1_runtime_contract(
             CTC library and model provenance to validate.
         normalisation:
             Text normalisation rules used before alignment.
+        dataset_license (optional):
+            Immutable target dataset licence provenance.
 
     Raises:
         ValueError:
@@ -794,16 +909,33 @@ def validate_p1_runtime_contract(
         ),
         "ctc.model.license": (ctc.model.license, contract.roest_license),
         "ctc.model.license_url": (ctc.model.license_url, contract.roest_license_url),
+        "ctc.model.license_repository": (
+            ctc.model.license_repository,
+            contract.roest_license_repository,
+        ),
+        "ctc.model.license_revision": (
+            ctc.model.license_revision,
+            contract.roest_license_revision,
+        ),
+        "ctc.model.license_sha256": (
+            ctc.model.license_sha256,
+            contract.roest_license_sha256,
+        ),
+        "ctc.model.model_card_url": (
+            ctc.model.model_card_url,
+            contract.roest_model_card_url,
+        ),
+        "ctc.model.model_card_sha256": (
+            ctc.model.model_card_sha256,
+            contract.roest_model_card_sha256,
+        ),
         "ctc.model.license_notes": (
             ctc.model.license_notes,
             contract.roest_license_meaning,
         ),
         "ctc.model.architecture": (ctc.model.architecture, contract.roest_architecture),
         "ctc.model.model_type": (ctc.model.model_type, contract.roest_model_type),
-        "ctc.model.sampling_rate": (
-            ctc.model.sampling_rate,
-            contract.roest_sampling_rate,
-        ),
+        "ctc.model.sampling_rate": (ctc.model.sampling_rate, None),
         "ctc.model.frame_stride_samples": (
             ctc.model.frame_stride_samples,
             contract.roest_frame_stride_samples,
@@ -846,6 +978,29 @@ def validate_p1_runtime_contract(
             contract.normalisation_preserves_source_word_map,
         ),
     }
+    if ctc.model.sampling_rate not in (None, contract.roest_sampling_rate):
+        values["ctc.model.sampling_rate"] = (
+            ctc.model.sampling_rate,
+            contract.roest_sampling_rate,
+        )
+    if dataset_license is not None:
+        expected_license = {
+            "template_repository": contract.dataset_license_template_repository,
+            "template_revision": contract.dataset_license_template_revision,
+            "template_url": contract.dataset_license_template_url,
+            "template_sha256": contract.dataset_license_template_sha256,
+            "template_bytes": contract.dataset_license_template_bytes,
+            "adaptation": contract.dataset_license_adaptation,
+            "target_path": contract.dataset_license_target_path,
+            "target_sha256": contract.dataset_license_target_sha256,
+        }
+        values.update(
+            {
+                f"dataset_license.{name}": (actual, expected)
+                for name, expected in expected_license.items()
+                for actual in [getattr(dataset_license, name)]
+            }
+        )
     mismatches = [
         name
         for name, (actual, expected) in values.items()

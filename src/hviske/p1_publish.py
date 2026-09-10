@@ -21,6 +21,7 @@ from pyarrow import parquet as pq
 
 from .p1_contracts import (
     OUTPUT_SCHEMA,
+    P1_RUNTIME_CONTRACT,
     BatchEvidence,
     LedgerState,
     RejectionCategory,
@@ -80,6 +81,7 @@ def build_dataset_card(
     rejection_policy: str,
     source_revisions: str,
     model_revisions: str,
+    dataset_license: str | None = None,
 ) -> str:
     """Build the required metadata-only private P1 dataset card.
 
@@ -102,6 +104,8 @@ def build_dataset_card(
             Immutable source dataset revisions.
         model_revisions:
             Immutable VAD, CTC, and other model revisions.
+        dataset_license (optional):
+            Immutable target dataset licence provenance.
 
     Returns:
         Dataset card Markdown with no credential-bearing metadata.
@@ -117,13 +121,40 @@ def build_dataset_card(
         "Source revisions": source_revisions,
         "Model revisions": model_revisions,
     }
+    if dataset_license is None:
+        dataset_license = json.dumps(
+            {
+                "template_repository": (
+                    P1_RUNTIME_CONTRACT.dataset_license_template_repository
+                ),
+                "template_revision": (
+                    P1_RUNTIME_CONTRACT.dataset_license_template_revision
+                ),
+                "template_url": (P1_RUNTIME_CONTRACT.dataset_license_template_url),
+                "template_sha256": (
+                    P1_RUNTIME_CONTRACT.dataset_license_template_sha256
+                ),
+                "template_bytes": P1_RUNTIME_CONTRACT.dataset_license_template_bytes,
+                "adaptation": P1_RUNTIME_CONTRACT.dataset_license_adaptation,
+                "target_path": P1_RUNTIME_CONTRACT.dataset_license_target_path,
+                "target_sha256": P1_RUNTIME_CONTRACT.dataset_license_target_sha256,
+            },
+            sort_keys=True,
+        )
+    values["Dataset licence provenance"] = dataset_license
     _assert_safe_metadata(values)
     sections = [f"## {name}\n\n{value}" for name, value in values.items()]
-    sections.append(
-        "## Redistribution\n\n"
-        "No public redistribution grant is provided. This dataset remains private."
+    return (
+        "---\n"
+        "license: other\n"
+        "license_name: Custom P1 dataset licence\n"
+        "license_link: LICENSE\n"
+        "---\n\n"
+        "# P1 segmented Danish speech\n\n"
+        + "\n\n".join(sections)
+        + "\n\n## Licence\n\n"
+        "Private access, use, and distribution are subject to [LICENSE](LICENSE).\n"
     )
-    return "# P1 segmented Danish speech\n\n" + "\n\n".join(sections) + "\n"
 
 
 def _assert_safe_metadata(value: object, token: str | None = None) -> None:
@@ -359,6 +390,7 @@ def initialise_private_dataset(
     repo_id: str,
     *,
     card: str,
+    license_text: str | None = None,
     gitattributes: str = "*.parquet filter=lfs diff=lfs merge=lfs -text\n",
     token: str | None = None,
 ) -> str | None:
@@ -371,6 +403,8 @@ def initialise_private_dataset(
             Dataset repository identifier.
         card:
             Dataset card Markdown, without credentials.
+        license_text (optional):
+            Full target dataset licence. Defaults to the tracked repository licence.
         gitattributes (optional):
             Initial Git attributes content.
         token (optional):
@@ -378,9 +412,23 @@ def initialise_private_dataset(
 
     Returns:
         The immutable initialisation commit SHA, if a commit was made.
+
+    Raises:
+        PublicationError:
+            If the card or target licence contains credentials, or the licence digest
+            is not the pinned target digest.
     """
     _assert_safe_metadata(card, token=token)
     _assert_safe_metadata(gitattributes, token=token)
+    if license_text is None:
+        license_path = Path(__file__).resolve().parents[2] / "LICENSE-DATASET"
+        license_text = license_path.read_text(encoding="utf-8")
+    _assert_safe_metadata(license_text, token=token)
+    if (
+        hashlib.sha256(license_text.encode("utf-8")).hexdigest()
+        != P1_RUNTIME_CONTRACT.dataset_license_target_sha256
+    ):
+        raise PublicationError("target dataset licence does not match the pinned file")
     try:
         info = api.repo_info(repo_id=repo_id, repo_type="dataset")
     except RepositoryNotFoundError:
@@ -394,17 +442,21 @@ def initialise_private_dataset(
         root = Path(directory)
         card_path = root / "README.md"
         attrs_path = root / ".gitattributes"
+        license_path = root / "LICENSE"
         card_path.write_text(card, encoding="utf-8")
         attrs_path.write_text(gitattributes, encoding="utf-8")
+        license_path.write_text(license_text, encoding="utf-8")
         commit = _mutate_commit(
             api,
             repo_id,
             operations=(
                 UploadOperation(path_in_repo="README.md", path=card_path),
                 UploadOperation(path_in_repo=".gitattributes", path=attrs_path),
+                UploadOperation(path_in_repo="LICENSE", path=license_path),
             ),
             message="Initialise private P1 dataset",
         )
+        _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     return _commit_sha(commit)
 
 
