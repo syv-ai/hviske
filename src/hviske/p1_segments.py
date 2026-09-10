@@ -489,7 +489,8 @@ def align_ctc_word_tokens(
         ValueError:
             If emissions, token IDs, or the blank ID are invalid.
         CTCAlignmentInfeasible:
-            If the prepared CTC path is longer than the emission window.
+            If the minimum CTC path, including repeated-label blank transitions,
+            is longer than the emission window.
     """
     values = np.asarray(emissions, dtype=np.float32)
     if values.ndim != 2 or values.shape[0] == 0:
@@ -517,7 +518,12 @@ def align_ctc_word_tokens(
     config.update_excluded_characters()
     text = [" ".join(str(token) for token in word) for word in tokenised_words]
     ground_truth, utterance_starts = ctc.prepare_tokenized_text(config, text)
-    if values.shape[0] < len(ground_truth):
+    minimum_frames = _minimum_ctc_frames(
+        prepared_ground_truth=ground_truth,
+        tokenised_words=tokenised_words,
+        blank_id=blank_id,
+    )
+    if values.shape[0] < minimum_frames:
         raise CTCAlignmentInfeasible(
             "emission frames cannot accommodate the prepared CTC ground-truth path"
         )
@@ -546,6 +552,55 @@ def align_ctc_word_tokens(
         ),
         raw_score_inputs=tuple(scores),
     )
+
+
+def _minimum_ctc_frames(
+    prepared_ground_truth: np.ndarray,
+    tokenised_words: c.Sequence[c.Sequence[int]],
+    blank_id: int,
+) -> int:
+    """Return the minimum frames needed by a prepared CTC target.
+
+    ``prepare_tokenized_text`` includes start/end sentinels and blank separators
+    between utterances.  Repeated non-blank labels within one utterance need one
+    additional blank frame; a separator or an explicit blank token already supplies
+    that transition and must not be counted again.
+
+    Raises:
+        ValueError:
+            If the prepared path does not contain the supplied non-blank tokens.
+    """
+    target = prepared_ground_truth[:, 0]
+    non_blank_positions = tuple(
+        int(index)
+        for index, label in enumerate(target)
+        if label >= 0 and label != blank_id
+    )
+    flattened_tokens = tuple(int(token) for word in tokenised_words for token in word)
+    non_blank_tokens = tuple(token for token in flattened_tokens if token != blank_id)
+    if len(non_blank_positions) != len(non_blank_tokens):
+        raise ValueError("prepared CTC path does not match tokenised words")
+
+    required_extra_blanks = 0
+    previous_token: int | None = None
+    previous_position: int | None = None
+    position_index = 0
+    for token in flattened_tokens:
+        if token == blank_id:
+            previous_token = None
+            previous_position = None
+            continue
+        current_position = non_blank_positions[position_index]
+        position_index += 1
+        if previous_token == token and previous_position is not None:
+            has_existing_blank = np.any(
+                target[previous_position + 1 : current_position] == blank_id
+            )
+            if not has_existing_blank:
+                required_extra_blanks += 1
+        previous_token = token
+        previous_position = current_position
+    return len(prepared_ground_truth) + required_extra_blanks
 
 
 def align_ctc_emissions(

@@ -127,7 +127,7 @@ def make_manifest() -> CanonicalIdentityManifest:
             minimum_duration_ms=1000,
             target_minimum_duration_ms=2000,
             target_maximum_duration_ms=8000,
-            maximum_duration_ms=9999,
+            maximum_duration_ms=10000,
             maximum_drift_ms=500,
             minimum_alignment_score=0.0,
             minimum_vad_speech_ratio=0.0,
@@ -163,6 +163,15 @@ def test_identity_and_segment_ids_are_deterministic() -> None:
             update={
                 "normalisation": manifest.normalisation.model_copy(
                     update={"source_text_ownership": "legacy"}
+                )
+            }
+        )
+    )
+    assert digest != pipeline_config_sha256(
+        manifest.model_copy(
+            update={
+                "segmentation": manifest.segmentation.model_copy(
+                    update={"maximum_duration_ms": 9999}
                 )
             }
         )

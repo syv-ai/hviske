@@ -26,6 +26,7 @@ from hviske.p1_segments import (
     CTCBackend,
     VADSignal,
     align_ctc_emissions,
+    align_ctc_word_tokens,
     correct_drift_once,
     encode_flac,
     form_candidate_segments,
@@ -221,6 +222,38 @@ def test_ctc_infeasible_proposal_does_not_abort_programme() -> None:
     assert len(result.rows) == 1
     assert result.rows[0].text == "normal"
     assert result.rejections == (("abcde", "ctc_alignment_failed"),)
+
+
+def test_ctc_nonrepeated_and_existing_blanks_are_not_double_counted() -> None:
+    """Prepared boundaries and blank labels already satisfy CTC transitions."""
+    cases = ((((1, 2),), 5), (((1,), (1,)), 6), (((1, 0, 1),), 6))
+    for tokenised_words, frame_count in cases:
+        result = align_ctc_word_tokens(
+            emissions=np.zeros((frame_count, 3), dtype=np.float32),
+            tokenised_words=tokenised_words,
+            start_ms=0,
+            frame_duration_ms=20.0,
+        )
+        assert result.word_boundaries
+
+
+def test_ctc_repeated_tokens_require_an_additional_blank_frame() -> None:
+    """Repeated labels need a blank beyond the prepared path length."""
+    with pytest.raises(CTCAlignmentInfeasible):
+        align_ctc_word_tokens(
+            emissions=np.zeros((5, 3), dtype=np.float32),
+            tokenised_words=((1, 1),),
+            start_ms=0,
+            frame_duration_ms=20.0,
+        )
+
+    result = align_ctc_word_tokens(
+        emissions=np.zeros((6, 3), dtype=np.float32),
+        tokenised_words=((1, 1),),
+        start_ms=0,
+        frame_duration_ms=20.0,
+    )
+    assert result.word_boundaries
 
 
 def test_danish_mapping_is_reversible() -> None:
@@ -472,6 +505,49 @@ def test_pilot_mean_log_probability_threshold_is_config_shaped() -> None:
 
     assert accepted.row is not None
     assert rejected.rejection == "low_alignment_score"
+
+
+@pytest.mark.parametrize(
+    ("duration_ms", "expected_calls", "expected_rows"), [(9_999, 1, 1), (10_000, 0, 0)]
+)
+def test_real_duration_boundary_is_checked_before_ctc(
+    duration_ms: int, expected_calls: int, expected_rows: int
+) -> None:
+    """The configured 10,000 ms maximum permits 9,999 ms but not 10,000 ms."""
+
+    class CTC:
+        calls = 0
+
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, alignment_text, word_map, sampling_rate
+            self.calls += 1
+            return AlignmentResult(start_ms=start_ms, end_ms=end_ms, score=1.0)
+
+    ctc = CTC()
+    result = segment_programme(
+        words=words(("hej", 0, duration_ms, None)),
+        audio=np.zeros(duration_ms * 16, dtype=np.float32),
+        source_file_id="source",
+        source_duration_ms=duration_ms,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(version="test"),
+        ctc=ctc,
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+    )
+
+    assert ctc.calls == expected_calls
+    assert len(result.rows) == expected_rows
+    if duration_ms == 10_000:
+        assert result.rejections == (("hej", "duration_out_of_range"),)
 
 
 def test_segment_ids_are_config_sensitive() -> None:
