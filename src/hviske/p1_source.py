@@ -19,6 +19,7 @@ import numbers
 import re
 import sqlite3
 import typing as t
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -89,13 +90,15 @@ _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 @dataclasses.dataclass(frozen=True)
 class ParsedTranscript:
-    """One fetched transcript with validated word timing information."""
+    """One transcript with timed words and lossless source-text ownership evidence."""
 
     file_id: str
     text: str
     words: tuple[SourceWord, ...]
     metadata: tuple[tuple[str, str], ...] = ()
     zero_duration_tokens_omitted: int = 0
+    untimed_tokens_owned: int = 0
+    ambiguous_source_text_records: int = 0
 
 
 class SourceError(RuntimeError):
@@ -1134,8 +1137,10 @@ def parse_transcript_row(
 ) -> ParsedTranscript:
     """Parse the P1 transcript schema and reconstruct verbatim text.
 
-    Spacing records contribute their literal text but do not become timed words.
-    Timestamp seconds are rounded to the nearest millisecond using decimal input,
+    Spacing and untimed records contribute their literal text but do not become
+    timing anchors. Their source characters are owned by the following timed word,
+    or by the final timed word when they trail the transcript. Timestamp seconds are
+    rounded to the nearest millisecond using decimal input,
     avoiding binary-float truncation at boundaries.
 
     Args:
@@ -1173,8 +1178,12 @@ def parse_transcript_row(
         raise InvalidSourceRecord(f"transcript {file_id} has no word records")
     words: list[SourceWord] = []
     pieces: list[str] = []
+    source_cursor = 0
+    timed_source_starts: list[int] = []
     previous_end = 0
     zero_duration_tokens_omitted = 0
+    untimed_tokens_owned = 0
+    ambiguous_source_text_records = 0
     for position, raw in enumerate(raw_words):
         if not isinstance(raw, c.Mapping):
             raise InvalidSourceRecord(f"word {position} is not a mapping")
@@ -1188,24 +1197,48 @@ def parse_transcript_row(
         )
         if text_value is None and is_spacing:
             pieces.append(" ")
+            source_cursor += 1
+            untimed_tokens_owned += 1
             continue
         if not isinstance(text_value, str):
             raise InvalidSourceRecord(f"word {position} has invalid text")
         if is_spacing and text_value == "<space>":
             text_value = " "
+        source_start = source_cursor
         pieces.append(text_value)
+        source_cursor += len(text_value)
         if is_spacing or not text_value.strip():
+            untimed_tokens_owned += 1
+            continue
+        raw_start = _first_present(raw, ("start_ms", "start"))
+        raw_end = _first_present(raw, ("end_ms", "end"))
+        if raw_start is None and raw_end is None:
+            untimed_tokens_owned += 1
+            if any(
+                not unicodedata.category(character).startswith(("P", "Z"))
+                for character in text_value
+            ):
+                ambiguous_source_text_records += 1
             continue
         start = _milliseconds(raw, "start", position)
         end = _milliseconds(raw, "end", position)
-        if start < 0 or end < start or start < previous_end:
+        if start < 0 or end < start:
+            raise InvalidSourceTimestamp(f"word {position} has an invalid span")
+        if end == start:
+            zero_duration_tokens_omitted += 1
+            untimed_tokens_owned += 1
+            if any(
+                not unicodedata.category(character).startswith(("P", "Z"))
+                for character in text_value
+            ):
+                ambiguous_source_text_records += 1
+            continue
+        if start < previous_end:
             raise InvalidSourceTimestamp(f"word {position} has an invalid span")
         if programme_duration_ms is not None and end > programme_duration_ms:
             raise InvalidSourceTimestamp(f"word {position} lies outside source audio")
-        if end == start:
-            zero_duration_tokens_omitted += 1
-            continue
         previous_end = end
+        timed_source_starts.append(source_start)
         speaker = raw.get("speaker_id", raw.get("speaker"))
         if speaker is not None and (
             isinstance(speaker, bool) or not isinstance(speaker, (str, int))
@@ -1222,20 +1255,29 @@ def parse_transcript_row(
     explicit_text = _first_present(row, ("transcript_text", "transcript", "text"))
     if explicit_text is not None and not isinstance(explicit_text, str):
         raise InvalidSourceRecord("transcript text is not a string")
-    text = explicit_text if isinstance(explicit_text, str) else "".join(pieces)
+    reconstructed_text = "".join(pieces)
+    text = explicit_text if isinstance(explicit_text, str) else reconstructed_text
+    if explicit_text is not None and text != reconstructed_text:
+        raise InvalidSourceRecord(
+            f"transcript {file_id} text does not match its source records"
+        )
     if not text:
         raise InvalidSourceRecord(f"transcript {file_id} is empty")
     try:
-        annotated_words = annotate_source_words(words, text)
+        annotated_words = annotate_source_words(
+            words, text, expected_starts=timed_source_starts
+        )
     except ValueError as exc:
         raise InvalidSourceRecord(
-            f"transcript {file_id} words do not reconstruct its verbatim text"
+            f"transcript {file_id} words do not reconstruct its verbatim text: {exc}"
         ) from exc
     return ParsedTranscript(
         file_id=file_id,
         text=text,
         words=annotated_words,
         zero_duration_tokens_omitted=zero_duration_tokens_omitted,
+        untimed_tokens_owned=untimed_tokens_owned,
+        ambiguous_source_text_records=ambiguous_source_text_records,
     )
 
 

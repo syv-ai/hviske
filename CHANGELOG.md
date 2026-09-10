@@ -7,9 +7,9 @@
 - Increase P1 projected metadata batches to 1,024 rows while retaining the 64 MiB
   hard byte bound and audio-column projection, add targeted source selection, aggregate
   missing-transcript evidence, and expose safe periodic pipeline progress.
-- Preserve zero-duration P1 transcript text while omitting only non-spacing timed
-  tokens, classify invalid source timestamps as terminal rejections, and abort
-  unexpectedly failed programmes with safe retryable ledger evidence.
+- Preserve exact P1 transcript characters, including zero-duration and untimed
+  records, by assigning each source span to a deterministic neighbouring timed word;
+  reject ambiguous ownership and classify transcripts without timed words explicitly.
 - Harden P1 transport logging by suppressing verbose dependency records and
   redacting signed URLs from root and file handlers.
 - Parse Hugging Face string-compatible CommitInfo objects using their immutable

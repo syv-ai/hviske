@@ -676,8 +676,11 @@ def _reconstruct_source_text(words: c.Sequence[SourceWord]) -> str:
     if not words:
         return ""
     if all(word.source_span is not None for word in words):
-        return words[0].text + "".join(
-            word.separator_text + word.text for word in words[1:]
+        return (
+            words[0].separator_text
+            + words[0].text
+            + "".join(word.separator_text + word.text for word in words[1:])
+            + words[-1].trailing_text
         )
     return " ".join(word.text for word in words)
 
@@ -737,6 +740,12 @@ def segment_programme(
     validated = validate_source_words(
         words=words, programme_duration_ms=source_duration_ms
     )
+    if not validated:
+        return SegmentationResult(
+            rows=(),
+            rejections=(("", RejectionCategory.NO_TIMED_WORDS.value),),
+            correction_count=0,
+        )
     vad_signal = None if vad is None else vad.analyse(values, 16000)
     proposals = form_candidate_segments(
         words=validated,

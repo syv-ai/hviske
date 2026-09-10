@@ -71,6 +71,15 @@ def test_identity_and_segment_ids_are_deterministic() -> None:
     assert digest != pipeline_config_sha256(
         manifest.model_copy(update={"pipeline_version": "p1-segmentation-2"})
     )
+    assert digest != pipeline_config_sha256(
+        manifest.model_copy(
+            update={
+                "normalisation": manifest.normalisation.model_copy(
+                    update={"source_text_ownership": "legacy"}
+                )
+            }
+        )
+    )
 
 
 def make_manifest() -> CanonicalIdentityManifest:
@@ -163,4 +172,5 @@ def test_source_contract_records_verbatim_character_spans() -> None:
     assert programme.words[0].source_span.start == 0
     assert programme.words[1].separator_text == "  "
     assert programme.words[1].separator_span is not None
+    assert programme.words[-1].trailing_text == ""
     assert programme.transcript_text == "Hej,  verden!"
