@@ -232,6 +232,11 @@ def test_card_contains_required_terms_and_no_credentials() -> None:
     assert "license: other" in card
     assert "license_link: LICENSE" in card
     assert "subject to [LICENSE](LICENSE)" in card
+    assert (
+        "https://huggingface.co/datasets/CoRal-project/coral-v3/resolve/"
+        "01f7c93c21fc9dec87fe9f7149c79569cc433f08/LICENSE" in card
+    )
+    assert "/main/" not in card
     assert all(section in card for section in ("Source provenance", "Field schema"))
     with pytest.raises(PublicationError):
         initialise_private_dataset(

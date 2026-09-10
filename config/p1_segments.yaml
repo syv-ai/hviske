@@ -89,15 +89,16 @@ segmentation:
 dataset_license:
   template_repository: CoRal-project/coral-v3
   template_revision: 01f7c93c21fc9dec87fe9f7149c79569cc433f08
-  template_url: https://huggingface.co/datasets/CoRal-project/coral-v3/raw/main/LICENSE
+  template_url: https://huggingface.co/datasets/CoRal-project/coral-v3/resolve/01f7c93c21fc9dec87fe9f7149c79569cc433f08/LICENSE
   template_sha256: ee93c98df9a894464d1c042b66c6039543776c463d06d1a6e93f176e08ca67bd
   template_bytes: 14112
-  adaptation: >-
-    Replace only 'Alexandra Instituttet A/S, Åbogade 34, 8200 Aarhus N, Denmark'
-    with 'syv.ai ApS, Rosenvængets Allé 11, 1. tv, 2100 København Ø, Denmark';
-    preserve all other terms and the Aarhus arbitration clause.
+  adaptation: "Replace only the exact UTF-8 byte/text sequence 'The Licensed Material
+    (as defined below) is made available to You by Alexandra\nInstituttet A/S, Åbogade
+    34, 8200 Aarhus N, Denmark' with 'The Licensed Material (as defined below) is made
+    available to You by syv.ai ApS,\nRosenvængets Allé 11, 1. tv, 2100 København Ø,
+    Denmark'; preserve all other bytes."
   target_path: LICENSE
-  target_sha256: 3c657d8d41bfbe131e2e24afd52004b1ddc10e4438edd97725c9df187ec5aa6f
+  target_sha256: e06010caf8ea36292a241339c08eedc7ea399778954cf9a546e989d421a48cd6
 
 output:
   audio_format: flac

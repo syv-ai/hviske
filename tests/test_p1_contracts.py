@@ -7,6 +7,7 @@ import pytest
 from hviske.p1_contracts import (
     CanonicalIdentityManifest,
     CTCContract,
+    DatasetLicenseContract,
     LedgerState,
     ModelContract,
     NormalisationContract,
@@ -49,37 +50,21 @@ def test_canonical_json_rejects_non_finite_floats() -> None:
         canonical_json({"score": float("nan")})
 
 
-def test_identity_and_segment_ids_are_deterministic() -> None:
-    """The manifest and segment identities are stable and framed by JSON."""
-    manifest = make_manifest()
-    digest = pipeline_config_sha256(manifest)
-
-    assert digest == pipeline_config_sha256(manifest.model_copy())
-    assert segment_id(
-        pipeline_config_sha256=digest,
-        source_file_id="programme-1",
-        source_start_ms=100,
-        source_end_ms=2100,
-        text="Hej, verden!",
-    ) == segment_id(
-        pipeline_config_sha256=digest,
-        source_file_id="programme-1",
-        source_start_ms=100,
-        source_end_ms=2100,
-        text="Hej, verden!",
-    )
-    assert digest != pipeline_config_sha256(
-        manifest.model_copy(update={"pipeline_version": "p1-segmentation-2"})
-    )
-    assert digest != pipeline_config_sha256(
-        manifest.model_copy(
-            update={
-                "normalisation": manifest.normalisation.model_copy(
-                    update={"source_text_ownership": "legacy"}
-                )
-            }
-        )
-    )
+@pytest.mark.parametrize(
+    "template_url",
+    [
+        "https://huggingface.co/datasets/org/data/raw/main/LICENSE",
+        "https://huggingface.co/datasets/org/data/resolve/main/LICENSE",
+        "https://huggingface.co/datasets/org/data/blob/main/LICENSE",
+        "https://huggingface.co/datasets/org/data/LICENSE",
+    ],
+)
+def test_dataset_license_rejects_mutable_urls(template_url: str) -> None:
+    """Dataset licence provenance accepts only commit-pinned Hub URLs."""
+    license_data = make_manifest().dataset_license.model_dump()
+    license_data["template_url"] = template_url
+    with pytest.raises(ValueError, match="complete SHA"):
+        DatasetLicenseContract.model_validate(license_data)
 
 
 def make_manifest() -> CanonicalIdentityManifest:
@@ -147,6 +132,39 @@ def make_manifest() -> CanonicalIdentityManifest:
             minimum_vad_speech_ratio=0.0,
         ),
         output=OutputEncodingContract(),
+    )
+
+
+def test_identity_and_segment_ids_are_deterministic() -> None:
+    """The manifest and segment identities are stable and framed by JSON."""
+    manifest = make_manifest()
+    digest = pipeline_config_sha256(manifest)
+
+    assert digest == pipeline_config_sha256(manifest.model_copy())
+    assert segment_id(
+        pipeline_config_sha256=digest,
+        source_file_id="programme-1",
+        source_start_ms=100,
+        source_end_ms=2100,
+        text="Hej, verden!",
+    ) == segment_id(
+        pipeline_config_sha256=digest,
+        source_file_id="programme-1",
+        source_start_ms=100,
+        source_end_ms=2100,
+        text="Hej, verden!",
+    )
+    assert digest != pipeline_config_sha256(
+        manifest.model_copy(update={"pipeline_version": "p1-segmentation-2"})
+    )
+    assert digest != pipeline_config_sha256(
+        manifest.model_copy(
+            update={
+                "normalisation": manifest.normalisation.model_copy(
+                    update={"source_text_ownership": "legacy"}
+                )
+            }
+        )
     )
 
 

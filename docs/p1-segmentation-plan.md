@@ -290,8 +290,10 @@ privacy failure as an incident and stop all further processing.
 The dataset card must use the custom `other` licence metadata, link to the committed
 `LICENSE`, and describe source provenance, permitted use, private-access terms,
 alignment method, field schema, known limitations, rejection policy, and immutable
-source, model, and target-licence provenance. Access, use, and distribution are subject
-to `LICENSE`.
+source, model, and target-licence provenance. The dataset-licence template is the
+[pinned CoRal-v3 licence][p1-dataset-licence] at revision
+`01f7c93c21fc9dec87fe9f7149c79569cc433f08`, never a mutable `main` URL. Access, use,
+and distribution are subject to `LICENSE`.
 Confirm the organisation has enough private storage for the pilot estimate before the
 full run.
 
@@ -466,7 +468,21 @@ Retain only:
 
 - source, model, and code revisions, including the CTC licence designation and URL;
 - the pinned CoRal-v3 dataset-licence template revision and digest, the exact
-  licensor-identity-only adaptation, and the target `LICENSE` digest;
+  licensor-identity-only adaptation, and the target `LICENSE` digest. The byte/text
+  replacement preserves the template's wrapping exactly except for the target identity:
+
+  ```text
+  The Licensed Material (as defined below) is made available to You by Alexandra
+  Instituttet A/S, Åbogade 34, 8200 Aarhus N, Denmark
+  ```
+
+  becomes
+
+  ```text
+  The Licensed Material (as defined below) is made available to You by syv.ai ApS,
+  Rosenvængets Allé 11, 1. tv, 2100 København Ø, Denmark
+  ```
+
 - versioned configuration and normalisation rules, including the CTC architecture,
   sampling rate, convolution stride, vocabulary size, blank, and delimiter IDs; the
   pipeline digest covers the lowercase-only Roest compatibility invariant and
@@ -480,6 +496,8 @@ Delete programme audio, extracted clips, alignment tensors, and temporary transc
 after their rows are recoverably sharded and fsynced. Delete local Parquet shards,
 batch staging, and remote-verification downloads only after the remote commit and
 content verification are durable in the ledger.
+
+[p1-dataset-licence]: https://huggingface.co/datasets/CoRal-project/coral-v3/resolve/01f7c93c21fc9dec87fe9f7149c79569cc433f08/LICENSE
 
 ## Primary references
 
