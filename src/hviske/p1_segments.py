@@ -731,16 +731,21 @@ def segment_programme(
             "source audio cannot be downmixed and resampled",
             category=RejectionCategory.MISSING_AUDIO,
         ) from exc
-    expected_samples = source_duration_ms * 16
-    # The programme duration is rounded to milliseconds from source frames.  At
+    expected_samples = _duration_sample_count(
+        duration_ms=source_duration_ms, sampling_rate=16_000
+    )
+    # The programme duration is rounded to milliseconds from source frames. At
     # 16 kHz that rounding can differ from the resampled sample count by up to half
     # a millisecond; rejecting those samples would turn a valid compressed source
-    # into a false missing-audio error.
+    # into a false missing-audio error. Once accepted, use the duration contract as
+    # the sole boundary so a tail ending at the programme duration has exactly the
+    # corresponding number of samples.
     if abs(values.size - expected_samples) > 8:
         raise SourceValidationError(
             "source audio length does not match its decoded duration",
             category=RejectionCategory.MISSING_AUDIO,
         )
+    values = _normalise_duration_samples(values, expected_samples)
     validated = validate_source_words(
         words=words, programme_duration_ms=source_duration_ms
     )
@@ -854,6 +859,45 @@ def segment_programme(
         correction_count=correction_count,
         audit_candidates=tuple(audit_candidates),
     )
+
+
+def _duration_sample_count(*, duration_ms: int, sampling_rate: int) -> int:
+    """Convert milliseconds to samples using deterministic nearest-sample rounding.
+
+    Returns:
+        The nearest target sample count.
+    """
+    return _round_half_up(duration_ms, sampling_rate, 1000)
+
+
+def _round_half_up(numerator: int, multiplier: int, denominator: int) -> int:
+    """Round a non-negative rational number to the nearest integer.
+
+    Exact half samples round up rather than following Python's ties-to-even rule.
+    This keeps resampling and duration normalisation independent of input shape.
+
+    Returns:
+        The nearest integer sample count.
+
+    Raises:
+        ValueError:
+            If any arithmetic operand is not positive as required.
+    """
+    if numerator < 0 or multiplier <= 0 or denominator <= 0:
+        raise ValueError("sample-count arithmetic requires positive values")
+    quotient, remainder = divmod(numerator * multiplier, denominator)
+    return quotient + int(remainder * 2 >= denominator)
+
+
+def _normalise_duration_samples(audio: np.ndarray, expected_samples: int) -> np.ndarray:
+    """Pad or truncate accepted audio to the duration contract's sample count.
+
+    Returns:
+        A mono array with exactly ``expected_samples`` frames.
+    """
+    if audio.size < expected_samples:
+        return np.pad(audio, (0, expected_samples - audio.size))
+    return audio[:expected_samples]
 
 
 def correct_drift_once(
@@ -1095,7 +1139,7 @@ def prepare_source_audio(
         divisor = math.gcd(sampling_rate, 16000)
         up = 16000 // divisor
         down = sampling_rate // divisor
-        expected = round(values.size * 16000 / sampling_rate)
+        expected = _round_half_up(values.size, 16000, sampling_rate)
         values = np.asarray(resample_poly(values, up, down), dtype=np.float32)
         if len(values) < expected:
             values = np.pad(values, (0, expected - len(values)))

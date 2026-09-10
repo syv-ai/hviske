@@ -12,6 +12,7 @@ from typing import cast
 
 import numpy as np
 import pytest
+import soundfile as sf
 from omegaconf import DictConfig, OmegaConf
 
 from hviske.p1_contracts import SourceWord
@@ -23,6 +24,7 @@ from hviske.p1_pipeline import (
     P1PreflightError,
     PipelineSettings,
     PreflightReport,
+    _decoded_native_audio,
     _native_candidates,
     _process_native_programmes,
     _SelectionDedup,
@@ -218,7 +220,8 @@ def test_decoded_duration_overrun_is_invalid_timestamp_before_alignment(
         record = ledger.programme("p1-file-1")
 
     assert record.source_duration_ms == 340_056
-    assert record.last_error == "invalid_timestamps"
+    assert record.last_error == "transcript_over_audio"
+    assert report.rejection_counts == {"transcript_over_audio": 1}
     assert calls == 0
 
 
@@ -284,6 +287,37 @@ def test_decoded_duration_replaces_declared_metadata_duration(
     assert captured["source_duration_ms"] == 340_056
     source_locator = cast(dict[str, object], captured["source_locator"])
     assert source_locator["source_duration_ms"] == 340_056
+
+
+def test_decoded_native_audio_enforces_cap_for_compressed_and_array_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Injected arrays and compressed bytes cannot bypass the decoded cap."""
+    info = type("Info", (), {"frames": 3, "samplerate": 1, "channels": 1})()
+    monkeypatch.setattr(sf, "info", lambda _stream: info)
+    monkeypatch.setattr(
+        sf, "read", lambda *_args, **_kwargs: pytest.fail("decode must not be called")
+    )
+
+    with pytest.raises(ValueError, match="decoded PCM exceeds"):
+        _decoded_native_audio(
+            ParsedAudio(
+                file_id="file-1", value=b"compressed", sampling_rate=1, channels=1
+            ),
+            file_id="file-1",
+            max_decoded_audio_bytes=8,
+        )
+    with pytest.raises(ValueError, match="configured limit"):
+        _decoded_native_audio(
+            ParsedAudio(
+                file_id="file-1",
+                value=np.zeros(3, dtype=np.float32),
+                sampling_rate=1,
+                channels=1,
+            ),
+            file_id="file-1",
+            max_decoded_audio_bytes=8,
+        )
 
 
 def test_empty_timed_words_precede_ambiguous_source_text(tmp_path: Path) -> None:
@@ -563,10 +597,10 @@ def test_native_selection_dedup_is_disk_backed_and_rebuilt(tmp_path: Path) -> No
     assert columns == ["file_id"]
 
 
-def test_overlong_transcript_is_a_terminal_invalid_timestamp_rejection(
+def test_overlong_transcript_is_a_terminal_transcript_over_audio_rejection(
     tmp_path: Path,
 ) -> None:
-    """Transcript words beyond audio are rejected before programme construction."""
+    """Transcript words beyond decoded audio get a stable dedicated category."""
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
 
     class Source:
@@ -601,10 +635,10 @@ def test_overlong_transcript_is_a_terminal_invalid_timestamp_rejection(
         )
         record = ledger.programme("p1-file-1")
         assert record.state.value == "rejected"
-        assert record.last_error == "invalid_timestamps"
-        assert record.rejection_counts == {"invalid_timestamps": 1}
+        assert record.last_error == "transcript_over_audio"
+        assert record.rejection_counts == {"transcript_over_audio": 1}
     assert report.processed == 1
-    assert report.rejection_counts == {"invalid_timestamps": 1}
+    assert report.rejection_counts == {"transcript_over_audio": 1}
 
 
 def test_parser_timestamp_failure_is_invalid_timestamp_rejection(
@@ -1112,7 +1146,7 @@ def test_zero_accepted_programme_is_skipped_on_the_second_run(
 
     monkeypatch.setattr(
         "hviske.p1_pipeline._decoded_native_audio",
-        lambda _audio, file_id: np.zeros(16_000),
+        lambda _audio, file_id, max_decoded_audio_bytes: np.zeros(16_000),
     )
     monkeypatch.setattr(
         "hviske.p1_pipeline.segment_programme",
