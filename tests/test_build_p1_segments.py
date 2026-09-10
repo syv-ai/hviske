@@ -38,19 +38,22 @@ def test_allocation_failure_never_leaves_programme_sharded(
         raise RuntimeError("simulated allocation crash")
 
     monkeypatch.setattr(Ledger, "allocate_batch_with_shards", crash)
-    run_pipeline(
-        config=config(tmp_path, mode="build"),
-        source=source,
-        hub=MemoryHub(),
-        ctc=FakeCtc(),
-        vad=FakeVad(),
-    )
+    with pytest.raises(RuntimeError, match="simulated allocation crash"):
+        run_pipeline(
+            config=config(tmp_path, mode="build"),
+            source=source,
+            hub=MemoryHub(),
+            ctc=FakeCtc(),
+            vad=FakeVad(),
+        )
 
     with Ledger(
         tmp_path / "scratch" / "ledger.sqlite", reset_processing=False
     ) as ledger:
-        assert not ledger.pending_batches()
-        assert ledger.programme("p1-programme-1").state.value == "retryable"
+        assert not ledger.reconstruct_work()
+        programme = ledger.programme("p1-programme-1")
+        assert programme.state.value == "retryable"
+        assert programme.last_error == "runtime_error"
 
 
 class FakeCtc:
@@ -313,20 +316,38 @@ run_pipeline(
 def test_verification_failure_retains_local_shard(tmp_path: Path) -> None:
     """A failed remote verification leaves the ledger batch and bytes recoverable."""
     source = FakeSource()
-    report = run_pipeline(
-        config=config(tmp_path, mode="build"),
-        source=source,
-        hub=VerifyFailHub(),
-        ctc=FakeCtc(),
-        vad=FakeVad(),
-    )
+    with pytest.raises(RuntimeError, match="simulated verification failure"):
+        run_pipeline(
+            config=config(tmp_path, mode="build"),
+            source=source,
+            hub=VerifyFailHub(),
+            ctc=FakeCtc(),
+            vad=FakeVad(),
+        )
 
-    assert report.processed == 0
-    assert list((tmp_path / "scratch" / "staging").rglob("*.parquet"))
+    local_shards = list((tmp_path / "scratch" / "staging").rglob("*.parquet"))
+    assert local_shards
     with Ledger(
         tmp_path / "scratch" / "ledger.sqlite", reset_processing=False
     ) as ledger:
-        assert ledger.pending_batches()
+        programme = ledger.programme("p1-programme-1")
+        assert programme.state.value == "retryable"
+        assert programme.last_error == "runtime_error"
+        pending = ledger.pending_batches()
+        assert len(pending) == 1
+        batch = pending[0]
+        assert batch.state.value == "committed"
+        assert batch.commit_id is not None
+        assert batch.last_error is None
+        shards = ledger.shards(batch.batch_id)
+        assert len(shards) == 1
+        shard = shards[0]
+        assert shard.state.value == "sharded"
+        assert shard.verification_time is None
+        assert shard.purge_time is None
+        assert shard.local_path is not None
+        assert shard.local_path == str(local_shards[0].resolve())
+        assert Path(shard.local_path).is_file()
 
 
 class VerifyFailHub(MemoryHub):
