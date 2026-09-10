@@ -111,9 +111,7 @@ class AuditReservoir:
                 continue
             _validate_candidate_locator(row, status)
             safe_row = _metadata_copy(row)
-            metadata_digest = _string(row, "_p1_metadata_sha256", "metadata_sha256")
-            if metadata_digest is None or not _SHA256.fullmatch(metadata_digest):
-                metadata_digest = _metadata_digest(row)
+            metadata_digest = _metadata_digest_for_candidate(row)
             safe_row["_p1_metadata_sha256"] = metadata_digest
             audio_digest = _audio_digest(row)
             if audio_digest is not None:
@@ -522,6 +520,30 @@ def _integer(row: MetadataRow, *keys: str) -> int | None:
     return int(value) if value is not None else None
 
 
+def _metadata_digest_for_candidate(row: MetadataRow) -> str:
+    """Return the producer digest, or calculate one for legacy rows.
+
+    The producer digest is calculated from the complete output row before the audit
+    record is reduced to metadata.  Recalculating after that reduction would hash a
+    different object and make valid audit records unretrievable.
+
+    Raises:
+        ValueError:
+            If a supplied digest is not lowercase SHA-256 hexadecimal text.
+    """
+    supplied = [
+        (key, row[key])
+        for key in ("_p1_metadata_sha256", "metadata_sha256")
+        if key in row
+    ]
+    for key, value in supplied:
+        if not isinstance(value, str) or not _SHA256.fullmatch(value):
+            raise ValueError(f"{key} must be lowercase SHA-256 hex")
+    if supplied:
+        return t.cast(str, supplied[0][1])
+    return _metadata_digest(row)
+
+
 def _metadata_digest(row: MetadataRow) -> str:
     """Hash the canonical metadata of the complete published row.
 
@@ -757,8 +779,9 @@ def create_blinded_audit_manifest(
         status = _status(row)
         if quotas[status]:
             _validate_candidate_locator(row, status)
+            metadata_digest = _metadata_digest_for_candidate(row)
             safe_row = _metadata_copy(row)
-            safe_row["_p1_metadata_sha256"] = _metadata_digest(row)
+            safe_row["_p1_metadata_sha256"] = metadata_digest
             audio_digest = _audio_digest(row)
             if audio_digest is not None:
                 safe_row["_p1_audio_sha256"] = audio_digest
@@ -800,9 +823,7 @@ def create_blinded_audit_manifest(
                 else 0
             ),
             stratum=_stratum_key(row),
-            metadata_sha256=(
-                _string(row, "_p1_metadata_sha256") or _metadata_digest(row)
-            ),
+            metadata_sha256=_metadata_digest_for_candidate(row),
             audio_sha256=_string(row, "_p1_audio_sha256", "audio_sha256"),
             parquet_sha256=_string(
                 row, "parquet_sha256", "shard_sha256", "_p1_parquet_sha256"

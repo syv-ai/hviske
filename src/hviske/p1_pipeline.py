@@ -2093,9 +2093,12 @@ def _record_audit_candidates(
                 raw_candidate = dict(row)
             else:
                 raise TypeError("audit rows must be mappings or contract models")
-            from hviske.p1_validation import _metadata_copy, _metadata_digest
+            from hviske.p1_validation import (
+                _metadata_copy,
+                _metadata_digest_for_candidate,
+            )
 
-            metadata_digest = _metadata_digest(raw_candidate)
+            metadata_digest = _metadata_digest_for_candidate(raw_candidate)
             candidate = _metadata_copy(raw_candidate)
             candidate["status"] = "accepted"
             # Keep the digest produced from the complete OutputRow while dropping

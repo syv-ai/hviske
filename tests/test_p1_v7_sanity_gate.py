@@ -8,10 +8,17 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 import soundfile as sf
 
+from hviske.p1_contracts import OutputRow
+from hviske.p1_segments import _rows_table
 from hviske.p1_v7_sanity_gate import run_v7_sanity_gate
-from hviske.p1_validation import _metadata_digest
+from hviske.p1_validation import (
+    AuditReservoir,
+    PinnedHubClipRetriever,
+    _metadata_digest,
+)
 
 _REVISION = "a" * 40
 
@@ -26,38 +33,107 @@ _AUDIO = _flac()
 _AUDIO_SHA256 = hashlib.sha256(_AUDIO).hexdigest()
 
 
-def test_gate_fails_without_a_full_dozen(tmp_path: Path) -> None:
-    """A short accepted pool produces a failed aggregate report."""
-    report_path = tmp_path / "gate.json"
+def test_audit_manifest_retrieves_published_parquet_rows(tmp_path: Path) -> None:
+    """The final audit manifest passes validation against its published shard."""
+    repository = "syvai/p1-segments"
+    parquet_path = tmp_path / "part.parquet"
+    revision = _REVISION
+    rows = []
+    for index in range(12):
+        raw_row = _row(index)
+        raw_row["audio"] = _AUDIO
+        raw_row["alignment_word_map"] = ("hej", "verden")
+        raw_row["speaker_ids"] = ("speaker",)
+        rows.append(OutputRow.model_validate(raw_row))
+    parquet_buffer = io.BytesIO()
+    pq.write_table(_rows_table(rows), parquet_buffer)
+    parquet_bytes = parquet_buffer.getvalue()
+    parquet_sha256 = hashlib.sha256(parquet_bytes).hexdigest()
+
+    reservoir = AuditReservoir(
+        tmp_path / "reservoir.json",
+        accepted_quota=12,
+        rejected_quota=0,
+        borderline_quota=0,
+        seed="e2e",
+    )
+    candidates = []
+    for index, row in enumerate(rows):
+        published = row.model_dump(mode="python")
+        digest = _metadata_digest(published)
+        published.update(
+            {
+                "_p1_metadata_sha256": digest,
+                "metadata_sha256": digest,
+                "repository": repository,
+                "revision": revision,
+                "parquet_path": "data/part.parquet",
+                "row_locator": index,
+                "parquet_sha256": parquet_sha256,
+            }
+        )
+        candidates.append(published)
+    reservoir.add(candidates)
+    manifest = reservoir.finalise(tmp_path / "manifest.jsonl")
+    parquet_path.write_bytes(parquet_bytes)
+
+    class _PublishedHub:
+        def get_paths_info(
+            self, repo_id: str, paths: list[str], *, repo_type: str, revision: str
+        ) -> list[dict[str, object]]:
+            assert (repo_id, paths, repo_type, revision) == (
+                repository,
+                ["data/part.parquet"],
+                "dataset",
+                _REVISION,
+            )
+            return [{"path": paths[0], "sha256": parquet_sha256}]
+
+        def load_dataset(
+            self, repo_id: str, *, shard_path: str, revision: str, streaming: bool
+        ) -> list[dict[str, object]]:
+            assert (repo_id, shard_path, revision, streaming) == (
+                repository,
+                "data/part.parquet",
+                _REVISION,
+                True,
+            )
+            return pq.read_table(parquet_path).to_pylist()
+
+        def repo_info(
+            self, repo_id: str, *, repo_type: str, revision: str
+        ) -> dict[str, object]:
+            assert (repo_id, repo_type, revision) == (repository, "dataset", _REVISION)
+            return {"private": True, "sha": _REVISION}
+
+    retriever = PinnedHubClipRetriever(
+        _PublishedHub(), repository=repository, revision=revision
+    )
     report = run_v7_sanity_gate(
-        _candidates(11),
-        retriever=_Retriever(_candidates(11)),
+        manifest,
+        retriever=retriever,
         asr=_ASR(),
-        report_path=report_path,
+        pilot_head=revision,
+        report_path=tmp_path / "sanity.json",
     )
 
-    assert report["pass"] is False
-    assert report["counts"] == {"accepted": 11, "selected": 11}
-    assert json.loads(report_path.read_text(encoding="utf-8"))["pass"] is False
+    assert report["pass"] is True
+    assert report["counts"] == {
+        "accepted": 12,
+        "selected": 12,
+        "retrieved": 12,
+        "structural_failures": 0,
+        "asr_empty": 0,
+        "asr_non_speech": 0,
+        "wer_high": 0,
+    }
+    assert all("_p1_metadata_sha256" not in candidate for candidate in manifest)
 
 
 class _ASR:
     def transcribe(self, audio: bytes) -> str:
         del audio
         return "hej verden"
-
-
-class _Retriever:
-    def __init__(self, candidates: list[dict[str, object]]) -> None:
-        self.rows = {
-            candidate["segment_id"]: _row(index)
-            for index, candidate in enumerate(candidates)
-        }
-        self.seen: list[str] = []
-
-    def retrieve_row(self, candidate: dict[str, object]) -> dict[str, object]:
-        self.seen.append(str(candidate["audit_id"]))
-        return self.rows[candidate["segment_id"]]
 
 
 def _row(index: int) -> dict[str, object]:
@@ -87,6 +163,34 @@ def _row(index: int) -> dict[str, object]:
         "pipeline_version": "p1-segmentation-7",
         "pipeline_config_sha256": "c" * 64,
     }
+
+
+def test_gate_fails_without_a_full_dozen(tmp_path: Path) -> None:
+    """A short accepted pool produces a failed aggregate report."""
+    report_path = tmp_path / "gate.json"
+    report = run_v7_sanity_gate(
+        _candidates(11),
+        retriever=_Retriever(_candidates(11)),
+        asr=_ASR(),
+        report_path=report_path,
+    )
+
+    assert report["pass"] is False
+    assert report["counts"] == {"accepted": 11, "selected": 11}
+    assert json.loads(report_path.read_text(encoding="utf-8"))["pass"] is False
+
+
+class _Retriever:
+    def __init__(self, candidates: list[dict[str, object]]) -> None:
+        self.rows = {
+            candidate["segment_id"]: _row(index)
+            for index, candidate in enumerate(candidates)
+        }
+        self.seen: list[str] = []
+
+    def retrieve_row(self, candidate: dict[str, object]) -> dict[str, object]:
+        self.seen.append(str(candidate["audit_id"]))
+        return self.rows[candidate["segment_id"]]
 
 
 def _candidates(count: int) -> list[dict[str, object]]:
