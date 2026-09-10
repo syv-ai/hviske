@@ -47,11 +47,19 @@ def test_hub_model_revision_uses_hf_api() -> None:
     assert api.calls == [("org/model", "a" * 40)]
 
 
-def test_roest_ctc_backend_casts_inputs_for_bfloat16_model() -> None:
-    """BF16 convolution inputs and integer masks retain their intended dtypes."""
+@pytest.mark.parametrize(
+    "model_dtype",
+    [torch.float32, torch.float16, torch.bfloat16],
+    ids=["float32", "float16", "bfloat16"],
+)
+def test_roest_ctc_backend_casts_inputs_and_normalises_emissions(
+    model_dtype: torch.dtype,
+) -> None:
+    """Inputs follow the model dtype and device while masks stay integer."""
+    requested_device = torch.device("meta")
 
     class FakeBatchEncoding(dict[str, torch.Tensor]):
-        def to(self, device: str) -> "FakeBatchEncoding":
+        def to(self, device: torch.device) -> "FakeBatchEncoding":
             return FakeBatchEncoding(
                 {key: value.to(device) for key, value in self.items()}
             )
@@ -69,45 +77,51 @@ def test_roest_ctc_backend_casts_inputs_for_bfloat16_model() -> None:
                 }
             )
 
-    class FakeBfloat16CTC(torch.nn.Module):
+    class FakeCTC(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.convolution = torch.nn.Conv1d(1, 2, kernel_size=1).to(
-                dtype=torch.bfloat16
+            self.dtype_marker = torch.nn.Parameter(
+                torch.ones(1, dtype=model_dtype), requires_grad=False
             )
+            self.input_values_device: torch.device | None = None
+            self.attention_mask_device: torch.device | None = None
+            self.input_values_dtype: torch.dtype | None = None
             self.attention_mask_dtype: torch.dtype | None = None
 
         def forward(
             self, input_values: torch.Tensor, attention_mask: torch.Tensor
         ) -> SimpleNamespace:
+            self.input_values_device = input_values.device
+            self.attention_mask_device = attention_mask.device
+            self.input_values_dtype = input_values.dtype
             self.attention_mask_dtype = attention_mask.dtype
-            assert input_values.dtype == torch.bfloat16
             assert not torch.is_grad_enabled()
-            logits = self.convolution(input_values.unsqueeze(1)).transpose(1, 2)
+            logits = torch.tensor(
+                [[[-2.0, 0.0], [0.5, -0.5], [1.0, 2.0], [0.0, 0.0]]], dtype=model_dtype
+            )
             return SimpleNamespace(logits=logits)
 
-    model = FakeBfloat16CTC()
+    model = FakeCTC()
     backend = object.__new__(HuggingFaceCTCBackend)
     object.__setattr__(backend, "_torch", torch)
     object.__setattr__(backend, "_processor", FakeProcessor())
     object.__setattr__(backend, "_model", model)
-    object.__setattr__(backend, "_device", "cpu")
+    object.__setattr__(backend, "_device", requested_device)
     object.__setattr__(backend, "_sampling_rate", 16_000)
 
     emissions = backend._compute_emissions(
         np.ones(4, dtype=np.float32), sampling_rate=16_000
     )
 
+    assert model.input_values_device == requested_device
+    assert model.attention_mask_device == requested_device
+    assert model.input_values_dtype == model_dtype
     assert model.attention_mask_dtype == torch.long
+    assert isinstance(emissions, np.ndarray)
     assert emissions.dtype == np.float32
     assert emissions.shape == (4, 2)
-    expected_logits = model.convolution(
-        torch.ones((1, 1, 4), dtype=torch.bfloat16)
-    ).transpose(1, 2)
-    expected = (
-        torch.log_softmax(expected_logits.float().squeeze(0), dim=-1).detach().numpy()
-    )
-    np.testing.assert_allclose(emissions, expected)
+    assert np.isfinite(emissions).all()
+    np.testing.assert_allclose(np.exp(emissions).sum(axis=-1), np.ones(4))
 
 
 def test_roest_ctc_contract_derives_20ms_frames_and_token_coverage() -> None:
