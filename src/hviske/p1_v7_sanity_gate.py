@@ -95,11 +95,15 @@ class WhisperSmallASR:
             ValueError:
                 If the backend returns no transcription or receives invalid audio.
         """
-        decoded, sample_rate = sf.read(
-            io.BytesIO(audio), dtype="float32", always_2d=True
-        )
-        if sample_rate != 16_000 or decoded.shape[1] != 1:
-            raise ValueError("ASR received audio outside the v7 audio contract")
+        with sf.SoundFile(io.BytesIO(audio)) as audio_file:
+            if (
+                audio_file.format != "FLAC"
+                or audio_file.subtype != "PCM_16"
+                or audio_file.samplerate != 16_000
+                or audio_file.channels != 1
+            ):
+                raise ValueError("ASR received audio outside the v7 audio contract")
+            decoded = audio_file.read(dtype="float32", always_2d=True)
         result = self._pipeline(
             decoded[:, 0], generate_kwargs={"language": "danish", "task": "transcribe"}
         )
@@ -169,6 +173,10 @@ def run_v7_sanity_gate(
         _write_report(report_path, report)
         return report
 
+    verify_repository = getattr(retriever, "verify_repository", None)
+    if callable(verify_repository):
+        verify_repository()
+
     structural_failures = 0
     retrievals = 0
     asr_empty = 0
@@ -176,10 +184,13 @@ def run_v7_sanity_gate(
     scores: list[float] = []
     for ordinal, candidate in enumerate(selected, 1):
         try:
+            if expected_head is None:
+                raise ValueError("an explicit final pilot HEAD is required")
+            rebound_candidate = _rebind_candidate(candidate, pilot_head=expected_head)
             _validate_candidate_locator(
-                candidate, pilot_head=expected_head, repository=PILOT_REPOSITORY
+                rebound_candidate, pilot_head=expected_head, repository=PILOT_REPOSITORY
             )
-            row = _retrieve_row(retriever, candidate)
+            row = _retrieve_row(retriever, rebound_candidate)
             retrievals += 1
             audio = _validate_row(row=row, candidate=candidate)
             duration = row.get("duration_ms")
@@ -244,9 +255,15 @@ def run_v7_sanity_gate(
 
 
 def _decode_audio(audio: bytes, *, duration_ms: int) -> np.ndarray:
-    decoded, sample_rate = sf.read(io.BytesIO(audio), dtype="float32", always_2d=True)
-    if sample_rate != 16_000 or decoded.shape[1] != 1:
-        raise ValueError("audio is not mono 16 kHz")
+    with sf.SoundFile(io.BytesIO(audio)) as audio_file:
+        if (
+            audio_file.format != "FLAC"
+            or audio_file.subtype != "PCM_16"
+            or audio_file.samplerate != 16_000
+            or audio_file.channels != 1
+        ):
+            raise ValueError("audio is not PCM_16 FLAC mono 16 kHz")
+        decoded = audio_file.read(dtype="float32", always_2d=True)
     if (
         not np.isfinite(decoded).all()
         or decoded.shape[0] != duration_ms * 16
@@ -329,6 +346,24 @@ def _is_accepted_candidate(row: MetadataRow) -> bool:
     return isinstance(row.get("parquet_path", row.get("remote_parquet_path")), str)
 
 
+def _rebind_candidate(candidate: MetadataRow, *, pilot_head: str) -> dict[str, object]:
+    """Rebind a candidate to the final immutable publication head in memory.
+
+    Returns:
+        A copy whose retrieval revision is the final pilot HEAD.
+
+    Raises:
+        ValueError:
+            If the candidate does not contain a complete immutable revision.
+    """
+    revision = candidate.get("revision")
+    if not isinstance(revision, str) or not _COMMIT_SHA.fullmatch(revision):
+        raise ValueError("candidate revision is not immutable")
+    rebound = dict(candidate)
+    rebound["revision"] = pilot_head
+    return rebound
+
+
 def _resolve_pilot_head(
     candidates: c.Iterable[MetadataRow], pilot_head: str | None
 ) -> str | None:
@@ -343,6 +378,8 @@ def _resolve_pilot_head(
         value = next(iter(revisions))
         if isinstance(value, str) and _COMMIT_SHA.fullmatch(value):
             return value
+    if pilot_head is None:
+        raise ValueError("an explicit final pilot HEAD is required")
     return pilot_head
 
 

@@ -49,8 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         help="aggregate JSON report destination",
     )
     parser.add_argument(
-        "--pilot-head",
-        help="complete immutable pilot commit SHA; inferred only when unambiguous",
+        "--pilot-head", required=True, help="complete immutable final pilot commit SHA"
     )
     parser.add_argument(
         "--seed", default="p1-v7-dozen", help="deterministic stratified sampling seed"
@@ -67,9 +66,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         candidates = _read_jsonl(args.input)
-        revision = args.pilot_head or _head(candidates)
         retriever = PinnedHubClipRetriever(
-            HfApiAdapter(), repository=PILOT_REPOSITORY, revision=revision
+            HfApiAdapter(), repository=PILOT_REPOSITORY, revision=args.pilot_head
         )
         report = run_v7_sanity_gate(
             candidates,
@@ -96,19 +94,6 @@ def _device(value: str | None) -> int | str | None:
         return int(value)
     except ValueError:
         return value
-
-
-def _head(candidates: list[dict[str, object]]) -> str:
-    accepted = [
-        value
-        for value in candidates
-        if value.get("status", value.get("quality_status")) in (None, "accepted")
-        and isinstance(value.get("parquet_path", value.get("remote_parquet_path")), str)
-    ]
-    revisions = {value.get("revision") for value in accepted}
-    if len(revisions) != 1 or not isinstance(next(iter(revisions), None), str):
-        raise ValueError("pilot candidates do not have one immutable head")
-    return t.cast(str, next(iter(revisions)))
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:

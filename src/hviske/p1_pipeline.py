@@ -2093,10 +2093,15 @@ def _record_audit_candidates(
                 raw_candidate = dict(row)
             else:
                 raise TypeError("audit rows must be mappings or contract models")
-            from hviske.p1_validation import _metadata_copy
+            from hviske.p1_validation import _metadata_copy, _metadata_digest
 
+            metadata_digest = _metadata_digest(raw_candidate)
             candidate = _metadata_copy(raw_candidate)
             candidate["status"] = "accepted"
+            # Keep the digest produced from the complete OutputRow while dropping
+            # transcript and audio fields from the reservoir candidate.
+            candidate["_p1_metadata_sha256"] = metadata_digest
+            candidate["metadata_sha256"] = metadata_digest
             if local_paths is None:
                 candidate.update(
                     {

@@ -4,16 +4,17 @@ Run `uv run python src/scripts/run_p1_v7_sanity_gate.py` only after the pilot
 has been published. This is a separate validation command and is not called by
 segmentation. It reads `scratch/audit-candidates.jsonl`, requires at least twelve
 accepted candidates, and retrieves the selected rows one at a time from the private
-`syvai/p1-segments` repository at one immutable pilot commit.
+`syvai/p1-segments` repository at one immutable pilot commit. Before retrieval it
+verifies the dataset namespace, private visibility, and exact resolved commit SHA.
 
 Sampling uses the supplied seed and round-robins deterministic hash-ranked candidates
-within programme/stratum groups. The default seed is `p1-v7-dozen`; use `--pilot-head`
-to make the expected commit explicit (otherwise a single unambiguous candidate
-revision is inferred).
+within programme/stratum groups. The default seed is `p1-v7-dozen`; `--pilot-head`
+is required and must identify the complete final pilot commit, because candidates
+from several publication commits are rebound to that immutable head in memory.
 
 The gate checks the exact `p1-segments-v2` schema and `p1-segmentation-7` contract,
-verified metadata/audio/Parquet hashes, in-memory FLAC decoding, finite mono 16 kHz
-audio, exact millisecond/sample duration, 1--10 second duration, trainable text,
+verified metadata/audio/Parquet hashes, in-memory PCM_16 FLAC decoding, finite mono
+16 kHz audio, exact millisecond/sample duration, 1--10 second duration, trainable text,
 and one speaker. An independently loaded `openai/whisper-small` model is pinned to
 revision `973afd24965f72e36ca33b3055d56a652f456b4d`, loaded once, and run in Danish.
 GPU 0 is used when available; `--device -1` forces CPU.
