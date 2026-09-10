@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Make native P1 selection deduplicate through crash-safe scratch SQLite state and
+  preserve exact scalar audio and transcript pointer metadata through pilot sampling.
 - Reduce deterministic P1 pilot selection to one audio metadata pass by retaining only
   bounded scalar row locators and reconstructing selected audio pointers from the plan.
 - Increase P1 projected metadata batches to 1,024 rows while retaining the 64 MiB

@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import time
 import typing as t
 from collections.abc import Mapping
@@ -43,7 +44,14 @@ from hviske.p1_contracts import (
 )
 from hviske.p1_ledger import Ledger
 from hviske.p1_segments import CTCBackend, VADBackend, segment_programme, write_shards
-from hviske.p1_source import AudioPointer, ParsedTranscript, TranscriptPointer
+from hviske.p1_source import (
+    _AUDIO_POINTER_METADATA_KEY,
+    _AUDIO_POINTER_METADATA_MAX_BYTES,
+    AudioPointer,
+    ParsedTranscript,
+    TranscriptPointer,
+    _scalar_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -557,6 +565,7 @@ def _run_native_pipeline(
             source_file_id=settings.source_file_id,
             pilot=settings.mode == "pilot",
             log=log,
+            scratch_root=settings.scratch_root,
         )
         if isinstance(candidates, list):
             logger.info(
@@ -592,10 +601,19 @@ class MetadataLog:
             "audio",
             "audio_bytes",
             "cache",
+            "file_id",
+            "id",
             "path",
             "path_local",
+            "programme_id",
             "query",
+            "row_group",
+            "row_index",
             "source_file_id",
+            "source_row_group",
+            "source_row_index",
+            "source_shard_byte_size",
+            "source_shard_index",
             "source_shard_path",
             "text",
             "transcript_id",
@@ -605,7 +623,9 @@ class MetadataLog:
         }
 
         def sanitise(value: object, key: str | None = None) -> object | None:
-            if key is not None and key.casefold() in forbidden:
+            if key is not None and (
+                key.casefold() in forbidden or key.startswith("_p1_")
+            ):
                 return None
             if isinstance(value, dict):
                 return {
@@ -664,6 +684,7 @@ def _native_candidates(
     source_file_id: str | None,
     pilot: bool,
     log: MetadataLog,
+    scratch_root: Path | None = None,
 ) -> c.Iterable[NativeCandidate]:
     """Select joined transcript and audio pointers with bounded metadata scans.
 
@@ -679,6 +700,8 @@ def _native_candidates(
 
     pointer_iterator = getattr(source, "iter_programme_pointers", None)
     metadata_iterator = getattr(source, "iter_programme_metadata", None)
+    dedup_root = scratch_root or log.path.parent
+    dedup = _SelectionDedup(dedup_root / "native-selection-dedup.sqlite")
 
     def safe_metadata(
         row: Mapping[str, object], pointer: object, file_id: str, shard_index: int
@@ -781,6 +804,7 @@ def _native_candidates(
             shard=t.cast(SourceShard, shard),
             row_group=metadata_row_group,
             row_index=metadata_row_index,
+            metadata=_scalar_metadata(row),
         )
         return NativeCandidate(
             file_id=file_id,
@@ -789,8 +813,9 @@ def _native_candidates(
             transcript_pointer=transcript_pointer,
         )
 
-    def stream(*, emit_summary: bool = True) -> c.Iterator[NativeCandidate]:
-        seen: set[str] = set()
+    def stream(
+        *, emit_summary: bool = True, include_pointer_metadata: bool = False
+    ) -> c.Iterator[NativeCandidate]:
         rows_scanned = 0
         shards_scanned = 0
         missing_transcript_count = 0
@@ -819,9 +844,18 @@ def _native_candidates(
                             if isinstance(file_id, str) and file_id:
                                 missing_transcript_count += 1
                             continue
-                        if candidate.file_id in seen:
+                        if not dedup.add_if_new(candidate.file_id):
                             continue
-                        seen.add(candidate.file_id)
+                        if include_pointer_metadata:
+                            metadata = dict(candidate.metadata)
+                            metadata[_AUDIO_POINTER_METADATA_KEY] = (
+                                _encode_audio_pointer_metadata(
+                                    candidate.audio_pointer.metadata
+                                )
+                            )
+                            candidate = dataclasses.replace(
+                                candidate, metadata=metadata
+                            )
                         yield candidate
                 elif callable(metadata_iterator):
                     for row_index, raw in enumerate(metadata_iterator(shard=shard)):
@@ -835,9 +869,18 @@ def _native_candidates(
                             if isinstance(file_id, str) and file_id:
                                 missing_transcript_count += 1
                             continue
-                        if candidate.file_id in seen:
+                        if not dedup.add_if_new(candidate.file_id):
                             continue
-                        seen.add(candidate.file_id)
+                        if include_pointer_metadata:
+                            metadata = dict(candidate.metadata)
+                            metadata[_AUDIO_POINTER_METADATA_KEY] = (
+                                _encode_audio_pointer_metadata(
+                                    candidate.audio_pointer.metadata
+                                )
+                            )
+                            candidate = dataclasses.replace(
+                                candidate, metadata=metadata
+                            )
                         yield candidate
         finally:
             if emit_summary and missing_transcript_count:
@@ -856,13 +899,18 @@ def _native_candidates(
                     shards_scanned,
                     missing_transcript_count,
                 )
+            dedup.close()
 
     def targeted() -> list[NativeCandidate]:
         target_id = t.cast(str, source_file_id)
-        for candidate in stream():
-            if candidate.file_id == target_id:
-                logger.info("Audio metadata selection complete: target selected")
-                return [candidate]
+        selection = stream()
+        try:
+            for candidate in selection:
+                if candidate.file_id == target_id:
+                    logger.info("Audio metadata selection complete: target selected")
+                    return [candidate]
+        finally:
+            selection.close()
         raise SourceSelectionError(
             "requested source_file_id was not found in audio metadata"
         )
@@ -872,11 +920,13 @@ def _native_candidates(
     if programme_limit is None:
         return stream()
     if not pilot:
-        return list(itertools.islice(stream(), programme_limit))
+        selected = list(itertools.islice(stream(), programme_limit))
+        dedup.close()
+        return selected
     from hviske.p1_validation import stratified_sample
 
     selected_rows = stratified_sample(
-        (candidate.metadata for candidate in stream()),
+        (candidate.metadata for candidate in stream(include_pointer_metadata=True)),
         sample_size=programme_limit,
         seed="p1-pilot",
     )
@@ -907,42 +957,23 @@ def _native_candidates(
         transcript_pointer = getattr(index, "get")(file_id)
         if transcript_pointer is None:
             raise SourceSelectionError("selected programme has no transcript pointer")
-        pointer_metadata = ()
-        if callable(pointer_iterator):
-            pointer_metadata = tuple(
-                sorted(
-                    (key, json.dumps(value, ensure_ascii=False, sort_keys=True))
-                    for key, value in row.items()
-                    if key.casefold()
-                    in {
-                        "broadcaster",
-                        "creator_affiliation",
-                        "duration",
-                        "duration_ms",
-                        "genre",
-                        "genre_sub",
-                        "language",
-                        "month",
-                        "platform",
-                        "show",
-                        "speaker_count",
-                        "split",
-                        "title",
-                        "year",
-                    }
-                    and isinstance(value, (str, int, float, bool, type(None)))
-                )
-            )
         pointer = AudioPointer(
             file_id=file_id,
             shard=shard,
             row_group=row_group,
             row_index=row_index,
-            metadata=pointer_metadata,
+            metadata=_decode_audio_pointer_metadata(
+                row.get(_AUDIO_POINTER_METADATA_KEY)
+            ),
         )
+        metadata = {
+            key: value
+            for key, value in row.items()
+            if key != _AUDIO_POINTER_METADATA_KEY
+        }
         return NativeCandidate(
             file_id=file_id,
-            metadata=dict(row),
+            metadata=metadata,
             audio_pointer=pointer,
             transcript_pointer=transcript_pointer,
         )
@@ -953,6 +984,81 @@ def _native_candidates(
         "Audio metadata selection complete: %d programmes selected", len(selected)
     )
     return selected
+
+
+class _SelectionDedup:
+    """Crash-safe, metadata-only deduplication for one selection pass."""
+
+    def __init__(self, path: Path) -> None:
+        """Create an empty deduplication database at ``path``."""
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(self.path)
+        self.connection.execute("PRAGMA journal_mode = DELETE")
+        self.connection.execute("PRAGMA synchronous = FULL")
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS selected_ids "
+            "(file_id TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID"
+        )
+        self.connection.execute("DELETE FROM selected_ids")
+        self.connection.commit()
+
+    def add_if_new(self, file_id: str) -> bool:
+        """Record ``file_id`` and return whether this is its first occurrence.
+
+        Returns:
+            Whether this call inserted the identifier.
+        """
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO selected_ids (file_id) VALUES (?)", (file_id,)
+        )
+        self.connection.commit()
+        return cursor.rowcount == 1
+
+    def close(self) -> None:
+        """Close the durable selection database connection."""
+        self.connection.close()
+
+
+def _decode_audio_pointer_metadata(value: object) -> tuple[tuple[str, str], ...]:
+    """Decode the bounded internal pointer-metadata scalar.
+
+    Returns:
+        The original scalar metadata tuple.
+
+    Raises:
+        ValueError:
+            If the scalar is missing, oversized, or malformed.
+    """
+    if not isinstance(value, str):
+        raise ValueError("selected audio metadata has no pointer metadata")
+    if len(value.encode("utf-8")) > _AUDIO_POINTER_METADATA_MAX_BYTES:
+        raise ValueError("selected audio pointer metadata exceeds its size limit")
+    decoded = json.loads(value)
+    if not isinstance(decoded, list) or not all(
+        isinstance(item, list)
+        and len(item) == 2
+        and all(isinstance(part, str) for part in item)
+        for item in decoded
+    ):
+        raise ValueError("selected audio pointer metadata is malformed")
+    return tuple((item[0], item[1]) for item in decoded)
+
+
+def _encode_audio_pointer_metadata(metadata: tuple[tuple[str, str], ...]) -> str:
+    """Encode pointer metadata without decoding non-finite scalar values.
+
+    Returns:
+        The bounded JSON scalar.
+
+    Raises:
+        ValueError:
+            If the encoded metadata exceeds the bounded selection limit.
+    """
+    encoded = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > _AUDIO_POINTER_METADATA_MAX_BYTES:
+        raise ValueError("audio pointer metadata exceeds the bounded selection limit")
+    return encoded
 
 
 def as_mapping(value: object) -> dict[str, object]:
