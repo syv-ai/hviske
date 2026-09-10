@@ -177,14 +177,31 @@ def test_ctc_emission_adapter_returns_token_boundaries() -> None:
 def test_danish_mapping_is_reversible() -> None:
     """Punctuation/case changes retain the exact Danish source words."""
     result = normalise_alignment_text(
-        words=words(("Ærlig,", 0, 1_000, None), ("Ål!", 1_000, 2_000, None)),
+        words=words(
+            ("Rødgrød", 0, 1_000, None),
+            ("Hej", 1_000, 2_000, None),
+            ("København", 2_000, 3_000, None),
+        ),
         contract=NormalisationContract(
-            version="test", case_folding=True, punctuation_removed=True
+            version="p1-text-normalisation-3",
+            case_folding=True,
+            punctuation_removed=True,
         ),
     )
-    assert result.text == "ærlig ål"
-    assert result.word_map == ("Ærlig,", "Ål!")
-    assert result.source_word_indexes == (0, 1)
+
+    def roest_like_tokeniser(value: str) -> tuple[int, ...]:
+        """Represent a lowercase-only Roest tokenizer for this contract test.
+
+        Returns:
+            Deterministic stand-in token IDs for the lowercase input.
+        """
+        assert value == value.casefold()
+        return tuple(ord(char) for char in value)
+
+    assert result.text == "rødgrød hej københavn"
+    assert all(roest_like_tokeniser(word) for word in result.text.split())
+    assert result.word_map == ("Rødgrød", "Hej", "København")
+    assert result.source_word_indexes == (0, 1, 2)
 
 
 def test_drift_correction_runs_at_most_once() -> None:
@@ -254,6 +271,48 @@ def test_malformed_timestamps_are_rejected() -> None:
             ],
             programme_duration_ms=1_000,
         )
+
+
+def test_output_text_preserves_case_when_alignment_text_is_folded() -> None:
+    """Canonical alignment text never replaces verbatim published text."""
+
+    class CTC:
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, word_map, sampling_rate
+            assert alignment_text == "rødgrød hej københavn"
+            return AlignmentResult(start_ms=start_ms, end_ms=end_ms, score=1.0)
+
+    result = segment_programme(
+        words=words(
+            ("Rødgrød", 0, 1_000, None),
+            ("Hej", 1_000, 2_000, None),
+            ("København", 2_000, 3_000, None),
+        ),
+        audio=np.zeros(48_000, dtype=np.float32),
+        source_file_id="source",
+        source_duration_ms=3_000,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(
+            version="p1-text-normalisation-3", case_folding=True
+        ),
+        ctc=CTC(),
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.text == "Rødgrød Hej København"
+    assert row.alignment_text == "rødgrød hej københavn"
+    assert row.alignment_word_map == ("Rødgrød", "Hej", "København")
 
 
 def test_pilot_mean_log_probability_threshold_is_config_shaped() -> None:

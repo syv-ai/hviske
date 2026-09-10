@@ -44,6 +44,7 @@ from hviske.p1_contracts import (
     pipeline_config_sha256,
 )
 from hviske.p1_ledger import Ledger
+from hviske.p1_models import validate_ctc_normalisation_compatibility
 from hviske.p1_segments import CTCBackend, VADBackend, segment_programme, write_shards
 from hviske.p1_source import (
     _AUDIO_POINTER_METADATA_KEY,
@@ -126,6 +127,11 @@ class PipelineSettings:
         ctc_raw = t.cast(dict[str, object], root["ctc"])
         ctc_model = t.cast(dict[str, object], ctc_raw["model"])
         ctc_repo = t.cast(dict[str, object], ctc_model["repository"])
+        normalisation_raw = t.cast(dict[str, object], root["normalisation"])
+        validate_ctc_normalisation_compatibility(
+            repository=str(ctc_repo["repository"]),
+            case_folding=bool(normalisation_raw.get("case_folding", False)),
+        )
         anomaly_raw = t.cast(dict[str, object], root["anomaly_model"])
         output_raw = t.cast(dict[str, object], root["output"])
         manifest = CanonicalIdentityManifest(
@@ -166,7 +172,7 @@ class PipelineSettings:
                 repository=RepositoryRevision.model_validate(anomaly_raw["repository"]),
                 license=str(anomaly_raw["license"]),
             ),
-            normalisation=NormalisationContract.model_validate(root["normalisation"]),
+            normalisation=NormalisationContract.model_validate(normalisation_raw),
             segmentation=SegmentationContract.model_validate(root["segmentation"]),
             output=OutputEncodingContract.model_validate(output_raw),
             max_decoded_audio_bytes=_as_int(max_decoded_audio),
@@ -2132,6 +2138,7 @@ def make_ctc_backend(settings: PipelineSettings) -> CTCBackend:
         settings.ctc_model_repository,
         settings.ctc_model_revision,
         device=settings.device,
+        case_folding=settings.normalisation.case_folding,
     )
 
 
@@ -2319,7 +2326,10 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
         private_access_terms="Access is restricted to authorised syv.ai members.",
         alignment_method=(
             "Pinned Silero VAD and CoRal Røst-v3 Wav2Vec2 CTC segmentation; "
-            "the CTC model is openrail/OpenRAIL-M metadata, not Apache-2.0."
+            "the lowercase-only Roest tokenizer uses NFC case-folded canonical "
+            "alignment text (p1-text-normalisation-3), while published text and "
+            "source-word spans remain verbatim; the CTC model is "
+            "openrail/OpenRAIL-M metadata, not Apache-2.0."
         ),
         field_schema="p1-segments-v1 OutputRow schema.",
         known_limitations="Pilot thresholds and anomaly statistics require review.",
@@ -2364,6 +2374,13 @@ def preflight_pipeline(
         P1PreflightError:
             If an immutable, storage, or privacy gate fails.
     """
+    try:
+        validate_ctc_normalisation_compatibility(
+            repository=settings.ctc_model_repository,
+            case_folding=settings.normalisation.case_folding,
+        )
+    except ValueError as exc:
+        raise P1PreflightError(str(exc)) from exc
     if maximum_source_bytes > settings.max_source_bytes:
         raise P1PreflightError(
             f"largest source object ({maximum_source_bytes}) exceeds "
@@ -2404,6 +2421,7 @@ def preflight_pipeline(
     checks = {
         "source_revisions": source_revision_ok,
         "model_revisions": model_revision_ok,
+        "ctc_normalisation_compatible": True,
         "free_space": free_bytes >= required,
         "scratch_quota": scratch_bytes <= settings.max_scratch_bytes,
         "scratch_budget": scratch_bytes + required <= settings.max_scratch_bytes,

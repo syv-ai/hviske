@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from hviske.p1_models import (
+    ROEST_REPOSITORY,
     SILERO_MODEL_BLOB,
     SILERO_MODEL_PATH,
     SILERO_MODEL_SHA256,
@@ -22,6 +23,7 @@ from hviske.p1_models import (
     SileroVADBackend,
     download_silero_vad,
     validate_ctc_model_contract,
+    validate_ctc_normalisation_compatibility,
     verify_hub_model_revision,
     verify_silero_vad_asset,
     verify_silero_vad_revision,
@@ -107,6 +109,18 @@ def test_roest_ctc_contract_rejects_unsupported_frame_stride() -> None:
 
     with pytest.raises(ValueError, match="unsupported CTC frame stride"):
         validate_ctc_model_contract(model_config=model_config, processor=processor)
+
+
+def test_roest_lowercase_tokenizer_requires_case_folding() -> None:
+    """The model/config invariant rejects canonical text that retains uppercase."""
+    with pytest.raises(ValueError, match="case_folding=true"):
+        validate_ctc_normalisation_compatibility(
+            repository=ROEST_REPOSITORY, case_folding=False
+        )
+
+    validate_ctc_normalisation_compatibility(
+        repository=ROEST_REPOSITORY, case_folding=True
+    )
 
 
 def test_silero_asset_rejects_content_checksum(tmp_path: Path) -> None:

@@ -38,6 +38,7 @@ ROEST_VOCAB_SIZE = 46
 ROEST_BLANK_TOKEN_ID = 45
 ROEST_WORD_DELIMITER_TOKEN_ID = 36
 ROEST_REQUIRED_TOKENS = frozenset("0123456789abcdefghijklmnopqrstuvwxyzåæéøü")
+ROEST_TOKENIZER_CASE = "lowercase-only"
 
 
 class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
@@ -50,6 +51,7 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
         *,
         device: str = "cpu",
         frame_duration_ms: float | None = None,
+        case_folding: bool = True,
     ) -> None:
         """Load the processor and model at one immutable Hub revision.
 
@@ -67,6 +69,9 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
 
         if (repository, revision) != (ROEST_REPOSITORY, ROEST_REVISION):
             raise ModelPinError("P1 CTC backend requires the pinned Roest checkpoint")
+        validate_ctc_normalisation_compatibility(
+            repository=repository, case_folding=case_folding
+        )
         verify_hub_model_revision(repository=repository, revision=revision)
         self._torch = torch
         tokenizer = Wav2Vec2CTCTokenizer.from_pretrained(repository, revision=revision)
@@ -239,6 +244,32 @@ def validate_ctc_model_contract(
     if vocabulary.get("|") != ROEST_WORD_DELIMITER_TOKEN_ID:
         raise ValueError("P1 CTC tokenizer must use token 36 as its word delimiter")
     return frame_duration_ms
+
+
+def validate_ctc_normalisation_compatibility(
+    *, repository: str, case_folding: bool
+) -> None:
+    """Validate text normalisation against the pinned CTC tokenizer.
+
+    The pinned Roest vocabulary contains lowercase letters only.  Case folding is
+    therefore part of the model/configuration contract, rather than an optional
+    presentation choice.
+
+    Args:
+        repository:
+            CTC model repository to validate.
+        case_folding:
+            Whether canonical alignment text is case-folded.
+
+    Raises:
+        ValueError:
+            If the pinned Roest model is configured without case folding.
+    """
+    if repository == ROEST_REPOSITORY and not case_folding:
+        raise ValueError(
+            f"Roest's {ROEST_TOKENIZER_CASE} tokenizer requires "
+            "normalisation.case_folding=true"
+        )
 
 
 def verify_hub_model_revision(

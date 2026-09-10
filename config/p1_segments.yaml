@@ -63,10 +63,10 @@ anomaly_model:
   license: Apache-2.0
 
 normalisation:
-  version: p1-text-normalisation-2
+  version: p1-text-normalisation-3
   source_text_ownership: following-timed-word-with-terminal-suffix-v1
   unicode_form: NFC
-  case_folding: false
+  case_folding: true
   punctuation_removed: true
   number_expansion: false
   preserves_source_word_map: true
