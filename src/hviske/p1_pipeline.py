@@ -11,6 +11,7 @@ import dataclasses
 import gc
 import hashlib
 import importlib
+import inspect
 import itertools
 import json
 import logging
@@ -547,6 +548,11 @@ def _run_native_pipeline(
             hub=hub,
             audit_reservoir=audit_reservoir,
         )
+
+        def scratch_guard() -> None:
+            enforce_scratch_cap(settings)
+
+        scratch_guard()
         index_path = scratch / "transcript-pointers.sqlite"
         index_builder = getattr(source, "build_transcript_index")
         index_kwargs: dict[str, object] = {
@@ -556,6 +562,12 @@ def _run_native_pipeline(
         }
         if settings.source_file_id is not None:
             index_kwargs["source_file_id"] = settings.source_file_id
+        index_signature = inspect.signature(index_builder)
+        if "scratch_guard" in index_signature.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in index_signature.parameters.values()
+        ):
+            index_kwargs["scratch_guard"] = scratch_guard
         index = index_builder(**index_kwargs)
         candidates = _native_candidates(
             source=source,
@@ -566,6 +578,7 @@ def _run_native_pipeline(
             pilot=settings.mode == "pilot",
             log=log,
             scratch_root=settings.scratch_root,
+            scratch_guard=scratch_guard,
         )
         if isinstance(candidates, list):
             logger.info(
@@ -685,6 +698,7 @@ def _native_candidates(
     pilot: bool,
     log: MetadataLog,
     scratch_root: Path | None = None,
+    scratch_guard: c.Callable[[], None] | None = None,
 ) -> c.Iterable[NativeCandidate]:
     """Select joined transcript and audio pointers with bounded metadata scans.
 
@@ -701,7 +715,11 @@ def _native_candidates(
     pointer_iterator = getattr(source, "iter_programme_pointers", None)
     metadata_iterator = getattr(source, "iter_programme_metadata", None)
     dedup_root = scratch_root or log.path.parent
-    dedup = _SelectionDedup(dedup_root / "native-selection-dedup.sqlite")
+    if scratch_guard is not None:
+        scratch_guard()
+    dedup = _SelectionDedup(
+        dedup_root / "native-selection-dedup.sqlite", scratch_guard=scratch_guard
+    )
 
     def safe_metadata(
         row: Mapping[str, object], pointer: object, file_id: str, shard_index: int
@@ -989,19 +1007,80 @@ def _native_candidates(
 class _SelectionDedup:
     """Crash-safe, metadata-only deduplication for one selection pass."""
 
-    def __init__(self, path: Path) -> None:
-        """Create an empty deduplication database at ``path``."""
-        self.path = path
+    def __init__(
+        self, path: Path, scratch_guard: c.Callable[[], None] | None = None
+    ) -> None:
+        """Create an empty deduplication database at ``path``.
+
+        Args:
+            path:
+                Database path in the owned scratch tree.
+            scratch_guard (optional):
+                Callback that rejects a run after scratch growth.
+        """
+        self.path = Path(path)
+        self._scratch_guard = scratch_guard
+        self._validate_path()
+        self._guard_scratch()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._recreate_database()
         self.connection = sqlite3.connect(self.path)
-        self.connection.execute("PRAGMA journal_mode = DELETE")
-        self.connection.execute("PRAGMA synchronous = FULL")
-        self.connection.execute(
-            "CREATE TABLE IF NOT EXISTS selected_ids "
-            "(file_id TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID"
-        )
-        self.connection.execute("DELETE FROM selected_ids")
-        self.connection.commit()
+        try:
+            self.connection.execute("PRAGMA journal_mode = DELETE")
+            self.connection.execute("PRAGMA synchronous = FULL")
+            self.connection.execute(
+                "CREATE TABLE selected_ids "
+                "(file_id TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID"
+            )
+            self.connection.commit()
+            self._guard_scratch()
+        except Exception:
+            self.connection.close()
+            raise
+
+    def _guard_scratch(self) -> None:
+        """Check the scratch quota after a database transaction is durable."""
+        if self._scratch_guard is not None:
+            self._scratch_guard()
+
+    def _recreate_database(self) -> None:
+        """Remove old high-water files before creating the next selection state."""
+        if self.path.exists():
+            self.path.unlink()
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.path}{suffix}")
+            if sidecar.exists():
+                sidecar.unlink()
+
+    def _validate_path(self) -> None:
+        """Reject paths that could make quota accounting or replacement unsafe.
+
+        Raises:
+            ValueError:
+                If the database or one of its sidecars is an unexpected path.
+        """
+        if self.path.is_symlink():
+            raise ValueError(f"deduplication path must not be a symlink: {self.path}")
+        if self.path.exists() and not self.path.is_file():
+            raise ValueError(f"deduplication path must be a regular file: {self.path}")
+        if self.path.parent.is_symlink():
+            raise ValueError(
+                f"deduplication parent must not be a symlink: {self.path.parent}"
+            )
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.path}{suffix}")
+            if sidecar.is_symlink():
+                raise ValueError(
+                    f"deduplication sidecar must not be a symlink: {sidecar}"
+                )
+            if sidecar.exists() and not sidecar.is_file():
+                raise ValueError(
+                    f"deduplication sidecar must be a regular file: {sidecar}"
+                )
+
+    def close(self) -> None:
+        """Close the durable selection database connection."""
+        self.connection.close()
 
     def add_if_new(self, file_id: str) -> bool:
         """Record ``file_id`` and return whether this is its first occurrence.
@@ -1012,12 +1091,11 @@ class _SelectionDedup:
         cursor = self.connection.execute(
             "INSERT OR IGNORE INTO selected_ids (file_id) VALUES (?)", (file_id,)
         )
+        is_new = cursor.rowcount == 1
         self.connection.commit()
-        return cursor.rowcount == 1
-
-    def close(self) -> None:
-        """Close the durable selection database connection."""
-        self.connection.close()
+        if is_new:
+            self._guard_scratch()
+        return is_new
 
 
 def _decode_audio_pointer_metadata(value: object) -> tuple[tuple[str, str], ...]:

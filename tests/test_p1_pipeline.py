@@ -25,7 +25,9 @@ from hviske.p1_pipeline import (
     PreflightReport,
     _native_candidates,
     _process_native_programmes,
+    _SelectionDedup,
     _unlink_recovered,
+    enforce_scratch_cap,
     preflight_pipeline,
     run_pipeline,
 )
@@ -807,6 +809,65 @@ def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
 
     assert not good.exists()
     assert replaced.exists()
+
+
+def test_selection_dedup_rebuild_reclaims_high_water_file(tmp_path: Path) -> None:
+    """A fresh selection database does not retain the previous high water mark."""
+    path = tmp_path / "selection.sqlite"
+    dedup = _SelectionDedup(path)
+    for number in range(2_000):
+        assert dedup.add_if_new(f"programme-{number}")
+    dedup.close()
+    grown_size = path.stat().st_size
+
+    rebuilt = _SelectionDedup(path)
+    rebuilt.close()
+
+    assert path.stat().st_size < grown_size
+
+
+def test_selection_quota_guard_aborts_before_audio_or_models(tmp_path: Path) -> None:
+    """A tiny quota stops selection before a candidate can reach payload work."""
+    config = pipeline_config(tmp_path, mode="build")
+    settings = dataclasses.replace(
+        PipelineSettings.from_config(config), max_scratch_bytes=0
+    )
+    calls = {"audio": 0, "model": 0}
+
+    class Source:
+        def fetch_audio(self, **_: object) -> object:
+            calls["audio"] += 1
+            raise AssertionError("quota failure must precede audio retrieval")
+
+        def iter_programme_metadata(self, **_: object) -> object:
+            yield {"file_id": "programme-1", "duration_ms": 1_000}
+
+        def load_model(self) -> object:
+            calls["model"] += 1
+            raise AssertionError("quota failure must precede model construction")
+
+    class Index:
+        def get(self, _: str) -> object:
+            return object()
+
+    def guard() -> None:
+        enforce_scratch_cap(settings)
+
+    with pytest.raises(P1PreflightError, match="scratch hard cap exceeded"):
+        list(
+            _native_candidates(
+                source=Source(),
+                shards=(SourceShard("audio.parquet", 10),),
+                index=Index(),
+                programme_limit=None,
+                source_file_id=None,
+                pilot=False,
+                log=MetadataLog(tmp_path / "events.jsonl"),
+                scratch_root=settings.scratch_root,
+                scratch_guard=guard,
+            )
+        )
+    assert calls == {"audio": 0, "model": 0}
 
 
 def test_targeted_selection_stops_after_matching_audio_metadata(tmp_path: Path) -> None:

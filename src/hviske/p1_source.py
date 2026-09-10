@@ -53,6 +53,27 @@ class _SignedUrlFilter(logging.Filter):
         return True
 
 
+def _validate_database_path(path: Path) -> None:
+    """Reject database paths that could escape the owned scratch tree.
+
+    Raises:
+        ValueError:
+            If the database or one of its sidecars is an unexpected path.
+    """
+    if path.is_symlink():
+        raise ValueError(f"database path must not be a symlink: {path}")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"database path must be a regular file: {path}")
+    if path.parent.is_symlink():
+        raise ValueError(f"database parent must not be a symlink: {path.parent}")
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.is_symlink():
+            raise ValueError(f"database sidecar must not be a symlink: {sidecar}")
+        if sidecar.exists() and not sidecar.is_file():
+            raise ValueError(f"database sidecar must be a regular file: {sidecar}")
+
+
 _SIGNED_URL_FILTER = _SignedUrlFilter()
 _TRANSPORT_LOGGER_NAMES = ("httpx", "httpcore", "huggingface_hub", "fsspec")
 
@@ -215,9 +236,21 @@ class TranscriptPointerIndex:
     words, or audio.
     """
 
-    def __init__(self, path: Path) -> None:
-        """Create or open an index at ``path``."""
+    def __init__(
+        self, path: Path, scratch_guard: c.Callable[[], None] | None = None
+    ) -> None:
+        """Create or open an index at ``path``.
+
+        Args:
+            path:
+                Database path in the owned scratch tree.
+            scratch_guard (optional):
+                Callback that rejects a run after scratch growth.
+        """
         self.path = Path(path)
+        self._scratch_guard = scratch_guard
+        _validate_database_path(self.path)
+        self._guard_scratch()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(
@@ -240,11 +273,17 @@ class TranscriptPointerIndex:
                 );
                 """
             )
+        self._guard_scratch()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA journal_mode = WAL")
         return connection
+
+    def _guard_scratch(self) -> None:
+        """Check the scratch quota after a database transaction is durable."""
+        if self._scratch_guard is not None:
+            self._scratch_guard()
 
     def __len__(self) -> int:
         """Return the number of indexed transcripts."""
@@ -282,12 +321,14 @@ class TranscriptPointerIndex:
                 raise InvalidSourceRecord(
                     f"duplicate transcript file_id: {pointer.file_id}"
                 ) from error
+        self._guard_scratch()
 
     def clear(self) -> None:
         """Remove pointers and rejection evidence before rebuilding an index."""
         with self._connect() as connection:
             connection.execute("DELETE FROM transcript_pointers")
             connection.execute("DELETE FROM rejections")
+        self._guard_scratch()
 
     def get(self, file_id: str) -> TranscriptPointer | None:
         """Return a pointer without reading transcript content."""
@@ -327,6 +368,7 @@ class TranscriptPointerIndex:
                 "INSERT INTO rejections VALUES (?, ?, ?, ?, ?)",
                 dataclasses.astuple(rejection),
             )
+        self._guard_scratch()
 
     def rejections(self) -> tuple[TranscriptIndexRejection, ...]:
         """Return metadata-only index rejection evidence."""
@@ -398,8 +440,21 @@ class HfP1Source:
         path: Path,
         objects: c.Iterable[tuple[str, int, str | None]],
         source_file_id: str | None = None,
+        scratch_guard: c.Callable[[], None] | None = None,
     ) -> TranscriptPointerIndex:
         """Build a bounded SQLite pointer index from transcript metadata columns.
+
+        Args:
+            revision:
+                Immutable transcript revision.
+            path:
+                Database path in the owned scratch tree.
+            objects:
+                Transcript objects to scan using metadata columns only.
+            source_file_id (optional):
+                If set, stop after indexing this file identifier.
+            scratch_guard (optional):
+                Callback that rejects the run after committed index growth.
 
         Returns:
             The disk-backed pointer index.
@@ -410,7 +465,7 @@ class HfP1Source:
             SourceSelectionError:
                 If ``source_file_id`` is requested but no valid pointer is found.
         """
-        index = TranscriptPointerIndex(path)
+        index = TranscriptPointerIndex(path, scratch_guard=scratch_guard)
         index.clear()
         indexed_count = 0
         for shard_path, byte_size, _oid in sorted(objects, key=lambda item: item[0]):
