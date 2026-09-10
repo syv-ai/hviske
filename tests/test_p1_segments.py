@@ -24,6 +24,7 @@ from hviske.p1_segments import (
     AlignmentResult,
     CTCAlignmentInfeasible,
     CTCBackend,
+    UnsupportedAlignmentText,
     VADSignal,
     align_ctc_emissions,
     align_ctc_word_tokens,
@@ -704,6 +705,92 @@ def test_tail_duration_normalises_accepted_resampling_edges() -> None:
         decoded, _ = sf.read(io.BytesIO(row.audio), dtype="float32")
         assert row.duration_ms == 1_001
         assert decoded.shape == (16_016,)
+
+
+def test_unsupported_text_during_drift_rejects_only_that_proposal() -> None:
+    """A drift realignment with unsupported text does not abort later proposals."""
+    calls: dict[str, int] = {}
+
+    class CTC:
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, word_map, end_ms, sampling_rate
+            calls[alignment_text] = calls.get(alignment_text, 0) + 1
+            if alignment_text == "drift" and calls[alignment_text] == 1:
+                return AlignmentResult(start_ms + 500, start_ms + 2_500, 1.0)
+            if alignment_text == "drift":
+                raise UnsupportedAlignmentText("tokeniser returned None")
+            return AlignmentResult(start_ms, start_ms + 2_000, 1.0)
+
+    result = segment_programme(
+        words=words(
+            ("drift", 0, 2_000, "speaker-a"), ("normal", 2_000, 4_000, "speaker-b")
+        ),
+        audio=np.zeros(64_000, dtype=np.float32),
+        source_file_id="source",
+        source_duration_ms=4_000,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(version="test"),
+        ctc=CTC(),
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+    )
+
+    assert calls == {"drift": 2, "normal": 1}
+    assert len(result.rows) == 1
+    assert result.rows[0].text == "normal"
+    assert result.rejections == (("drift", "unsupported_text"),)
+    assert result.audit_candidates[0]["rejection_reason"] == "unsupported_text"
+
+
+def test_unsupported_text_proposal_does_not_abort_programme() -> None:
+    """Unsupported alignment data is audited while later rows are published."""
+
+    class CTC:
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, word_map, end_ms, sampling_rate
+            if alignment_text == "unsupported":
+                raise UnsupportedAlignmentText("tokeniser returned None")
+            return AlignmentResult(
+                start_ms=start_ms, end_ms=start_ms + 2_000, score=1.0
+            )
+
+    result = segment_programme(
+        words=words(
+            ("unsupported", 0, 2_000, "speaker-a"),
+            ("normal", 2_000, 4_000, "speaker-b"),
+        ),
+        audio=np.zeros(64_000, dtype=np.float32),
+        source_file_id="source",
+        source_duration_ms=4_000,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(version="test"),
+        ctc=CTC(),
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+        source_locator={"source_row": 3},
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].text == "normal"
+    assert result.rejections == (("unsupported", "unsupported_text"),)
+    assert result.audit_candidates[0]["rejection_reason"] == "unsupported_text"
+    assert result.audit_candidates[0]["source_row"] == 3
 
 
 def test_vad_ratio_and_edges() -> None:

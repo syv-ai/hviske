@@ -14,6 +14,7 @@ import torch
 
 from hviske.p1_models import (
     ROEST_REPOSITORY,
+    ROEST_VOCAB_SIZE,
     SILERO_MODEL_BLOB,
     SILERO_MODEL_PATH,
     SILERO_MODEL_SHA256,
@@ -22,6 +23,7 @@ from hviske.p1_models import (
     HuggingFaceCTCBackend,
     ModelPinError,
     SileroVADBackend,
+    UnsupportedAlignmentText,
     download_silero_vad,
     validate_ctc_model_contract,
     validate_ctc_normalisation_compatibility,
@@ -199,6 +201,63 @@ def test_roest_lowercase_tokenizer_requires_case_folding() -> None:
     validate_ctc_normalisation_compatibility(
         repository=ROEST_REPOSITORY, case_folding=True
     )
+
+
+def test_roest_tokeniser_rejects_unknown_and_blank_token_ids() -> None:
+    """Unknown and blank labels cannot be forced through the CTC aligner."""
+
+    class Tokenizer:
+        def __init__(self, unk_token_id: int | None, input_ids: list[int]) -> None:
+            self.unk_token_id = unk_token_id
+            self.input_ids = input_ids
+
+        def __call__(self, word: str, *, add_special_tokens: bool) -> SimpleNamespace:
+            del word
+            assert not add_special_tokens
+            return SimpleNamespace(input_ids=self.input_ids)
+
+    backend = object.__new__(HuggingFaceCTCBackend)
+    object.__setattr__(
+        backend,
+        "_processor",
+        SimpleNamespace(tokenizer=Tokenizer(unk_token_id=7, input_ids=[7])),
+    )
+    object.__setattr__(backend, "_blank_id", 0)
+
+    with pytest.raises(UnsupportedAlignmentText):
+        backend._tokenise_word("hej")
+
+    object.__setattr__(
+        backend,
+        "_processor",
+        SimpleNamespace(tokenizer=Tokenizer(unk_token_id=None, input_ids=[0])),
+    )
+    with pytest.raises(UnsupportedAlignmentText):
+        backend._tokenise_word("hej")
+
+
+@pytest.mark.parametrize(
+    "input_ids",
+    [[], [None], [True], [1.5], [-1], [ROEST_VOCAB_SIZE]],
+    ids=["empty", "none", "bool", "non-integral", "negative", "out-of-range"],
+)
+def test_roest_tokeniser_rejects_unsupported_token_ids(input_ids: list[object]) -> None:
+    """Malformed tokenizer output becomes a typed unsupported-text rejection."""
+
+    class Tokenizer:
+        unk_token_id = None
+
+        def __call__(self, word: str, *, add_special_tokens: bool) -> SimpleNamespace:
+            del word
+            assert not add_special_tokens
+            return SimpleNamespace(input_ids=input_ids)
+
+    backend = object.__new__(HuggingFaceCTCBackend)
+    object.__setattr__(backend, "_processor", SimpleNamespace(tokenizer=Tokenizer()))
+    object.__setattr__(backend, "_blank_id", 0)
+
+    with pytest.raises(UnsupportedAlignmentText):
+        backend._tokenise_word("hej")
 
 
 def test_silero_asset_rejects_content_checksum(tmp_path: Path) -> None:

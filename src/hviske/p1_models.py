@@ -6,6 +6,7 @@ import collections.abc as c
 import hashlib
 import json
 import logging
+import numbers
 import os
 import typing as t
 import urllib.parse
@@ -16,7 +17,12 @@ from pathlib import Path
 import numpy as np
 
 from .p1_contracts import P1_RUNTIME_CONTRACT
-from .p1_segments import CTCEmissionsAlignmentAdapter, VADBackend, VADSignal
+from .p1_segments import (
+    CTCEmissionsAlignmentAdapter,
+    UnsupportedAlignmentText,
+    VADBackend,
+    VADSignal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,20 +163,37 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
             Token IDs for the word.
 
         Raises:
-            ValueError:
-                If the word contains a character outside the pinned vocabulary.
+            UnsupportedAlignmentText:
+                If the word contains a character outside the pinned vocabulary or
+                the tokenizer returns an invalid token ID.
         """
         token_ids = self._processor.tokenizer(word, add_special_tokens=False).input_ids
         unk_id = getattr(self._processor.tokenizer, "unk_token_id", None)
-        if not token_ids or (unk_id is not None and unk_id in token_ids):
-            raise ValueError(
+        if token_ids is None or isinstance(token_ids, (bool, str, bytes)):
+            raise UnsupportedAlignmentText(
+                "alignment text contains no usable CTC token IDs"
+            )
+        if not token_ids:
+            raise UnsupportedAlignmentText(
                 "alignment text contains a token outside the CTC vocabulary"
             )
-        if any(
-            token_id < 0 or token_id >= ROEST_VOCAB_SIZE or token_id == self._blank_id
-            for token_id in token_ids
-        ):
-            raise ValueError("tokeniser returned an invalid CTC token id")
+        for token_id in token_ids:
+            if isinstance(token_id, bool) or not isinstance(token_id, numbers.Integral):
+                raise UnsupportedAlignmentText(
+                    "tokeniser returned a non-integral CTC token ID"
+                )
+            if unk_id is not None and token_id == unk_id:
+                raise UnsupportedAlignmentText(
+                    "alignment text contains a token outside the CTC vocabulary"
+                )
+            if token_id < 0 or token_id >= ROEST_VOCAB_SIZE:
+                raise UnsupportedAlignmentText(
+                    "tokeniser returned an invalid CTC token ID"
+                )
+            if token_id == self._blank_id:
+                raise UnsupportedAlignmentText(
+                    "tokeniser returned the CTC blank token ID"
+                )
         return token_ids
 
 
