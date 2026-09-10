@@ -51,7 +51,7 @@ Each `train` row has these fields:
 | `audio_sha256` | string | Digest of the encoded FLAC payload. |
 | `text` | string | Verbatim segment text before model normalisation. |
 | `alignment_text` | string | Canonical text supplied to the aligner. |
-| `alignment_word_map` | list[string] | Mapping from alignment units to source words. |
+| `alignment_word_map` | list[string] | Mapping from alignment units to exact owned source-text chunks. |
 | `language` | string | Always `da`. |
 | `segment_id` | string | Deterministic content and provenance identifier. |
 | `source_file_id` | string | P1 programme join key. |
@@ -106,12 +106,19 @@ before alignment when timestamps are missing, non-finite, outside the audio dura
 or substantially non-monotonic. Record the exact rejection reason in the ledger.
 
 Create a canonical `alignment_text` separately from the verbatim training text. Record
-a reversible mapping from every retained alignment unit to its source word. The mapping
+a reversible mapping from every retained alignment unit to its exact owned source-text
+chunk. The mapping
 must make case folding, punctuation removal, number expansion, unsupported characters,
 and optional romanisation auditable. The pinned Roest tokenizer is lowercase-only, so
-P1 normalisation version 3 requires case folding for canonical CTC text. Published
+P1 normalisation version 5 requires case folding for canonical CTC text. Published
 `text`, source spans, and the word map remain verbatim and case-preserving; never infer
-published text by reversing aligner normalisation.
+published text by reversing aligner normalisation. Untimed and zero-duration lexical
+records use bounded, per-transcript ownership lookahead: leading and interior text
+belongs to the following positive-duration word, while terminal text belongs to the
+final previous word. Ownership is accepted only when its speaker evidence is
+consistent with that anchor; a missing token speaker is accepted between two
+same-speaker anchors. Zero-duration points at either closed gap boundary are valid.
+Owned lexical text remains in both the exact candidate text and canonical CTC text.
 
 ### Form candidate segments
 
@@ -485,8 +492,9 @@ Retain only:
 
 - versioned configuration and normalisation rules, including the CTC architecture,
   sampling rate, convolution stride, vocabulary size, blank, and delimiter IDs; the
-  pipeline digest covers the lowercase-only Roest compatibility invariant and
-  `p1-text-normalisation-3` case-folding setting;
+  pipeline digest covers the lowercase-only Roest compatibility invariant,
+  `p1-text-normalisation-5` case-folding, and
+  `speaker-consistent-following-word-with-terminal-suffix-v5` source-text ownership;
 - metadata-only SQLite ledger and batch manifests;
 - shard paths, sizes, row counts, SHA-256 digests, and Hub commit IDs;
 - aggregate quality reports and manual-audit decisions;

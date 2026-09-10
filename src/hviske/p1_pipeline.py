@@ -2352,7 +2352,11 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
             f"{P1_RUNTIME_CONTRACT.normalisation_unicode_form} case-folded canonical "
             f"alignment text ({P1_RUNTIME_CONTRACT.normalisation_version}), with "
             "punctuation removed, numbers not expanded, and the source-word map "
-            "preserved; published text and source-word spans remain verbatim; the "
+            "preserved; speaker-consistent untimed lexical text uses bounded "
+            "following-word ownership or a terminal previous-word suffix "
+            f"({P1_RUNTIME_CONTRACT.normalisation_source_text_ownership}) and remains "
+            "in exact published and canonical CTC text; published source-word spans "
+            "remain verbatim; the "
             f"CTC model is {P1_RUNTIME_CONTRACT.roest_license}/OpenRAIL-M metadata, "
             "not Apache-2.0. Roest model weights are internal and are not distributed."
         ),

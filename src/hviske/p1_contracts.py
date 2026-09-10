@@ -88,7 +88,7 @@ class P1RuntimeContract:
 
 
 P1_RUNTIME_CONTRACT = P1RuntimeContract(
-    pipeline_version="p1-segmentation-4",
+    pipeline_version="p1-segmentation-5",
     ctc_name="ctc-segmentation",
     ctc_version="1.7.4",
     ctc_source_commit="69bd9b53b7b82ad926d35e7b280f957ed299a7db",
@@ -130,8 +130,10 @@ P1_RUNTIME_CONTRACT = P1RuntimeContract(
     roest_word_delimiter_token_id=36,
     roest_required_tokens=frozenset("0123456789abcdefghijklmnopqrstuvwxyzåæéøü"),
     roest_tokenizer_case="lowercase-only",
-    normalisation_version="p1-text-normalisation-3",
-    normalisation_source_text_ownership="following-timed-word-with-terminal-suffix-v1",
+    normalisation_version="p1-text-normalisation-5",
+    normalisation_source_text_ownership=(
+        "speaker-consistent-following-word-with-terminal-suffix-v5"
+    ),
     normalisation_unicode_form="NFC",
     normalisation_case_folding=True,
     normalisation_punctuation_removed=True,
@@ -435,9 +437,10 @@ def annotate_source_words(
 ) -> tuple[SourceWord, ...]:
     """Attach exact character and separator spans to transcript words.
 
-    The source text is treated as authoritative.  A word that cannot be found in
-    order is rejected rather than silently normalised or re-spaced.  Expected
-    offsets prevent a timed word from stealing an identical untimed token.
+    The source text is treated as authoritative. A word that cannot be found in
+    order is rejected rather than silently normalised or re-spaced. Expected
+    offsets identify timed words exactly, even when an owned untimed token has the
+    same text.
 
     Args:
         words:
@@ -459,11 +462,15 @@ def annotate_source_words(
     if expected_starts is not None and len(expected_starts) != len(words):
         raise ValueError("expected source offsets do not match timed words")
     for index, word in enumerate(words):
-        start = transcript_text.find(word.text, cursor)
-        if start < 0:
-            raise ValueError(f"word {index} is not present in transcript text")
-        if expected_starts is not None and start != expected_starts[index]:
-            raise ValueError(f"word {index} has ambiguous source-text ownership")
+        if expected_starts is None:
+            start = transcript_text.find(word.text, cursor)
+        else:
+            start = expected_starts[index]
+        if (
+            start < cursor
+            or transcript_text[start : start + len(word.text)] != word.text
+        ):
+            raise ValueError(f"word {index} is not present at its source offset")
         source_span = SourceTextSpan(start=start, end=start + len(word.text))
         separator_span = (
             SourceTextSpan(start=cursor, end=start) if start > cursor else None
@@ -661,7 +668,9 @@ class NormalisationContract(ContractModel):
     """Versioned text normalisation rules used by the aligner."""
 
     version: StrictStr
-    source_text_ownership: StrictStr = "following-timed-word-with-terminal-suffix-v1"
+    source_text_ownership: StrictStr = (
+        "speaker-consistent-following-word-with-terminal-suffix-v5"
+    )
     unicode_form: StrictStr = "NFC"
     case_folding: bool = False
     punctuation_removed: bool = True
