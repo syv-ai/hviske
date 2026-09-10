@@ -189,6 +189,11 @@ class TranscriptPointer(_RemoteRowPointerMixin):
 
 TranscriptWord = SourceWord
 
+# This value is carried only between the metadata sampler and pointer rebuild.  It
+# must remain small enough to exclude accidental source payloads from the reservoir.
+_AUDIO_POINTER_METADATA_KEY = "_p1_audio_pointer_metadata"
+_AUDIO_POINTER_METADATA_MAX_BYTES = 64 * 1024
+
 
 @dataclasses.dataclass(frozen=True)
 class SourcePlan:
@@ -270,7 +275,7 @@ class TranscriptPointerIndex:
                         pointer.row_index,
                         pointer.revision,
                         pointer.byte_size,
-                        json.dumps(dict(pointer.metadata), sort_keys=True),
+                        json.dumps(pointer.metadata, ensure_ascii=False),
                     ),
                 )
             except sqlite3.IntegrityError as error:
@@ -296,6 +301,15 @@ class TranscriptPointerIndex:
             ).fetchone()
         if row is None:
             return None
+        decoded_metadata = json.loads(row[6])
+        if isinstance(decoded_metadata, dict):
+            metadata = tuple(sorted(decoded_metadata.items()))
+        else:
+            metadata = tuple(
+                (item[0], item[1])
+                for item in decoded_metadata
+                if isinstance(item, list) and len(item) == 2
+            )
         return TranscriptPointer(
             file_id=row[0],
             path=row[1],
@@ -303,7 +317,7 @@ class TranscriptPointerIndex:
             row_index=row[3],
             revision=row[4],
             byte_size=row[5],
-            metadata=tuple(sorted(json.loads(row[6]).items())),
+            metadata=metadata,
         )
 
     def reject(self, rejection: TranscriptIndexRejection) -> None:

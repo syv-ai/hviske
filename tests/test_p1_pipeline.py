@@ -6,6 +6,7 @@ import dataclasses
 import io
 import json
 import logging
+import sqlite3
 from pathlib import Path
 from typing import cast
 
@@ -385,6 +386,62 @@ def test_native_candidates_retain_discovered_audio_pointers(tmp_path: Path) -> N
     assert candidate.metadata["duration_ms"] == 1000
 
 
+def test_native_selection_dedup_is_disk_backed_and_rebuilt(tmp_path: Path) -> None:
+    """Deduplication keeps the first row without retaining IDs in Python."""
+
+    class Source:
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self.rows = rows
+
+        def iter_programme_metadata(self, **_: object) -> object:
+            yield from self.rows
+
+    class Index:
+        def get(self, _: str) -> object:
+            return object()
+
+    shard = SourceShard("data/audio.parquet", 10)
+    source = Source(
+        [
+            {"file_id": "programme-1", "duration_ms": 1_000},
+            {"file_id": "programme-1", "duration_ms": 9_000},
+        ]
+    )
+    first = list(
+        _native_candidates(
+            source=source,
+            shards=(shard,),
+            index=Index(),
+            programme_limit=None,
+            source_file_id=None,
+            pilot=False,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+            scratch_root=tmp_path,
+        )
+    )
+    assert [candidate.metadata["duration_ms"] for candidate in first] == [1_000]
+
+    source.rows = [{"file_id": "programme-2", "duration_ms": 2_000}]
+    second = list(
+        _native_candidates(
+            source=source,
+            shards=(shard,),
+            index=Index(),
+            programme_limit=None,
+            source_file_id=None,
+            pilot=False,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+            scratch_root=tmp_path,
+        )
+    )
+    assert [candidate.file_id for candidate in second] == ["programme-2"]
+    with sqlite3.connect(tmp_path / "native-selection-dedup.sqlite") as connection:
+        columns = [
+            row[1] for row in connection.execute("PRAGMA table_info(selected_ids)")
+        ]
+    assert columns == ["file_id"]
+
+
 def test_overlong_transcript_is_a_terminal_invalid_timestamp_rejection(
     tmp_path: Path,
 ) -> None:
@@ -553,6 +610,41 @@ def test_pilot_selection_is_bounded_and_not_first_rows(tmp_path: Path) -> None:
     )
     assert [item[0] for item in first] == [item[0] for item in second]
     assert [item[0] for item in first] != ["programme-0", "programme-1", "programme-2"]
+
+
+def test_pilot_selection_preserves_nonfinite_pointer_metadata(tmp_path: Path) -> None:
+    """Pilot reconstruction preserves the encoded scalar tuple byte-for-byte."""
+    shard = SourceShard("audio.parquet", 10)
+    pointer = AudioPointer(
+        "programme-1",
+        shard,
+        2,
+        7,
+        (("duration_ms", "NaN"), ("title", json.dumps("A", sort_keys=True))),
+    )
+
+    class Source:
+        def iter_programme_pointers(self, *, shard: SourceShard) -> object:
+            assert shard == pointer.shard
+            yield pointer
+
+    class Index:
+        def get(self, _: str) -> object:
+            return object()
+
+    candidates = _native_candidates(
+        source=Source(),
+        shards=(shard,),
+        index=Index(),
+        programme_limit=1,
+        source_file_id=None,
+        pilot=True,
+        log=MetadataLog(tmp_path / "events.jsonl"),
+        scratch_root=tmp_path,
+    )
+    selected = list(candidates)
+    assert selected[0].audio_pointer == pointer
+    assert "_p1_audio_pointer_metadata" not in selected[0].metadata
 
 
 def test_pipeline_hardens_hydra_root_and_file_logging(

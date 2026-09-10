@@ -27,6 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, median
 
+from hviske.p1_source import (
+    _AUDIO_POINTER_METADATA_KEY,
+    _AUDIO_POINTER_METADATA_MAX_BYTES,
+)
+
 MetadataRow = c.Mapping[str, object]
 RowStream = c.Iterable[MetadataRow]
 
@@ -2359,7 +2364,18 @@ def stratified_sample(
         raise ValueError("sample_size must not be negative")
     reservoir = _StratifiedReservoir(sample_size)
     for ordinal, raw_row in enumerate(rows):
-        reservoir.add(_metadata_copy(raw_row), seed=str(seed), ordinal=ordinal)
+        row = _metadata_copy(raw_row)
+        internal_metadata = raw_row.get(_AUDIO_POINTER_METADATA_KEY)
+        if internal_metadata is not None:
+            if not isinstance(internal_metadata, str):
+                raise ValueError("audio pointer metadata must be an internal string")
+            if (
+                len(internal_metadata.encode("utf-8"))
+                > _AUDIO_POINTER_METADATA_MAX_BYTES
+            ):
+                raise ValueError("audio pointer metadata exceeds its size limit")
+            row[_AUDIO_POINTER_METADATA_KEY] = internal_metadata
+        reservoir.add(row, seed=str(seed), ordinal=ordinal)
     selected = reservoir.rows()
     selected.sort(key=lambda row: (_identity(row), _stratum_key(row)))
     return selected

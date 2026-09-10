@@ -19,6 +19,8 @@ from hviske.p1_source import (
     InvalidSourceTimestamp,
     SourceObjectTooLarge,
     SourceShard,
+    TranscriptPointer,
+    TranscriptPointerIndex,
     parse_audio_row,
     parse_transcript_row,
 )
@@ -419,3 +421,21 @@ def test_transcript_parser_rejects_invalid_words_and_preserves_verbatim_text() -
         parse_transcript_row(
             row={"file_id": "x", "words": [{"word": "bad", "start": 1.0}]}
         )
+
+
+def test_transcript_pointer_round_trip_preserves_encoded_metadata(
+    tmp_path: Path,
+) -> None:
+    """Pointer persistence keeps tuple order and non-finite encodings exact."""
+    original = TranscriptPointer(
+        file_id="programme-a",
+        path="data/train.parquet",
+        row_group=1,
+        row_index=2,
+        revision="a" * 40,
+        byte_size=10,
+        metadata=(("duration_ms", "NaN"), ("title", '"A"')),
+    )
+    index = TranscriptPointerIndex(tmp_path / "pointers.sqlite")
+    index.add(original)
+    assert index.get(original.file_id) == original
