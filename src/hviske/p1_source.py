@@ -28,7 +28,9 @@ import soundfile as sf
 from .p1_contracts import SourceWord, annotate_source_words
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
+
+_INDEX_PROGRESS_INTERVAL = 10_000
 
 
 class _SignedUrlFilter(logging.Filter):
@@ -110,6 +112,10 @@ class InvalidSourceTimestamp(InvalidSourceRecord):
 
 class SourceObjectTooLarge(SourceError, ValueError):
     """Raised before opening a source object larger than the configured limit."""
+
+
+class SourceSelectionError(SourceError, ValueError):
+    """Raised when a requested source programme has no valid joined pointer."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -336,7 +342,7 @@ class HfP1Source:
         token: str | bool | None = True,
         local_root: Path | None = None,
         max_source_object_bytes: int = 6_197_291_423,
-        max_batch_rows: int = 1,
+        max_batch_rows: int = 1024,
         max_batch_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         """Create an adapter without downloading source data.
@@ -374,6 +380,7 @@ class HfP1Source:
         revision: str,
         path: Path,
         objects: c.Iterable[tuple[str, int, str | None]],
+        source_file_id: str | None = None,
     ) -> TranscriptPointerIndex:
         """Build a bounded SQLite pointer index from transcript metadata columns.
 
@@ -383,9 +390,12 @@ class HfP1Source:
         Raises:
             SourceObjectTooLarge:
                 If a transcript object exceeds the configured limit.
+            SourceSelectionError:
+                If ``source_file_id`` is requested but no valid pointer is found.
         """
         index = TranscriptPointerIndex(path)
         index.clear()
+        indexed_count = 0
         for shard_path, byte_size, _oid in sorted(objects, key=lambda item: item[0]):
             if byte_size > self.max_source_object_bytes:
                 raise SourceObjectTooLarge(
@@ -416,6 +426,12 @@ class HfP1Source:
                                     )
                                 )
                             else:
+                                if (
+                                    source_file_id is not None
+                                    and file_id != source_file_id
+                                ):
+                                    row_offset += 1
+                                    continue
                                 pointer = TranscriptPointer(
                                     file_id=file_id,
                                     path=shard_path,
@@ -427,6 +443,19 @@ class HfP1Source:
                                 )
                                 try:
                                     index.add(pointer)
+                                    indexed_count += 1
+                                    if indexed_count % _INDEX_PROGRESS_INTERVAL == 0:
+                                        logger.info(
+                                            "Transcript index progress: %d pointers",
+                                            indexed_count,
+                                        )
+                                    if source_file_id is not None:
+                                        logger.info(
+                                            "Transcript index complete: %d pointers "
+                                            "(targeted)",
+                                            indexed_count,
+                                        )
+                                        return index
                                 except InvalidSourceRecord:
                                     index.reject(
                                         TranscriptIndexRejection(
@@ -438,6 +467,11 @@ class HfP1Source:
                                         )
                                     )
                             row_offset += 1
+        logger.info("Transcript index complete: %d pointers", indexed_count)
+        if source_file_id is not None:
+            raise SourceSelectionError(
+                "requested source_file_id has no valid transcript pointer"
+            )
         return index
 
     @contextlib.contextmanager
@@ -1242,6 +1276,7 @@ __all__ = [
     "SourceError",
     "SourceObjectTooLarge",
     "SourcePlan",
+    "SourceSelectionError",
     "SourceShard",
     "TranscriptIndexRejection",
     "TranscriptPointer",

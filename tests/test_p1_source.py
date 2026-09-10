@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import sqlite3
 from pathlib import Path
@@ -158,6 +159,59 @@ def test_hf_source_reads_under_explicit_dataset_namespace() -> None:
     assert paths == ["datasets/org/source/data/train.parquet"]
 
 
+def test_metadata_batches_are_capped_by_rows_and_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Projected discovery honours both the row cap and hard byte cap."""
+    calls: list[dict[str, object]] = []
+
+    class Batch:
+        nbytes = 32
+
+        def to_pylist(self) -> list[dict[str, object]]:
+            return [{"file_id": "programme-a"}]
+
+    class Schema:
+        names = ("file_id", "audio")
+
+    class Parquet:
+        schema_arrow = Schema()
+        num_row_groups = 1
+
+        def iter_batches(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return iter((Batch(),))
+
+    @contextlib.contextmanager
+    def parquet(_path: str, **_: object) -> object:
+        yield Parquet()
+
+    source = HfP1Source(max_batch_rows=2, max_batch_bytes=64)
+    monkeypatch.setattr(source, "_parquet", parquet)
+    shard = SourceShard("audio.parquet", 10)
+    assert list(source.iter_programme_metadata(shard=shard, batch_size=10))
+    assert calls == [{"row_groups": [0], "columns": ("file_id",), "batch_size": 2}]
+    calls.clear()
+    assert list(source.iter_programme_pointers(shard=shard, batch_size=10))
+    assert calls == [{"row_groups": [0], "columns": ("file_id",), "batch_size": 2}]
+
+    class OversizedBatch(Batch):
+        nbytes = 65
+
+    class OversizedParquet(Parquet):
+        def iter_batches(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return iter((OversizedBatch(),))
+
+    @contextlib.contextmanager
+    def oversized_parquet(_path: str, **_: object) -> object:
+        yield OversizedParquet()
+
+    monkeypatch.setattr(source, "_parquet", oversized_parquet)
+    with pytest.raises(SourceObjectTooLarge):
+        list(source.iter_programme_metadata(shard=shard, batch_size=10))
+
+
 def test_plan_uses_local_tree_metadata_and_orders_shards(tmp_path: Path) -> None:
     """Planning lists objects without opening or iterating any Parquet row."""
     _write_source_files(tmp_path)
@@ -231,6 +285,36 @@ def test_targeted_audio_selection_reads_one_48khz_row(tmp_path: Path) -> None:
     assert audio.file_id == "programme-a"
     assert audio.value == b"a"
     assert audio.sampling_rate == 48_000
+
+
+def test_targeted_transcript_index_fails_if_pointer_is_absent(tmp_path: Path) -> None:
+    """A missing targeted transcript is an explicit selection failure."""
+    _write_source_files(tmp_path)
+    source = HfP1Source(local_root=tmp_path)
+    plan = source.plan(audio_revision="a" * 40, transcript_revision="b" * 40)
+    with pytest.raises(ValueError, match="no valid transcript pointer"):
+        source.build_transcript_index(
+            revision=plan.transcript_revision,
+            path=tmp_path / "targeted-pointers.sqlite",
+            objects=plan.transcript_objects,
+            source_file_id="programme-missing",
+        )
+
+
+def test_targeted_transcript_index_stops_at_first_valid_pointer(tmp_path: Path) -> None:
+    """Targeted transcript discovery does not build a corpus-wide index."""
+    _write_source_files(tmp_path)
+    source = HfP1Source(local_root=tmp_path)
+    plan = source.plan(audio_revision="a" * 40, transcript_revision="b" * 40)
+    index = source.build_transcript_index(
+        revision=plan.transcript_revision,
+        path=tmp_path / "targeted-pointers.sqlite",
+        objects=plan.transcript_objects,
+        source_file_id="programme-a",
+    )
+    assert len(index) == 1
+    assert index.get("programme-a") is not None
+    assert index.get("programme-b") is None
 
 
 def test_transcript_parser_omits_zero_duration_tokens_without_losing_source_text() -> (
