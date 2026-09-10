@@ -387,7 +387,7 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
     )
 
     assert hub.private is True
-    assert hub.commits == [("README.md", ".gitattributes")]
+    assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
     assert source.iterated is False
 
 
@@ -653,16 +653,28 @@ def test_p1_settings_record_roest_model_evidence(tmp_path: Path) -> None:
         "revision": "beb3e790246d6b9dec1df596b0b21d5c42f4d99c",
         "license": "openrail",
         "license_url": (
-            "https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE"
+            "https://huggingface.co/Alvenir/coral-1-whisper-large/resolve/"
+            "a6c1e24d9f10e6289607a1ba32341b68e8660688/LICENSE"
+        ),
+        "license_repository": "Alvenir/coral-1-whisper-large",
+        "license_revision": "a6c1e24d9f10e6289607a1ba32341b68e8660688",
+        "license_sha256": (
+            "f575b6361ff69b52388967f69219f0cc7f9ae91f96482e5ad038261b2728799e"
+        ),
+        "model_card_url": (
+            "https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m/resolve/"
+            "beb3e790246d6b9dec1df596b0b21d5c42f4d99c/README.md"
+        ),
+        "model_card_sha256": (
+            "64b3a837fdcb580eeebe31d457113f0a84b200ca90ac5fe1f27475d8fc257cfb"
         ),
         "license_notes": (
-            "Model card metadata is openrail; the card describes a custom OpenRAIL-M "
-            "licence permitting commercial use with restrictions on speech synthesis "
-            "and biometric identification. P1 uses the model for ASR alignment only."
+            "Roest model-card metadata is openrail; its pinned card describes a custom "
+            "OpenRAIL-M licence. P1 uses the checkpoint for ASR alignment only. Model "
+            "weights are internal and are not distributed by this dataset."
         ),
         "architecture": "Wav2Vec2ForCTC",
         "model_type": "wav2vec2",
-        "sampling_rate": 16000,
         "frame_stride_samples": 320,
         "vocab_size": 46,
         "blank_token_id": 45,

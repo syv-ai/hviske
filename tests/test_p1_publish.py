@@ -228,7 +228,10 @@ def write_valid_shard(path: Path) -> None:
 def test_card_contains_required_terms_and_no_credentials() -> None:
     """Cards contain the required private-use statement and reject tokens."""
     card = make_card()
-    assert "No public redistribution grant" in card
+    assert "No public redistribution grant" not in card
+    assert "license: other" in card
+    assert "license_link: LICENSE" in card
+    assert "subject to [LICENSE](LICENSE)" in card
     assert all(section in card for section in ("Source provenance", "Field schema"))
     with pytest.raises(PublicationError):
         initialise_private_dataset(
@@ -456,8 +459,9 @@ def test_initialisation_commits_card_and_attributes_privately() -> None:
     hub = MemoryHub()
     commit = initialise_private_dataset(hub, "org/p1", card=make_card())
     assert commit == "a" * 40
-    assert hub.commits == [("README.md", ".gitattributes")]
+    assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
     assert "*.parquet" in hub.files[".gitattributes"].decode()
+    assert hub.files["LICENSE"]
     assert hub.privacy_checks >= 3
 
 
@@ -526,7 +530,7 @@ def test_missing_repository_is_created_private_before_initialisation() -> None:
     commit = initialise_private_dataset(hub, "org/p1", card=make_card())
     assert commit == "a" * 40
     assert hub.created
-    assert hub.commits == [("README.md", ".gitattributes")]
+    assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
 
 
 def test_post_commit_privacy_failure_stops_before_verification(tmp_path: Path) -> None:

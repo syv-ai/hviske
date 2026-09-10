@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Pin the P1 DATASET licence to the CoRal-v3 source revision and SHA-256, adapt only
+  the licensor identity for syv.ai, and initialise the private target atomically with
+  its card, `.gitattributes`, and `LICENSE`.
+- Treat the pinned Roest processor/preprocessor 16 kHz metadata as authoritative while
+  allowing its real model config to omit `sampling_rate`; keep model-card and upstream
+  licence provenance separate from the internal, undistributed weights.
 - Enforce the complete P1 Roest and ctc-segmentation provenance contract before
   source planning, and use one immutable contract specification for adapters and
   publication metadata.

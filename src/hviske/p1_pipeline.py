@@ -31,6 +31,7 @@ from hviske.p1_contracts import (
     P1_RUNTIME_CONTRACT,
     CanonicalIdentityManifest,
     CTCContract,
+    DatasetLicenseContract,
     LedgerState,
     ModelContract,
     NormalisationContract,
@@ -100,6 +101,7 @@ class PipelineSettings:
     ctc_contract: CTCContract
     segmentation: SegmentationContract
     normalisation: NormalisationContract
+    dataset_license: DatasetLicenseContract
     pipeline_digest: str
 
     @classmethod
@@ -132,6 +134,7 @@ class PipelineSettings:
         normalisation_raw = t.cast(dict[str, object], root["normalisation"])
         anomaly_raw = t.cast(dict[str, object], root["anomaly_model"])
         output_raw = t.cast(dict[str, object], root["output"])
+        dataset_license_raw = t.cast(dict[str, object], root["dataset_license"])
         manifest = CanonicalIdentityManifest(
             schema_version=str(root["schema_version"]),
             pipeline_version=str(root["pipeline_version"]),
@@ -152,6 +155,13 @@ class PipelineSettings:
                     repository=RepositoryRevision.model_validate(ctc_repo),
                     license=str(ctc_model["license"]),
                     license_url=_optional_str(ctc_model.get("license_url")),
+                    license_repository=_optional_str(
+                        ctc_model.get("license_repository")
+                    ),
+                    license_revision=_optional_str(ctc_model.get("license_revision")),
+                    license_sha256=_optional_str(ctc_model.get("license_sha256")),
+                    model_card_url=_optional_str(ctc_model.get("model_card_url")),
+                    model_card_sha256=_optional_str(ctc_model.get("model_card_sha256")),
                     license_notes=_optional_str(ctc_model.get("license_notes")),
                     architecture=_optional_str(ctc_model.get("architecture")),
                     model_type=_optional_str(ctc_model.get("model_type")),
@@ -173,12 +183,14 @@ class PipelineSettings:
             normalisation=NormalisationContract.model_validate(normalisation_raw),
             segmentation=SegmentationContract.model_validate(root["segmentation"]),
             output=OutputEncodingContract.model_validate(output_raw),
+            dataset_license=DatasetLicenseContract.model_validate(dataset_license_raw),
             max_decoded_audio_bytes=_as_int(max_decoded_audio),
         )
         validate_p1_runtime_contract(
             pipeline_version=manifest.pipeline_version,
             ctc=manifest.ctc,
             normalisation=manifest.normalisation,
+            dataset_license=manifest.dataset_license,
         )
         digest = pipeline_config_sha256(manifest)
         return cls(
@@ -230,7 +242,7 @@ class PipelineSettings:
                 "ctc": {
                     **manifest.ctc.model.repository.model_dump(mode="json"),
                     **manifest.ctc.model.model_dump(
-                        mode="json", exclude={"repository"}
+                        mode="json", exclude={"repository"}, exclude_none=True
                     ),
                 },
                 "ctc_library": {
@@ -246,6 +258,7 @@ class PipelineSettings:
             ctc_contract=manifest.ctc,
             segmentation=manifest.segmentation,
             normalisation=manifest.normalisation,
+            dataset_license=manifest.dataset_license,
             pipeline_digest=digest,
         )
 
@@ -2341,7 +2354,7 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
             "punctuation removed, numbers not expanded, and the source-word map "
             "preserved; published text and source-word spans remain verbatim; the "
             f"CTC model is {P1_RUNTIME_CONTRACT.roest_license}/OpenRAIL-M metadata, "
-            "not Apache-2.0."
+            "not Apache-2.0. Roest model weights are internal and are not distributed."
         ),
         field_schema="p1-segments-v1 OutputRow schema.",
         known_limitations="Pilot thresholds and anomaly statistics require review.",
@@ -2349,11 +2362,30 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
             "Invalid, empty, low-confidence, and undecodable programmes are "
             "recorded in the ledger."
         ),
-        source_revisions=str(settings.source_audio_revision),
+        source_revisions=json.dumps(
+            {
+                "audio": {
+                    "repository": settings.source_audio_repository,
+                    "revision": settings.source_audio_revision,
+                },
+                "transcripts": {
+                    "repository": settings.source_transcript_repository,
+                    "revision": settings.source_transcript_revision,
+                },
+            },
+            sort_keys=True,
+        ),
         model_revisions=json.dumps(settings.model_revisions, sort_keys=True),
+        dataset_license=json.dumps(
+            settings.dataset_license.model_dump(mode="json"), sort_keys=True
+        ),
     )
+    license_path = Path(__file__).resolve().parents[2] / "LICENSE-DATASET"
     initialise_private_dataset(
-        t.cast(HubClient, hub), settings.target_private_repo, card=card
+        t.cast(HubClient, hub),
+        settings.target_private_repo,
+        card=card,
+        license_text=license_path.read_text(encoding="utf-8"),
     )
 
 
@@ -2391,6 +2423,7 @@ def preflight_pipeline(
             pipeline_version=settings.pipeline_version,
             ctc=_settings_ctc_contract(settings),
             normalisation=settings.normalisation,
+            dataset_license=settings.dataset_license,
         )
     except ValueError as exc:
         raise P1PreflightError(str(exc)) from exc

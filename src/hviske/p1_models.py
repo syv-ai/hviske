@@ -31,6 +31,11 @@ ROEST_REPOSITORY = P1_RUNTIME_CONTRACT.roest_repository
 ROEST_REVISION = P1_RUNTIME_CONTRACT.roest_revision
 ROEST_LICENSE = P1_RUNTIME_CONTRACT.roest_license
 ROEST_LICENSE_URL = P1_RUNTIME_CONTRACT.roest_license_url
+ROEST_LICENSE_REPOSITORY = P1_RUNTIME_CONTRACT.roest_license_repository
+ROEST_LICENSE_REVISION = P1_RUNTIME_CONTRACT.roest_license_revision
+ROEST_LICENSE_SHA256 = P1_RUNTIME_CONTRACT.roest_license_sha256
+ROEST_MODEL_CARD_URL = P1_RUNTIME_CONTRACT.roest_model_card_url
+ROEST_MODEL_CARD_SHA256 = P1_RUNTIME_CONTRACT.roest_model_card_sha256
 ROEST_SAMPLING_RATE = P1_RUNTIME_CONTRACT.roest_sampling_rate
 ROEST_FRAME_STRIDE_SAMPLES = P1_RUNTIME_CONTRACT.roest_frame_stride_samples
 ROEST_FRAME_DURATION_MS = P1_RUNTIME_CONTRACT.roest_frame_duration_ms
@@ -109,7 +114,7 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
 
         Raises:
             ValueError:
-                If audio uses a sampling rate other than the model's configured rate.
+                If audio uses a sampling rate other than the pinned processor rate.
         """
         if sampling_rate != self._sampling_rate:
             raise ValueError(
@@ -201,11 +206,14 @@ def validate_ctc_model_contract(
             f"P1 CTC processor must use {ROEST_SAMPLING_RATE} Hz sampling, "
             f"not {sampling_rate!r}"
         )
+    # Roest's pinned config.json does not declare a sampling rate. The processor
+    # preprocessor metadata is the authoritative input clock; validate the model
+    # declaration only when a future checkpoint supplies one.
     configured_sampling_rate = getattr(model_config, "sampling_rate", None)
-    if configured_sampling_rate != P1_RUNTIME_CONTRACT.roest_sampling_rate:
+    if configured_sampling_rate is not None and (
+        configured_sampling_rate != P1_RUNTIME_CONTRACT.roest_sampling_rate
+    ):
         raise ValueError("CTC model sampling rate is not the P1 contract")
-    if configured_sampling_rate != sampling_rate:
-        raise ValueError("CTC model and processor sampling rates do not agree")
 
     strides = getattr(model_config, "conv_stride", None)
     if not isinstance(strides, c.Sequence) or isinstance(strides, (str, bytes)):

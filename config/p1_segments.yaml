@@ -43,14 +43,19 @@ ctc:
       repository: CoRal-project/roest-v3-wav2vec2-315m
       revision: beb3e790246d6b9dec1df596b0b21d5c42f4d99c
     license: openrail
-    license_url: https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE
+    license_url: https://huggingface.co/Alvenir/coral-1-whisper-large/resolve/a6c1e24d9f10e6289607a1ba32341b68e8660688/LICENSE
+    license_repository: Alvenir/coral-1-whisper-large
+    license_revision: a6c1e24d9f10e6289607a1ba32341b68e8660688
+    license_sha256: f575b6361ff69b52388967f69219f0cc7f9ae91f96482e5ad038261b2728799e
+    model_card_url: https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m/resolve/beb3e790246d6b9dec1df596b0b21d5c42f4d99c/README.md
+    model_card_sha256: 64b3a837fdcb580eeebe31d457113f0a84b200ca90ac5fe1f27475d8fc257cfb
     license_notes: >-
-      Model card metadata is openrail; the card describes a custom OpenRAIL-M
-      licence permitting commercial use with restrictions on speech synthesis
-      and biometric identification. P1 uses the model for ASR alignment only.
+      Roest model-card metadata is openrail; its pinned card describes a custom
+      OpenRAIL-M licence. P1 uses the checkpoint for ASR alignment only. Model
+      weights are internal and are not distributed by this dataset.
     architecture: Wav2Vec2ForCTC
     model_type: wav2vec2
-    sampling_rate: 16000
+    # The pinned processor/preprocessor metadata is authoritative for input rate.
     frame_stride_samples: 320
     vocab_size: 46
     blank_token_id: 45
@@ -80,6 +85,19 @@ segmentation:
   # Pilot-tunable: ctc-segmentation returns mean log probabilities <= 0.
   minimum_alignment_score: -10.0
   minimum_vad_speech_ratio: 0.0
+
+dataset_license:
+  template_repository: CoRal-project/coral-v3
+  template_revision: 01f7c93c21fc9dec87fe9f7149c79569cc433f08
+  template_url: https://huggingface.co/datasets/CoRal-project/coral-v3/raw/main/LICENSE
+  template_sha256: ee93c98df9a894464d1c042b66c6039543776c463d06d1a6e93f176e08ca67bd
+  template_bytes: 14112
+  adaptation: >-
+    Replace only 'Alexandra Instituttet A/S, Åbogade 34, 8200 Aarhus N, Denmark'
+    with 'syv.ai ApS, Rosenvængets Allé 11, 1. tv, 2100 København Ø, Denmark';
+    preserve all other terms and the Aarhus arbitration clause.
+  target_path: LICENSE
+  target_sha256: 3c657d8d41bfbe131e2e24afd52004b1ddc10e4438edd97725c9df187ec5aa6f
 
 output:
   audio_format: flac
