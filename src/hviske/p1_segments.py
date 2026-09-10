@@ -200,9 +200,10 @@ def normalise_alignment_text(
 ) -> AlignmentText:
     """Normalise words for alignment while retaining a reversible word map.
 
-    Each whitespace-separated output unit points at the exact original word.  A
-    number expansion may therefore create several units with the same mapping;
-    published text is never reconstructed from this normalised representation.
+    Each whitespace-separated output unit points at its exact owned source-text
+    chunk. A number expansion may therefore create several units with the same
+    mapping; published text is never reconstructed from this normalised
+    representation.
 
     Returns:
         Canonical text, source-word mapping, and source indexes.
@@ -210,30 +211,46 @@ def normalise_alignment_text(
     units: list[str] = []
     mapping: list[str] = []
     indexes: list[int] = []
+    final_index = len(words) - 1
     for index, word in enumerate(words):
-        value = unicodedata.normalize(
-            t.cast(t.Literal["NFC", "NFD", "NFKC", "NFKD"], contract.unicode_form),
-            word.text,
-        )
-        if contract.case_folding:
-            value = value.casefold()
-        if contract.punctuation_removed:
-            value = "".join(
-                char if not unicodedata.category(char).startswith("P") else " "
-                for char in value
+        source_chunks = [word.separator_text, word.text]
+        if index == final_index:
+            source_chunks.append(word.trailing_text)
+        for source_chunk in source_chunks:
+            normalised_units = _normalise_alignment_chunk(
+                value=source_chunk, contract=contract
             )
-        if contract.number_expansion:
-            value = _expand_danish_numbers(value)
-        value = _retain_alignment_characters(value)
-        for unit in value.split():
-            units.append(unit)
-            mapping.append(word.text)
-            indexes.append(index)
+            units.extend(normalised_units)
+            mapping.extend(source_chunk for _ in normalised_units)
+            indexes.extend(index for _ in normalised_units)
     return AlignmentText(
         text=" ".join(units),
         word_map=tuple(mapping),
         source_word_indexes=tuple(indexes),
     )
+
+
+def _normalise_alignment_chunk(
+    *, value: str, contract: NormalisationContract
+) -> tuple[str, ...]:
+    """Normalise one exact source-text ownership chunk into CTC units.
+
+    Returns:
+        Canonical whitespace-separated units from the source chunk.
+    """
+    value = unicodedata.normalize(
+        t.cast(t.Literal["NFC", "NFD", "NFKC", "NFKD"], contract.unicode_form), value
+    )
+    if contract.case_folding:
+        value = value.casefold()
+    if contract.punctuation_removed:
+        value = "".join(
+            char if not unicodedata.category(char).startswith("P") else " "
+            for char in value
+        )
+    if contract.number_expansion:
+        value = _expand_danish_numbers(value)
+    return tuple(_retain_alignment_characters(value).split())
 
 
 def validate_raw_timestamps(

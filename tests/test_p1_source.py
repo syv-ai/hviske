@@ -233,6 +233,57 @@ def test_hf_source_reads_under_explicit_dataset_namespace() -> None:
     assert paths == ["datasets/org/source/data/train.parquet"]
 
 
+def test_lexical_ownership_accepts_leading_trailing_and_missing_speaker() -> None:
+    """Compatible anchors own lexical prefixes, gaps, and terminal suffixes."""
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "x",
+            "words": [
+                {"text": "før", "start_ms": 0, "end_ms": 0, "speaker": "speaker-a"},
+                {"text": "one", "start_ms": 0, "end_ms": 100, "speaker": "speaker-a"},
+                {"text": "mellem"},
+                {"text": "two", "start_ms": 200, "end_ms": 300, "speaker": "speaker-a"},
+                {
+                    "text": "efter",
+                    "start_ms": 300,
+                    "end_ms": 300,
+                    "speaker": "speaker-a",
+                },
+            ],
+        }
+    )
+
+    assert parsed.ambiguous_source_text_records == 0
+    assert parsed.words[0].separator_text == "før"
+    assert parsed.words[1].separator_text == "mellem"
+    assert parsed.words[1].trailing_text == "efter"
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        [
+            {"text": "left", "start_ms": 0, "end_ms": 100, "speaker": "a"},
+            {"text": "cross", "start_ms": 150, "end_ms": 150, "speaker": "a"},
+            {"text": "right", "start_ms": 200, "end_ms": 300, "speaker": "b"},
+        ],
+        [
+            {"text": "left", "start_ms": 0, "end_ms": 100, "speaker": "a"},
+            {"text": "conflict"},
+            {"text": "right", "start_ms": 200, "end_ms": 300, "speaker": "b"},
+        ],
+        [{"text": "unanchored", "start_ms": 0, "end_ms": 0, "speaker": "a"}],
+    ],
+)
+def test_lexical_ownership_marks_cross_speaker_or_missing_anchor_ambiguous(
+    words: list[dict[str, object]],
+) -> None:
+    """Cross-speaker, conflicting, and unanchored lexical text fails closed."""
+    parsed = parse_transcript_row(row={"file_id": "x", "words": words})
+
+    assert parsed.ambiguous_source_text_records == 1
+
+
 def test_metadata_batches_are_capped_by_rows_and_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -521,6 +572,27 @@ def test_targeted_transcript_index_stops_at_first_valid_pointer(tmp_path: Path) 
     assert index.get("programme-b") is None
 
 
+def test_timed_duplicate_keeps_its_exact_source_span() -> None:
+    """An owned lexical duplicate cannot steal the timed word's source offset."""
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "x",
+            "words": [
+                {"text": "a", "start_ms": 0, "end_ms": 0, "speaker": "speaker-a"},
+                {"text": "a", "start_ms": 0, "end_ms": 100, "speaker": "speaker-a"},
+            ],
+        }
+    )
+
+    assert parsed.ambiguous_source_text_records == 0
+    assert parsed.words[0].separator_text == "a"
+    assert parsed.words[0].source_span is not None
+    assert (parsed.words[0].source_span.start, parsed.words[0].source_span.end) == (
+        1,
+        2,
+    )
+
+
 def test_transcript_parser_assigns_untimed_text_to_adjacent_timed_words() -> None:
     """Untimed records survive in deterministic prefix and terminal ownership."""
     parsed = parse_transcript_row(
@@ -546,20 +618,6 @@ def test_transcript_parser_assigns_untimed_text_to_adjacent_timed_words() -> Non
     assert parsed.ambiguous_source_text_records == 0
 
 
-def test_transcript_parser_fails_closed_on_ambiguous_lexical_ownership() -> None:
-    """A timed duplicate cannot silently steal an untimed lexical record."""
-    with pytest.raises(InvalidSourceRecord, match="ownership"):
-        parse_transcript_row(
-            row={
-                "file_id": "x",
-                "words": [
-                    {"text": "a", "start_ms": 0, "end_ms": 0},
-                    {"text": "a", "start_ms": 0, "end_ms": 100},
-                ],
-            }
-        )
-
-
 def test_transcript_parser_omits_zero_duration_tokens_without_losing_source_text() -> (
     None
 ):
@@ -568,9 +626,19 @@ def test_transcript_parser_omits_zero_duration_tokens_without_losing_source_text
         row={
             "file_id": "x",
             "words": [
-                {"text": "left", "start_ms": 0, "end_ms": 100},
-                {"text": "<noise>", "start_ms": 999, "end_ms": 999},
-                {"text": "right", "start_ms": 100, "end_ms": 200},
+                {"text": "left", "start_ms": 0, "end_ms": 100, "speaker": "speaker-a"},
+                {
+                    "text": "<noise>",
+                    "start_ms": 100,
+                    "end_ms": 100,
+                    "speaker": "speaker-a",
+                },
+                {
+                    "text": "right",
+                    "start_ms": 100,
+                    "end_ms": 200,
+                    "speaker": "speaker-a",
+                },
             ],
         }
     )
@@ -578,7 +646,7 @@ def test_transcript_parser_omits_zero_duration_tokens_without_losing_source_text
     assert parsed.text == "left<noise>right"
     assert [word.text for word in parsed.words] == ["left", "right"]
     assert parsed.zero_duration_tokens_omitted == 1
-    assert parsed.ambiguous_source_text_records == 1
+    assert parsed.ambiguous_source_text_records == 0
     assert parsed.words[1].separator_text == "<noise>"
     assert parsed.words[1].separator_span is not None
     assert parsed.words[1].separator_span.start == 4
@@ -641,3 +709,36 @@ def test_transcript_pointer_round_trip_preserves_encoded_metadata(
     index = TranscriptPointerIndex(tmp_path / "pointers.sqlite")
     index.add(original)
     assert index.get(original.file_id) == original
+
+
+@pytest.mark.parametrize("point_ms", [100, 150, 200])
+def test_zero_duration_lexical_gap_has_deterministic_ownership(point_ms: int) -> None:
+    """Same-speaker points at either closed gap edge belong to the next word."""
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "x",
+            "words": [
+                {"text": "left", "start_ms": 0, "end_ms": 100, "speaker": "speaker-a"},
+                {
+                    "text": "MELLEM",
+                    "start_ms": point_ms,
+                    "end_ms": point_ms,
+                    "speaker": "speaker-a",
+                },
+                {
+                    "text": "right",
+                    "start_ms": 200,
+                    "end_ms": 300,
+                    "speaker": "speaker-a",
+                },
+            ],
+        }
+    )
+
+    assert parsed.ambiguous_source_text_records == 0
+    assert parsed.words[1].separator_text == "MELLEM"
+    assert parsed.words[1].separator_span is not None
+    assert (
+        parsed.words[1].separator_span.start,
+        parsed.words[1].separator_span.end,
+    ) == (4, 10)

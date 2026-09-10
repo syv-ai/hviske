@@ -183,7 +183,7 @@ def test_danish_mapping_is_reversible() -> None:
             ("København", 2_000, 3_000, None),
         ),
         contract=NormalisationContract(
-            version="p1-text-normalisation-3",
+            version="p1-text-normalisation-5",
             case_folding=True,
             punctuation_removed=True,
         ),
@@ -301,7 +301,7 @@ def test_output_text_preserves_case_when_alignment_text_is_folded() -> None:
         source_duration_ms=3_000,
         segmentation=segmentation_contract(),
         normalisation=NormalisationContract(
-            version="p1-text-normalisation-3", case_folding=True
+            version="p1-text-normalisation-5", case_folding=True
         ),
         ctc=CTC(),
         pipeline_version="test",
@@ -313,6 +313,83 @@ def test_output_text_preserves_case_when_alignment_text_is_folded() -> None:
     assert row.text == "Rødgrød Hej København"
     assert row.alignment_text == "rødgrød hej københavn"
     assert row.alignment_word_map == ("Rødgrød", "Hej", "København")
+
+
+def test_owned_lexical_text_reaches_ctc_and_published_text_exactly() -> None:
+    """Speaker-safe untimed text remains in CTC and verbatim candidate text."""
+
+    class CTC:
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, sampling_rate
+            assert alignment_text == "hej altså verden slut"
+            assert word_map == ("Hej,", "  ALTSÅ\n", "Verden!", " <SLUT>")
+            return AlignmentResult(start_ms=start_ms, end_ms=end_ms, score=1.0)
+
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "source",
+            "words": [
+                {
+                    "text": "Hej,",
+                    "start_ms": 0,
+                    "end_ms": 1_000,
+                    "speaker": "speaker-a",
+                },
+                {"text": "  ", "type": "spacing"},
+                {
+                    "text": "ALTSÅ",
+                    "start_ms": 1_000,
+                    "end_ms": 1_000,
+                    "speaker": "speaker-a",
+                },
+                {"text": "\n", "type": "spacing"},
+                {
+                    "text": "Verden!",
+                    "start_ms": 1_000,
+                    "end_ms": 2_000,
+                    "speaker": "speaker-a",
+                },
+                {
+                    "text": " <SLUT>",
+                    "start_ms": 2_000,
+                    "end_ms": 2_000,
+                    "speaker": "speaker-a",
+                },
+            ],
+        }
+    )
+    result = segment_programme(
+        words=parsed.words,
+        audio=np.zeros(32_000, dtype=np.float32),
+        source_file_id="source",
+        source_duration_ms=2_000,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(
+            version="p1-text-normalisation-5", case_folding=True
+        ),
+        ctc=CTC(),
+        pipeline_version="p1-segmentation-5",
+        pipeline_config_sha256=CONFIG_DIGEST,
+    )
+
+    assert parsed.ambiguous_source_text_records == 0
+    assert parsed.words[1].separator_span is not None
+    assert (
+        parsed.words[1].separator_span.start,
+        parsed.words[1].separator_span.end,
+    ) == (4, 12)
+    assert parsed.words[1].trailing_text == " <SLUT>"
+    assert len(result.rows) == 1
+    assert result.rows[0].text == "Hej,  ALTSÅ\nVerden! <SLUT>"
+    assert result.rows[0].alignment_text == "hej altså verden slut"
 
 
 def test_pilot_mean_log_probability_threshold_is_config_shaped() -> None:

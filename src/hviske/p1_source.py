@@ -172,6 +172,14 @@ class TranscriptOverAudio(InvalidSourceTimestamp):
     """Raised when a valid transcript endpoint exceeds decoded source audio."""
 
 
+@dataclasses.dataclass(frozen=True)
+class _PendingLexicalRecord:
+    """Lexical source text waiting for its bounded ownership lookahead."""
+
+    speaker_id: str | None
+    point_ms: int | None
+
+
 class _RemoteRowPointerMixin:
     """Provide one implementation for immutable remote row coordinates."""
 
@@ -215,6 +223,15 @@ class TranscriptPointer(_RemoteRowPointerMixin):
     def _remote_row_path(self) -> str:
         """Return the transcript object path represented by this pointer."""
         return self.path
+
+
+@dataclasses.dataclass(frozen=True)
+class _TimedOwnershipAnchor:
+    """One positive-duration speaker and timestamp ownership anchor."""
+
+    speaker_id: str | None
+    start_ms: int
+    end_ms: int
 
 
 TranscriptWord = SourceWord
@@ -1401,8 +1418,9 @@ def parse_transcript_row(
 
     Spacing and untimed records contribute their literal text but do not become
     timing anchors. Their source characters are owned by the following timed word,
-    or by the final timed word when they trail the transcript. Timestamp seconds are
-    rounded to the nearest millisecond using decimal input,
+    or by the final timed word when they trail the transcript. Lexical ownership is
+    accepted only when bounded lookahead finds a speaker-consistent timed anchor.
+    Timestamp seconds are rounded to the nearest millisecond using decimal input,
     avoiding binary-float truncation at boundaries.
 
     Args:
@@ -1445,6 +1463,8 @@ def parse_transcript_row(
     source_cursor = 0
     timed_source_starts: list[int] = []
     previous_end = 0
+    previous_anchor: _TimedOwnershipAnchor | None = None
+    pending_lexical: list[_PendingLexicalRecord] = []
     zero_duration_tokens_omitted = 0
     untimed_tokens_owned = 0
     ambiguous_source_text_records = 0
@@ -1474,15 +1494,15 @@ def parse_transcript_row(
         if is_spacing or not text_value.strip():
             untimed_tokens_owned += 1
             continue
+        speaker_id = _speaker_id(raw=raw, position=position)
         raw_start = _first_present(raw, ("start_ms", "start"))
         raw_end = _first_present(raw, ("end_ms", "end"))
         if raw_start is None and raw_end is None:
             untimed_tokens_owned += 1
-            if any(
-                not unicodedata.category(character).startswith(("P", "Z"))
-                for character in text_value
-            ):
-                ambiguous_source_text_records += 1
+            if _contains_lexical_text(text_value):
+                pending_lexical.append(
+                    _PendingLexicalRecord(speaker_id=speaker_id, point_ms=None)
+                )
             continue
         start = _milliseconds(raw, "start", position)
         end = _milliseconds(raw, "end", position)
@@ -1491,31 +1511,37 @@ def parse_transcript_row(
         if end == start:
             zero_duration_tokens_omitted += 1
             untimed_tokens_owned += 1
-            if any(
-                not unicodedata.category(character).startswith(("P", "Z"))
-                for character in text_value
-            ):
-                ambiguous_source_text_records += 1
+            if _contains_lexical_text(text_value):
+                pending_lexical.append(
+                    _PendingLexicalRecord(speaker_id=speaker_id, point_ms=start)
+                )
             continue
         if start < previous_end:
             raise InvalidSourceTimestamp(f"word {position} has an invalid span")
         if programme_duration_ms is not None and end > programme_duration_ms:
             raise TranscriptOverAudio(f"word {position} lies outside source audio")
+        anchor = _TimedOwnershipAnchor(
+            speaker_id=speaker_id, start_ms=start, end_ms=end
+        )
+        ambiguous_source_text_records += sum(
+            not _following_ownership_is_consistent(
+                record=record, previous=previous_anchor, following=anchor
+            )
+            for record in pending_lexical
+        )
+        pending_lexical.clear()
+        previous_anchor = anchor
         previous_end = end
         timed_source_starts.append(source_start)
-        speaker = raw.get("speaker_id", raw.get("speaker"))
-        if speaker is not None and (
-            isinstance(speaker, bool) or not isinstance(speaker, (str, int))
-        ):
-            raise InvalidSourceRecord(f"word {position} has an invalid speaker ID")
         words.append(
             TranscriptWord(
-                text=text_value,
-                start_ms=start,
-                end_ms=end,
-                speaker_id=None if speaker is None else str(speaker),
+                text=text_value, start_ms=start, end_ms=end, speaker_id=speaker_id
             )
         )
+    ambiguous_source_text_records += sum(
+        not _terminal_ownership_is_consistent(record=record, previous=previous_anchor)
+        for record in pending_lexical
+    )
     explicit_text = _first_present(row, ("transcript_text", "transcript", "text"))
     if explicit_text is not None and not isinstance(explicit_text, str):
         raise InvalidSourceRecord("transcript text is not a string")
@@ -1545,11 +1571,40 @@ def parse_transcript_row(
     )
 
 
+def _contains_lexical_text(value: str) -> bool:
+    """Return whether text contains characters beyond punctuation and separators."""
+    return any(
+        not unicodedata.category(character).startswith(("P", "Z"))
+        for character in value
+    )
+
+
 def _first_present(row: c.Mapping[str, object], names: c.Sequence[str]) -> object:
     for name in names:
         if name in row:
             return row[name]
     return None
+
+
+def _following_ownership_is_consistent(
+    *,
+    record: _PendingLexicalRecord,
+    previous: _TimedOwnershipAnchor | None,
+    following: _TimedOwnershipAnchor,
+) -> bool:
+    """Return whether following-word ownership agrees with speaker and time evidence."""
+    if record.point_ms is not None and (
+        record.point_ms > following.start_ms
+        or (previous is not None and record.point_ms < previous.end_ms)
+    ):
+        return False
+    if record.speaker_id is not None:
+        return record.speaker_id == following.speaker_id
+    return (
+        previous is not None
+        and previous.speaker_id is not None
+        and previous.speaker_id == following.speaker_id
+    )
 
 
 def _milliseconds(row: c.Mapping[str, object], name: str, position: int) -> int:
@@ -1569,6 +1624,33 @@ def _milliseconds(row: c.Mapping[str, object], name: str, position: int) -> int:
     if isinstance(value, bool) or not isinstance(value, numbers.Integral):
         raise InvalidSourceTimestamp(f"word {position} has invalid {name}_ms")
     return int(value)
+
+
+def _speaker_id(*, raw: c.Mapping[str, object], position: int) -> str | None:
+    """Return one validated source speaker identifier.
+
+    Raises:
+        InvalidSourceRecord:
+            If the speaker ID is not a string or integer.
+    """
+    speaker = raw.get("speaker_id", raw.get("speaker"))
+    if speaker is not None and (
+        isinstance(speaker, bool) or not isinstance(speaker, (str, int))
+    ):
+        raise InvalidSourceRecord(f"word {position} has an invalid speaker ID")
+    return None if speaker is None else str(speaker)
+
+
+def _terminal_ownership_is_consistent(
+    *, record: _PendingLexicalRecord, previous: _TimedOwnershipAnchor | None
+) -> bool:
+    """Return whether final-word ownership agrees with speaker and time evidence."""
+    return (
+        previous is not None
+        and record.speaker_id is not None
+        and record.speaker_id == previous.speaker_id
+        and (record.point_ms is None or record.point_ms >= previous.end_ms)
+    )
 
 
 __all__ = [

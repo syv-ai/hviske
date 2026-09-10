@@ -388,6 +388,10 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
 
     assert hub.private is True
     assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
+    card = hub.files["README.md"].decode("utf-8")
+    assert "p1-text-normalisation-5" in card
+    assert "speaker-consistent-following-word-with-terminal-suffix-v5" in card
+    assert "exact published and canonical CTC text" in card
     assert source.iterated is False
 
 
@@ -645,8 +649,11 @@ def test_p1_settings_record_roest_model_evidence(tmp_path: Path) -> None:
     """Pipeline reports and identity evidence name the exact Roest checkpoint."""
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
 
-    assert settings.pipeline_version == "p1-segmentation-4"
-    assert settings.normalisation.version == "p1-text-normalisation-3"
+    assert settings.pipeline_version == "p1-segmentation-5"
+    assert settings.normalisation.version == "p1-text-normalisation-5"
+    assert settings.normalisation.source_text_ownership == (
+        "speaker-consistent-following-word-with-terminal-suffix-v5"
+    )
     assert settings.normalisation.case_folding is True
     assert settings.model_revisions["ctc"] == {
         "repository": "CoRal-project/roest-v3-wav2vec2-315m",
@@ -1343,9 +1350,24 @@ def test_zero_duration_normalisation_is_reported_as_metadata_only(
                 row={
                     "file_id": "file-1",
                     "words": [
-                        {"text": "a", "start_ms": 0, "end_ms": 100},
-                        {"text": "<hidden>", "start_ms": 100, "end_ms": 100},
-                        {"text": "b", "start_ms": 100, "end_ms": 200},
+                        {
+                            "text": "a",
+                            "start_ms": 0,
+                            "end_ms": 100,
+                            "speaker": "speaker-a",
+                        },
+                        {
+                            "text": "<hidden>",
+                            "start_ms": 100,
+                            "end_ms": 100,
+                            "speaker": "speaker-a",
+                        },
+                        {
+                            "text": "b",
+                            "start_ms": 100,
+                            "end_ms": 200,
+                            "speaker": "speaker-a",
+                        },
                     ],
                 }
             )
