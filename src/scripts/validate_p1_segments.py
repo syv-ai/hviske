@@ -101,16 +101,56 @@ def main() -> None:
             borderline_quota=args.borderline_quota,
             seed=args.sample_seed,
         )
-        _write_json(args.manifest, manifest)
+        _write_jsonl(args.manifest, manifest)
         persist_audit_candidates(args.database, manifest)
 
 
 def _read_jsonl(path: Path) -> t.Iterator[dict[str, object]]:
+    """Read JSONL records, also accepting the legacy JSON-array format.
+
+    Args:
+        path:
+            Manifest or metadata file to read.
+
+    Yields:
+        JSON object records in file order.
+
+    Raises:
+        ValueError:
+            If a record is not a JSON object or the file is malformed.
+    """
     with path.open(encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, 1):
+        first_line: str | None = None
+        first_line_number = 0
+        for first_line_number, line in enumerate(stream, 1):
+            if line.strip():
+                first_line = line
+                break
+        if first_line is None:
+            return
+        if first_line.lstrip().startswith("["):
+            raw = json.loads(first_line + stream.read())
+            if not isinstance(raw, list):
+                raise ValueError("JSON-array manifest must contain a list")
+            for index, value in enumerate(raw, 1):
+                if not isinstance(value, dict):
+                    raise ValueError(f"array item {index} is not a JSON object")
+                yield t.cast(dict[str, object], value)
+            return
+        try:
+            value = json.loads(first_line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"line {first_line_number} is not valid JSON") from error
+        if not isinstance(value, dict):
+            raise ValueError(f"line {first_line_number} is not a JSON object")
+        yield t.cast(dict[str, object], value)
+        for line_number, line in enumerate(stream, first_line_number + 1):
             if not line.strip():
                 continue
-            value = json.loads(line)
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"line {line_number} is not valid JSON") from error
             if not isinstance(value, dict):
                 raise ValueError(f"line {line_number} is not a JSON object")
             yield t.cast(dict[str, object], value)
@@ -124,14 +164,11 @@ def _run_review(args: argparse.Namespace) -> None:
             "choose exactly one of --decision (playing review) or --export-audio "
             "(non-playing review)"
         )
-    raw_manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-    if not isinstance(raw_manifest, list):
-        raise ValueError("audit manifest must be a JSON list")
     entry = next(
         (
             item
-            for item in raw_manifest
-            if isinstance(item, dict) and item.get("audit_id") == args.review_id
+            for item in _read_jsonl(args.manifest)
+            if item.get("audit_id") == args.review_id
         ),
         None,
     )
@@ -156,7 +193,7 @@ def _run_review(args: argparse.Namespace) -> None:
         )
     else:
         retriever = SourceClipRetriever(_source_clip_callback)
-    candidate = t.cast(dict[str, object], entry)
+    candidate = entry
     if args.export_audio is not None:
         destination = export_clip_for_review(
             entry=candidate, retriever=retriever, destination=args.export_audio
@@ -243,6 +280,15 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(
         json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    logger.info("Wrote %s", path)
+
+
+def _write_jsonl(path: Path, records: t.Iterable[dict[str, object]]) -> None:
+    """Write one JSON object per line for streaming review interoperability."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for record in records:
+            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
     logger.info("Wrote %s", path)
 
 

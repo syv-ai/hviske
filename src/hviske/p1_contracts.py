@@ -350,6 +350,7 @@ class RejectionCategory(str, enum.Enum):
     DUPLICATE_SEGMENT_ID = "duplicate_segment_id"
     UNSUPPORTED_TEXT = "unsupported_text"
     MUSIC_DOMINANT = "music_dominant"
+    NO_ACCEPTED_SEGMENTS = "no_accepted_segments"
 
 
 _ALLOWED_TRANSITIONS: dict[LedgerState, frozenset[LedgerState]] = {

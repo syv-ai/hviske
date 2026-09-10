@@ -6,6 +6,8 @@
 
 - Harden P1 VAD framing, corpus-wide audit sampling, rejection completion,
   local shard validation, source playback locators, and crash-safe recovery.
+- Make terminal programme rejection resumable, persist audit candidates across
+  publication recovery, and emit manifests consumable by the validation CLI.
 
 ### Added
 

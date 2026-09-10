@@ -564,7 +564,11 @@ def _run_native_pipeline(
     ledger_path = scratch / "ledger.sqlite"
     with Ledger(ledger_path) as ledger:
         _recover_native_batches(
-            source=source, settings=settings, ledger=ledger, hub=hub
+            source=source,
+            settings=settings,
+            ledger=ledger,
+            hub=hub,
+            audit_reservoir=audit_reservoir,
         )
         _process_native_programmes(
             source=source,
@@ -753,7 +757,9 @@ def _process_native_programmes(
             source_duration_ms=_as_int(as_mapping(metadata).get("duration_ms", 1)),
         )
         state = ledger.programme(programme_id).state.value
-        if settings.resume and state in {"purged", "verified", "sharded"}:
+        if state == "rejected" or (
+            settings.resume and state in {"purged", "verified", "sharded"}
+        ):
             continue
         try:
             started = time.monotonic()
@@ -814,20 +820,35 @@ def _process_native_programmes(
             )
             enforce_scratch_cap(settings)
             if not written.shards:
-                if result.rejections:
+                if not result.rows:
                     reason_counts = {
                         reason: sum(
                             1 for _, value in result.rejections if value == reason
                         )
                         for _, reason in result.rejections
                     }
-                    ledger.transition_programme(
+                    if not reason_counts:
+                        reason_counts = {
+                            RejectionCategory.NO_ACCEPTED_SEGMENTS.value: 1
+                        }
+                        # Proposal-level rejection counts are already included above;
+                        # an empty proposal set still needs one terminal programme
+                        # outcome so that the run report has a durable count.
+                        report.rejected += 1
+                        report.rejection_counts[
+                            RejectionCategory.NO_ACCEPTED_SEGMENTS.value
+                        ] = (
+                            report.rejection_counts.get(
+                                RejectionCategory.NO_ACCEPTED_SEGMENTS.value, 0
+                            )
+                            + 1
+                        )
+                    ledger.reject_programme(
                         programme_id,
-                        _state("rejected"),
+                        reason=next(iter(reason_counts)),
                         rejection_counts=reason_counts,
                         accepted_count=0,
-                        rejected_count=len(result.rejections),
-                        last_error=next(iter(reason_counts)),
+                        rejected_count=sum(reason_counts.values()),
                     )
                     purge_source_temporary(getattr(source, "last_temporary", None))
                     report.processed += 1
@@ -835,7 +856,7 @@ def _process_native_programmes(
                         {
                             "event": "programme_rejected",
                             "source_file_id": file_id,
-                            "reason": "quality_gates",
+                            "reason": next(iter(reason_counts)),
                         }
                     )
                     continue
@@ -878,16 +899,19 @@ def _process_native_programmes(
             )
             report.processed += 1
         except Exception as exc:
-            report.rejected += 1
-            report.rejection_counts[RejectionCategory.DECODE_ERROR.value] = (
-                report.rejection_counts.get(RejectionCategory.DECODE_ERROR.value, 0) + 1
-            )
             current = ledger.programme(programme_id)
+            if current.state.value != "rejected":
+                report.rejected += 1
+                report.rejection_counts[RejectionCategory.DECODE_ERROR.value] = (
+                    report.rejection_counts.get(RejectionCategory.DECODE_ERROR.value, 0)
+                    + 1
+                )
             if current.state.value not in {
                 "sharded",
                 "committed",
                 "verified",
                 "purged",
+                "rejected",
             }:
                 ledger.transition_programme(
                     programme_id, target=_state("retryable"), last_error=str(exc)[:500]
@@ -1042,38 +1066,49 @@ def publish_pending(
         return evidence.model_copy(update={"state": _state("purged")})
     if not shards:
         raise ValueError("publication batch has no local shards")
+    ledger_shards = ledger.shards(batch_id)
     programme_ids = tuple(
         sorted(
             {
                 item.programme_id
-                for item in ledger.shards(batch_id)
+                for item in ledger_shards
                 if item.programme_id is not None
             }
         )
     )
+    local_paths = tuple(shard.path for shard in shards)
+    remote_paths = tuple(item.path for item in ledger_shards)
+    row_counts = tuple(item.row_count for item in ledger_shards)
+    if not (len(shards) == len(remote_paths) == len(row_counts)):
+        raise ValueError("pending shards differ from their durable ledger records")
+    if audit_rows and audit_reservoir is not None:
+        candidates = _record_audit_candidates(
+            rows=audit_rows,
+            path=None,
+            repository=settings.target_private_repo,
+            revision=None,
+            remote_paths=remote_paths,
+            row_counts=row_counts,
+            local_paths=local_paths,
+        )
+        getattr(audit_reservoir, "add")(candidates)
 
     def purge(paths: tuple[Path, ...]) -> None:
         for path in paths:
             if path.is_file() and not path.is_symlink():
                 path.unlink()
 
-    def durable_verification(evidence: object) -> None:
-        if audit_rows:
-            commit_id = getattr(evidence, "commit_id", None)
-            if not isinstance(commit_id, str):
-                raise ValueError("verified publication has no commit for audit records")
-            candidates = _record_audit_candidates(
-                rows=audit_rows,
-                path=None,
-                repository=settings.target_private_repo,
-                revision=commit_id,
-                remote_paths=tuple(record.path for record in ledger.shards(batch_id)),
-                row_counts=tuple(
-                    record.row_count for record in ledger.shards(batch_id)
-                ),
-            )
-            if audit_reservoir is not None:
-                getattr(audit_reservoir, "add")(candidates)
+    def commit_recorded(commit_id: str) -> None:
+        if audit_reservoir is not None:
+            updater = getattr(audit_reservoir, "update_remote_locators", None)
+            if callable(updater):
+                updater(
+                    repository=settings.target_private_repo,
+                    revision=commit_id,
+                    local_paths=local_paths,
+                    remote_paths=remote_paths,
+                    row_counts=row_counts,
+                )
 
     evidence = publish_batch(
         t.cast(HubClient, hub),
@@ -1087,8 +1122,8 @@ def publish_pending(
         },
         staging_dir=Path(shards[0].path).parent,
         ledger=ledger,
-        durable_verification=durable_verification if audit_rows else None,
         purge_callback=purge,
+        commit_recorded=commit_recorded,
     )
     ledger.finalise_batch_children(batch_id)
     for programme_id in programme_ids:
@@ -1112,22 +1147,29 @@ def _record_audit_candidates(
     rows: c.Sequence[object],
     path: Path | None,
     repository: str,
-    revision: str,
+    revision: str | None,
     remote_paths: tuple[str, ...],
     row_counts: tuple[int, ...],
+    local_paths: tuple[Path, ...] | None = None,
 ) -> list[dict[str, object]]:
-    """Persist bounded blinded audit metadata with committed row locators.
+    """Build bounded blinded audit metadata with local or remote locators.
 
     Returns:
-        The metadata-only candidates with committed locators.
+        The metadata-only candidates with local or committed locators.
 
     Raises:
         TypeError:
             If an audit row is neither a mapping nor a contract model.
+        ValueError:
+            If local and remote shard paths are mismatched.
     """
     candidates: list[dict[str, object]] = []
     row_index = 0
-    for shard_path, shard_rows in zip(remote_paths, row_counts):
+    if local_paths is not None and len(local_paths) != len(remote_paths):
+        raise ValueError("local and remote shard paths must have equal lengths")
+    for shard_number, (shard_path, shard_rows) in enumerate(
+        zip(remote_paths, row_counts, strict=True)
+    ):
         for offset, row in enumerate(rows[row_index : row_index + shard_rows]):
             model_dump = getattr(row, "model_dump", None)
             if callable(model_dump):
@@ -1136,15 +1178,23 @@ def _record_audit_candidates(
                 candidate = dict(row)
             else:
                 raise TypeError("audit rows must be mappings or contract models")
-            candidate.update(
-                {
-                    "status": "accepted",
-                    "repository": repository,
-                    "revision": revision,
-                    "parquet_path": shard_path,
-                    "row_locator": offset,
-                }
-            )
+            candidate["status"] = "accepted"
+            if local_paths is None:
+                candidate.update(
+                    {
+                        "repository": repository,
+                        "revision": revision,
+                        "parquet_path": shard_path,
+                        "row_locator": offset,
+                    }
+                )
+            else:
+                candidate.update(
+                    {
+                        "local_path": str(local_paths[shard_number]),
+                        "local_row_locator": offset,
+                    }
+                )
             candidates.append(candidate)
             row_index += 1
     if not candidates:
@@ -1196,7 +1246,12 @@ def purge_source_temporary(value: object) -> None:
 
 
 def _recover_native_batches(
-    *, source: object, settings: PipelineSettings, ledger: Ledger, hub: object
+    *,
+    source: object,
+    settings: PipelineSettings,
+    ledger: Ledger,
+    hub: object,
+    audit_reservoir: object | None = None,
 ) -> None:
     """Reconcile every durable local and remote item after a restart.
 
@@ -1241,10 +1296,25 @@ def _recover_native_batches(
                 pending=tuple(_local_shard_from_record(record) for record in records),
                 pending_ids=tuple(record.shard_id for record in records),
                 batch_id=batch.batch_id,
+                audit_reservoir=audit_reservoir,
             )
             continue
         if batch.commit_id is None:
             continue
+        if audit_reservoir is not None and all(
+            record.local_path is not None for record in records
+        ):
+            updater = getattr(audit_reservoir, "update_remote_locators", None)
+            if callable(updater):
+                updater(
+                    repository=settings.target_private_repo,
+                    revision=batch.commit_id,
+                    local_paths=tuple(
+                        t.cast(str, record.local_path) for record in records
+                    ),
+                    remote_paths=tuple(record.path for record in records),
+                    row_counts=tuple(record.row_count for record in records),
+                )
         verify_batch(
             t.cast(HubClient, hub),
             settings.target_private_repo,
