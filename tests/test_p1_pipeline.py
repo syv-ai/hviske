@@ -33,123 +33,6 @@ from hviske.p1_source import SourcePlan, SourceShard
 from tests.test_p1_publish import MemoryHub
 
 
-def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
-    """Partial unlink recovery tolerates missing files and protects replacements."""
-    good = tmp_path / "good.parquet"
-    replaced = tmp_path / "replaced.parquet"
-    good.write_bytes(b"good")
-    replaced.write_bytes(b"new content")
-
-    _unlink_recovered(
-        (good, replaced, tmp_path / "missing.parquet"),
-        expected={
-            good: (
-                4,
-                "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
-            ),
-            replaced: (3, "0" * 64),
-        },
-    )
-
-    assert not good.exists()
-    assert replaced.exists()
-
-
-def test_zero_accepted_programme_is_skipped_on_the_second_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An empty proposal result is terminal and is not processed twice."""
-    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
-    source_calls = 0
-
-    class Source:
-        last_temporary = None
-
-        def fetch_transcript(self, _pointer: object) -> object:
-            nonlocal source_calls
-            source_calls += 1
-            return type("Transcript", (), {"words": (), "text": ""})()
-
-        def iter_programme_pointers(self, *, shard: object) -> object:
-            del shard
-            return iter(
-                (
-                    type(
-                        "Pointer",
-                        (),
-                        {"file_id": "file-1", "row_group": 0, "row_index": 0},
-                    )(),
-                )
-            )
-
-        def fetch_audio(self, *, pointer: object) -> object:
-            del pointer
-            return type("Audio", (), {"sampling_rate": 16_000, "channels": 1})()
-
-    monkeypatch.setattr(
-        "hviske.p1_pipeline._decoded_native_audio",
-        lambda _audio, file_id: np.zeros(16_000),
-    )
-    monkeypatch.setattr(
-        "hviske.p1_pipeline.segment_programme",
-        lambda **_: SegmentationResult(rows=(), rejections=(), correction_count=0),
-    )
-    monkeypatch.setattr(
-        "hviske.p1_pipeline.write_shards",
-        lambda *_, **__: ShardBatchResult(shards=(), source_recoverable=False),
-    )
-    preflight = PreflightReport(
-        mode="build",
-        selected_programmes=1,
-        maximum_source_bytes=0,
-        required_scratch_bytes=0,
-        free_bytes=1,
-        scratch_bytes=0,
-        source_revisions={},
-        model_revisions={},
-        cuda={},
-        target={},
-        checks={},
-    )
-    report = BuildReport(preflight=preflight, selected_file_ids=("file-1",))
-    source_shard = type(
-        "Shard", (), {"path": "source/part.parquet", "byte_size": 1_000}
-    )()
-    candidate = [("file-1", {"duration_ms": 1_000}, (source_shard, object()))]
-    database = tmp_path / "ledger.sqlite"
-    with Ledger(database) as ledger:
-        _process_native_programmes(
-            source=Source(),
-            settings=settings,
-            candidates=candidate,
-            ledger=ledger,
-            hub=object(),
-            vad=cast(VADBackend, object()),
-            ctc=cast(CTCBackend, object()),
-            report=report,
-            log=MetadataLog(tmp_path / "events.jsonl"),
-        )
-        record = ledger.programme("p1-file-1")
-        assert (record.state.value, record.last_error) == (
-            "rejected",
-            "no_accepted_segments",
-        )
-    with Ledger(database) as ledger:
-        _process_native_programmes(
-            source=Source(),
-            settings=settings,
-            candidates=candidate,
-            ledger=ledger,
-            hub=object(),
-            vad=cast(VADBackend, object()),
-            ctc=cast(CTCBackend, object()),
-            report=report,
-            log=MetadataLog(tmp_path / "events.jsonl"),
-        )
-    assert source_calls == 1
-    assert report.rejected == 1
-
-
 def test_existing_scratch_is_included_in_hard_budget(tmp_path: Path) -> None:
     """An existing scratch tree cannot be ignored by the preflight quota."""
     config = pipeline_config(tmp_path)
@@ -284,3 +167,120 @@ def test_plan_verifies_github_vad_and_hub_models(
     run_pipeline(config=pipeline_config(tmp_path), source=source)
 
     assert [item[0] for item in calls] == ["github", "hub", "hub"]
+
+
+def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
+    """Partial unlink recovery tolerates missing files and protects replacements."""
+    good = tmp_path / "good.parquet"
+    replaced = tmp_path / "replaced.parquet"
+    good.write_bytes(b"good")
+    replaced.write_bytes(b"new content")
+
+    _unlink_recovered(
+        (good, replaced, tmp_path / "missing.parquet"),
+        expected={
+            good: (
+                4,
+                "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            ),
+            replaced: (3, "0" * 64),
+        },
+    )
+
+    assert not good.exists()
+    assert replaced.exists()
+
+
+def test_zero_accepted_programme_is_skipped_on_the_second_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty proposal result is terminal and is not processed twice."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+    source_calls = 0
+
+    class Source:
+        last_temporary = None
+
+        def fetch_audio(self, *, pointer: object) -> object:
+            del pointer
+            return type("Audio", (), {"sampling_rate": 16_000, "channels": 1})()
+
+        def fetch_transcript(self, _pointer: object) -> object:
+            nonlocal source_calls
+            source_calls += 1
+            return type("Transcript", (), {"words": (), "text": ""})()
+
+        def iter_programme_pointers(self, *, shard: object) -> object:
+            del shard
+            return iter(
+                (
+                    type(
+                        "Pointer",
+                        (),
+                        {"file_id": "file-1", "row_group": 0, "row_index": 0},
+                    )(),
+                )
+            )
+
+    monkeypatch.setattr(
+        "hviske.p1_pipeline._decoded_native_audio",
+        lambda _audio, file_id: np.zeros(16_000),
+    )
+    monkeypatch.setattr(
+        "hviske.p1_pipeline.segment_programme",
+        lambda **_: SegmentationResult(rows=(), rejections=(), correction_count=0),
+    )
+    monkeypatch.setattr(
+        "hviske.p1_pipeline.write_shards",
+        lambda *_, **__: ShardBatchResult(shards=(), source_recoverable=False),
+    )
+    preflight = PreflightReport(
+        mode="build",
+        selected_programmes=1,
+        maximum_source_bytes=0,
+        required_scratch_bytes=0,
+        free_bytes=1,
+        scratch_bytes=0,
+        source_revisions={},
+        model_revisions={},
+        cuda={},
+        target={},
+        checks={},
+    )
+    report = BuildReport(preflight=preflight, selected_file_ids=("file-1",))
+    source_shard = type(
+        "Shard", (), {"path": "source/part.parquet", "byte_size": 1_000}
+    )()
+    candidate = [("file-1", {"duration_ms": 1_000}, (source_shard, object()))]
+    database = tmp_path / "ledger.sqlite"
+    with Ledger(database) as ledger:
+        _process_native_programmes(
+            source=Source(),
+            settings=settings,
+            candidates=candidate,
+            ledger=ledger,
+            hub=object(),
+            vad=cast(VADBackend, object()),
+            ctc=cast(CTCBackend, object()),
+            report=report,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+        )
+        record = ledger.programme("p1-file-1")
+        assert (record.state.value, record.last_error) == (
+            "rejected",
+            "no_accepted_segments",
+        )
+    with Ledger(database) as ledger:
+        _process_native_programmes(
+            source=Source(),
+            settings=settings,
+            candidates=candidate,
+            ledger=ledger,
+            hub=object(),
+            vad=cast(VADBackend, object()),
+            ctc=cast(CTCBackend, object()),
+            report=report,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+        )
+    assert source_calls == 1
+    assert report.rejected == 1

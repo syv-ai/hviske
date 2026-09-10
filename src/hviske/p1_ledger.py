@@ -780,36 +780,6 @@ class Ledger:
 
     create_batch = register_batch
 
-    def audit_candidates(self, batch_id: str) -> tuple[dict[str, object], ...]:
-        """Return metadata-only audit candidates durably attached to a batch.
-
-        Args:
-            batch_id:
-                Batch whose accepted candidate locators should be returned.
-
-        Returns:
-            Candidates in their deterministic allocation order.
-
-        Raises:
-            LedgerError:
-                If persisted candidate metadata is not an object.
-        """
-        rows = self._connection.execute(
-            "SELECT candidate_json, local_path, local_row_locator "
-            "FROM audit_candidates WHERE batch_id = ? ORDER BY candidate_id",
-            (batch_id,),
-        ).fetchall()
-        candidates: list[dict[str, object]] = []
-        for row in rows:
-            value = json.loads(str(row[0]))
-            if not isinstance(value, dict):
-                raise LedgerError("audit candidate metadata is not an object")
-            candidate = cast(dict[str, object], value)
-            candidate["local_path"] = str(row[1])
-            candidate["local_row_locator"] = int(row[2])
-            candidates.append(candidate)
-        return tuple(candidates)
-
     def attach_shard(self, batch_id: str, shard_id: str) -> BatchRecord:
         """Attach a registered shard and refresh batch counts atomically.
 
@@ -847,6 +817,36 @@ class Ledger:
             )
             self._refresh_batch_counts(connection, batch_id)
         return self.batch(batch_id)
+
+    def audit_candidates(self, batch_id: str) -> tuple[dict[str, object], ...]:
+        """Return metadata-only audit candidates durably attached to a batch.
+
+        Args:
+            batch_id:
+                Batch whose accepted candidate locators should be returned.
+
+        Returns:
+            Candidates in their deterministic allocation order.
+
+        Raises:
+            LedgerError:
+                If persisted candidate metadata is not an object.
+        """
+        rows = self._connection.execute(
+            "SELECT candidate_json, local_path, local_row_locator "
+            "FROM audit_candidates WHERE batch_id = ? ORDER BY candidate_id",
+            (batch_id,),
+        ).fetchall()
+        candidates: list[dict[str, object]] = []
+        for row in rows:
+            value = json.loads(str(row[0]))
+            if not isinstance(value, dict):
+                raise LedgerError("audit candidate metadata is not an object")
+            candidate = cast(dict[str, object], value)
+            candidate["local_path"] = str(row[1])
+            candidate["local_row_locator"] = int(row[2])
+            candidates.append(candidate)
+        return tuple(candidates)
 
     def finalise_batch_children(self, batch_id: str) -> BatchRecord:
         """Idempotently finish every shard and programme in a purged batch.

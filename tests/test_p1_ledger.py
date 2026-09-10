@@ -216,25 +216,6 @@ def test_purged_batch_child_finalisation_is_idempotent(tmp_path: Path) -> None:
         ledger.finalise_batch_children("batch-1")
 
 
-def test_rejected_programmes_and_retryable_transitions_are_durable(
-    tmp_path: Path,
-) -> None:
-    """Failure states retain their reason and can retry before final rejection."""
-    with Ledger(tmp_path / "ledger.sqlite") as ledger:
-        add_programme(ledger)
-        ledger.start_processing("programme-1")
-        retry = ledger.transition_programme(
-            "programme-1", LedgerState.RETRYABLE, last_error="temporary decode failure"
-        )
-        assert retry.state is LedgerState.RETRYABLE
-        assert retry.attempts == 1
-        rejected = ledger.reject_programme(
-            "programme-1", reason=RejectionCategory.DECODE_ERROR
-        )
-        assert rejected.state is LedgerState.REJECTED
-        assert rejected.rejection_counts == {"decode_error": 1}
-
-
 def test_rejected_programme_is_terminal_across_two_runs(tmp_path: Path) -> None:
     """A restart skips rejected work and cannot reopen its terminal state."""
     database = tmp_path / "ledger.sqlite"
@@ -255,6 +236,25 @@ def test_rejected_programme_is_terminal_across_two_runs(tmp_path: Path) -> None:
             restarted.start_processing("programme-1")
         with pytest.raises(InvalidTransition):
             restarted.transition_programme("programme-1", LedgerState.RETRYABLE)
+
+
+def test_rejected_programmes_and_retryable_transitions_are_durable(
+    tmp_path: Path,
+) -> None:
+    """Failure states retain their reason and can retry before final rejection."""
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        add_programme(ledger)
+        ledger.start_processing("programme-1")
+        retry = ledger.transition_programme(
+            "programme-1", LedgerState.RETRYABLE, last_error="temporary decode failure"
+        )
+        assert retry.state is LedgerState.RETRYABLE
+        assert retry.attempts == 1
+        rejected = ledger.reject_programme(
+            "programme-1", reason=RejectionCategory.DECODE_ERROR
+        )
+        assert rejected.state is LedgerState.REJECTED
+        assert rejected.rejection_counts == {"decode_error": 1}
 
 
 def test_remote_reconciliation_avoids_reupload_or_marks_retryable(

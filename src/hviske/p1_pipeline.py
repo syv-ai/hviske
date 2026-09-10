@@ -212,27 +212,6 @@ def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)
 
 
-def _unlink_recovered(
-    paths: tuple[Path, ...], expected: Mapping[Path, tuple[int, str]] | None = None
-) -> None:
-    """Remove only surviving regular files matching durable recovery evidence."""
-    for path in paths:
-        if not path.is_file() or path.is_symlink():
-            continue
-        evidence = None if expected is None else expected.get(path)
-        if evidence is not None:
-            size, digest = evidence
-            if path.stat().st_size != size:
-                continue
-            checksum_builder = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    checksum_builder.update(chunk)
-            if checksum_builder.hexdigest() != digest:
-                continue
-        path.unlink()
-
-
 @dataclass(frozen=True)
 class PreflightReport:
     """JSON-safe evidence from the checks performed before audio retrieval."""
@@ -1239,6 +1218,27 @@ def _state(value: str) -> LedgerState:
         The corresponding ledger state.
     """
     return LedgerState(value)
+
+
+def _unlink_recovered(
+    paths: tuple[Path, ...], expected: Mapping[Path, tuple[int, str]] | None = None
+) -> None:
+    """Remove only surviving regular files matching durable recovery evidence."""
+    for path in paths:
+        if not path.is_file() or path.is_symlink():
+            continue
+        evidence = None if expected is None else expected.get(path)
+        if evidence is not None:
+            size, digest = evidence
+            if path.stat().st_size != size:
+                continue
+            checksum_builder = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    checksum_builder.update(chunk)
+            if checksum_builder.hexdigest() != digest:
+                continue
+        path.unlink()
 
 
 def enforce_scratch_cap(settings: PipelineSettings) -> None:

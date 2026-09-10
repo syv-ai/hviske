@@ -785,6 +785,21 @@ class AllowListError(PublicationError):
     """Raised when an upload contains an unsafe local path."""
 
 
+def _has_parquet_footer(path: Path) -> bool:
+    """Identify a Parquet candidate without reading its payload into memory.
+
+    Returns:
+        Whether the file has the Parquet magic bytes at both ends.
+    """
+    if path.stat().st_size < 8:
+        return False
+    with path.open("rb") as stream:
+        header = stream.read(4)
+        stream.seek(-4, os.SEEK_END)
+        footer = stream.read(4)
+    return header == b"PAR1" and footer == b"PAR1"
+
+
 def _local_evidence(shard: LocalShard) -> ShardEvidence:
     if shard.row_count < 0:
         raise AllowListError(f"negative row count for {shard.repo_path}")
@@ -810,21 +825,6 @@ def _assert_repo_path(path: str) -> None:
         or str(pure) != path
     ):
         raise AllowListError(f"unsafe repository path: {path!r}")
-
-
-def _has_parquet_footer(path: Path) -> bool:
-    """Identify a Parquet candidate without reading its payload into memory.
-
-    Returns:
-        Whether the file has the Parquet magic bytes at both ends.
-    """
-    if path.stat().st_size < 8:
-        return False
-    with path.open("rb") as stream:
-        header = stream.read(4)
-        stream.seek(-4, os.SEEK_END)
-        footer = stream.read(4)
-    return header == b"PAR1" and footer == b"PAR1"
 
 
 def _stream_local(path: Path) -> tuple[str, int]:

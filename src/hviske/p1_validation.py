@@ -34,6 +34,932 @@ _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
+class AuditReservoir:
+    """Crash-safe, corpus-wide reservoir for the bounded audit manifest.
+
+    The state file contains only the currently selected metadata records.  Each
+    update is written to a temporary sibling and atomically renamed, so a crash
+    cannot leave a half-written reservoir or an unbounded per-programme log.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        accepted_quota: int = 200,
+        rejected_quota: int = 100,
+        borderline_quota: int = 100,
+        seed: int | str = "p1",
+    ) -> None:
+        """Open a bounded reservoir, recovering its previous selection.
+
+        Raises:
+            ValueError:
+                If quotas or a recovered state file are invalid.
+        """
+        self.path = Path(path)
+        self.quotas = {
+            "accepted": accepted_quota,
+            "rejected": rejected_quota,
+            "borderline": borderline_quota,
+        }
+        if any(value < 0 for value in self.quotas.values()):
+            raise ValueError("audit quotas must not be negative")
+        self.seed = seed
+        self.rows: list[dict[str, object]] = []
+        if self.path.exists():
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(value, list) or not all(
+                isinstance(item, dict) for item in value
+            ):
+                raise ValueError("audit reservoir is not a JSON list of records")
+            self.rows = [t.cast(dict[str, object], item) for item in value]
+
+    def add(self, candidates: RowStream) -> None:
+        """Merge candidates and persist the bounded, stratified selection.
+
+        Raises:
+            ValueError:
+                If a candidate has no valid temporary or immutable locator.
+        """
+        combined_by_identity: dict[tuple[str, str], MetadataRow] = {}
+        for row in [*self.rows, *candidates]:
+            key = (_status(row), _identity(row))
+            existing = combined_by_identity.get(key)
+            if existing is not None and _parquet_path(existing) is not None:
+                incoming_path = _parquet_path(row)
+                incoming_revision = _string(row, "revision", "hub_revision")
+                existing_revision = _string(existing, "revision", "hub_revision")
+                if incoming_path is None:
+                    continue
+                if incoming_path != _parquet_path(existing) or (
+                    incoming_revision != existing_revision
+                ):
+                    raise ValueError("audit candidate remote locator is immutable")
+            combined_by_identity[key] = row
+        combined = list(combined_by_identity.values())
+        reservoirs = {
+            status: _StratifiedReservoir(quota) for status, quota in self.quotas.items()
+        }
+        for ordinal, row in enumerate(combined):
+            status = _status(row)
+            if status not in reservoirs or not self.quotas[status]:
+                continue
+            _validate_candidate_locator(row, status)
+            safe_row = _metadata_copy(row)
+            safe_row["_p1_metadata_sha256"] = _metadata_digest(row)
+            audio_digest = _audio_digest(row)
+            if audio_digest is not None:
+                safe_row["_p1_audio_sha256"] = audio_digest
+            reservoirs[status].add(
+                safe_row, seed=f"{self.seed}:{status}", ordinal=ordinal
+            )
+        self.rows = [
+            row
+            for status, reservoir in reservoirs.items()
+            for row in reservoir.rows()
+            if _status(row) == status
+        ]
+        self._write_state()
+
+    def update_remote_locators(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        local_paths: c.Sequence[Path | str],
+        remote_paths: c.Sequence[str],
+        row_counts: c.Sequence[int],
+    ) -> int:
+        """Resolve selected local candidates to immutable remote locations.
+
+        Local identity is retained in the crash-safe reservoir until the commit SHA
+        and publication-relative path are known.  This makes a restart after a
+        verification failure able to finish the same audit selection without
+        sampling the accepted rows again.
+
+        Returns:
+            Number of selected candidates resolved to remote locators.
+
+        Raises:
+            ValueError:
+                If shard locator sequences or the immutable revision are invalid.
+        """
+        if not _COMMIT_SHA.fullmatch(revision):
+            raise ValueError("audit candidates require a complete immutable revision")
+        if not (len(local_paths) == len(remote_paths) == len(row_counts)):
+            raise ValueError("local and remote shard evidence must have equal lengths")
+        by_identity: dict[tuple[str, int], tuple[str, str]] = {}
+        for local, remote, count in zip(
+            local_paths, remote_paths, row_counts, strict=True
+        ):
+            if count < 0:
+                raise ValueError("audit shard row counts must not be negative")
+            local_key = str(Path(local).expanduser().resolve(strict=False))
+            for row_locator in range(count):
+                by_identity[(local_key, row_locator)] = (remote, repository)
+
+        resolved = 0
+        for row in self.rows:
+            if _status(row) != "accepted":
+                continue
+            local = _string(row, "local_path")
+            row_locator = _integer(row, "local_row_locator")
+            if local is None or row_locator is None:
+                continue
+            target = by_identity.get(
+                (str(Path(local).expanduser().resolve(strict=False)), row_locator)
+            )
+            if target is None:
+                continue
+            remote, target_repository = target
+            existing_path = _parquet_path(row)
+            existing_revision = _string(row, "revision", "hub_revision")
+            if existing_path is not None:
+                if existing_path != remote or existing_revision != revision:
+                    raise ValueError("audit candidate remote locator is immutable")
+                continue
+            row.update(
+                {
+                    "repository": target_repository,
+                    "revision": revision,
+                    "parquet_path": remote,
+                    "remote_parquet_path": remote,
+                    "row_locator": row_locator,
+                }
+            )
+            row.pop("local_path", None)
+            row.pop("local_row_locator", None)
+            resolved += 1
+        if resolved:
+            self._write_state()
+        return resolved
+
+    resolve_remote_locators = update_remote_locators
+
+    def _write_state(self) -> None:
+        """Atomically persist the bounded selection."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(self.rows, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(self.path)
+
+    def finalise(self, path: Path | str) -> list[dict[str, object]]:
+        """Write the sole final blinded manifest after all commits are known.
+
+        Returns:
+            The metadata-only manifest records.
+        """
+        manifest = create_blinded_audit_manifest(
+            self.rows,
+            accepted_quota=self.quotas["accepted"],
+            rejected_quota=self.quotas["rejected"],
+            borderline_quota=self.quotas["borderline"],
+            seed=self.seed,
+        )
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            for candidate in manifest:
+                stream.write(json.dumps(candidate, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(destination)
+        return manifest
+
+
+class _StratifiedReservoir:
+    """Bounded, multi-axis reservoir with one fair bucket per stratum.
+
+    A bucket is a complete combination of the required axes, rather than one axis
+    selected after the fact.  Each bucket receives a fair share of the bounded
+    capacity; a seeded ``random.Random`` priority makes selection reproducible
+    without depending on Python's process-randomised ``hash`` function.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 0:
+            raise ValueError("reservoir capacity must not be negative")
+        self.capacity = capacity
+        self.groups: dict[tuple[str, ...], list[tuple[float, dict[str, object]]]] = {}
+
+    def add(self, row: dict[str, object], *, seed: str, ordinal: int) -> None:
+        """Add a row while retaining at most ``capacity`` metadata records."""
+        del ordinal
+        if not self.capacity:
+            return
+        key = _stratum_key(row)
+        if key not in self.groups:
+            if len(self.groups) >= self.capacity:
+                new_priority = _random_priority(seed, "stratum", key)
+                worst = max(
+                    self.groups,
+                    key=lambda item: _random_priority(seed, "stratum", item),
+                )
+                if new_priority >= _random_priority(seed, "stratum", worst):
+                    return
+                del self.groups[worst]
+            self.groups[key] = []
+        bucket = self.groups[key]
+        bucket.append((_random_priority(seed, "row", key, _identity(row)), row))
+        bucket.sort(key=lambda item: (item[0], _identity(item[1])))
+        limit = max(1, self.capacity // len(self.groups))
+        for values in self.groups.values():
+            del values[limit:]
+
+    def rows(self) -> list[dict[str, object]]:
+        """Return round-robin records without exceeding the reservoir capacity."""
+        result: list[dict[str, object]] = []
+        ordered = sorted(self.groups.items())
+        depth = 0
+        while len(result) < self.capacity:
+            added = False
+            for _, bucket in ordered:
+                if depth < len(bucket):
+                    result.append(bucket[depth][1])
+                    added = True
+                    if len(result) == self.capacity:
+                        break
+            if not added:
+                break
+            depth += 1
+        return result
+
+
+def _identity(row: MetadataRow) -> str:
+    return (
+        _string(row, "segment_id", "id")
+        or hashlib.sha256(
+            json.dumps(_metadata_copy(row), sort_keys=True, default=str).encode()
+        ).hexdigest()
+    )
+
+
+def _metadata_copy(row: MetadataRow) -> dict[str, object]:
+    """Copy only bounded scalar metadata needed to choose an audit candidate.
+
+    Returns:
+        Bounded metadata with no audio or transcript payload.
+    """
+    allowed = {
+        "segment_id",
+        "id",
+        "source_file_id",
+        "source_repository",
+        "source_revision",
+        "programme_id",
+        "source_start_ms",
+        "source_end_ms",
+        "duration_ms",
+        "programme_duration_ms",
+        "source_duration_ms",
+        "status",
+        "quality_status",
+        "accepted",
+        "borderline",
+        "show",
+        "show_type",
+        "programme_type",
+        "speaker_count",
+        "speaker_ids",
+        "speakers",
+        "music",
+        "music_dominant",
+        "language_probability",
+        "language_prob",
+        "language_probability_decile",
+        "language_decile",
+        "programme_position",
+        "programme_position_decile",
+        "position_decile",
+        "position",
+        "alignment_score",
+        "confidence",
+        "confidence_decile",
+        "drift_ms",
+        "start_drift_ms",
+        "end_drift_ms",
+        "drift_decile",
+        "repository",
+        "repo_id",
+        "hub_repo",
+        "revision",
+        "hub_revision",
+        "parquet_path",
+        "remote_parquet_path",
+        "shard_path",
+        "source_parquet",
+        "source_shard_path",
+        "source_shard",
+        "source_parquet_path",
+        "source_row_group",
+        "source_row_index",
+        "source_row_locator",
+        "source_shard_byte_size",
+        "parquet_sha256",
+        "shard_sha256",
+        "audio_sha256",
+        "metadata_sha256",
+        "row_locator",
+        "row_index",
+        "parquet_row",
+        "local_path",
+        "local_row_locator",
+        "rejection_reason",
+        "reject_reason",
+    }
+    return {key: value for key, value in row.items() if key in allowed}
+
+
+def _string(row: MetadataRow, *keys: str) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, str):
+            return value
+        if value is not None and not isinstance(
+            value, (bytes, bytearray, dict, list, tuple)
+        ):
+            return str(value)
+    return None
+
+
+def _random_priority(seed: str, *parts: object) -> float:
+    """Return a stable pseudo-random priority without using process hash state."""
+    generator = random.Random("\0".join([seed, *(str(part) for part in parts)]))
+    return generator.random()
+
+
+def _stratum_key(row: MetadataRow) -> tuple[str, ...]:
+    """Build the fixed-dimensional key used by the bounded sampler.
+
+    Returns:
+        Duration, show, speaker, music, probability, position, confidence, and
+        drift dimensions.
+    """
+    duration = _number(row, "duration_ms") or 0
+    duration_class = (
+        "short" if duration < 2_000 else "long" if duration > 8_000 else "target"
+    )
+    speakers = row.get("speaker_ids", row.get("speakers", ()))
+    if isinstance(speakers, (str, bytes)):
+        speaker_count = 1
+    elif isinstance(speakers, c.Sized):
+        speaker_count = len(speakers)
+    else:
+        speaker_count = int(_number(row, "speaker_count") or 0)
+    language_probability = _number(row, "language_probability", "language_prob") or 0
+    confidence = _number(row, "alignment_score", "confidence") or 0
+    drift = abs(
+        _number(row, "drift_ms")
+        or max(
+            abs(_number(row, "start_drift_ms") or 0),
+            abs(_number(row, "end_drift_ms") or 0),
+        )
+    )
+    return (
+        f"duration-{duration_class}",
+        f"show-{_string(row, 'show', 'show_type', 'programme_type') or 'unknown'}",
+        f"speakers-{speaker_count}",
+        "music" if _boolean(row, "music", "music_dominant") else "speech",
+        "language-"
+        + _explicit_or_decile(
+            row,
+            ("language_probability_decile", "language_decile"),
+            language_probability,
+        ),
+        "position-"
+        + _explicit_or_decile(
+            row,
+            ("programme_position_decile", "position_decile"),
+            _number(row, "programme_position", "position") or 0,
+        ),
+        f"confidence-{_explicit_or_decile(row, ('confidence_decile',), confidence)}",
+        f"drift-{_explicit_or_decile(row, ('drift_decile',), drift / 1_000)}",
+    )
+
+
+def _boolean(row: MetadataRow, *keys: str) -> bool:
+    """Read common JSON boolean spellings without treating ``"false"`` as true.
+
+    Returns:
+        The first recognised boolean value, or ``False``.
+    """
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.casefold() in {"1", "true", "yes", "music"}
+    return False
+
+
+def _explicit_or_decile(row: MetadataRow, keys: tuple[str, ...], value: float) -> str:
+    """Use a supplied decile or derive one from a normalised numeric value.
+
+    Returns:
+        A canonical ``d0`` to ``d9`` label.
+    """
+    explicit = _string(row, *keys)
+    if explicit:
+        label = explicit.casefold()
+        if label.startswith("d"):
+            label = label[1:]
+        try:
+            decile = int(label)
+        except ValueError:
+            decile = int(value * 10)
+        return f"d{min(9, max(0, decile))}"
+    return f"d{min(9, max(0, int(value * 10)))}"
+
+
+def _number(row: MetadataRow, *keys: str) -> float | None:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+    return None
+
+
+def _audio_digest(row: MetadataRow) -> str | None:
+    value = row.get("audio", row.get("waveform"))
+    if isinstance(value, bytes):
+        return hashlib.sha256(value).hexdigest()
+    if isinstance(value, c.Mapping) and isinstance(value.get("bytes"), bytes):
+        return hashlib.sha256(t.cast(bytes, value["bytes"])).hexdigest()
+    return None
+
+
+def _integer(row: MetadataRow, *keys: str) -> int | None:
+    value = _number(row, *keys)
+    return int(value) if value is not None else None
+
+
+def _metadata_digest(row: MetadataRow) -> str:
+    """Hash the canonical remote-equivalent, non-audio row projection.
+
+    Repository provenance, audit locators, decisions, hashes and embedded payloads
+    are transport metadata rather than row metadata and are excluded.  Nested
+    mappings are sorted and tuples are represented as JSON arrays, so the exact same
+    projection can be computed before upload and after streaming retrieval.
+
+    Returns:
+        A SHA-256 digest of the canonical metadata projection.
+    """
+    ignored = {
+        "audio",
+        "waveform",
+        "array",
+        "input_values",
+        "status",
+        "quality_status",
+        "accepted",
+        "borderline",
+        "rejection_reason",
+        "reject_reason",
+        "_p1_metadata_sha256",
+        "_p1_audio_sha256",
+        "audio_sha256",
+        "repository",
+        "repo_id",
+        "hub_repo",
+        "revision",
+        "hub_revision",
+        "parquet_path",
+        "remote_parquet_path",
+        "shard_path",
+        "source_parquet",
+        "parquet_sha256",
+        "shard_sha256",
+        "metadata_sha256",
+        "row_locator",
+        "row_index",
+        "parquet_row",
+        "local_path",
+        "local_row_locator",
+        "id",
+        "remote_path",
+    }
+    payload = _canonical_json_value(
+        {key: value for key, value in row.items() if key not in ignored}
+    )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_json_value(value: object) -> object:
+    """Convert a remote row value to the canonical JSON projection.
+
+    Returns:
+        A JSON-compatible scalar, list, or mapping.
+    """
+    if isinstance(value, c.Mapping):
+        return {
+            str(key): _canonical_json_value(child)
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_json_value(child) for child in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _parquet_path(row: MetadataRow) -> str | None:
+    """Read a Parquet object path, never treating an audio path as one.
+
+    Returns:
+        A Parquet path, or ``None`` when the row has no such locator.
+    """
+    value = _string(
+        row, "parquet_path", "remote_parquet_path", "shard_path", "source_parquet"
+    )
+    return value if value and value.lower().endswith(".parquet") else None
+
+
+def _status(row: MetadataRow) -> str:
+    value = _string(row, "status", "quality_status", "decision")
+    if value in {"accepted", "pass", "keep"}:
+        return "accepted"
+    if value in {"rejected", "fail", "reject"}:
+        return "rejected"
+    if value == "borderline":
+        return value
+    accepted = row.get("accepted")
+    if accepted is False:
+        return "rejected"
+    if row.get("borderline") is True:
+        return "borderline"
+    return "accepted"
+
+
+def _validate_candidate_locator(row: MetadataRow, status: str) -> None:
+    """Validate the locator appropriate to an audit status.
+
+    Raises:
+        ValueError:
+            If the status-specific immutable locator is incomplete.
+    """
+    if status == "accepted" and _string(row, "local_path") is not None:
+        local_locator = _integer(row, "local_row_locator")
+        if local_locator is None or local_locator < 0:
+            raise ValueError("accepted candidates require a local row locator")
+        return
+    if _parquet_path(row) is not None and (
+        status == "accepted" or not _has_source_locator(row)
+    ):
+        _validate_audit_locator(row)
+        return
+    for key in ("source_repository", "source_file_id"):
+        if not _string(row, key):
+            raise ValueError(f"{status} candidates require {key}")
+    revision = _string(row, "source_revision")
+    if revision is None or not _COMMIT_SHA.fullmatch(revision):
+        raise ValueError(f"{status} candidates require an immutable source revision")
+    start = _integer(row, "source_start_ms")
+    end = _integer(row, "source_end_ms")
+    if start is None or end is None or start < 0 or end <= start:
+        raise ValueError(f"{status} candidates require a valid source interval")
+    shard_path = _source_shard_path(row)
+    row_group = _integer(row, "source_row_group")
+    if row_group is None:
+        row_group = 0
+    row_index = _integer(row, "source_row_index", "source_row_locator", "row_locator")
+    if shard_path is None or row_group is None or row_index is None:
+        raise ValueError(f"{status} candidates require an exact source row locator")
+    if not shard_path.lower().endswith(".parquet") or row_group < 0 or row_index < 0:
+        raise ValueError(f"{status} candidates have an invalid source row locator")
+
+
+def _has_source_locator(row: MetadataRow) -> bool:
+    """Return whether a row contains the complete source interval locator."""
+    return all(
+        (
+            _string(row, "source_repository"),
+            _string(row, "source_revision"),
+            _string(row, "source_file_id"),
+            _integer(row, "source_start_ms") is not None,
+            _integer(row, "source_end_ms") is not None,
+        )
+    )
+
+
+def _source_shard_path(row: MetadataRow) -> str | None:
+    """Return the exact source Parquet path, including legacy aliases."""
+    value = _string(
+        row,
+        "source_shard_path",
+        "source_shard",
+        "source_parquet_path",
+        "source_parquet",
+        "parquet_path",
+    )
+    return value if value and value.lower().endswith(".parquet") else None
+
+
+def _validate_audit_locator(row: MetadataRow) -> tuple[str, int, str]:
+    """Validate the immutable remote locator required by an audit record.
+
+    Returns:
+        The Parquet path, row locator, and immutable commit SHA.
+
+    Raises:
+        ValueError:
+            If any required locator field is absent or malformed.
+    """
+    parquet_path = _parquet_path(row)
+    if parquet_path is None:
+        raise ValueError("audit candidates require a remote Parquet path")
+    locator = _explicit_row_locator(row)
+    if locator is None or locator < 0:
+        raise ValueError("audit candidates require a non-negative row locator")
+    revision = _string(row, "revision", "hub_revision")
+    if revision is None or not _COMMIT_SHA.fullmatch(revision):
+        raise ValueError("audit candidates require a complete immutable commit SHA")
+    return parquet_path, locator, revision
+
+
+def _explicit_row_locator(row: MetadataRow) -> int | None:
+    """Return the supplied Parquet row locator, without inventing one."""
+    for key in (
+        "row_locator",
+        "row_index",
+        "parquet_row",
+        "source_row_index",
+        "source_row_locator",
+    ):
+        value = row.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def create_blinded_audit_manifest(
+    rows: RowStream,
+    *,
+    accepted_quota: int = 200,
+    rejected_quota: int = 100,
+    borderline_quota: int = 0,
+    seed: int | str = 0,
+) -> list[dict[str, object]]:
+    """Create bounded, label-free candidate records for a blinded audit.
+
+    Sampling is performed by a bounded reservoir for each status.  At most the
+    requested quota is retained for a status, irrespective of corpus size; source
+    labels, transcripts, and audio are never copied into the result.  The default
+    quotas are the production pilot quotas (200 accepted and 100 rejected).
+
+    Returns:
+        Metadata-only candidate records. Accepted rows have a Parquet locator;
+        rejected and borderline rows have a source interval locator.
+
+    Raises:
+        ValueError:
+            If a quota is negative.
+    """
+    quotas = {
+        "accepted": accepted_quota,
+        "rejected": rejected_quota,
+        "borderline": borderline_quota,
+    }
+    if any(value < 0 for value in quotas.values()):
+        raise ValueError("audit quotas must not be negative")
+    reservoirs = {
+        status: _StratifiedReservoir(quota) for status, quota in quotas.items()
+    }
+    for ordinal, row in enumerate(rows):
+        status = _status(row)
+        if quotas[status]:
+            _validate_candidate_locator(row, status)
+            safe_row = _metadata_copy(row)
+            safe_row["_p1_metadata_sha256"] = _metadata_digest(row)
+            audio_digest = _audio_digest(row)
+            if audio_digest is not None:
+                safe_row["_p1_audio_sha256"] = audio_digest
+            reservoirs[status].add(safe_row, seed=f"{seed}:{status}", ordinal=ordinal)
+    selected: list[dict[str, object]] = []
+    for status, quota in quotas.items():
+        selected.extend(
+            _candidate_source_rows(
+                reservoirs[status].rows(), status=status, seed=f"{seed}:{status}"
+            )
+        )
+    selected.sort(key=lambda item: (_identity(item), _stratum_key(item)))
+    manifest: list[dict[str, object]] = []
+    for ordinal, row in enumerate(selected):
+        identity = _identity(row)
+        status = _status(row)
+        audit_id = hashlib.sha256(f"{seed}\0{ordinal}\0{identity}".encode()).hexdigest()
+        candidate = AuditCandidate(
+            audit_id=audit_id,
+            segment_id=identity,
+            repository=(
+                _string(row, "repository", "repo_id", "hub_repo")
+                if status == "accepted" or not _has_source_locator(row)
+                else None
+            ),
+            revision=(
+                _string(row, "revision", "hub_revision")
+                if status == "accepted" or not _has_source_locator(row)
+                else None
+            ),
+            parquet_path=(
+                _parquet_path(row)
+                if status == "accepted" or not _has_source_locator(row)
+                else None
+            ),
+            row_locator=(
+                _row_locator(row, ordinal)
+                if status == "accepted" or not _has_source_locator(row)
+                else 0
+            ),
+            stratum=_stratum_key(row),
+            metadata_sha256=(
+                _string(row, "_p1_metadata_sha256") or _metadata_digest(row)
+            ),
+            audio_sha256=_string(row, "_p1_audio_sha256", "audio_sha256"),
+            parquet_sha256=_string(
+                row, "parquet_sha256", "shard_sha256", "_p1_parquet_sha256"
+            ),
+            source_file_id=_string(row, "source_file_id", "programme_id"),
+            source_repository=_string(row, "source_repository"),
+            source_revision=_string(row, "source_revision"),
+            source_start_ms=_integer(row, "source_start_ms"),
+            source_end_ms=_integer(row, "source_end_ms"),
+            source_shard_path=(
+                _source_shard_path(row) if status != "accepted" else None
+            ),
+            source_row_group=(
+                (_integer(row, "source_row_group") or 0)
+                if status != "accepted"
+                else None
+            ),
+            source_row_index=(
+                _integer(row, "source_row_index", "source_row_locator", "row_locator")
+                if status != "accepted"
+                else None
+            ),
+            source_shard_byte_size=(
+                _integer(row, "source_shard_byte_size")
+                if status != "accepted"
+                else None
+            ),
+        )
+        manifest.append(candidate.as_dict())
+    return manifest
+
+
+@dataclass(frozen=True)
+class AuditCandidate:
+    """Durable, metadata-only location for one blinded audit item.
+
+    Accepted candidates contain a Parquet object and row locator. Rejected and
+    borderline candidates contain an immutable source file and interval locator.
+    It is safe to persist in a manifest or SQLite database.
+    """
+
+    audit_id: str
+    segment_id: str
+    repository: str | None = None
+    revision: str | None = None
+    parquet_path: str | None = None
+    row_locator: int = 0
+    stratum: tuple[str, ...] = ()
+    metadata_sha256: str = ""
+    audio_sha256: str | None = None
+    parquet_sha256: str | None = None
+    source_file_id: str | None = None
+    source_repository: str | None = None
+    source_revision: str | None = None
+    source_start_ms: int | None = None
+    source_end_ms: int | None = None
+    source_shard_path: str | None = None
+    source_row_group: int | None = None
+    source_row_index: int | None = None
+    source_shard_byte_size: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject durable records that cannot be retrieved later.
+
+        Raises:
+            ValueError:
+                If the remote locator is incomplete or malformed.
+        """
+        if self.parquet_path is not None:
+            if not self.parquet_path.lower().endswith(".parquet"):
+                raise ValueError("audit candidates require a remote Parquet path")
+            if self.row_locator < 0:
+                raise ValueError("audit candidates require a non-negative row locator")
+            if self.revision is None or not _COMMIT_SHA.fullmatch(self.revision):
+                raise ValueError(
+                    "audit candidates require a complete immutable commit SHA"
+                )
+        elif not self.source_file_id or not self.source_repository:
+            raise ValueError("source audit candidates require a source locator")
+        if self.parquet_path is None:
+            if self.source_revision is None or not _COMMIT_SHA.fullmatch(
+                self.source_revision
+            ):
+                raise ValueError(
+                    "source audit candidates require an immutable revision"
+                )
+            if (
+                self.source_start_ms is None
+                or self.source_end_ms is None
+                or self.source_start_ms < 0
+                or self.source_end_ms <= self.source_start_ms
+            ):
+                raise ValueError("source audit candidates require a valid interval")
+            if (
+                self.source_shard_path is None
+                or not self.source_shard_path.lower().endswith(".parquet")
+                or self.source_row_group is None
+                or self.source_row_group < 0
+                or self.source_row_index is None
+                or self.source_row_index < 0
+            ):
+                raise ValueError(
+                    "source audit candidates require an exact source row locator"
+                )
+            if (
+                self.source_shard_byte_size is not None
+                and self.source_shard_byte_size <= 0
+            ):
+                raise ValueError("source shard byte size must be positive")
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-compatible metadata record without the source label."""
+        result: dict[str, object] = {
+            "audit_id": self.audit_id,
+            "segment_id": self.segment_id,
+            "stratum": list(self.stratum),
+            "metadata_sha256": self.metadata_sha256,
+        }
+        if self.parquet_path is not None:
+            result.update(
+                {
+                    "repository": self.repository,
+                    "revision": self.revision,
+                    "parquet_path": self.parquet_path,
+                    "remote_parquet_path": self.parquet_path,
+                    "row_locator": self.row_locator,
+                }
+            )
+        if self.audio_sha256 is not None:
+            result["audio_sha256"] = self.audio_sha256
+        if self.parquet_sha256 is not None:
+            result["parquet_sha256"] = self.parquet_sha256
+        if self.source_file_id is not None:
+            result["source_file_id"] = self.source_file_id
+        if self.source_repository is not None:
+            result["source_repository"] = self.source_repository
+        if self.source_revision is not None:
+            result["source_revision"] = self.source_revision
+        if self.source_start_ms is not None:
+            result["source_start_ms"] = self.source_start_ms
+        if self.source_end_ms is not None:
+            result["source_end_ms"] = self.source_end_ms
+        if self.source_shard_path is not None:
+            result["source_shard_path"] = self.source_shard_path
+        if self.source_row_group is not None:
+            result["source_row_group"] = self.source_row_group
+        if self.source_row_index is not None:
+            result["source_row_index"] = self.source_row_index
+        if self.source_shard_byte_size is not None:
+            result["source_shard_byte_size"] = self.source_shard_byte_size
+        return result
+
+
+def _candidate_source_rows(
+    rows: c.Iterable[dict[str, object]], *, status: str, seed: str
+) -> list[dict[str, object]]:
+    """Keep status selection internal while returning only selected source rows.
+
+    Returns:
+        The selected metadata rows.
+    """
+    del status, seed
+    return list(rows)
+
+
+def _row_locator(row: MetadataRow, fallback: int) -> int:
+    explicit = _explicit_row_locator(row)
+    return fallback if explicit is None else explicit
+
+
 class ClipRetriever(t.Protocol):
     """Retrieve one audit clip into a temporary location or memory."""
 
@@ -152,76 +1078,6 @@ def _embedded_audio(row: MetadataRow) -> bytes:
     raise ValueError("Parquet row does not contain embedded audio bytes")
 
 
-def _metadata_digest(row: MetadataRow) -> str:
-    """Hash the canonical remote-equivalent, non-audio row projection.
-
-    Repository provenance, audit locators, decisions, hashes and embedded payloads
-    are transport metadata rather than row metadata and are excluded.  Nested
-    mappings are sorted and tuples are represented as JSON arrays, so the exact same
-    projection can be computed before upload and after streaming retrieval.
-
-    Returns:
-        A SHA-256 digest of the canonical metadata projection.
-    """
-    ignored = {
-        "audio",
-        "waveform",
-        "array",
-        "input_values",
-        "status",
-        "quality_status",
-        "accepted",
-        "borderline",
-        "rejection_reason",
-        "reject_reason",
-        "_p1_metadata_sha256",
-        "_p1_audio_sha256",
-        "audio_sha256",
-        "repository",
-        "repo_id",
-        "hub_repo",
-        "revision",
-        "hub_revision",
-        "parquet_path",
-        "remote_parquet_path",
-        "shard_path",
-        "source_parquet",
-        "parquet_sha256",
-        "shard_sha256",
-        "metadata_sha256",
-        "row_locator",
-        "row_index",
-        "parquet_row",
-        "local_path",
-        "local_row_locator",
-        "id",
-        "remote_path",
-    }
-    payload = _canonical_json_value(
-        {key: value for key, value in row.items() if key not in ignored}
-    )
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _canonical_json_value(value: object) -> object:
-    """Convert a remote row value to the canonical JSON projection.
-
-    Returns:
-        A JSON-compatible scalar, list, or mapping.
-    """
-    if isinstance(value, c.Mapping):
-        return {
-            str(key): _canonical_json_value(child)
-            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
-        }
-    if isinstance(value, (list, tuple)):
-        return [_canonical_json_value(child) for child in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
 def _row_at(dataset: object, locator: int) -> MetadataRow:
     iterator = iter(dataset) if isinstance(dataset, c.Iterable) else None
     if iterator is None:
@@ -232,73 +1088,6 @@ def _row_at(dataset: object, locator: int) -> MetadataRow:
                 raise TypeError("Hub dataset rows must be mappings")
             return row
     raise FileNotFoundError(f"Parquet row {locator} was not found")
-
-
-def _string(row: MetadataRow, *keys: str) -> str | None:
-    for key in keys:
-        value = row.get(key)
-        if isinstance(value, str):
-            return value
-        if value is not None and not isinstance(
-            value, (bytes, bytearray, dict, list, tuple)
-        ):
-            return str(value)
-    return None
-
-
-def _validate_audit_locator(row: MetadataRow) -> tuple[str, int, str]:
-    """Validate the immutable remote locator required by an audit record.
-
-    Returns:
-        The Parquet path, row locator, and immutable commit SHA.
-
-    Raises:
-        ValueError:
-            If any required locator field is absent or malformed.
-    """
-    parquet_path = _parquet_path(row)
-    if parquet_path is None:
-        raise ValueError("audit candidates require a remote Parquet path")
-    locator = _explicit_row_locator(row)
-    if locator is None or locator < 0:
-        raise ValueError("audit candidates require a non-negative row locator")
-    revision = _string(row, "revision", "hub_revision")
-    if revision is None or not _COMMIT_SHA.fullmatch(revision):
-        raise ValueError("audit candidates require a complete immutable commit SHA")
-    return parquet_path, locator, revision
-
-
-def _explicit_row_locator(row: MetadataRow) -> int | None:
-    """Return the supplied Parquet row locator, without inventing one."""
-    for key in (
-        "row_locator",
-        "row_index",
-        "parquet_row",
-        "source_row_index",
-        "source_row_locator",
-    ):
-        value = row.get(key)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
-    return None
-
-
-def _parquet_path(row: MetadataRow) -> str | None:
-    """Read a Parquet object path, never treating an audio path as one.
-
-    Returns:
-        A Parquet path, or ``None`` when the row has no such locator.
-    """
-    value = _string(
-        row, "parquet_path", "remote_parquet_path", "shard_path", "source_parquet"
-    )
-    return value if value and value.lower().endswith(".parquet") else None
 
 
 def _validate_remote_shard_hash(
@@ -377,21 +1166,6 @@ class SourceClipRetriever:
             if _integer(entry, key) is None:
                 raise ValueError(f"candidate has no {key}")
         return self._callback(entry)
-
-
-def _integer(row: MetadataRow, *keys: str) -> int | None:
-    value = _number(row, *keys)
-    return int(value) if value is not None else None
-
-
-def _number(row: MetadataRow, *keys: str) -> float | None:
-    for key in keys:
-        value = row.get(key)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            return float(value)
-    return None
 
 
 def _asr_report(
@@ -643,23 +1417,6 @@ def aggregate_rows(rows: RowStream, *, bounded: bool = False) -> dict[str, objec
     return result
 
 
-def _boolean(row: MetadataRow, *keys: str) -> bool:
-    """Read common JSON boolean spellings without treating ``"false"`` as true.
-
-    Returns:
-        The first recognised boolean value, or ``False``.
-    """
-    for key in keys:
-        value = row.get(key)
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        if isinstance(value, str):
-            return value.casefold() in {"1", "true", "yes", "music"}
-    return False
-
-
 def _first_number(row: MetadataRow, keys: tuple[str, ...]) -> float | None:
     return _number(row, *keys)
 
@@ -671,22 +1428,6 @@ def _position_decile(row: MetadataRow) -> str:
         duration = _number(row, "programme_duration_ms", "source_duration_ms") or 1
         value = start / duration
     return f"d{min(9, max(0, int(value * 10)))}"
-
-
-def _status(row: MetadataRow) -> str:
-    value = _string(row, "status", "quality_status", "decision")
-    if value in {"accepted", "pass", "keep"}:
-        return "accepted"
-    if value in {"rejected", "fail", "reject"}:
-        return "rejected"
-    if value == "borderline":
-        return value
-    accepted = row.get("accepted")
-    if accepted is False:
-        return "rejected"
-    if row.get("borderline") is True:
-        return "borderline"
-    return "accepted"
 
 
 def stream_remote_rows(
@@ -1194,91 +1935,6 @@ class MetadataLedger:
             yield dict(zip(columns, values, strict=True))
 
 
-def _identity(row: MetadataRow) -> str:
-    return (
-        _string(row, "segment_id", "id")
-        or hashlib.sha256(
-            json.dumps(_metadata_copy(row), sort_keys=True, default=str).encode()
-        ).hexdigest()
-    )
-
-
-def _metadata_copy(row: MetadataRow) -> dict[str, object]:
-    """Copy only bounded scalar metadata needed to choose an audit candidate.
-
-    Returns:
-        Bounded metadata with no audio or transcript payload.
-    """
-    allowed = {
-        "segment_id",
-        "id",
-        "source_file_id",
-        "source_repository",
-        "source_revision",
-        "programme_id",
-        "source_start_ms",
-        "source_end_ms",
-        "duration_ms",
-        "programme_duration_ms",
-        "source_duration_ms",
-        "status",
-        "quality_status",
-        "accepted",
-        "borderline",
-        "show",
-        "show_type",
-        "programme_type",
-        "speaker_count",
-        "speaker_ids",
-        "speakers",
-        "music",
-        "music_dominant",
-        "language_probability",
-        "language_prob",
-        "language_probability_decile",
-        "language_decile",
-        "programme_position",
-        "programme_position_decile",
-        "position_decile",
-        "position",
-        "alignment_score",
-        "confidence",
-        "confidence_decile",
-        "drift_ms",
-        "start_drift_ms",
-        "end_drift_ms",
-        "drift_decile",
-        "repository",
-        "repo_id",
-        "hub_repo",
-        "revision",
-        "hub_revision",
-        "parquet_path",
-        "remote_parquet_path",
-        "shard_path",
-        "source_parquet",
-        "source_shard_path",
-        "source_shard",
-        "source_parquet_path",
-        "source_row_group",
-        "source_row_index",
-        "source_row_locator",
-        "source_shard_byte_size",
-        "parquet_sha256",
-        "shard_sha256",
-        "audio_sha256",
-        "metadata_sha256",
-        "row_locator",
-        "row_index",
-        "parquet_row",
-        "local_path",
-        "local_row_locator",
-        "rejection_reason",
-        "reject_reason",
-    }
-    return {key: value for key, value in row.items() if key in allowed}
-
-
 def _speaker_count(row: MetadataRow) -> int:
     """Return a scalar speaker count for metadata ledger storage."""
     speakers = row.get("speaker_ids", row.get("speakers", ()))
@@ -1287,70 +1943,6 @@ def _speaker_count(row: MetadataRow) -> int:
     if isinstance(speakers, c.Sized):
         return len(speakers)
     return 0
-
-
-def _validate_candidate_locator(row: MetadataRow, status: str) -> None:
-    """Validate the locator appropriate to an audit status.
-
-    Raises:
-        ValueError:
-            If the status-specific immutable locator is incomplete.
-    """
-    if status == "accepted" and _string(row, "local_path") is not None:
-        local_locator = _integer(row, "local_row_locator")
-        if local_locator is None or local_locator < 0:
-            raise ValueError("accepted candidates require a local row locator")
-        return
-    if _parquet_path(row) is not None and (
-        status == "accepted" or not _has_source_locator(row)
-    ):
-        _validate_audit_locator(row)
-        return
-    for key in ("source_repository", "source_file_id"):
-        if not _string(row, key):
-            raise ValueError(f"{status} candidates require {key}")
-    revision = _string(row, "source_revision")
-    if revision is None or not _COMMIT_SHA.fullmatch(revision):
-        raise ValueError(f"{status} candidates require an immutable source revision")
-    start = _integer(row, "source_start_ms")
-    end = _integer(row, "source_end_ms")
-    if start is None or end is None or start < 0 or end <= start:
-        raise ValueError(f"{status} candidates require a valid source interval")
-    shard_path = _source_shard_path(row)
-    row_group = _integer(row, "source_row_group")
-    if row_group is None:
-        row_group = 0
-    row_index = _integer(row, "source_row_index", "source_row_locator", "row_locator")
-    if shard_path is None or row_group is None or row_index is None:
-        raise ValueError(f"{status} candidates require an exact source row locator")
-    if not shard_path.lower().endswith(".parquet") or row_group < 0 or row_index < 0:
-        raise ValueError(f"{status} candidates have an invalid source row locator")
-
-
-def _source_shard_path(row: MetadataRow) -> str | None:
-    """Return the exact source Parquet path, including legacy aliases."""
-    value = _string(
-        row,
-        "source_shard_path",
-        "source_shard",
-        "source_parquet_path",
-        "source_parquet",
-        "parquet_path",
-    )
-    return value if value and value.lower().endswith(".parquet") else None
-
-
-def _has_source_locator(row: MetadataRow) -> bool:
-    """Return whether a row contains the complete source interval locator."""
-    return all(
-        (
-            _string(row, "source_repository"),
-            _string(row, "source_revision"),
-            _string(row, "source_file_id"),
-            _integer(row, "source_start_ms") is not None,
-            _integer(row, "source_end_ms") is not None,
-        )
-    )
 
 
 def normalised_wer(reference: str, hypothesis: str) -> float:
@@ -1448,598 +2040,6 @@ def build_representative_audit_candidates(
         borderline_quota=borderline_quota,
         seed=seed,
     )
-
-
-class AuditReservoir:
-    """Crash-safe, corpus-wide reservoir for the bounded audit manifest.
-
-    The state file contains only the currently selected metadata records.  Each
-    update is written to a temporary sibling and atomically renamed, so a crash
-    cannot leave a half-written reservoir or an unbounded per-programme log.
-    """
-
-    def __init__(
-        self,
-        path: Path | str,
-        *,
-        accepted_quota: int = 200,
-        rejected_quota: int = 100,
-        borderline_quota: int = 100,
-        seed: int | str = "p1",
-    ) -> None:
-        """Open a bounded reservoir, recovering its previous selection.
-
-        Raises:
-            ValueError:
-                If quotas or a recovered state file are invalid.
-        """
-        self.path = Path(path)
-        self.quotas = {
-            "accepted": accepted_quota,
-            "rejected": rejected_quota,
-            "borderline": borderline_quota,
-        }
-        if any(value < 0 for value in self.quotas.values()):
-            raise ValueError("audit quotas must not be negative")
-        self.seed = seed
-        self.rows: list[dict[str, object]] = []
-        if self.path.exists():
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(value, list) or not all(
-                isinstance(item, dict) for item in value
-            ):
-                raise ValueError("audit reservoir is not a JSON list of records")
-            self.rows = [t.cast(dict[str, object], item) for item in value]
-
-    def add(self, candidates: RowStream) -> None:
-        """Merge candidates and persist the bounded, stratified selection.
-
-        Raises:
-            ValueError:
-                If a candidate has no valid temporary or immutable locator.
-        """
-        combined_by_identity: dict[tuple[str, str], MetadataRow] = {}
-        for row in [*self.rows, *candidates]:
-            key = (_status(row), _identity(row))
-            existing = combined_by_identity.get(key)
-            if existing is not None and _parquet_path(existing) is not None:
-                incoming_path = _parquet_path(row)
-                incoming_revision = _string(row, "revision", "hub_revision")
-                existing_revision = _string(existing, "revision", "hub_revision")
-                if incoming_path is None:
-                    continue
-                if incoming_path != _parquet_path(existing) or (
-                    incoming_revision != existing_revision
-                ):
-                    raise ValueError("audit candidate remote locator is immutable")
-            combined_by_identity[key] = row
-        combined = list(combined_by_identity.values())
-        reservoirs = {
-            status: _StratifiedReservoir(quota) for status, quota in self.quotas.items()
-        }
-        for ordinal, row in enumerate(combined):
-            status = _status(row)
-            if status not in reservoirs or not self.quotas[status]:
-                continue
-            _validate_candidate_locator(row, status)
-            safe_row = _metadata_copy(row)
-            safe_row["_p1_metadata_sha256"] = _metadata_digest(row)
-            audio_digest = _audio_digest(row)
-            if audio_digest is not None:
-                safe_row["_p1_audio_sha256"] = audio_digest
-            reservoirs[status].add(
-                safe_row, seed=f"{self.seed}:{status}", ordinal=ordinal
-            )
-        self.rows = [
-            row
-            for status, reservoir in reservoirs.items()
-            for row in reservoir.rows()
-            if _status(row) == status
-        ]
-        self._write_state()
-
-    def update_remote_locators(
-        self,
-        *,
-        repository: str,
-        revision: str,
-        local_paths: c.Sequence[Path | str],
-        remote_paths: c.Sequence[str],
-        row_counts: c.Sequence[int],
-    ) -> int:
-        """Resolve selected local candidates to immutable remote locations.
-
-        Local identity is retained in the crash-safe reservoir until the commit SHA
-        and publication-relative path are known.  This makes a restart after a
-        verification failure able to finish the same audit selection without
-        sampling the accepted rows again.
-
-        Returns:
-            Number of selected candidates resolved to remote locators.
-
-        Raises:
-            ValueError:
-                If shard locator sequences or the immutable revision are invalid.
-        """
-        if not _COMMIT_SHA.fullmatch(revision):
-            raise ValueError("audit candidates require a complete immutable revision")
-        if not (len(local_paths) == len(remote_paths) == len(row_counts)):
-            raise ValueError("local and remote shard evidence must have equal lengths")
-        by_identity: dict[tuple[str, int], tuple[str, str]] = {}
-        for local, remote, count in zip(
-            local_paths, remote_paths, row_counts, strict=True
-        ):
-            if count < 0:
-                raise ValueError("audit shard row counts must not be negative")
-            local_key = str(Path(local).expanduser().resolve(strict=False))
-            for row_locator in range(count):
-                by_identity[(local_key, row_locator)] = (remote, repository)
-
-        resolved = 0
-        for row in self.rows:
-            if _status(row) != "accepted":
-                continue
-            local = _string(row, "local_path")
-            row_locator = _integer(row, "local_row_locator")
-            if local is None or row_locator is None:
-                continue
-            target = by_identity.get(
-                (str(Path(local).expanduser().resolve(strict=False)), row_locator)
-            )
-            if target is None:
-                continue
-            remote, target_repository = target
-            existing_path = _parquet_path(row)
-            existing_revision = _string(row, "revision", "hub_revision")
-            if existing_path is not None:
-                if existing_path != remote or existing_revision != revision:
-                    raise ValueError("audit candidate remote locator is immutable")
-                continue
-            row.update(
-                {
-                    "repository": target_repository,
-                    "revision": revision,
-                    "parquet_path": remote,
-                    "remote_parquet_path": remote,
-                    "row_locator": row_locator,
-                }
-            )
-            row.pop("local_path", None)
-            row.pop("local_row_locator", None)
-            resolved += 1
-        if resolved:
-            self._write_state()
-        return resolved
-
-    resolve_remote_locators = update_remote_locators
-
-    def finalise(self, path: Path | str) -> list[dict[str, object]]:
-        """Write the sole final blinded manifest after all commits are known.
-
-        Returns:
-            The metadata-only manifest records.
-        """
-        manifest = create_blinded_audit_manifest(
-            self.rows,
-            accepted_quota=self.quotas["accepted"],
-            rejected_quota=self.quotas["rejected"],
-            borderline_quota=self.quotas["borderline"],
-            seed=self.seed,
-        )
-        destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(f".{destination.name}.tmp")
-        with temporary.open("w", encoding="utf-8") as stream:
-            for candidate in manifest:
-                stream.write(json.dumps(candidate, sort_keys=True) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(destination)
-        return manifest
-
-    def _write_state(self) -> None:
-        """Atomically persist the bounded selection."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(f".{self.path.name}.tmp")
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(self.rows, stream, sort_keys=True, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(self.path)
-
-
-def create_blinded_audit_manifest(
-    rows: RowStream,
-    *,
-    accepted_quota: int = 200,
-    rejected_quota: int = 100,
-    borderline_quota: int = 0,
-    seed: int | str = 0,
-) -> list[dict[str, object]]:
-    """Create bounded, label-free candidate records for a blinded audit.
-
-    Sampling is performed by a bounded reservoir for each status.  At most the
-    requested quota is retained for a status, irrespective of corpus size; source
-    labels, transcripts, and audio are never copied into the result.  The default
-    quotas are the production pilot quotas (200 accepted and 100 rejected).
-
-    Returns:
-        Metadata-only candidate records. Accepted rows have a Parquet locator;
-        rejected and borderline rows have a source interval locator.
-
-    Raises:
-        ValueError:
-            If a quota is negative.
-    """
-    quotas = {
-        "accepted": accepted_quota,
-        "rejected": rejected_quota,
-        "borderline": borderline_quota,
-    }
-    if any(value < 0 for value in quotas.values()):
-        raise ValueError("audit quotas must not be negative")
-    reservoirs = {
-        status: _StratifiedReservoir(quota) for status, quota in quotas.items()
-    }
-    for ordinal, row in enumerate(rows):
-        status = _status(row)
-        if quotas[status]:
-            _validate_candidate_locator(row, status)
-            safe_row = _metadata_copy(row)
-            safe_row["_p1_metadata_sha256"] = _metadata_digest(row)
-            audio_digest = _audio_digest(row)
-            if audio_digest is not None:
-                safe_row["_p1_audio_sha256"] = audio_digest
-            reservoirs[status].add(safe_row, seed=f"{seed}:{status}", ordinal=ordinal)
-    selected: list[dict[str, object]] = []
-    for status, quota in quotas.items():
-        selected.extend(
-            _candidate_source_rows(
-                reservoirs[status].rows(), status=status, seed=f"{seed}:{status}"
-            )
-        )
-    selected.sort(key=lambda item: (_identity(item), _stratum_key(item)))
-    manifest: list[dict[str, object]] = []
-    for ordinal, row in enumerate(selected):
-        identity = _identity(row)
-        status = _status(row)
-        audit_id = hashlib.sha256(f"{seed}\0{ordinal}\0{identity}".encode()).hexdigest()
-        candidate = AuditCandidate(
-            audit_id=audit_id,
-            segment_id=identity,
-            repository=(
-                _string(row, "repository", "repo_id", "hub_repo")
-                if status == "accepted" or not _has_source_locator(row)
-                else None
-            ),
-            revision=(
-                _string(row, "revision", "hub_revision")
-                if status == "accepted" or not _has_source_locator(row)
-                else None
-            ),
-            parquet_path=(
-                _parquet_path(row)
-                if status == "accepted" or not _has_source_locator(row)
-                else None
-            ),
-            row_locator=(
-                _row_locator(row, ordinal)
-                if status == "accepted" or not _has_source_locator(row)
-                else 0
-            ),
-            stratum=_stratum_key(row),
-            metadata_sha256=(
-                _string(row, "_p1_metadata_sha256") or _metadata_digest(row)
-            ),
-            audio_sha256=_string(row, "_p1_audio_sha256", "audio_sha256"),
-            parquet_sha256=_string(
-                row, "parquet_sha256", "shard_sha256", "_p1_parquet_sha256"
-            ),
-            source_file_id=_string(row, "source_file_id", "programme_id"),
-            source_repository=_string(row, "source_repository"),
-            source_revision=_string(row, "source_revision"),
-            source_start_ms=_integer(row, "source_start_ms"),
-            source_end_ms=_integer(row, "source_end_ms"),
-            source_shard_path=(
-                _source_shard_path(row) if status != "accepted" else None
-            ),
-            source_row_group=(
-                (_integer(row, "source_row_group") or 0)
-                if status != "accepted"
-                else None
-            ),
-            source_row_index=(
-                _integer(row, "source_row_index", "source_row_locator", "row_locator")
-                if status != "accepted"
-                else None
-            ),
-            source_shard_byte_size=(
-                _integer(row, "source_shard_byte_size")
-                if status != "accepted"
-                else None
-            ),
-        )
-        manifest.append(candidate.as_dict())
-    return manifest
-
-
-@dataclass(frozen=True)
-class AuditCandidate:
-    """Durable, metadata-only location for one blinded audit item.
-
-    Accepted candidates contain a Parquet object and row locator. Rejected and
-    borderline candidates contain an immutable source file and interval locator.
-    It is safe to persist in a manifest or SQLite database.
-    """
-
-    audit_id: str
-    segment_id: str
-    repository: str | None = None
-    revision: str | None = None
-    parquet_path: str | None = None
-    row_locator: int = 0
-    stratum: tuple[str, ...] = ()
-    metadata_sha256: str = ""
-    audio_sha256: str | None = None
-    parquet_sha256: str | None = None
-    source_file_id: str | None = None
-    source_repository: str | None = None
-    source_revision: str | None = None
-    source_start_ms: int | None = None
-    source_end_ms: int | None = None
-    source_shard_path: str | None = None
-    source_row_group: int | None = None
-    source_row_index: int | None = None
-    source_shard_byte_size: int | None = None
-
-    def __post_init__(self) -> None:
-        """Reject durable records that cannot be retrieved later.
-
-        Raises:
-            ValueError:
-                If the remote locator is incomplete or malformed.
-        """
-        if self.parquet_path is not None:
-            if not self.parquet_path.lower().endswith(".parquet"):
-                raise ValueError("audit candidates require a remote Parquet path")
-            if self.row_locator < 0:
-                raise ValueError("audit candidates require a non-negative row locator")
-            if self.revision is None or not _COMMIT_SHA.fullmatch(self.revision):
-                raise ValueError(
-                    "audit candidates require a complete immutable commit SHA"
-                )
-        elif not self.source_file_id or not self.source_repository:
-            raise ValueError("source audit candidates require a source locator")
-        if self.parquet_path is None:
-            if self.source_revision is None or not _COMMIT_SHA.fullmatch(
-                self.source_revision
-            ):
-                raise ValueError(
-                    "source audit candidates require an immutable revision"
-                )
-            if (
-                self.source_start_ms is None
-                or self.source_end_ms is None
-                or self.source_start_ms < 0
-                or self.source_end_ms <= self.source_start_ms
-            ):
-                raise ValueError("source audit candidates require a valid interval")
-            if (
-                self.source_shard_path is None
-                or not self.source_shard_path.lower().endswith(".parquet")
-                or self.source_row_group is None
-                or self.source_row_group < 0
-                or self.source_row_index is None
-                or self.source_row_index < 0
-            ):
-                raise ValueError(
-                    "source audit candidates require an exact source row locator"
-                )
-            if (
-                self.source_shard_byte_size is not None
-                and self.source_shard_byte_size <= 0
-            ):
-                raise ValueError("source shard byte size must be positive")
-
-    def as_dict(self) -> dict[str, object]:
-        """Return a JSON-compatible metadata record without the source label."""
-        result: dict[str, object] = {
-            "audit_id": self.audit_id,
-            "segment_id": self.segment_id,
-            "stratum": list(self.stratum),
-            "metadata_sha256": self.metadata_sha256,
-        }
-        if self.parquet_path is not None:
-            result.update(
-                {
-                    "repository": self.repository,
-                    "revision": self.revision,
-                    "parquet_path": self.parquet_path,
-                    "remote_parquet_path": self.parquet_path,
-                    "row_locator": self.row_locator,
-                }
-            )
-        if self.audio_sha256 is not None:
-            result["audio_sha256"] = self.audio_sha256
-        if self.parquet_sha256 is not None:
-            result["parquet_sha256"] = self.parquet_sha256
-        if self.source_file_id is not None:
-            result["source_file_id"] = self.source_file_id
-        if self.source_repository is not None:
-            result["source_repository"] = self.source_repository
-        if self.source_revision is not None:
-            result["source_revision"] = self.source_revision
-        if self.source_start_ms is not None:
-            result["source_start_ms"] = self.source_start_ms
-        if self.source_end_ms is not None:
-            result["source_end_ms"] = self.source_end_ms
-        if self.source_shard_path is not None:
-            result["source_shard_path"] = self.source_shard_path
-        if self.source_row_group is not None:
-            result["source_row_group"] = self.source_row_group
-        if self.source_row_index is not None:
-            result["source_row_index"] = self.source_row_index
-        if self.source_shard_byte_size is not None:
-            result["source_shard_byte_size"] = self.source_shard_byte_size
-        return result
-
-
-class _StratifiedReservoir:
-    """Bounded, multi-axis reservoir with one fair bucket per stratum.
-
-    A bucket is a complete combination of the required axes, rather than one axis
-    selected after the fact.  Each bucket receives a fair share of the bounded
-    capacity; a seeded ``random.Random`` priority makes selection reproducible
-    without depending on Python's process-randomised ``hash`` function.
-    """
-
-    def __init__(self, capacity: int) -> None:
-        if capacity < 0:
-            raise ValueError("reservoir capacity must not be negative")
-        self.capacity = capacity
-        self.groups: dict[tuple[str, ...], list[tuple[float, dict[str, object]]]] = {}
-
-    def add(self, row: dict[str, object], *, seed: str, ordinal: int) -> None:
-        """Add a row while retaining at most ``capacity`` metadata records."""
-        del ordinal
-        if not self.capacity:
-            return
-        key = _stratum_key(row)
-        if key not in self.groups:
-            if len(self.groups) >= self.capacity:
-                new_priority = _random_priority(seed, "stratum", key)
-                worst = max(
-                    self.groups,
-                    key=lambda item: _random_priority(seed, "stratum", item),
-                )
-                if new_priority >= _random_priority(seed, "stratum", worst):
-                    return
-                del self.groups[worst]
-            self.groups[key] = []
-        bucket = self.groups[key]
-        bucket.append((_random_priority(seed, "row", key, _identity(row)), row))
-        bucket.sort(key=lambda item: (item[0], _identity(item[1])))
-        limit = max(1, self.capacity // len(self.groups))
-        for values in self.groups.values():
-            del values[limit:]
-
-    def rows(self) -> list[dict[str, object]]:
-        """Return round-robin records without exceeding the reservoir capacity."""
-        result: list[dict[str, object]] = []
-        ordered = sorted(self.groups.items())
-        depth = 0
-        while len(result) < self.capacity:
-            added = False
-            for _, bucket in ordered:
-                if depth < len(bucket):
-                    result.append(bucket[depth][1])
-                    added = True
-                    if len(result) == self.capacity:
-                        break
-            if not added:
-                break
-            depth += 1
-        return result
-
-
-def _random_priority(seed: str, *parts: object) -> float:
-    """Return a stable pseudo-random priority without using process hash state."""
-    generator = random.Random("\0".join([seed, *(str(part) for part in parts)]))
-    return generator.random()
-
-
-def _stratum_key(row: MetadataRow) -> tuple[str, ...]:
-    """Build the fixed-dimensional key used by the bounded sampler.
-
-    Returns:
-        Duration, show, speaker, music, probability, position, confidence, and
-        drift dimensions.
-    """
-    duration = _number(row, "duration_ms") or 0
-    duration_class = (
-        "short" if duration < 2_000 else "long" if duration > 8_000 else "target"
-    )
-    speakers = row.get("speaker_ids", row.get("speakers", ()))
-    if isinstance(speakers, (str, bytes)):
-        speaker_count = 1
-    elif isinstance(speakers, c.Sized):
-        speaker_count = len(speakers)
-    else:
-        speaker_count = int(_number(row, "speaker_count") or 0)
-    language_probability = _number(row, "language_probability", "language_prob") or 0
-    confidence = _number(row, "alignment_score", "confidence") or 0
-    drift = abs(
-        _number(row, "drift_ms")
-        or max(
-            abs(_number(row, "start_drift_ms") or 0),
-            abs(_number(row, "end_drift_ms") or 0),
-        )
-    )
-    return (
-        f"duration-{duration_class}",
-        f"show-{_string(row, 'show', 'show_type', 'programme_type') or 'unknown'}",
-        f"speakers-{speaker_count}",
-        "music" if _boolean(row, "music", "music_dominant") else "speech",
-        "language-"
-        + _explicit_or_decile(
-            row,
-            ("language_probability_decile", "language_decile"),
-            language_probability,
-        ),
-        "position-"
-        + _explicit_or_decile(
-            row,
-            ("programme_position_decile", "position_decile"),
-            _number(row, "programme_position", "position") or 0,
-        ),
-        f"confidence-{_explicit_or_decile(row, ('confidence_decile',), confidence)}",
-        f"drift-{_explicit_or_decile(row, ('drift_decile',), drift / 1_000)}",
-    )
-
-
-def _explicit_or_decile(row: MetadataRow, keys: tuple[str, ...], value: float) -> str:
-    """Use a supplied decile or derive one from a normalised numeric value.
-
-    Returns:
-        A canonical ``d0`` to ``d9`` label.
-    """
-    explicit = _string(row, *keys)
-    if explicit:
-        label = explicit.casefold()
-        if label.startswith("d"):
-            label = label[1:]
-        try:
-            decile = int(label)
-        except ValueError:
-            decile = int(value * 10)
-        return f"d{min(9, max(0, decile))}"
-    return f"d{min(9, max(0, int(value * 10)))}"
-
-
-def _audio_digest(row: MetadataRow) -> str | None:
-    value = row.get("audio", row.get("waveform"))
-    if isinstance(value, bytes):
-        return hashlib.sha256(value).hexdigest()
-    if isinstance(value, c.Mapping) and isinstance(value.get("bytes"), bytes):
-        return hashlib.sha256(t.cast(bytes, value["bytes"])).hexdigest()
-    return None
-
-
-def _candidate_source_rows(
-    rows: c.Iterable[dict[str, object]], *, status: str, seed: str
-) -> list[dict[str, object]]:
-    """Keep status selection internal while returning only selected source rows.
-
-    Returns:
-        The selected metadata rows.
-    """
-    del status, seed
-    return list(rows)
-
-
-def _row_locator(row: MetadataRow, fallback: int) -> int:
-    explicit = _explicit_row_locator(row)
-    return fallback if explicit is None else explicit
 
 
 def build_structural_report(

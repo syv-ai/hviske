@@ -30,6 +30,45 @@ from hviske.p1_validation import (
 )
 
 
+def test_accepted_audit_locator_is_resolved_after_restart(tmp_path: Path) -> None:
+    """A pending local candidate survives a failed upload verification."""
+    reservoir_path = tmp_path / "reservoir.json"
+    local_path = tmp_path / "staging" / "shard.parquet"
+    reservoir = AuditReservoir(
+        reservoir_path, accepted_quota=1, rejected_quota=0, borderline_quota=0
+    )
+    reservoir.add(
+        [
+            {
+                "segment_id": "accepted-1",
+                "status": "accepted",
+                "local_path": str(local_path),
+                "local_row_locator": 3,
+            }
+        ]
+    )
+
+    recovered = AuditReservoir(
+        reservoir_path, accepted_quota=1, rejected_quota=0, borderline_quota=0
+    )
+    assert recovered.rows[0]["local_path"] == str(local_path)
+    assert (
+        recovered.update_remote_locators(
+            repository="org/private-p1",
+            revision="a" * 40,
+            local_paths=[local_path],
+            remote_paths=["data/train/shard.parquet"],
+            row_counts=[4],
+        )
+        == 1
+    )
+    manifest = recovered.finalise(tmp_path / "manifest.jsonl")
+    assert manifest[0]["revision"] == "a" * 40
+    assert manifest[0]["parquet_path"] == "data/train/shard.parquet"
+    assert manifest[0]["row_locator"] == 3
+    assert "local_path" not in manifest[0]
+
+
 def test_aggregate_totals_and_distributions() -> None:
     """Aggregates preserve status totals and numeric distribution counts."""
     report = aggregate_rows([_row(0), _row(1, "rejected"), _row(2, "borderline")])
@@ -142,6 +181,23 @@ def test_blinded_manifest_has_all_quotas_without_labels() -> None:
         assert prefixes == required_axes
 
 
+def test_bounded_reservoir_does_not_retain_audio_or_grow() -> None:
+    """Representative selection keeps only its configured candidate reservoir."""
+    rows = (
+        {
+            **_row(index),
+            "parquet_path": "data/train/part-00000.parquet",
+            "row_locator": index,
+            "audio": b"must not be retained",
+        }
+        for index in range(10_000)
+    )
+    selected = stratified_sample(rows, sample_size=17, seed="bounded")
+
+    assert len(selected) == 17
+    assert all("audio" not in row and "waveform" not in row for row in selected)
+
+
 def test_corpus_audit_reservoir_is_bounded_and_recoverable(tmp_path: Path) -> None:
     """One durable reservoir retains every requested status without growing."""
     path = tmp_path / "reservoir.json"
@@ -162,62 +218,6 @@ def test_corpus_audit_reservoir_is_bounded_and_recoverable(tmp_path: Path) -> No
     assert len(manifest) == 6
     assert {item["source_file_id"] for item in manifest if "source_file_id" in item}
     assert not (tmp_path / ".reservoir.json.tmp").exists()
-
-
-def test_accepted_audit_locator_is_resolved_after_restart(tmp_path: Path) -> None:
-    """A pending local candidate survives a failed upload verification."""
-    reservoir_path = tmp_path / "reservoir.json"
-    local_path = tmp_path / "staging" / "shard.parquet"
-    reservoir = AuditReservoir(
-        reservoir_path, accepted_quota=1, rejected_quota=0, borderline_quota=0
-    )
-    reservoir.add(
-        [
-            {
-                "segment_id": "accepted-1",
-                "status": "accepted",
-                "local_path": str(local_path),
-                "local_row_locator": 3,
-            }
-        ]
-    )
-
-    recovered = AuditReservoir(
-        reservoir_path, accepted_quota=1, rejected_quota=0, borderline_quota=0
-    )
-    assert recovered.rows[0]["local_path"] == str(local_path)
-    assert (
-        recovered.update_remote_locators(
-            repository="org/private-p1",
-            revision="a" * 40,
-            local_paths=[local_path],
-            remote_paths=["data/train/shard.parquet"],
-            row_counts=[4],
-        )
-        == 1
-    )
-    manifest = recovered.finalise(tmp_path / "manifest.jsonl")
-    assert manifest[0]["revision"] == "a" * 40
-    assert manifest[0]["parquet_path"] == "data/train/shard.parquet"
-    assert manifest[0]["row_locator"] == 3
-    assert "local_path" not in manifest[0]
-
-
-def test_bounded_reservoir_does_not_retain_audio_or_grow() -> None:
-    """Representative selection keeps only its configured candidate reservoir."""
-    rows = (
-        {
-            **_row(index),
-            "parquet_path": "data/train/part-00000.parquet",
-            "row_locator": index,
-            "audio": b"must not be retained",
-        }
-        for index in range(10_000)
-    )
-    selected = stratified_sample(rows, sample_size=17, seed="bounded")
-
-    assert len(selected) == 17
-    assert all("audio" not in row and "waveform" not in row for row in selected)
 
 
 def test_deciles_and_strata_are_deterministic() -> None:

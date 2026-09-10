@@ -192,36 +192,6 @@ class MemoryHub:
         return [content[:1], content[1:]]
 
 
-def test_card_contains_required_terms_and_no_credentials() -> None:
-    """Cards contain the required private-use statement and reject tokens."""
-    card = make_card()
-    assert "No public redistribution grant" in card
-    assert all(section in card for section in ("Source provenance", "Field schema"))
-    with pytest.raises(PublicationError):
-        initialise_private_dataset(
-            MemoryHub(), "org/p1", card="token=hf_" + "x" * 20, token="hf_" + "x" * 20
-        )
-
-
-def make_card() -> str:
-    """Build representative card metadata for tests.
-
-    Returns:
-        A safe dataset card.
-    """
-    return build_dataset_card(
-        source_provenance="Pinned source programmes",
-        permitted_use="Internal ASR research",
-        private_access_terms="Access is limited to the project organisation",
-        alignment_method="VAD followed by CTC alignment",
-        field_schema="audio, text and deterministic metadata",
-        known_limitations="Danish speech only",
-        rejection_policy="Reject undecodable or poorly aligned material",
-        source_revisions="dataset@" + "a" * 40,
-        model_revisions="ctc@" + "b" * 40,
-    )
-
-
 def write_valid_shard(path: Path) -> None:
     """Write one contract-valid shard for publisher integration tests."""
     payload_stream = io.BytesIO()
@@ -251,6 +221,36 @@ def write_valid_shard(path: Path) -> None:
         pipeline_config_sha256="b" * 64,
     )
     pq.write_table(_rows_table([row]), path)
+
+
+def test_card_contains_required_terms_and_no_credentials() -> None:
+    """Cards contain the required private-use statement and reject tokens."""
+    card = make_card()
+    assert "No public redistribution grant" in card
+    assert all(section in card for section in ("Source provenance", "Field schema"))
+    with pytest.raises(PublicationError):
+        initialise_private_dataset(
+            MemoryHub(), "org/p1", card="token=hf_" + "x" * 20, token="hf_" + "x" * 20
+        )
+
+
+def make_card() -> str:
+    """Build representative card metadata for tests.
+
+    Returns:
+        A safe dataset card.
+    """
+    return build_dataset_card(
+        source_provenance="Pinned source programmes",
+        permitted_use="Internal ASR research",
+        private_access_terms="Access is limited to the project organisation",
+        alignment_method="VAD followed by CTC alignment",
+        field_schema="audio, text and deterministic metadata",
+        known_limitations="Danish speech only",
+        rejection_policy="Reject undecodable or poorly aligned material",
+        source_revisions="dataset@" + "a" * 40,
+        model_revisions="ctc@" + "b" * 40,
+    )
 
 
 def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
