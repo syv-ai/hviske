@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ from hviske.p1_models import (
     ModelPinError,
     SileroVADBackend,
     download_silero_vad,
+    validate_ctc_model_contract,
     verify_hub_model_revision,
     verify_silero_vad_asset,
     verify_silero_vad_revision,
@@ -40,6 +42,71 @@ def test_hub_model_revision_uses_hf_api() -> None:
     api = FakeApi()
     verify_hub_model_revision(repository="org/model", revision="a" * 40, api=api)
     assert api.calls == [("org/model", "a" * 40)]
+
+
+def test_roest_ctc_contract_derives_20ms_frames_and_token_coverage() -> None:
+    """The pinned architecture derives the expected alignment clock and coverage."""
+    model_config, processor = _roest_contract_objects()
+
+    assert (
+        validate_ctc_model_contract(model_config=model_config, processor=processor)
+        == 20.0
+    )
+
+
+def _roest_contract_objects() -> tuple[SimpleNamespace, SimpleNamespace]:
+    vocabulary = {
+        token: index
+        for index, token in enumerate("0123456789abcdefghijklmnopqrstuvwxyz|åæéøü")
+    }
+    vocabulary.update({"<s>": 42, "</s>": 43, "<unk>": 44, "<pad>": 45})
+    tokenizer = SimpleNamespace(
+        get_vocab=lambda: vocabulary,
+        pad_token_id=45,
+        pad_token="<pad>",
+        word_delimiter_token="|",
+    )
+    processor = SimpleNamespace(
+        feature_extractor=SimpleNamespace(sampling_rate=16000), tokenizer=tokenizer
+    )
+    model_config = SimpleNamespace(
+        architectures=["Wav2Vec2ForCTC"],
+        model_type="wav2vec2",
+        sampling_rate=16000,
+        conv_stride=[5, 2, 2, 2, 2, 2, 2],
+        inputs_to_logits_ratio=320,
+        vocab_size=46,
+        pad_token_id=45,
+    )
+    return model_config, processor
+
+
+def test_roest_ctc_contract_rejects_missing_danish_token() -> None:
+    """The tokenizer must retain the Danish letters used by alignment text."""
+    model_config, processor = _roest_contract_objects()
+    vocabulary = processor.tokenizer.get_vocab()
+    del vocabulary["å"]
+
+    with pytest.raises(ValueError, match="does not cover Danish letters"):
+        validate_ctc_model_contract(model_config=model_config, processor=processor)
+
+
+def test_roest_ctc_contract_rejects_sampling_rate_mismatch() -> None:
+    """The processor and model must use the P1 16 kHz input clock."""
+    model_config, processor = _roest_contract_objects()
+    processor.feature_extractor.sampling_rate = 8_000
+
+    with pytest.raises(ValueError, match="must use 16000 Hz sampling"):
+        validate_ctc_model_contract(model_config=model_config, processor=processor)
+
+
+def test_roest_ctc_contract_rejects_unsupported_frame_stride() -> None:
+    """A changed convolutional stride cannot silently corrupt boundaries."""
+    model_config, processor = _roest_contract_objects()
+    model_config.conv_stride = [5, 2, 2, 2, 2, 2]
+
+    with pytest.raises(ValueError, match="unsupported CTC frame stride"):
+        validate_ctc_model_contract(model_config=model_config, processor=processor)
 
 
 def test_silero_asset_rejects_content_checksum(tmp_path: Path) -> None:

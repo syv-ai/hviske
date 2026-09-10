@@ -641,6 +641,33 @@ def test_overlong_transcript_is_a_terminal_transcript_over_audio_rejection(
     assert report.rejection_counts == {"transcript_over_audio": 1}
 
 
+def test_p1_settings_record_roest_model_evidence(tmp_path: Path) -> None:
+    """Pipeline reports and identity evidence name the exact Roest checkpoint."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+
+    assert settings.pipeline_version == "p1-segmentation-4"
+    assert settings.model_revisions["ctc"] == {
+        "repository": "CoRal-project/roest-v3-wav2vec2-315m",
+        "revision": "beb3e790246d6b9dec1df596b0b21d5c42f4d99c",
+        "license": "openrail",
+        "license_url": (
+            "https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE"
+        ),
+        "license_notes": (
+            "Model card metadata is openrail; the card describes a custom OpenRAIL-M "
+            "licence permitting commercial use with restrictions on speech synthesis "
+            "and biometric identification. P1 uses the model for ASR alignment only."
+        ),
+        "architecture": "Wav2Vec2ForCTC",
+        "model_type": "wav2vec2",
+        "sampling_rate": 16000,
+        "frame_stride_samples": 320,
+        "vocab_size": 46,
+        "blank_token_id": 45,
+        "word_delimiter_token_id": 36,
+    }
+
+
 def test_parser_timestamp_failure_is_invalid_timestamp_rejection(
     tmp_path: Path,
 ) -> None:

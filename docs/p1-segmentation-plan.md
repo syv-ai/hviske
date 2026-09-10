@@ -137,19 +137,28 @@ or noise rejection through a separate pinned heuristic or classifier validated i
 pilot.
 
 Refine and verify each local candidate with a Danish-capable CTC forced aligner. The
-first implementation should adapt the Python interface exposed by
-[`ctc-forced-aligner`](https://github.com/MahmoudAshraf97/ctc-forced-aligner): it
-supports ISO 639-3 language identifiers, chunked emissions, word timestamps, and
-alignment scores. Pin both the code commit and model commit.
+implementation uses the pinned `ctc-segmentation` source and the
+[`CoRal-project/roest-v3-wav2vec2-315m`](https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m)
+checkpoint at `beb3e790246d6b9dec1df596b0b21d5c42f4d99c`. Its
+`Wav2Vec2ForCTC`/`wav2vec2` configuration has a 16 kHz processor and a 320-sample
+convolution stride (20 ms). The pipeline derives and validates that frame duration
+from the loaded configuration rather than trusting a free default.
 
-Do not adopt its default model without checking its licence and Danish pilot quality.
-Select the production model through the pilot. A model is eligible only when:
+The model card metadata designates the model `openrail`, and its prose describes a
+custom OpenRAIL-M licence. The licence URL recorded in the pipeline metadata is
+[the model card's referenced licence](https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE);
+it permits commercial use with restrictions on speech synthesis and biometric
+identification. P1 uses the checkpoint for ASR alignment only; it is not labelled
+Apache-2.0. Its 46-token vocabulary includes digits, Danish letters, blank/pad token
+45, and word delimiter `|` at token 36. A model is eligible only when:
 
-- its licence permits this private commercial data-preparation use;
+- its exact Hub revision can be pinned;
+- its declared licence permits this private commercial data-preparation use;
+- its processor sampling rate and convolution stride match the P1 16 kHz/20 ms
+  alignment clock;
 - its tokenizer covers Danish letters and the normalised transcript sufficiently;
 - it produces stable word scores and boundaries on representative P1 programmes;
-- it is independent enough from the target training model to provide useful checks;
-- its exact Hub revision can be pinned.
+- it is independent enough from the target training model to provide useful checks.
 
 WhisperX supports the locality rationale: VAD and transcription proposals are followed
 by a language-specific phoneme model and dynamic time warping. It is not evidence for
@@ -447,8 +456,9 @@ segmented P1 dataset.
 
 Retain only:
 
-- source, model, and code revisions;
-- versioned configuration and normalisation rules;
+- source, model, and code revisions, including the CTC licence designation and URL;
+- versioned configuration and normalisation rules, including the CTC architecture,
+  sampling rate, convolution stride, vocabulary size, blank, and delimiter IDs;
 - metadata-only SQLite ledger and batch manifests;
 - shard paths, sizes, row counts, SHA-256 digests, and Hub commit IDs;
 - aggregate quality reports and manual-audit decisions;

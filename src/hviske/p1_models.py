@@ -25,9 +25,23 @@ SILERO_MODEL_PATH = "src/silero_vad/data/silero_vad.jit"
 SILERO_MODEL_BLOB = "5c6988d663950a93a5f0d6c38c2fe024653ec552"
 SILERO_MODEL_SHA256 = "e1122837f4154c511485fe0b9c64455f7b929c96fbb8d79fbdb336383ebd3720"
 
+ROEST_REPOSITORY = "CoRal-project/roest-v3-wav2vec2-315m"
+ROEST_REVISION = "beb3e790246d6b9dec1df596b0b21d5c42f4d99c"
+ROEST_LICENSE = "openrail"
+ROEST_LICENSE_URL = (
+    "https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE"
+)
+ROEST_SAMPLING_RATE = 16_000
+ROEST_FRAME_STRIDE_SAMPLES = 320
+ROEST_FRAME_DURATION_MS = 20.0
+ROEST_VOCAB_SIZE = 46
+ROEST_BLANK_TOKEN_ID = 45
+ROEST_WORD_DELIMITER_TOKEN_ID = 36
+ROEST_REQUIRED_TOKENS = frozenset("0123456789abcdefghijklmnopqrstuvwxyzåæéøü")
+
 
 class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
-    """Pinned Danish wav2vec2 emissions plus real ctc-segmentation alignment."""
+    """Pinned Roest Danish wav2vec2 emissions and CTC alignment."""
 
     def __init__(
         self,
@@ -35,29 +49,45 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
         revision: str,
         *,
         device: str = "cpu",
-        frame_duration_ms: float = 20.0,
+        frame_duration_ms: float | None = None,
     ) -> None:
         """Load the processor and model at one immutable Hub revision.
 
         Raises:
-            ValueError:
-                If the processor does not expose a CTC blank token.
+            ModelPinError:
+                If the repository or revision is not the pinned Roest checkpoint.
         """
         import torch
-        from transformers import AutoModelForCTC, AutoProcessor
+        from transformers import (
+            AutoModelForCTC,
+            Wav2Vec2CTCTokenizer,
+            Wav2Vec2FeatureExtractor,
+            Wav2Vec2Processor,
+        )
 
+        if (repository, revision) != (ROEST_REPOSITORY, ROEST_REVISION):
+            raise ModelPinError("P1 CTC backend requires the pinned Roest checkpoint")
         verify_hub_model_revision(repository=repository, revision=revision)
         self._torch = torch
-        self._processor = AutoProcessor.from_pretrained(repository, revision=revision)
+        tokenizer = Wav2Vec2CTCTokenizer.from_pretrained(repository, revision=revision)
+        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+            repository, revision=revision
+        )
+        self._processor = Wav2Vec2Processor(
+            feature_extractor=feature_extractor, tokenizer=tokenizer
+        )
         self._model = AutoModelForCTC.from_pretrained(repository, revision=revision)
         self._model.eval()
         self._device = device
         self._model.to(device)
-        self._frame_duration_ms = frame_duration_ms
-        blank_id = self._processor.tokenizer.pad_token_id
-        if blank_id is None:
-            raise ValueError("the CTC tokenizer must declare its blank/pad token")
-        self._blank_id = int(blank_id)
+        self._frame_duration_ms = validate_ctc_model_contract(
+            model_config=self._model.config,
+            processor=self._processor,
+            expected_frame_duration_ms=frame_duration_ms,
+        )
+        self._sampling_rate = ROEST_SAMPLING_RATE
+        self._frame_stride_samples = ROEST_FRAME_STRIDE_SAMPLES
+        self._blank_id = ROEST_BLANK_TOKEN_ID
         super().__init__(
             emissions_provider=self._compute_emissions,
             tokeniser=self._tokenise_word,
@@ -71,7 +101,16 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
 
         Returns:
             Frame-by-class CTC log probabilities.
+
+        Raises:
+            ValueError:
+                If audio uses a sampling rate other than the model's configured rate.
         """
+        if sampling_rate != self._sampling_rate:
+            raise ValueError(
+                f"CTC audio must be sampled at {self._sampling_rate} Hz, "
+                f"not {sampling_rate} Hz"
+            )
         inputs = self._processor(
             audio, sampling_rate=sampling_rate, return_tensors="pt"
         )
@@ -85,8 +124,121 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
 
         Returns:
             Token IDs for the word.
+
+        Raises:
+            ValueError:
+                If the word contains a character outside the pinned vocabulary.
         """
-        return self._processor.tokenizer(word, add_special_tokens=False).input_ids
+        token_ids = self._processor.tokenizer(word, add_special_tokens=False).input_ids
+        unk_id = getattr(self._processor.tokenizer, "unk_token_id", None)
+        if not token_ids or (unk_id is not None and unk_id in token_ids):
+            raise ValueError(
+                "alignment text contains a token outside the CTC vocabulary"
+            )
+        if any(
+            token_id < 0 or token_id >= ROEST_VOCAB_SIZE or token_id == self._blank_id
+            for token_id in token_ids
+        ):
+            raise ValueError("tokeniser returned an invalid CTC token id")
+        return token_ids
+
+
+class ModelPinError(ValueError):
+    """Raised when a pinned model asset is absent or has changed."""
+
+
+def validate_ctc_model_contract(
+    *,
+    model_config: object,
+    processor: object,
+    expected_frame_duration_ms: float | None = None,
+) -> float:
+    """Validate the pinned Roest CTC architecture and return its frame duration.
+
+    The alignment clock is derived from the model's convolutional feature extractor,
+    rather than from a separately maintained default.  This keeps a changed model
+    architecture from silently shifting every boundary in the P1 output.
+
+    Args:
+        model_config:
+            Transformers model configuration to validate.
+        processor:
+            Transformers processor exposing a feature extractor and tokenizer.
+        expected_frame_duration_ms (optional):
+            Optional caller expectation retained for explicit compatibility checks.
+
+    Returns:
+        Duration represented by one emission frame in milliseconds.
+
+    Raises:
+        ValueError:
+            If the model is not the pinned CTC shape or its tokenizer is incomplete.
+    """
+    architecture = getattr(model_config, "architectures", None)
+    if architecture is None or "Wav2Vec2ForCTC" not in architecture:
+        raise ValueError("P1 CTC model must declare Wav2Vec2ForCTC architecture")
+    if getattr(model_config, "model_type", None) != "wav2vec2":
+        raise ValueError("P1 CTC model must declare model_type wav2vec2")
+
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    sampling_rate = getattr(feature_extractor, "sampling_rate", None)
+    if sampling_rate != ROEST_SAMPLING_RATE:
+        raise ValueError(
+            f"P1 CTC processor must use {ROEST_SAMPLING_RATE} Hz sampling, "
+            f"not {sampling_rate!r}"
+        )
+    configured_sampling_rate = getattr(model_config, "sampling_rate", None)
+    if (
+        configured_sampling_rate is not None
+        and configured_sampling_rate != sampling_rate
+    ):
+        raise ValueError("CTC model and processor sampling rates do not agree")
+
+    strides = getattr(model_config, "conv_stride", None)
+    if not isinstance(strides, c.Sequence) or isinstance(strides, (str, bytes)):
+        raise ValueError("CTC model must declare convolutional strides")
+    if not strides or any(
+        not isinstance(value, int) or value <= 0 for value in strides
+    ):
+        raise ValueError("CTC convolutional strides must be positive integers")
+    stride_samples = int(np.prod(strides))
+    if stride_samples != ROEST_FRAME_STRIDE_SAMPLES:
+        raise ValueError(
+            "unsupported CTC frame stride: "
+            f"expected {ROEST_FRAME_STRIDE_SAMPLES} samples, got {stride_samples}"
+        )
+    ratio = getattr(model_config, "inputs_to_logits_ratio", None)
+    if ratio is not None and ratio != stride_samples:
+        raise ValueError("CTC inputs_to_logits_ratio disagrees with conv_stride")
+    frame_duration_ms = 1000.0 * stride_samples / sampling_rate
+    if frame_duration_ms != ROEST_FRAME_DURATION_MS:
+        raise ValueError("CTC frame duration is not the P1 20 ms contract")
+    if expected_frame_duration_ms is not None and (
+        expected_frame_duration_ms != frame_duration_ms
+    ):
+        raise ValueError(
+            "configured frame duration does not match the loaded CTC model: "
+            f"expected {expected_frame_duration_ms}, got {frame_duration_ms}"
+        )
+
+    vocab_size = getattr(model_config, "vocab_size", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    vocabulary = getattr(tokenizer, "get_vocab", lambda: {})()
+    if any(vocabulary.get(token) is None for token in ROEST_REQUIRED_TOKENS):
+        raise ValueError("P1 CTC tokenizer does not cover Danish letters and numbers")
+    if vocab_size != ROEST_VOCAB_SIZE or len(vocabulary) != ROEST_VOCAB_SIZE:
+        raise ValueError("P1 CTC tokenizer must expose exactly 46 vocabulary entries")
+    if getattr(model_config, "pad_token_id", None) != ROEST_BLANK_TOKEN_ID:
+        raise ValueError("P1 CTC model must use token 45 as its CTC blank")
+    if getattr(tokenizer, "pad_token_id", None) != ROEST_BLANK_TOKEN_ID:
+        raise ValueError("P1 CTC tokenizer must use token 45 as its CTC blank")
+    if getattr(tokenizer, "pad_token", None) != "<pad>":
+        raise ValueError("P1 CTC tokenizer blank must be the <pad> token")
+    if getattr(tokenizer, "word_delimiter_token", None) != "|":
+        raise ValueError("P1 CTC tokenizer must use | as its word delimiter")
+    if vocabulary.get("|") != ROEST_WORD_DELIMITER_TOKEN_ID:
+        raise ValueError("P1 CTC tokenizer must use token 36 as its word delimiter")
+    return frame_duration_ms
 
 
 def verify_hub_model_revision(
@@ -116,10 +268,6 @@ def verify_hub_model_revision(
     )
     if resolved is not None and resolved != revision:
         raise ModelPinError("Hugging Face did not resolve the pinned model revision")
-
-
-class ModelPinError(ValueError):
-    """Raised when a pinned model asset is absent or has changed."""
 
 
 @dataclass
