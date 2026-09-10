@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Enforce the P1 scratch quota during pointer-index and selection-dedup growth, and
+  recreate selection state between passes so deleted SQLite high-water space is reclaimed.
 - Make native P1 selection deduplicate through crash-safe scratch SQLite state and
   preserve exact scalar audio and transcript pointer metadata through pilot sampling.
 - Reduce deterministic P1 pilot selection to one audio metadata pass by retaining only

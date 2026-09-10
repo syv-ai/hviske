@@ -262,6 +262,42 @@ def test_pointer_index_is_disk_backed_and_contains_no_transcript_payload(
     assert fetched.words[0].end_ms == 251
 
 
+def test_pointer_index_quota_abort_leaves_a_rebuildable_partial_db(
+    tmp_path: Path,
+) -> None:
+    """Committed index rows survive a quota abort and can be rebuilt."""
+    _write_source_files(tmp_path)
+    source = HfP1Source(local_root=tmp_path)
+    plan = source.plan(audio_revision="a" * 40, transcript_revision="b" * 40)
+    checks = 0
+
+    def guard() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            raise RuntimeError("scratch hard cap exceeded")
+
+    with pytest.raises(RuntimeError, match="scratch hard cap exceeded"):
+        source.build_transcript_index(
+            revision=plan.transcript_revision,
+            path=tmp_path / "partial-pointers.sqlite",
+            objects=plan.transcript_objects,
+            scratch_guard=guard,
+        )
+    with sqlite3.connect(tmp_path / "partial-pointers.sqlite") as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM transcript_pointers").fetchone()[0]
+            == 1
+        )
+
+    index = source.build_transcript_index(
+        revision=plan.transcript_revision,
+        path=tmp_path / "partial-pointers.sqlite",
+        objects=plan.transcript_objects,
+    )
+    assert len(index) == 2
+
+
 def test_source_object_cap_is_checked_before_audio_open(tmp_path: Path) -> None:
     """A rejected object cannot reach the Parquet reader."""
     _write_source_files(tmp_path)
