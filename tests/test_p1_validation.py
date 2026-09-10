@@ -181,6 +181,35 @@ def test_blinded_manifest_has_all_quotas_without_labels() -> None:
         assert prefixes == required_axes
 
 
+@pytest.mark.parametrize("digest_key", ["_p1_metadata_sha256", "metadata_sha256"])
+def test_blinded_manifest_preserves_producer_metadata_digest(digest_key: str) -> None:
+    """The manifest retains the digest calculated from the complete output row."""
+    producer_digest = "d" * 64
+    row = _row(0)
+    row[digest_key] = producer_digest
+
+    manifest = create_blinded_audit_manifest(
+        [row], accepted_quota=1, rejected_quota=0, seed="producer-digest"
+    )
+
+    assert manifest[0]["metadata_sha256"] == producer_digest
+    assert all(not key.startswith("_p1_") for key in manifest[0])
+
+
+@pytest.mark.parametrize("digest_key", ["_p1_metadata_sha256", "metadata_sha256"])
+def test_blinded_manifest_rejects_malformed_producer_metadata_digest(
+    digest_key: str,
+) -> None:
+    """A malformed producer digest must not be silently replaced."""
+    row = _row(0)
+    row[digest_key] = "not-a-sha256"
+
+    with pytest.raises(ValueError, match="lowercase SHA-256 hex"):
+        create_blinded_audit_manifest(
+            [row], accepted_quota=1, rejected_quota=0, seed="producer-digest"
+        )
+
+
 def test_bounded_reservoir_does_not_retain_audio_or_grow() -> None:
     """Representative selection keeps only its configured candidate reservoir."""
     rows = (
