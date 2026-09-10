@@ -1,7 +1,7 @@
 # Phase 1C contract configuration. Every revision is immutable and complete.
 # Use mode=plan for a Hub-metadata-only preflight; initialise creates the private
 # target card, while pilot and production are bounded builds.
-pipeline_version: p1-segmentation-1d
+pipeline_version: p1-segmentation-1e
 mode: plan
 programme_limit: null
 source_file_id: null

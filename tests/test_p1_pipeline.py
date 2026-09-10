@@ -18,6 +18,7 @@ from hviske.p1_ledger import Ledger
 from hviske.p1_pipeline import (
     BuildReport,
     MetadataLog,
+    NativeCandidate,
     P1PreflightError,
     PipelineSettings,
     PreflightReport,
@@ -34,10 +35,12 @@ from hviske.p1_segments import (
     VADBackend,
 )
 from hviske.p1_source import (
+    AudioPointer,
     ParsedAudio,
     ParsedTranscript,
     SourcePlan,
     SourceShard,
+    TranscriptPointer,
     harden_p1_logging,
     parse_transcript_row,
 )
@@ -113,6 +116,76 @@ class MetadataSource:
         )
 
 
+def test_invalid_transcript_never_constructs_models_or_retrieves_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Terminal transcript defects stop before audio and model work."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+    shard = SourceShard("audio.parquet", 10)
+    candidate = NativeCandidate(
+        file_id="file-1",
+        metadata={"duration_ms": 1_000},
+        audio_pointer=AudioPointer("file-1", shard, 0, 0),
+        transcript_pointer=cast(TranscriptPointer, object()),
+    )
+    calls = {"audio": 0, "vad": 0, "ctc": 0}
+
+    class Source:
+        last_temporary = None
+
+        def fetch_audio(self, *, pointer: object) -> object:
+            del pointer
+            calls["audio"] += 1
+            raise AssertionError("invalid transcript must not retrieve audio")
+
+        def fetch_transcript(self, _pointer: object) -> ParsedTranscript:
+            return ParsedTranscript(file_id="file-1", text="  ", words=())
+
+    def make_vad(_settings: PipelineSettings) -> object:
+        calls["vad"] += 1
+        return object()
+
+    def make_ctc(_settings: PipelineSettings) -> object:
+        calls["ctc"] += 1
+        return object()
+
+    monkeypatch.setattr("hviske.p1_pipeline.make_silero_vad", make_vad)
+    monkeypatch.setattr("hviske.p1_pipeline.make_ctc_backend", make_ctc)
+    report = _pipeline_test_report()
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        _process_native_programmes(
+            source=Source(),
+            settings=settings,
+            candidates=[candidate],
+            ledger=ledger,
+            hub=object(),
+            vad=None,
+            ctc=None,
+            report=report,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+        )
+        assert ledger.programme("p1-file-1").last_error == "empty_text"
+    assert calls == {"audio": 0, "vad": 0, "ctc": 0}
+
+
+def _pipeline_test_report() -> BuildReport:
+    """Return a report suitable for direct native-programme tests."""
+    preflight = PreflightReport(
+        mode="build",
+        selected_programmes=1,
+        maximum_source_bytes=0,
+        required_scratch_bytes=0,
+        free_bytes=1,
+        scratch_bytes=0,
+        source_revisions={},
+        model_revisions={},
+        cuda={},
+        target={},
+        checks={},
+    )
+    return BuildReport(preflight=preflight, selected_file_ids=("file-1",))
+
+
 def test_missing_transcripts_are_aggregated_without_ids(tmp_path: Path) -> None:
     """Missing transcript evidence contains only an aggregate count."""
 
@@ -145,6 +218,41 @@ def test_missing_transcripts_are_aggregated_without_ids(tmp_path: Path) -> None:
     ]
     assert "missing-a" not in events.read_text()
     assert "missing-b" not in events.read_text()
+
+
+def test_native_candidates_retain_discovered_audio_pointers(tmp_path: Path) -> None:
+    """Selection joins transcript pointers without a later audio rescan."""
+
+    class Source:
+        def iter_programme_metadata(self, **_: object) -> object:
+            raise AssertionError("pointer discovery should be the metadata scan")
+
+        def iter_programme_pointers(self, *, shard: SourceShard) -> object:
+            yield AudioPointer("wanted", shard, 3, 7, (("duration_ms", "1000"),))
+
+    class Index:
+        def get(self, file_id: str) -> object:
+            return object() if file_id == "wanted" else None
+
+    shard = SourceShard("audio.parquet", 10)
+    candidates = list(
+        _native_candidates(
+            source=Source(),
+            shards=(shard,),
+            index=Index(),
+            programme_limit=None,
+            source_file_id=None,
+            pilot=False,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+        )
+    )
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert isinstance(candidate, NativeCandidate)
+    assert candidate.audio_pointer == AudioPointer(
+        "wanted", shard, 3, 7, (("duration_ms", "1000"),)
+    )
+    assert candidate.metadata["duration_ms"] == 1000
 
 
 def test_overlong_transcript_is_a_terminal_invalid_timestamp_rejection(
@@ -189,24 +297,6 @@ def _pipeline_test_candidate() -> list[tuple[str, object, object]]:
     """Return one metadata-only candidate for direct native-programme tests."""
     shard = type("Shard", (), {"path": "source/part.parquet", "byte_size": 1_000})()
     return [("file-1", {"duration_ms": 1_000}, (shard, object()))]
-
-
-def _pipeline_test_report() -> BuildReport:
-    """Return a report suitable for direct native-programme tests."""
-    preflight = PreflightReport(
-        mode="build",
-        selected_programmes=1,
-        maximum_source_bytes=0,
-        required_scratch_bytes=0,
-        free_bytes=1,
-        scratch_bytes=0,
-        source_revisions={},
-        model_revisions={},
-        cuda={},
-        target={},
-        checks={},
-    )
-    return BuildReport(preflight=preflight, selected_file_ids=("file-1",))
 
 
 def test_pilot_selection_is_bounded_and_not_first_rows(tmp_path: Path) -> None:
@@ -436,7 +526,7 @@ def test_targeted_selection_stops_after_matching_audio_metadata(tmp_path: Path) 
 
 
 def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Unexpected failures abort the run and persist only a safe error category."""
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
@@ -462,19 +552,20 @@ def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
     database = tmp_path / "ledger.sqlite"
     events = tmp_path / "events.jsonl"
     report = _pipeline_test_report()
-    with pytest.raises(RuntimeError):
-        with Ledger(database) as ledger:
-            _process_native_programmes(
-                source=Source(),
-                settings=settings,
-                candidates=_pipeline_test_candidate(),
-                ledger=ledger,
-                hub=object(),
-                vad=cast(VADBackend, object()),
-                ctc=cast(CTCBackend, object()),
-                report=report,
-                log=MetadataLog(events),
-            )
+    with caplog.at_level(logging.INFO, logger="hviske.p1_pipeline"):
+        with pytest.raises(RuntimeError):
+            with Ledger(database) as ledger:
+                _process_native_programmes(
+                    source=Source(),
+                    settings=settings,
+                    candidates=_pipeline_test_candidate(),
+                    ledger=ledger,
+                    hub=object(),
+                    vad=cast(VADBackend, object()),
+                    ctc=cast(CTCBackend, object()),
+                    report=report,
+                    log=MetadataLog(events),
+                )
     with Ledger(database) as ledger:
         record = ledger.programme("p1-file-1")
         assert record.state.value == "retryable"
@@ -482,6 +573,8 @@ def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
     event_text = events.read_text(encoding="utf-8")
     assert "secret transcript" not in event_text
     assert "runtime_error" in event_text
+    assert "secret transcript" not in caplog.text
+    assert "runtime_error" in caplog.text
 
 
 def test_zero_accepted_programme_is_skipped_on_the_second_run(

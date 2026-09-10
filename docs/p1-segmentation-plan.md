@@ -239,11 +239,24 @@ commit IDs, verification time, and purge time.
 
 On restart:
 
+- bind and validate the pipeline digest before constructing models or selecting new
+  programmes; an incompatible populated ledger is rejected without mutation;
+- recover sharded and committed publication states before constructing VAD/CTC or
+  retrieving new audio;
 - reset abandoned `processing` rows to `retryable`;
 - reuse complete local shards only when their digests match the ledger;
 - query the remote commit before re-uploading a `committed` shard;
 - never regenerate or overwrite a `verified` path with different bytes;
 - resume from the first state lacking durable evidence.
+
+Selection retains the exact audio row pointer discovered by the metadata scan and
+joins it to the disk-backed transcript pointer. Processing fetches and qualifies the
+transcript first: empty, untimed, ambiguous, malformed, invalid-timestamp, and
+transcript-over-audio records are terminal metadata-only rejections and do not load
+models or retrieve audio. Only a qualified transcript permits audio retrieval and
+lazy VAD/CTC construction. Unexpected failures before sharding are categorised as
+retryable; publication failures leave durable sharded/committed evidence unchanged so
+a restart can resume the exact bytes and commit.
 
 ### Private repository setup
 

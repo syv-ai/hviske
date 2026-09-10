@@ -386,6 +386,8 @@ class RejectionCategory(str, enum.Enum):
     DUPLICATE_SEGMENT_ID = "duplicate_segment_id"
     UNSUPPORTED_TEXT = "unsupported_text"
     MUSIC_DOMINANT = "music_dominant"
+    INVALID_SOURCE_RECORD = "invalid_source_record"
+    TRANSCRIPT_OVER_AUDIO = "transcript_over_audio"
     AMBIGUOUS_SOURCE_TEXT = "ambiguous_source_text"
     NO_TIMED_WORDS = "no_timed_words"
     NO_ACCEPTED_SEGMENTS = "no_accepted_segments"
