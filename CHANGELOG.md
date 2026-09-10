@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Recreate validated P1 transcript-index database files and SQLite sidecars between
+  builds, reclaiming high-water space without following unsafe filesystem entries.
 - Enforce the P1 scratch quota during pointer-index and selection-dedup growth, and
   recreate selection state between passes so deleted SQLite high-water space is reclaimed.
 - Make native P1 selection deduplicate through crash-safe scratch SQLite state and
