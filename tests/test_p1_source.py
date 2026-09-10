@@ -274,7 +274,7 @@ def test_pointer_index_quota_abort_leaves_a_rebuildable_partial_db(
     def guard() -> None:
         nonlocal checks
         checks += 1
-        if checks == 4:
+        if checks == 2:
             raise RuntimeError("scratch hard cap exceeded")
 
     with pytest.raises(RuntimeError, match="scratch hard cap exceeded"):
@@ -296,6 +296,99 @@ def test_pointer_index_quota_abort_leaves_a_rebuildable_partial_db(
         objects=plan.transcript_objects,
     )
     assert len(index) == 2
+
+
+def test_pointer_index_rebuild_reclaims_files_and_accounts_fresh_state(
+    tmp_path: Path,
+) -> None:
+    """A targeted rebuild replaces the database and stale SQLite sidecars."""
+    _write_source_files(tmp_path)
+    source = HfP1Source(local_root=tmp_path)
+    plan = source.plan(audio_revision="a" * 40, transcript_revision="b" * 40)
+    path = tmp_path / "pointers.sqlite"
+    TranscriptPointerIndex(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.executemany(
+            """INSERT INTO transcript_pointers
+            (file_id, path, row_group, row_index, revision, byte_size, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                (
+                    f"old-programme-{number}",
+                    "old/transcripts.parquet",
+                    0,
+                    number,
+                    "c" * 40,
+                    1,
+                    "x" * 512,
+                )
+                for number in range(2_000)
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    grown_database_allocation = path.stat().st_size
+    sidecars = (Path(f"{path}-wal"), Path(f"{path}-shm"))
+    sidecars[0].write_bytes(b"w" * 131_072)
+    sidecars[1].write_bytes(b"s" * 32_768)
+    grown_allocation = sum(
+        database_file.stat().st_size for database_file in (path, *sidecars)
+    )
+    quota_observations: list[int] = []
+
+    def guard() -> None:
+        quota_observations.append(
+            sum(
+                database_file.stat().st_size
+                for database_file in (path, *sidecars)
+                if database_file.exists()
+            )
+        )
+
+    rebuilt = source.build_transcript_index(
+        revision=plan.transcript_revision,
+        path=path,
+        objects=plan.transcript_objects,
+        source_file_id="programme-a",
+        scratch_guard=guard,
+    )
+    rebuilt_allocation = path.stat().st_size
+
+    assert all(not sidecar.exists() for sidecar in sidecars)
+    assert len(rebuilt) == 1
+    assert rebuilt_allocation < grown_database_allocation
+    assert quota_observations
+    assert quota_observations[-1] >= rebuilt_allocation
+    assert max(quota_observations) < grown_allocation
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+@pytest.mark.parametrize("entry_kind", ["symlink", "directory"])
+def test_pointer_index_rebuild_rejects_unsafe_database_files(
+    tmp_path: Path, suffix: str, entry_kind: str
+) -> None:
+    """Rebuild never follows or removes unexpected database entries."""
+    path = tmp_path / "pointers.sqlite"
+    database_file = Path(f"{path}{suffix}")
+    target = tmp_path / "unrelated.txt"
+    target.write_text("retain me")
+    if entry_kind == "symlink":
+        database_file.symlink_to(target)
+    else:
+        database_file.mkdir()
+
+    with pytest.raises(ValueError, match="must (?:not be a symlink|be a regular file)"):
+        TranscriptPointerIndex.rebuild(path)
+
+    assert target.read_text() == "retain me"
+    if entry_kind == "symlink":
+        assert database_file.is_symlink()
+    else:
+        assert database_file.is_dir()
 
 
 def test_source_object_cap_is_checked_before_audio_open(tmp_path: Path) -> None:

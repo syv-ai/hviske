@@ -228,6 +228,16 @@ class SourcePlan:
     transcript_objects: tuple[tuple[str, int, str | None], ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class ParsedAudio:
+    """One fetched audio row, retaining its source shape and sampling rate."""
+
+    file_id: str
+    value: bytes | np.ndarray | Path
+    sampling_rate: int
+    channels: int = 1
+
+
 class TranscriptPointerIndex:
     """Disk-backed file-id to transcript-row index.
 
@@ -250,9 +260,12 @@ class TranscriptPointerIndex:
         self.path = Path(path)
         self._scratch_guard = scratch_guard
         _validate_database_path(self.path)
-        self._guard_scratch()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        self._initialise_database()
+
+    def _initialise_database(self) -> None:
+        """Create the index schema and account for its durable scratch state."""
+        with contextlib.closing(self._connect()) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS transcript_pointers (
@@ -287,7 +300,7 @@ class TranscriptPointerIndex:
 
     def __len__(self) -> int:
         """Return the number of indexed transcripts."""
-        with self._connect() as connection:
+        with contextlib.closing(self._connect()) as connection, connection:
             return int(
                 connection.execute(
                     "SELECT count(*) FROM transcript_pointers"
@@ -301,7 +314,7 @@ class TranscriptPointerIndex:
             InvalidSourceRecord:
                 If the file identifier has already been indexed.
         """
-        with self._connect() as connection:
+        with contextlib.closing(self._connect()) as connection, connection:
             try:
                 connection.execute(
                     """INSERT INTO transcript_pointers
@@ -324,15 +337,20 @@ class TranscriptPointerIndex:
         self._guard_scratch()
 
     def clear(self) -> None:
-        """Remove pointers and rejection evidence before rebuilding an index."""
-        with self._connect() as connection:
-            connection.execute("DELETE FROM transcript_pointers")
-            connection.execute("DELETE FROM rejections")
-        self._guard_scratch()
+        """Recreate this index without retaining SQLite high-water space."""
+        _validate_database_path(self.path)
+        self._remove_database_files(self.path)
+        self._initialise_database()
+
+    @staticmethod
+    def _remove_database_files(path: Path) -> None:
+        """Unlink only the validated database files owned by this index."""
+        for database_file in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+            database_file.unlink(missing_ok=True)
 
     def get(self, file_id: str) -> TranscriptPointer | None:
         """Return a pointer without reading transcript content."""
-        with self._connect() as connection:
+        with contextlib.closing(self._connect()) as connection, connection:
             row = connection.execute(
                 (
                     "SELECT file_id, path, row_group, row_index, revision, byte_size, "
@@ -361,9 +379,29 @@ class TranscriptPointerIndex:
             metadata=metadata,
         )
 
+    @classmethod
+    def rebuild(
+        cls, path: Path, scratch_guard: c.Callable[[], None] | None = None
+    ) -> t.Self:
+        """Recreate an empty index without retaining SQLite high-water space.
+
+        Args:
+            path:
+                Database path in the owned scratch tree.
+            scratch_guard (optional):
+                Callback that rejects a run after scratch growth.
+
+        Returns:
+            A fresh disk-backed pointer index.
+        """
+        database_path = Path(path)
+        _validate_database_path(database_path)
+        cls._remove_database_files(database_path)
+        return cls(database_path, scratch_guard=scratch_guard)
+
     def reject(self, rejection: TranscriptIndexRejection) -> None:
         """Record metadata-only rejection evidence."""
-        with self._connect() as connection:
+        with contextlib.closing(self._connect()) as connection, connection:
             connection.execute(
                 "INSERT INTO rejections VALUES (?, ?, ?, ?, ?)",
                 dataclasses.astuple(rejection),
@@ -372,22 +410,12 @@ class TranscriptPointerIndex:
 
     def rejections(self) -> tuple[TranscriptIndexRejection, ...]:
         """Return metadata-only index rejection evidence."""
-        with self._connect() as connection:
+        with contextlib.closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 "SELECT reason, file_id, path, row_group, row_index FROM rejections "
                 "ORDER BY path, row_group, row_index"
             ).fetchall()
         return tuple(TranscriptIndexRejection(*row) for row in rows)
-
-
-@dataclasses.dataclass(frozen=True)
-class ParsedAudio:
-    """One fetched audio row, retaining its source shape and sampling rate."""
-
-    file_id: str
-    value: bytes | np.ndarray | Path
-    sampling_rate: int
-    channels: int = 1
 
 
 class HfP1Source:
@@ -465,8 +493,7 @@ class HfP1Source:
             SourceSelectionError:
                 If ``source_file_id`` is requested but no valid pointer is found.
         """
-        index = TranscriptPointerIndex(path, scratch_guard=scratch_guard)
-        index.clear()
+        index = TranscriptPointerIndex.rebuild(path, scratch_guard=scratch_guard)
         indexed_count = 0
         for shard_path, byte_size, _oid in sorted(objects, key=lambda item: item[0]):
             if byte_size > self.max_source_object_bytes:
