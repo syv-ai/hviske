@@ -63,6 +63,37 @@ def add_programme(ledger: Ledger, programme_id: str = "programme-1") -> None:
     )
 
 
+def test_audit_candidates_commit_with_sharded_transition(tmp_path: Path) -> None:
+    """Accepted local audit locators share the allocation transaction."""
+    local = tmp_path / "part.parquet"
+    local.write_bytes(b"durable shard")
+    digest = hashlib.sha256(local.read_bytes()).hexdigest()
+    candidate = {
+        "segment_id": "segment-1",
+        "status": "accepted",
+        "local_path": str(local),
+        "local_row_locator": 0,
+        "audio_sha256": digest,
+    }
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        add_programme(ledger)
+        batch, _ = ledger.allocate_batch_with_shards(
+            "programme-1",
+            [
+                ShardAllocation(
+                    local_path=local,
+                    remote_path="data/part.parquet",
+                    sha256=digest,
+                    byte_size=local.stat().st_size,
+                    row_count=1,
+                )
+            ],
+            audit_candidates=(candidate,),
+        )
+        assert ledger.programme("programme-1").state is LedgerState.SHARDED
+        assert ledger.audit_candidates(batch.batch_id) == (candidate,)
+
+
 def test_batch_shard_state_machine_and_separate_publication_purge(
     tmp_path: Path,
 ) -> None:
@@ -303,7 +334,7 @@ def test_schema_is_atomic_and_metadata_only(tmp_path: Path) -> None:
     database = tmp_path / "ledger.sqlite"
     with Ledger(database) as ledger:
         version = ledger._connection.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 1
+        assert version == 2
         columns = {
             row[1]
             for row in ledger._connection.execute("PRAGMA table_info(programmes)")
@@ -311,7 +342,7 @@ def test_schema_is_atomic_and_metadata_only(tmp_path: Path) -> None:
         assert "transcript_text" not in columns
         assert "audio_bytes" not in columns
     connection = sqlite3.connect(database)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
     connection.close()
 
 

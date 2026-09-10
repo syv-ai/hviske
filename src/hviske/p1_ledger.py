@@ -29,7 +29,7 @@ from .p1_contracts import (
     valid_ledger_transition,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _SEQUENCE_TABLE = "ledger_sequences"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -202,12 +202,13 @@ class Ledger:
         rejected_count: int = 0,
         processed_duration_ms: int | None = None,
         rejection_counts: Mapping[RejectionCategory | str, int] | None = None,
+        audit_candidates: Sequence[Mapping[str, object]] = (),
     ) -> tuple[BatchRecord, tuple[ShardRecord, ...]]:
         """Allocate and attach a complete batch in one durable transaction.
 
-        The caller supplies already-fsynced local shards.  Their local path, remote
+        The caller supplies already-fsynced local shards. Their local path, remote
         path, size and digest are committed together with the generated identities;
-        only then is the programme allowed to become ``sharded``.  This removes the
+        only then is the programme allowed to become ``sharded``. This removes the
         crash window between a programme transition and shard registration.
 
         Args:
@@ -215,10 +216,10 @@ class Ledger:
                 Programme whose output is being published.
             shards:
                 Shard allocations, mappings, or objects exposing ``path``,
-                ``repo_path`` and ``row_count``.  Objects may omit digest and size;
+                ``repo_path`` and ``row_count``. Objects may omit digest and size;
                 those values are computed from the local file.
             batch_id (optional):
-                Explicit id for retry or recovery.  Defaults to a durable allocation.
+                Explicit id for retry or recovery. Defaults to a durable allocation.
             batch_prefix (optional):
                 Prefix for generated batch IDs. Defaults to ``batch``.
             shard_prefix (optional):
@@ -231,6 +232,10 @@ class Ledger:
                 Processing duration. Defaults to None.
             rejection_counts (optional):
                 Metadata-only rejection counts. Defaults to an empty mapping.
+            audit_candidates (optional):
+                Accepted metadata-only audit candidates with local row locators.
+                They are committed with the batch and shard rows. Defaults to an
+                empty sequence.
 
         Returns:
             The atomically created batch and its attached shards.
@@ -251,6 +256,9 @@ class Ledger:
         self._validate_nonnegative(processed_duration_ms, "processed_duration_ms")
         safe_rejections = self._rejection_counts(rejection_counts or {})
         prepared = tuple(self._prepare_allocation(item) for item in shards)
+        prepared_audit = tuple(
+            self._prepare_audit_candidate(candidate) for candidate in audit_candidates
+        )
         remote_paths = [cast(str, item["remote_path"]) for item in prepared]
         if len(remote_paths) != len(set(remote_paths)):
             raise EvidenceError("publication paths must be unique")
@@ -330,6 +338,21 @@ class Ledger:
                             connection, "shards", "shard_id", resolved_shard_id
                         )
                     )
+                )
+            for candidate in prepared_audit:
+                connection.execute(
+                    """INSERT INTO audit_candidates (
+                        batch_id, programme_id, candidate_json, local_path,
+                        local_row_locator, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        resolved_batch_id,
+                        programme_id,
+                        candidate[0],
+                        candidate[1],
+                        candidate[2],
+                        now,
+                    ),
                 )
             programme_updates = {
                 "state": LedgerState.SHARDED.value,
@@ -756,6 +779,36 @@ class Ledger:
         )
 
     create_batch = register_batch
+
+    def audit_candidates(self, batch_id: str) -> tuple[dict[str, object], ...]:
+        """Return metadata-only audit candidates durably attached to a batch.
+
+        Args:
+            batch_id:
+                Batch whose accepted candidate locators should be returned.
+
+        Returns:
+            Candidates in their deterministic allocation order.
+
+        Raises:
+            LedgerError:
+                If persisted candidate metadata is not an object.
+        """
+        rows = self._connection.execute(
+            "SELECT candidate_json, local_path, local_row_locator "
+            "FROM audit_candidates WHERE batch_id = ? ORDER BY candidate_id",
+            (batch_id,),
+        ).fetchall()
+        candidates: list[dict[str, object]] = []
+        for row in rows:
+            value = json.loads(str(row[0]))
+            if not isinstance(value, dict):
+                raise LedgerError("audit candidate metadata is not an object")
+            candidate = cast(dict[str, object], value)
+            candidate["local_path"] = str(row[1])
+            candidate["local_row_locator"] = int(row[2])
+            candidates.append(candidate)
+        return tuple(candidates)
 
     def attach_shard(self, batch_id: str, shard_id: str) -> BatchRecord:
         """Attach a registered shard and refresh batch counts atomically.
@@ -1192,6 +1245,31 @@ class Ledger:
             "shard_id": value("shard_id"),
         }
 
+    @staticmethod
+    def _prepare_audit_candidate(
+        candidate: Mapping[str, object],
+    ) -> tuple[str, str, int]:
+        if not isinstance(candidate, Mapping):
+            raise EvidenceError("audit candidates must be metadata mappings")
+        if candidate.get("status") != "accepted":
+            raise EvidenceError("ledger audit candidates must be accepted")
+        segment_id = candidate.get("segment_id")
+        local_path = candidate.get("local_path")
+        row_locator = candidate.get("local_row_locator")
+        if not isinstance(segment_id, str) or not segment_id:
+            raise EvidenceError("audit candidates need a segment identity")
+        if not isinstance(local_path, (str, Path)) or not str(local_path):
+            raise EvidenceError("accepted audit candidates need a local path")
+        if not isinstance(row_locator, int) or isinstance(row_locator, bool):
+            raise EvidenceError("accepted audit candidates need a local row locator")
+        if row_locator < 0:
+            raise EvidenceError("accepted audit row locators must not be negative")
+        resolved_path = str(Path(local_path).expanduser().resolve(strict=False))
+        metadata = dict(candidate)
+        metadata.pop("local_path")
+        metadata.pop("local_row_locator")
+        return Ledger._metadata_json(metadata), resolved_path, row_locator
+
     def allocate_sequence(self, kind: str) -> int:
         """Allocate a durable sequence for ``batch`` or ``shard`` work.
 
@@ -1502,12 +1580,29 @@ class Ledger:
                 connection.execute("CREATE INDEX programmes_state ON programmes(state)")
                 connection.execute("CREATE INDEX batches_state ON batches(state)")
                 connection.execute("PRAGMA user_version = 1")
-            elif version == 1:
+            if version < 2:
                 columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(shards)")
                 }
                 if "local_path" not in columns:
                     connection.execute("ALTER TABLE shards ADD COLUMN local_path TEXT")
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS audit_candidates (
+                        candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+                        programme_id TEXT NOT NULL REFERENCES programmes(programme_id),
+                        candidate_json TEXT NOT NULL,
+                        local_path TEXT NOT NULL,
+                        local_row_locator INTEGER NOT NULL
+                            CHECK (local_row_locator >= 0),
+                        created_at TEXT NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS audit_candidates_batch "
+                    "ON audit_candidates(batch_id, candidate_id)"
+                )
+                connection.execute("PRAGMA user_version = 2")
 
     @staticmethod
     def _publication_path(value: str) -> str:

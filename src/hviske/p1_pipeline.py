@@ -871,6 +871,15 @@ def _process_native_programmes(
                 )
                 for ordinal, item in enumerate(written.shards)
             )
+            audit_candidates = _record_audit_candidates(
+                rows=result.rows,
+                path=None,
+                repository=settings.target_private_repo,
+                revision=None,
+                remote_paths=tuple(item.remote_path for item in allocations),
+                row_counts=tuple(item.row_count for item in allocations),
+                local_paths=tuple(Path(item.local_path) for item in allocations),
+            )
             batch, shard_records = ledger.allocate_batch_with_shards(
                 programme_id,
                 allocations,
@@ -881,7 +890,10 @@ def _process_native_programmes(
                     reason: sum(1 for _, value in result.rejections if value == reason)
                     for _, reason in result.rejections
                 },
+                audit_candidates=audit_candidates,
             )
+            if audit_reservoir is not None and audit_candidates:
+                getattr(audit_reservoir, "add")(audit_candidates)
             report.shard_count += len(shard_records)
             purge_source_temporary(getattr(source, "last_temporary", None))
             ledger.mark_source_temps_purged(programme_id, evidence={"deleted": True})
@@ -1081,17 +1093,21 @@ def publish_pending(
     row_counts = tuple(item.row_count for item in ledger_shards)
     if not (len(shards) == len(remote_paths) == len(row_counts)):
         raise ValueError("pending shards differ from their durable ledger records")
-    if audit_rows and audit_reservoir is not None:
-        candidates = _record_audit_candidates(
-            rows=audit_rows,
-            path=None,
-            repository=settings.target_private_repo,
-            revision=None,
-            remote_paths=remote_paths,
-            row_counts=row_counts,
-            local_paths=local_paths,
-        )
-        getattr(audit_reservoir, "add")(candidates)
+    if audit_reservoir is not None:
+        stored_candidates = ledger.audit_candidates(batch_id)
+        if stored_candidates:
+            getattr(audit_reservoir, "add")(stored_candidates)
+        elif audit_rows:
+            candidates = _record_audit_candidates(
+                rows=audit_rows,
+                path=None,
+                repository=settings.target_private_repo,
+                revision=None,
+                remote_paths=remote_paths,
+                row_counts=row_counts,
+                local_paths=local_paths,
+            )
+            getattr(audit_reservoir, "add")(candidates)
 
     def purge(paths: tuple[Path, ...]) -> None:
         for path in paths:
@@ -1173,11 +1189,14 @@ def _record_audit_candidates(
         for offset, row in enumerate(rows[row_index : row_index + shard_rows]):
             model_dump = getattr(row, "model_dump", None)
             if callable(model_dump):
-                candidate = t.cast(dict[str, object], model_dump(mode="python"))
+                raw_candidate = t.cast(dict[str, object], model_dump(mode="python"))
             elif isinstance(row, Mapping):
-                candidate = dict(row)
+                raw_candidate = dict(row)
             else:
                 raise TypeError("audit rows must be mappings or contract models")
+            from hviske.p1_validation import _metadata_copy
+
+            candidate = _metadata_copy(raw_candidate)
             candidate["status"] = "accepted"
             if local_paths is None:
                 candidate.update(
@@ -1304,6 +1323,9 @@ def _recover_native_batches(
         if audit_reservoir is not None and all(
             record.local_path is not None for record in records
         ):
+            stored_candidates = ledger.audit_candidates(batch.batch_id)
+            if stored_candidates:
+                getattr(audit_reservoir, "add")(stored_candidates)
             updater = getattr(audit_reservoir, "update_remote_locators", None)
             if callable(updater):
                 updater(

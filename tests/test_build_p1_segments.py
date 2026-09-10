@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import collections.abc as c
 import io
+import subprocess
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -47,6 +49,81 @@ def test_quality_rejection_is_terminal_and_keeps_source_audit_locator(
     manifest = (tmp_path / "scratch" / "audit-candidates.jsonl").read_text()
     assert '"source_shard_path": "data/audio.parquet"' in manifest
     assert '"source_row_index": 0' in manifest
+
+
+def test_sharding_crash_recovers_equivalent_audit_manifest(tmp_path: Path) -> None:
+    """A second invocation recovers audit metadata committed with sharding."""
+    crash_code = """
+import os
+import sys
+from pathlib import Path
+from hviske.p1_ledger import Ledger
+from hviske.p1_pipeline import run_pipeline
+from tests.test_build_p1_segments import FakeCtc, FakeSource, FakeVad, config
+from tests.test_p1_publish import MemoryHub
+
+root = Path(sys.argv[1])
+original = Ledger.allocate_batch_with_shards
+
+def crash(self, *args, **kwargs):
+    result = original(self, *args, **kwargs)
+    os._exit(91)
+
+Ledger.allocate_batch_with_shards = crash
+run_pipeline(
+    config=config(root, mode="build"),
+    source=FakeSource(),
+    hub=MemoryHub(),
+    ctc=FakeCtc(),
+    vad=FakeVad(),
+)
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", crash_code, str(tmp_path / "recovery")],
+        cwd=Path.cwd(),
+        check=False,
+    )
+    assert crashed.returncode == 91
+
+    recovery_code = """
+import sys
+from pathlib import Path
+from hviske.p1_pipeline import run_pipeline
+from tests.test_build_p1_segments import FakeCtc, FakeSource, FakeVad, config
+from tests.test_p1_publish import MemoryHub
+
+root = Path(sys.argv[1])
+run_pipeline(
+    config=config(root, mode="build"),
+    source=FakeSource(),
+    hub=MemoryHub(),
+    ctc=FakeCtc(),
+    vad=FakeVad(),
+)
+"""
+    recovered = subprocess.run(
+        [sys.executable, "-c", recovery_code, str(tmp_path / "recovery")],
+        cwd=Path.cwd(),
+        check=False,
+    )
+    assert recovered.returncode == 0
+
+    control_root = tmp_path / "control"
+    run_pipeline(
+        config=config(control_root, mode="build"),
+        source=FakeSource(),
+        hub=MemoryHub(),
+        ctc=FakeCtc(),
+        vad=FakeVad(),
+    )
+    recovery_manifest = (
+        tmp_path / "recovery" / "scratch" / "audit-candidates.jsonl"
+    ).read_text()
+    control_manifest = (control_root / "scratch" / "audit-candidates.jsonl").read_text()
+    assert recovery_manifest
+    assert sorted(recovery_manifest.splitlines()) == sorted(
+        control_manifest.splitlines()
+    )
 
 
 def test_allocation_failure_never_leaves_programme_sharded(
