@@ -31,6 +31,10 @@ from pydantic import (
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _BLOB_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+_IMMUTABLE_HUB_URL_PATTERN = re.compile(
+    r"^https://huggingface\.co/(?:datasets/)?[^/]+/[^/]+/resolve/"
+    r"[0-9a-f]{40}/.+$"
+)
 
 JSONScalar: TypeAlias = None | bool | int | float | str
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
@@ -136,20 +140,23 @@ P1_RUNTIME_CONTRACT = P1RuntimeContract(
     dataset_license_template_repository="CoRal-project/coral-v3",
     dataset_license_template_revision=("01f7c93c21fc9dec87fe9f7149c79569cc433f08"),
     dataset_license_template_url=(
-        "https://huggingface.co/datasets/CoRal-project/coral-v3/raw/main/LICENSE"
+        "https://huggingface.co/datasets/CoRal-project/coral-v3/resolve/"
+        "01f7c93c21fc9dec87fe9f7149c79569cc433f08/LICENSE"
     ),
     dataset_license_template_sha256=(
         "ee93c98df9a894464d1c042b66c6039543776c463d06d1a6e93f176e08ca67bd"
     ),
     dataset_license_template_bytes=14112,
     dataset_license_adaptation=(
-        "Replace only 'Alexandra Instituttet A/S, Åbogade 34, 8200 Aarhus N, "
-        "Denmark' with 'syv.ai ApS, Rosenvængets Allé 11, 1. tv, 2100 København Ø, "
-        "Denmark'; preserve all other terms and the Aarhus arbitration clause."
+        "Replace only the exact UTF-8 byte/text sequence 'The Licensed Material "
+        "(as defined below) is made available to You by Alexandra\nInstituttet A/S, "
+        "Åbogade 34, 8200 Aarhus N, Denmark' with 'The Licensed Material (as "
+        "defined below) is made available to You by syv.ai ApS,\nRosenvængets Allé "
+        "11, 1. tv, 2100 København Ø, Denmark'; preserve all other bytes."
     ),
     dataset_license_target_path="LICENSE",
     dataset_license_target_sha256=(
-        "3c657d8d41bfbe131e2e24afd52004b1ddc10e4438edd97725c9df187ec5aa6f"
+        "e06010caf8ea36292a241339c08eedc7ea399778954cf9a546e989d421a48cd6"
     ),
 )
 
@@ -185,6 +192,11 @@ class DatasetLicenseContract(ContractModel):
         if not _COMMIT_PATTERN.fullmatch(value):
             raise ValueError("licence template revision must be a complete SHA")
         return value
+
+    @field_validator("template_url")
+    @classmethod
+    def _template_url_is_immutable(cls, value: str) -> str:
+        return _validate_immutable_hub_url(value=value)
 
 
 class OutputField(ContractModel):
@@ -587,6 +599,13 @@ class ModelContract(ContractModel):
             raise ValueError("licence metadata digest must be lowercase SHA-256 hex")
         return value
 
+    @field_validator("license_url", "model_card_url")
+    @classmethod
+    def _optional_provenance_url_is_immutable(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_immutable_hub_url(value=value)
+
     @field_validator("license_revision")
     @classmethod
     def _optional_revision_is_immutable(cls, value: str | None) -> str | None:
@@ -617,6 +636,25 @@ class CTCContract(ContractModel):
         if not _COMMIT_PATTERN.fullmatch(value):
             raise ValueError("source_commit must be a complete SHA")
         return value
+
+
+def _validate_immutable_hub_url(*, value: str) -> str:
+    """Reject mutable Hugging Face provenance URLs.
+
+    Args:
+        value:
+            URL to validate.
+
+    Returns:
+        The immutable URL.
+
+    Raises:
+        ValueError:
+            If the URL is not a commit-pinned Hugging Face resolve URL.
+    """
+    if not _IMMUTABLE_HUB_URL_PATTERN.fullmatch(value):
+        raise ValueError("licence URL must use a complete SHA in a Hub resolve URL")
+    return value
 
 
 class NormalisationContract(ContractModel):
