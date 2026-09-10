@@ -90,6 +90,7 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
         self._model.eval()
         self._device = device
         self._model.to(device)
+        self._model_dtype = self._model_floating_dtype()
         self._frame_duration_ms = validate_ctc_model_contract(
             model_config=self._model.config,
             processor=self._processor,
@@ -105,6 +106,21 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
             blank_id=self._blank_id,
             validate_word_map=True,
         )
+
+    def _model_floating_dtype(self) -> object:
+        """Return the first floating-point parameter dtype, or float32."""
+        parameters = getattr(self._model, "parameters", None)
+        if not callable(parameters):
+            return self._torch.float32
+        try:
+            parameter_iterator = iter(parameters())
+        except (AttributeError, TypeError):
+            return self._torch.float32
+        for parameter in parameter_iterator:
+            is_floating_point = getattr(parameter, "is_floating_point", None)
+            if callable(is_floating_point) and is_floating_point():
+                return parameter.dtype
+        return self._torch.float32
 
     def _compute_emissions(self, audio: np.ndarray, sampling_rate: int) -> np.ndarray:
         """Run the pinned model and return frame-by-class log probabilities.
@@ -125,8 +141,13 @@ class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
             audio, sampling_rate=sampling_rate, return_tensors="pt"
         )
         inputs = inputs.to(self._device)
-        with self._torch.no_grad():
-            logits = self._model(**inputs).logits.squeeze(0)
+        model_dtype = self._model_floating_dtype()
+        self._model_dtype = model_dtype
+        inputs["input_values"] = inputs["input_values"].to(
+            self._device, dtype=model_dtype
+        )
+        with self._torch.inference_mode():
+            logits = self._model(**inputs).logits.squeeze(0).float()
             return self._torch.log_softmax(logits, dim=-1).cpu().numpy()
 
     def _tokenise_word(self, word: str) -> c.Sequence[int]:
