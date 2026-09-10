@@ -210,7 +210,7 @@ def test_plan_dispatches_metadata_only_source_tree_access(tmp_path: Path) -> Non
 
     assert source.plan_calls == 1
     assert source.audio_calls == 0
-    assert report.selected_file_ids == ()
+    assert report.selected_programmes == 0
     assert report.preflight.target["present"] is False
 
 

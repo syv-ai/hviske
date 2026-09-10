@@ -114,13 +114,20 @@ def test_audio_scan_progress_reports_threshold_crossings(
     ]
 
 
-def test_build_report_serialises_only_selected_programme_count(tmp_path: Path) -> None:
-    """Report serialisation never exposes selected source identifiers."""
+def test_build_report_serialises_only_selected_programme_count() -> None:
+    """Report representations never expose selected source identifiers."""
     report = _pipeline_test_report()
     payload = report.as_dict()
+    dataclass_payload = dataclasses.asdict(report)
+    representations = (repr(report), repr(dataclass_payload), repr(payload))
 
+    assert report.selected_programmes == 1
     assert payload["selected_programmes"] == 1
+    assert dataclass_payload["selected_programmes"] == 1
     assert "selected_file_ids" not in payload
+    assert "selected_file_ids" not in dataclass_payload
+    assert all("selected_file_ids" not in value for value in representations)
+    assert all("file-1" not in value for value in representations)
     assert "file-1" not in json.dumps(payload)
 
 
@@ -139,7 +146,7 @@ def _pipeline_test_report() -> BuildReport:
         target={},
         checks={},
     )
-    return BuildReport(preflight=preflight, selected_file_ids=("file-1",))
+    return BuildReport(preflight=preflight, selected_programmes=1)
 
 
 def test_empty_timed_words_precede_ambiguous_source_text(tmp_path: Path) -> None:
@@ -565,7 +572,7 @@ def test_plan_reads_tree_metadata_only(tmp_path: Path) -> None:
     source = MetadataSource()
     report = run_pipeline(config=pipeline_config(tmp_path), source=source)
 
-    assert report.selected_file_ids == ()
+    assert report.selected_programmes == 0
     assert source.iterated is False
     assert report.preflight.target["present"] is False
 
@@ -785,7 +792,7 @@ def test_zero_accepted_programme_is_skipped_on_the_second_run(
         target={},
         checks={},
     )
-    report = BuildReport(preflight=preflight, selected_file_ids=("file-1",))
+    report = BuildReport(preflight=preflight, selected_programmes=1)
     source_shard = type(
         "Shard", (), {"path": "source/part.parquet", "byte_size": 1_000}
     )()

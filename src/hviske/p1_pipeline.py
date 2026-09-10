@@ -256,7 +256,7 @@ class BuildReport:
     """Bounded run counters and preflight evidence."""
 
     preflight: PreflightReport
-    selected_file_ids: tuple[str, ...]
+    selected_programmes: int
     processed: int = 0
     rejected: int = 0
     accepted_segments: int = 0
@@ -269,7 +269,7 @@ class BuildReport:
         """Return metadata-only run evidence."""
         return {
             "preflight": self.preflight.as_dict(),
-            "selected_programmes": len(self.selected_file_ids),
+            "selected_programmes": self.selected_programmes,
             "processed": self.processed,
             "rejected": self.rejected,
             "accepted_segments": self.accepted_segments,
@@ -355,7 +355,7 @@ def _initialise_report(*, settings: PipelineSettings, hub: object) -> BuildRepor
         target=target,
         checks={"target_checked": target["private"] is True},
     )
-    return BuildReport(preflight=preflight, selected_file_ids=())
+    return BuildReport(preflight=preflight, selected_programmes=0)
 
 
 def calculate_scratch_requirement(
@@ -519,7 +519,9 @@ def _run_native_pipeline(
         maximum_source_bytes=maximum_source_bytes,
     )
     log.write({"event": "preflight", **preflight.as_dict()})
-    report = BuildReport(preflight=preflight, selected_file_ids=(), rejection_counts={})
+    report = BuildReport(
+        preflight=preflight, selected_programmes=0, rejection_counts={}
+    )
     if settings.mode == "plan":
         return report
     if settings.mode == "initialise":
@@ -557,7 +559,7 @@ def _run_native_pipeline(
             log=log,
         )
         if isinstance(candidates, list):
-            report.selected_file_ids = tuple(item.file_id for item in candidates)
+            report.selected_programmes = len(candidates)
             report.preflight = dataclasses.replace(
                 report.preflight, selected_programmes=len(candidates)
             )
