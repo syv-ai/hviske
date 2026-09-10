@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 import soundfile as sf
 from datasets import Audio, Features, Sequence, Value, load_dataset
 from huggingface_hub import CommitOperationAdd, HfApi, HfFileSystem, hf_hub_url
-from huggingface_hub.utils import RepositoryNotFoundError
+from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 from pyarrow import parquet as pq
 
 from .p1_contracts import (
@@ -438,8 +438,8 @@ def initialise_private_dataset(
             repo_id=repo_id, repo_type="dataset", private=True, exist_ok=True
         )
         info = api.repo_info(repo_id=repo_id, repo_type="dataset")
-    _assert_private(info, repo_id)
-    _assert_initialise_target_is_safe(api, repo_id, card)
+    target_head = _target_head(info, repo_id)
+    _assert_initialise_target_is_safe(api, repo_id, card, revision=target_head)
 
     with tempfile.TemporaryDirectory(prefix="hviske-p1-card-") as directory:
         root = Path(directory)
@@ -458,12 +458,15 @@ def initialise_private_dataset(
                 UploadOperation(path_in_repo="LICENSE", path=license_path),
             ),
             message="Initialise private P1 dataset",
+            parent_commit=target_head,
         )
         _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     return _commit_sha(commit)
 
 
-def _assert_initialise_target_is_safe(api: HubClient, repo_id: str, card: str) -> None:
+def _assert_initialise_target_is_safe(
+    api: HubClient, repo_id: str, card: str, *, revision: str | None
+) -> None:
     """Reject target trees that could contain an earlier generation payload.
 
     Raises:
@@ -475,9 +478,15 @@ def _assert_initialise_target_is_safe(api: HubClient, repo_id: str, card: str) -
         paths = tuple(
             str(path)
             for path in api.list_repo_files(
-                repo_id=repo_id, repo_type="dataset", revision="main"
+                repo_id=repo_id, repo_type="dataset", revision=revision
             )
         )
+    except RevisionNotFoundError as error:
+        if revision is not None:
+            raise PublicationError(
+                "cannot inspect the private target tree before initialisation"
+            ) from error
+        paths = ()
     except Exception as error:
         raise PublicationError(
             "cannot inspect the private target tree before initialisation"
@@ -495,7 +504,10 @@ def _assert_initialise_target_is_safe(api: HubClient, repo_id: str, card: str) -
             try:
                 existing_license = b"".join(
                     api.stream_file(
-                        repo_id, "LICENSE", repo_type="dataset", revision="main"
+                        repo_id,
+                        "LICENSE",
+                        repo_type="dataset",
+                        revision=t.cast(str, revision),
                     )
                 )
             except Exception as error:
@@ -511,7 +523,12 @@ def _assert_initialise_target_is_safe(api: HubClient, repo_id: str, card: str) -
         return
     try:
         existing_card = b"".join(
-            api.stream_file(repo_id, "README.md", repo_type="dataset", revision="main")
+            api.stream_file(
+                repo_id,
+                "README.md",
+                repo_type="dataset",
+                revision=t.cast(str, revision),
+            )
         ).decode("utf-8")
     except Exception as error:
         raise PublicationError(
@@ -540,7 +557,10 @@ def _assert_initialise_target_is_safe(api: HubClient, repo_id: str, card: str) -
         try:
             existing_license = b"".join(
                 api.stream_file(
-                    repo_id, "LICENSE", repo_type="dataset", revision="main"
+                    repo_id,
+                    "LICENSE",
+                    repo_type="dataset",
+                    revision=t.cast(str, revision),
                 )
             )
         except Exception as error:
@@ -595,17 +615,54 @@ def _mutate_commit(
     *,
     operations: c.Sequence[UploadOperation],
     message: str,
+    parent_commit: str | None,
     commit_recorded: c.Callable[[str], None] | None = None,
 ) -> object:
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     result = api.create_commit(
-        repo_id, operations, repo_type="dataset", commit_message=message
+        repo_id,
+        operations,
+        repo_type="dataset",
+        commit_message=message,
+        parent_commit=parent_commit,
     )
     commit_id = _commit_sha(result)
     if commit_recorded is not None:
         commit_recorded(commit_id)
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
     return result
+
+
+def _target_head(info: object, repo_id: str) -> str | None:
+    """Return the exact current target head, including an empty-repo marker.
+
+    Returns:
+        The full SHA of the target's current head, or ``None`` for a repository
+        whose API explicitly reports that it has no commits.
+
+    Raises:
+        PublicationError:
+            If the target is not private or exposes a non-immutable head.
+    """
+    _assert_private(info, repo_id)
+    present = False
+    value: object = None
+    for name in ("sha", "oid", "commit_id"):
+        if isinstance(info, dict) and name in info:
+            present = True
+            value = info[name]
+            break
+        if hasattr(info, name):
+            present = True
+            value = getattr(info, name)
+            break
+    if not present:
+        raise PublicationError("Hub did not expose the private target HEAD")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _COMMIT_SHA.fullmatch(value):
+        raise PublicationError("Hub did not return a complete private target HEAD")
+    return value
 
 
 def publish_batch(
@@ -671,7 +728,8 @@ def publish_batch(
     """
     if shards and len(shards) + 1 >= 100:
         raise AllowListError("a Hub commit must contain fewer than 100 operations")
-    _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
+    target_info = api.repo_info(repo_id=repo_id, repo_type="dataset")
+    target_head = _target_head(target_info, repo_id)
     ledger_record = None if ledger is None else ledger.batch(batch_id)
     if ledger_record is not None and ledger_record.state in {
         LedgerState.COMMITTED,
@@ -754,7 +812,9 @@ def publish_batch(
         row_count=0,
         sha256=_sha256_bytes(manifest),
     )
-    _refuse_remote_collisions(api, repo_id, (*local_evidence, manifest_evidence))
+    _refuse_remote_collisions(
+        api, repo_id, (*local_evidence, manifest_evidence), revision=target_head
+    )
     operations = tuple(
         [
             UploadOperation(path_in_repo=item.path, path=shard.path)
@@ -777,6 +837,7 @@ def publish_batch(
         repo_id,
         operations=operations,
         message=f"Publish P1 batch {batch_id}",
+        parent_commit=target_head,
         commit_recorded=remember_commit,
     )
     assert commit_id is not None
@@ -1159,7 +1220,11 @@ def _manifest_repo_path(batch_id: str) -> str:
 
 
 def _refuse_remote_collisions(
-    api: HubClient, repo_id: str, expected: tuple[ShardEvidence, ...]
+    api: HubClient,
+    repo_id: str,
+    expected: tuple[ShardEvidence, ...],
+    *,
+    revision: str | None,
 ) -> None:
     """Refuse overwriting paths from an unrelated publication.
 
@@ -1167,11 +1232,14 @@ def _refuse_remote_collisions(
         AllowListError:
             If a requested path already exists in the repository.
     """
-    listing = getattr(api, "list_repo_files", None)
-    if not callable(listing):
-        return
     try:
-        existing = set(listing(repo_id, repo_type="dataset", revision=None))
+        existing = set(
+            api.list_repo_files(repo_id, repo_type="dataset", revision=revision)
+        )
+    except RevisionNotFoundError as error:
+        if revision is not None:
+            raise AllowListError("could not establish remote path safety") from error
+        existing = set()
     except Exception as error:
         raise AllowListError("could not establish remote path safety") from error
     collisions = existing.intersection(item.path for item in expected)
