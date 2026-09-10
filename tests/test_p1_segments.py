@@ -16,6 +16,7 @@ from hviske.p1_contracts import (
     NormalisationContract,
     RejectionCategory,
     SegmentationContract,
+    SourceProgramme,
     SourceWord,
     annotate_source_words,
 )
@@ -545,3 +546,74 @@ def test_vad_ratio_and_edges() -> None:
     signal = VADSignal(speech_intervals=((100, 300),), programme_duration_ms=500)
     assert signal.speech_ratio(100, 400) == pytest.approx(2 / 3)
     assert signal.snap_edges(300, 400) == (300, 400)
+
+
+def test_zero_duration_duplicate_keeps_timed_source_occurrence() -> None:
+    """Source ownership survives programme validation and output creation."""
+
+    class CTC:
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, sampling_rate
+            assert alignment_text == "foo foo"
+            assert word_map == ("foo", "foo")
+            return AlignmentResult(start_ms=start_ms, end_ms=end_ms, score=1.0)
+
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "source",
+            "words": [
+                {"text": "foo", "start_ms": 0, "end_ms": 0},
+                {"text": "foo", "start_ms": 1_000, "end_ms": 2_000},
+            ],
+        }
+    )
+    programme = SourceProgramme(
+        file_id=parsed.file_id,
+        duration_ms=2_000,
+        words=parsed.words,
+        transcript_text=parsed.text,
+    )
+
+    word = programme.words[0]
+    source_span = word.source_span
+    assert source_span is not None
+    assert (source_span.start, source_span.end) == (3, 6)
+    assert word.separator_text == "foo"
+    assert word.separator_span is not None
+    assert (word.separator_span.start, word.separator_span.end) == (0, 3)
+    assert word.trailing_text == ""
+    proposals = form_candidate_segments(
+        words=programme.words,
+        source_file_id=programme.file_id,
+        contract=segmentation_contract(),
+    )
+    assert [proposal.text for proposal in proposals] == ["foofoo"]
+
+    result = segment_programme(
+        words=programme.words,
+        audio=np.zeros(32_000, dtype=np.float32),
+        source_file_id=programme.file_id,
+        source_duration_ms=programme.duration_ms,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(
+            version="p1-text-normalisation-5", case_folding=True
+        ),
+        ctc=CTC(),
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].text == "foofoo"
+    assert (result.rows[0].source_start_ms, result.rows[0].source_end_ms) == (
+        1_000,
+        2_000,
+    )

@@ -415,7 +415,25 @@ class SourceProgramme(ContractModel):
                 raise ValueError("word span must fit programme duration")
             previous_end = word.end_ms
         if self.transcript_text is not None and self.words:
-            annotated = annotate_source_words(self.words, self.transcript_text)
+            has_source_spans = any(word.source_span is not None for word in self.words)
+            if has_source_spans and not all(
+                word.source_span is not None for word in self.words
+            ):
+                raise ValueError(
+                    "source character spans must be present for every source word"
+                )
+            expected_starts = (
+                tuple(
+                    word.source_span.start
+                    for word in self.words
+                    if word.source_span is not None
+                )
+                if has_source_spans
+                else None
+            )
+            annotated = annotate_source_words(
+                self.words, self.transcript_text, expected_starts=expected_starts
+            )
             object.__setattr__(self, "words", annotated)
             object.__setattr__(
                 self,
