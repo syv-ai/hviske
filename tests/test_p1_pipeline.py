@@ -649,7 +649,7 @@ def test_p1_settings_record_roest_model_evidence(tmp_path: Path) -> None:
     """Pipeline reports and identity evidence name the exact Roest checkpoint."""
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
 
-    assert settings.pipeline_version == "p1-segmentation-5"
+    assert settings.pipeline_version == "p1-segmentation-6"
     assert settings.normalisation.version == "p1-text-normalisation-5"
     assert settings.normalisation.source_text_ownership == (
         "speaker-consistent-following-word-with-terminal-suffix-v5"

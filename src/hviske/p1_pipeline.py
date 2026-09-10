@@ -2355,16 +2355,19 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
             "preserved; speaker-consistent untimed lexical text uses bounded "
             "following-word ownership or a terminal previous-word suffix "
             f"({P1_RUNTIME_CONTRACT.normalisation_source_text_ownership}) and remains "
-            "in exact published and canonical CTC text; published source-word spans "
-            "remain verbatim; the "
+            "in exact published and canonical CTC text; proposal durations are checked "
+            "against the hard segmentation bounds before CTC; prepared CTC paths "
+            "that cannot fit the emission window are rejected as data; published "
+            "source-word spans remain verbatim; the "
             f"CTC model is {P1_RUNTIME_CONTRACT.roest_license}/OpenRAIL-M metadata, "
             "not Apache-2.0. Roest model weights are internal and are not distributed."
         ),
         field_schema="p1-segments-v1 OutputRow schema.",
         known_limitations="Pilot thresholds and anomaly statistics require review.",
         rejection_policy=(
-            "Invalid, empty, low-confidence, and undecodable programmes are "
-            "recorded in the ledger."
+            "Invalid, empty, short or overlong proposals, CTC-infeasible alignment "
+            "windows, low-confidence, and undecodable programmes are recorded in "
+            "the ledger; unexpected model and programming failures remain fatal."
         ),
         source_revisions=json.dumps(
             {

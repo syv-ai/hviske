@@ -53,6 +53,10 @@ class AlignmentResult:
     raw_score_inputs: tuple[float, ...] = ()
 
 
+class CTCAlignmentInfeasible(ValueError):
+    """Raised when an emission window cannot represent the CTC target path."""
+
+
 class CTCBackend(t.Protocol):
     """Injectable CTC forced-alignment implementation."""
 
@@ -484,6 +488,8 @@ def align_ctc_word_tokens(
     Raises:
         ValueError:
             If emissions, token IDs, or the blank ID are invalid.
+        CTCAlignmentInfeasible:
+            If the prepared CTC path is longer than the emission window.
     """
     values = np.asarray(emissions, dtype=np.float32)
     if values.ndim != 2 or values.shape[0] == 0:
@@ -511,6 +517,10 @@ def align_ctc_word_tokens(
     config.update_excluded_characters()
     text = [" ".join(str(token) for token in word) for word in tokenised_words]
     ground_truth, utterance_starts = ctc.prepare_tokenized_text(config, text)
+    if values.shape[0] < len(ground_truth):
+        raise CTCAlignmentInfeasible(
+            "emission frames cannot accommodate the prepared CTC ground-truth path"
+        )
     timings, char_probs, _ = ctc.ctc_segmentation(config, values, ground_truth)
     segments = ctc.determine_utterance_segments(
         config, utterance_starts, char_probs, timings, text
@@ -806,6 +816,13 @@ def segment_programme(
         audit_candidates.append(candidate)
 
     for proposal in proposals:
+        proposal_duration_ms = proposal.proposal_end_ms - proposal.proposal_start_ms
+        if (
+            proposal_duration_ms < segmentation.minimum_duration_ms
+            or proposal_duration_ms >= segmentation.maximum_duration_ms
+        ):
+            reject(proposal, RejectionCategory.DURATION_OUT_OF_RANGE.value)
+            continue
         canonical = normalise_alignment_text(
             words=validated[proposal.word_start_index : proposal.word_end_index],
             contract=normalisation,
@@ -816,27 +833,31 @@ def segment_programme(
         local_audio = values[
             proposal.proposal_start_ms * 16 : proposal.proposal_end_ms * 16
         ]
-        first = ctc.align(
-            audio=local_audio,
-            alignment_text=canonical.text,
-            word_map=canonical.word_map,
-            start_ms=proposal.proposal_start_ms,
-            end_ms=proposal.proposal_end_ms,
-            sampling_rate=16000,
-        )
-        final_alignment, applied = correct_drift_once(
-            proposal=proposal,
-            first_alignment=first,
-            maximum_drift_ms=segmentation.maximum_drift_ms,
-            realign=lambda start, end: ctc.align(
-                audio=values[start * 16 : end * 16],
+        try:
+            first = ctc.align(
+                audio=local_audio,
                 alignment_text=canonical.text,
                 word_map=canonical.word_map,
-                start_ms=start,
-                end_ms=end,
+                start_ms=proposal.proposal_start_ms,
+                end_ms=proposal.proposal_end_ms,
                 sampling_rate=16000,
-            ),
-        )
+            )
+            final_alignment, applied = correct_drift_once(
+                proposal=proposal,
+                first_alignment=first,
+                maximum_drift_ms=segmentation.maximum_drift_ms,
+                realign=lambda start, end: ctc.align(
+                    audio=values[start * 16 : end * 16],
+                    alignment_text=canonical.text,
+                    word_map=canonical.word_map,
+                    start_ms=start,
+                    end_ms=end,
+                    sampling_rate=16000,
+                ),
+            )
+        except CTCAlignmentInfeasible:
+            reject(proposal, RejectionCategory.CTC_ALIGNMENT_FAILED.value)
+            continue
         correction_count += applied
         if vad_signal is not None:
             snapped_start, snapped_end = vad_signal.snap_edges(

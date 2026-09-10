@@ -88,7 +88,7 @@ class P1RuntimeContract:
 
 
 P1_RUNTIME_CONTRACT = P1RuntimeContract(
-    pipeline_version="p1-segmentation-5",
+    pipeline_version="p1-segmentation-6",
     ctc_name="ctc-segmentation",
     ctc_version="1.7.4",
     ctc_source_commit="69bd9b53b7b82ad926d35e7b280f957ed299a7db",
@@ -562,6 +562,7 @@ class RejectionCategory(str, enum.Enum):
 
     EMPTY_TEXT = "empty_text"
     DURATION_OUT_OF_RANGE = "duration_out_of_range"
+    CTC_ALIGNMENT_FAILED = "ctc_alignment_failed"
     INVALID_TIMESTAMPS = "invalid_timestamps"
     LOW_ALIGNMENT_SCORE = "low_alignment_score"
     EXCESSIVE_DRIFT = "excessive_drift"

@@ -22,6 +22,7 @@ from hviske.p1_contracts import (
 )
 from hviske.p1_segments import (
     AlignmentResult,
+    CTCAlignmentInfeasible,
     CTCBackend,
     VADSignal,
     align_ctc_emissions,
@@ -161,6 +162,16 @@ def test_candidates_preserve_verbatim_source_separators() -> None:
     assert source_words[2].separator_text == "\n"
 
 
+def test_ctc_alignment_rejects_impossible_prepared_path() -> None:
+    """The segmenter is not called when the target path exceeds frame capacity."""
+    emissions = np.zeros((2, 3), dtype=np.float32)
+
+    with pytest.raises(CTCAlignmentInfeasible):
+        align_ctc_emissions(
+            emissions=emissions, token_ids=(1,), start_ms=0, frame_duration_ms=20.0
+        )
+
+
 def test_ctc_emission_adapter_returns_token_boundaries() -> None:
     """Synthetic emissions prove model-free CTC boundary extraction."""
     emissions = np.full((6, 3), -5.0, dtype=np.float32)
@@ -173,6 +184,43 @@ def test_ctc_emission_adapter_returns_token_boundaries() -> None:
     assert result.word_boundaries[0][:2] == (105, 125)
     assert result.word_boundaries[1][:2] == (125, 145)
     assert result.score_type == "ctc-segmentation:min_mean_log_probability"
+
+
+def test_ctc_infeasible_proposal_does_not_abort_programme() -> None:
+    """A typed infeasibility rejects one proposal while later rows publish."""
+
+    class CTC:
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, word_map, sampling_rate
+            if alignment_text == "abcde":
+                raise CTCAlignmentInfeasible("target path does not fit")
+            return AlignmentResult(start_ms=start_ms, end_ms=end_ms, score=1.0)
+
+    result = segment_programme(
+        words=words(
+            ("abcde", 0, 1_000, "speaker-a"), ("normal", 1_000, 3_000, "speaker-b")
+        ),
+        audio=np.zeros(48_000, dtype=np.float32),
+        source_file_id="source",
+        source_duration_ms=3_000,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(version="test"),
+        ctc=CTC(),
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].text == "normal"
+    assert result.rejections == (("abcde", "ctc_alignment_failed"),)
 
 
 def test_danish_mapping_is_reversible() -> None:
@@ -377,7 +425,7 @@ def test_owned_lexical_text_reaches_ctc_and_published_text_exactly() -> None:
             version="p1-text-normalisation-5", case_folding=True
         ),
         ctc=CTC(),
-        pipeline_version="p1-segmentation-5",
+        pipeline_version="p1-segmentation-6",
         pipeline_config_sha256=CONFIG_DIGEST,
     )
 
@@ -494,6 +542,47 @@ def test_shards_rotate_and_callback_follows_fsync(tmp_path: Path) -> None:
     assert all(pq.read_table(shard.path).num_rows == 1 for shard in result.shards)
     assert all(stream_sha256(shard.path) == shard.sha256 for shard in result.shards)
     assert all(validate_output_shard(shard.path) is None for shard in result.shards)
+
+
+def test_short_proposal_is_rejected_before_ctc_and_audited() -> None:
+    """A short speaker run cannot invoke CTC or disappear from the audit trail."""
+
+    class CTC:
+        calls = 0
+
+        def align(
+            self,
+            audio: np.ndarray,
+            alignment_text: str,
+            word_map: tuple[str, ...],
+            start_ms: int,
+            end_ms: int,
+            sampling_rate: int,
+        ) -> AlignmentResult:
+            del audio, alignment_text, word_map, sampling_rate
+            self.calls += 1
+            return AlignmentResult(start_ms=start_ms, end_ms=end_ms, score=1.0)
+
+    ctc = CTC()
+    result = segment_programme(
+        words=words(
+            ("abcde", 0, 40, "speaker-a"), ("normal", 1_000, 3_000, "speaker-b")
+        ),
+        audio=np.zeros(48_000, dtype=np.float32),
+        source_file_id="source",
+        source_duration_ms=3_000,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(version="test"),
+        ctc=ctc,
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+    )
+
+    assert ctc.calls == 1
+    assert len(result.rows) == 1
+    assert result.rejections == (("abcde", "duration_out_of_range"),)
+    assert result.audit_candidates[0]["source_start_ms"] == 0
+    assert result.audit_candidates[0]["source_end_ms"] == 40
 
 
 def test_source_audio_is_downmixed_and_resampled() -> None:
