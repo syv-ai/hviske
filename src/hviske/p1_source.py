@@ -34,7 +34,7 @@ logger.setLevel(logging.WARNING)
 class _SignedUrlFilter(logging.Filter):
     """Remove credentials from accidental dependency log records."""
 
-    _url_pattern = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+    _url_pattern = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Redact query strings and signed URL parameters in-place.
@@ -43,13 +43,45 @@ class _SignedUrlFilter(logging.Filter):
             Always ``True`` so the record remains eligible for other handlers.
         """
         message = record.getMessage()
-        if "http" in message.lower():
-            record.msg = self._url_pattern.sub("<url-redacted>", message)
-            record.args = ()
+        record.msg = self._url_pattern.sub("<url-redacted>", message)
+        record.args = ()
+        if record.exc_text:
+            record.exc_text = self._url_pattern.sub("<url-redacted>", record.exc_text)
         return True
 
 
-logger.addFilter(_SignedUrlFilter())
+_SIGNED_URL_FILTER = _SignedUrlFilter()
+_TRANSPORT_LOGGER_NAMES = ("httpx", "httpcore", "huggingface_hub", "fsspec")
+
+
+def harden_p1_logging() -> None:
+    """Harden dependency logging and redact URLs on all active handlers.
+
+    Hydra installs its handlers before invoking the pipeline, so this function is
+    intended to run at the beginning of :func:`run_pipeline`.  It is safe to call
+    repeatedly, including after a handler has been added, and leaves the P1
+    application loggers at their configured levels.
+    """
+    for name in _TRANSPORT_LOGGER_NAMES:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    handlers: list[logging.Handler] = list(logging.root.handlers)
+    if logging.lastResort is not None:
+        handlers.append(logging.lastResort)
+    for value in logging.Logger.manager.loggerDict.values():
+        if isinstance(value, logging.Logger):
+            handlers.extend(value.handlers)
+
+    seen: set[int] = set()
+    for handler in handlers:
+        if id(handler) in seen:
+            continue
+        seen.add(id(handler))
+        if not any(isinstance(item, _SignedUrlFilter) for item in handler.filters):
+            handler.addFilter(_SIGNED_URL_FILTER)
+
+
+logger.addFilter(_SIGNED_URL_FILTER)
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
