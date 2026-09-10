@@ -135,6 +135,7 @@ class AuditReservoir:
         local_paths: c.Sequence[Path | str],
         remote_paths: c.Sequence[str],
         row_counts: c.Sequence[int],
+        parquet_sha256: c.Sequence[str] | None = None,
     ) -> int:
         """Resolve selected local candidates to immutable remote locations.
 
@@ -148,21 +149,27 @@ class AuditReservoir:
 
         Raises:
             ValueError:
-                If shard locator sequences or the immutable revision are invalid.
+                If shard locator sequences, hashes, or the immutable revision are
+                invalid.
         """
         if not _COMMIT_SHA.fullmatch(revision):
             raise ValueError("audit candidates require a complete immutable revision")
         if not (len(local_paths) == len(remote_paths) == len(row_counts)):
             raise ValueError("local and remote shard evidence must have equal lengths")
-        by_identity: dict[tuple[str, int], tuple[str, str]] = {}
-        for local, remote, count in zip(
-            local_paths, remote_paths, row_counts, strict=True
+        if parquet_sha256 is not None and len(parquet_sha256) != len(remote_paths):
+            raise ValueError("Parquet hashes must match remote shard evidence")
+        by_identity: dict[tuple[str, int], tuple[str, str, str | None]] = {}
+        for index, (local, remote, count) in enumerate(
+            zip(local_paths, remote_paths, row_counts, strict=True)
         ):
+            shard_hash = parquet_sha256[index] if parquet_sha256 is not None else None
+            if shard_hash is not None and not _SHA256.fullmatch(shard_hash):
+                raise ValueError("Parquet hashes must be lowercase SHA-256 hex")
             if count < 0:
                 raise ValueError("audit shard row counts must not be negative")
             local_key = str(Path(local).expanduser().resolve(strict=False))
             for row_locator in range(count):
-                by_identity[(local_key, row_locator)] = (remote, repository)
+                by_identity[(local_key, row_locator)] = (remote, repository, shard_hash)
 
         resolved = 0
         for row in self.rows:
@@ -177,7 +184,7 @@ class AuditReservoir:
             )
             if target is None:
                 continue
-            remote, target_repository = target
+            remote, target_repository, shard_hash = target
             existing_path = _parquet_path(row)
             existing_revision = _string(row, "revision", "hub_revision")
             if existing_path is not None:
@@ -193,6 +200,8 @@ class AuditReservoir:
                     "row_locator": row_locator,
                 }
             )
+            if shard_hash is not None:
+                row["parquet_sha256"] = shard_hash
             row.pop("local_path", None)
             row.pop("local_row_locator", None)
             resolved += 1
@@ -1020,6 +1029,15 @@ class PinnedHubClipRetriever:
 
         Returns:
             The addressed embedded audio bytes.
+        """
+        return _embedded_audio(self.retrieve_row(entry))
+
+    def retrieve_row(self, entry: MetadataRow) -> MetadataRow:
+        """Retrieve and verify one complete row represented by a candidate record.
+
+        Returns:
+            The addressed row mapping. Only this one row remains reachable by the
+            caller; the streaming dataset itself is not retained.
 
         Raises:
             ValueError:
@@ -1066,7 +1084,7 @@ class PinnedHubClipRetriever:
         expected_audio = _string(entry, "audio_sha256")
         if expected_audio and hashlib.sha256(audio).hexdigest() != expected_audio:
             raise ValueError("retrieved audio hash does not match candidate")
-        return audio
+        return row
 
 
 def _embedded_audio(row: MetadataRow) -> bytes:
