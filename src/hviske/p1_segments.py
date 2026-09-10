@@ -1259,8 +1259,13 @@ def decode_flac(payload: bytes) -> np.ndarray:
     try:
         with sf.SoundFile(io.BytesIO(payload)) as decoded_file:
             decoded = decoded_file.read(dtype="float32", always_2d=True)
-            if decoded_file.samplerate != 16000 or decoded_file.channels != 1:
-                raise ValueError("fresh FLAC decode is not mono 16 kHz")
+            if (
+                decoded_file.format != "FLAC"
+                or decoded_file.subtype != "PCM_16"
+                or decoded_file.samplerate != 16000
+                or decoded_file.channels != 1
+            ):
+                raise ValueError("fresh decode is not PCM_16 FLAC mono 16 kHz")
     except (RuntimeError, sf.LibsndfileError) as exc:
         raise ValueError("payload is not a readable FLAC stream") from exc
     return decoded[:, 0]

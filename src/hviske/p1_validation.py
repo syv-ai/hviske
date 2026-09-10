@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,13 +25,11 @@ import time
 import typing as t
 import unicodedata
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from statistics import mean, median
 
-from hviske.p1_source import (
-    _AUDIO_POINTER_METADATA_KEY,
-    _AUDIO_POINTER_METADATA_MAX_BYTES,
-)
+from .p1_contracts import OUTPUT_SCHEMA
+from .p1_source import _AUDIO_POINTER_METADATA_KEY, _AUDIO_POINTER_METADATA_MAX_BYTES
 
 MetadataRow = c.Mapping[str, object]
 RowStream = c.Iterable[MetadataRow]
@@ -112,7 +111,10 @@ class AuditReservoir:
                 continue
             _validate_candidate_locator(row, status)
             safe_row = _metadata_copy(row)
-            safe_row["_p1_metadata_sha256"] = _metadata_digest(row)
+            metadata_digest = _string(row, "_p1_metadata_sha256", "metadata_sha256")
+            if metadata_digest is None or not _SHA256.fullmatch(metadata_digest):
+                metadata_digest = _metadata_digest(row)
+            safe_row["_p1_metadata_sha256"] = metadata_digest
             audio_digest = _audio_digest(row)
             if audio_digest is not None:
                 safe_row["_p1_audio_sha256"] = audio_digest
@@ -521,53 +523,24 @@ def _integer(row: MetadataRow, *keys: str) -> int | None:
 
 
 def _metadata_digest(row: MetadataRow) -> str:
-    """Hash the canonical remote-equivalent, non-audio row projection.
+    """Hash the canonical metadata of the complete published row.
 
-    Repository provenance, audit locators, decisions, hashes and embedded payloads
-    are transport metadata rather than row metadata and are excluded.  Nested
-    mappings are sorted and tuples are represented as JSON arrays, so the exact same
-    projection can be computed before upload and after streaming retrieval.
+    The digest is calculated from the output schema before audit metadata is reduced
+    to its bounded reservoir representation. Audio bytes and the digest itself are
+    excluded because they are payload and transport values, respectively. Keeping
+    every other published field (including source and segment identities) means that
+    a row changing between local generation and remote retrieval cannot pass audit.
 
     Returns:
-        A SHA-256 digest of the canonical metadata projection.
+        A SHA-256 digest of the canonical published metadata.
     """
-    ignored = {
-        "audio",
-        "waveform",
-        "array",
-        "input_values",
-        "status",
-        "quality_status",
-        "accepted",
-        "borderline",
-        "rejection_reason",
-        "reject_reason",
-        "_p1_metadata_sha256",
-        "_p1_audio_sha256",
-        "audio_sha256",
-        "repository",
-        "repo_id",
-        "hub_repo",
-        "revision",
-        "hub_revision",
-        "parquet_path",
-        "remote_parquet_path",
-        "shard_path",
-        "source_parquet",
-        "parquet_sha256",
-        "shard_sha256",
-        "metadata_sha256",
-        "row_locator",
-        "row_index",
-        "parquet_row",
-        "local_path",
-        "local_row_locator",
-        "id",
-        "remote_path",
+    published_fields = {
+        field.name for field in OUTPUT_SCHEMA.fields if field.name != "audio"
     }
-    payload = _canonical_json_value(
-        {key: value for key, value in row.items() if key not in ignored}
-    )
+    metadata = {
+        key: _canonical_published_value(key, row.get(key)) for key in published_fields
+    }
+    payload = _canonical_json_value(metadata)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -588,6 +561,20 @@ def _canonical_json_value(value: object) -> object:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _canonical_published_value(key: str, value: object) -> object:
+    """Match scalar coercions performed by the published Arrow schema.
+
+    Returns:
+        The value in the representation used by the published row.
+    """
+    if key in {"alignment_score", "vad_speech_ratio"} and isinstance(value, float):
+        try:
+            return struct.unpack("!f", struct.pack("!f", value))[0]
+        except OverflowError:
+            return value
+    return value
 
 
 def _parquet_path(row: MetadataRow) -> str | None:
@@ -695,6 +682,14 @@ def _validate_audit_locator(row: MetadataRow) -> tuple[str, int, str]:
     parquet_path = _parquet_path(row)
     if parquet_path is None:
         raise ValueError("audit candidates require a remote Parquet path")
+    pure_path = PurePosixPath(parquet_path)
+    if (
+        pure_path.is_absolute()
+        or "\\" in parquet_path
+        or "://" in parquet_path
+        or ".." in pure_path.parts
+    ):
+        raise ValueError("audit candidate Parquet locator is unsafe")
     locator = _explicit_row_locator(row)
     if locator is None or locator < 0:
         raise ValueError("audit candidates require a non-negative row locator")
@@ -995,10 +990,10 @@ class IndependentASR(t.Protocol):
 class PinnedHubClipRetriever:
     """Read exactly one embedded-audio row from an immutable Hub revision.
 
-    ``hub`` only needs the small ``load_dataset`` method exposed by the publication
-    adapter, which keeps this class straightforward to test without network access.
-    Dataset iteration may scan preceding rows, but only the addressed row's audio is
-    returned and no dataset or row is retained.
+    ``hub`` exposes the small ``repo_info``, ``get_paths_info``, and ``load_dataset``
+    methods provided by the publication adapter. Dataset iteration may scan preceding
+    rows, but only the addressed row's audio is returned and no dataset or row is
+    retained.
     """
 
     def __init__(
@@ -1023,6 +1018,7 @@ class PinnedHubClipRetriever:
         self.hub = hub
         self.repository = selected_repository
         self.revision = revision
+        self._repository_verified = False
 
     def retrieve(self, entry: MetadataRow) -> bytes:
         """Retrieve and verify one clip represented by a candidate record.
@@ -1045,6 +1041,11 @@ class PinnedHubClipRetriever:
             TypeError:
                 If the Hub adapter or returned rows are not stream-compatible.
         """
+        if (
+            callable(getattr(self.hub, "repo_info", None))
+            and not self._repository_verified
+        ):
+            self.verify_repository()
         repository = _string(entry, "repository", "repo_id")
         revision = _string(entry, "revision")
         if repository and repository != self.repository:
@@ -1066,12 +1067,15 @@ class PinnedHubClipRetriever:
         loader = getattr(self.hub, "load_dataset", None)
         if loader is None:
             raise TypeError("Hub adapter must provide load_dataset")
-        dataset = loader(
-            self.repository,
-            shard_path=parquet_path,
-            revision=self.revision,
-            streaming=True,
-        )
+        try:
+            dataset = loader(
+                self.repository,
+                shard_path=parquet_path,
+                revision=self.revision,
+                streaming=True,
+            )
+        except Exception:
+            raise ValueError("unable to retrieve the pinned dataset row") from None
         row = _row_at(dataset, locator)
         expected_segment = _string(entry, "segment_id")
         actual_segment = _string(row, "segment_id", "id")
@@ -1085,6 +1089,49 @@ class PinnedHubClipRetriever:
         if expected_audio and hashlib.sha256(audio).hexdigest() != expected_audio:
             raise ValueError("retrieved audio hash does not match candidate")
         return row
+
+    def verify_repository(self) -> None:
+        """Verify the pinned private dataset revision before retrieval.
+
+        Raises:
+            ValueError:
+                If repository metadata is unavailable, public, or resolves to a
+                different commit than the pinned revision.
+        """
+        getter = getattr(self.hub, "repo_info", None)
+        if not callable(getter):
+            raise ValueError("Hub adapter cannot verify the pinned dataset revision")
+        try:
+            info = getter(self.repository, repo_type="dataset", revision=self.revision)
+        except Exception:
+            raise ValueError("unable to verify the pinned dataset revision") from None
+        private = (
+            info.get("private")
+            if isinstance(info, c.Mapping)
+            else getattr(info, "private", None)
+        )
+        resolved_sha = (
+            next(
+                (
+                    info.get(name)
+                    for name in ("sha", "oid", "commit_id")
+                    if isinstance(info, c.Mapping) and isinstance(info.get(name), str)
+                ),
+                None,
+            )
+            if isinstance(info, c.Mapping)
+            else next(
+                (
+                    getattr(info, name)
+                    for name in ("sha", "oid", "commit_id")
+                    if isinstance(getattr(info, name, None), str)
+                ),
+                None,
+            )
+        )
+        if private is not True or resolved_sha != self.revision:
+            raise ValueError("pinned dataset is not private at the requested revision")
+        self._repository_verified = True
 
 
 def _embedded_audio(row: MetadataRow) -> bytes:
@@ -1114,7 +1161,7 @@ def _row_at(dataset: object, locator: int) -> MetadataRow:
             if not isinstance(row, c.Mapping):
                 raise TypeError("Hub dataset rows must be mappings")
             return row
-    raise FileNotFoundError(f"Parquet row {locator} was not found")
+    raise FileNotFoundError("requested Parquet row was not found")
 
 
 def _validate_remote_shard_hash(
@@ -1133,11 +1180,14 @@ def _validate_remote_shard_hash(
     getter = getattr(hub, "get_paths_info", None)
     if getter is None:
         raise ValueError("Hub adapter cannot verify the candidate Parquet hash")
-    info = list(
-        getter(repository, [parquet_path], repo_type="dataset", revision=revision)
-    )
+    try:
+        info = list(
+            getter(repository, [parquet_path], repo_type="dataset", revision=revision)
+        )
+    except Exception:
+        raise ValueError("unable to verify the remote Parquet shard") from None
     if not info:
-        raise FileNotFoundError(parquet_path)
+        raise FileNotFoundError("requested Parquet shard was not found")
     value = _object_value(info[0], "sha256") or _object_value(info[0], "oid")
     if value != expected:
         raise ValueError("remote Parquet hash does not match candidate")
