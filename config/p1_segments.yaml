@@ -1,7 +1,9 @@
 # Phase 1C contract configuration. Every revision is immutable and complete.
+# P1 v7 is timestamp-native; the VAD/CTC pins below remain legacy evidence only.
 # Use mode=plan for a Hub-metadata-only preflight; initialise creates the private
 # target card, while pilot and production are bounded builds.
-pipeline_version: p1-segmentation-6
+pipeline_version: p1-segmentation-7
+alignment_method: timestamp-native:p1-transcripts.words
 mode: plan
 programme_limit: null
 source_file_id: null
@@ -10,7 +12,7 @@ resume: true
 max_source_bytes: null
 max_scratch_bytes: null
 shards_per_commit: null
-schema_version: p1-segments-v1
+schema_version: p1-segments-v2
 
 source:
   audio:
@@ -82,7 +84,7 @@ segmentation:
   target_maximum_duration_ms: 8000
   maximum_duration_ms: 10000
   maximum_drift_ms: 500
-  # Pilot-tunable: ctc-segmentation returns mean log probabilities <= 0.
+  # Retained for the generic CTC/VAD path; v7 does not use these thresholds.
   minimum_alignment_score: -10.0
   minimum_vad_speech_ratio: 0.0
 
@@ -120,6 +122,7 @@ runtime:
   # 2 GiB covers the observed ~58-minute, 48 kHz mono P1 programme as float32
   # PCM while bounding compressed-audio expansion before libsndfile allocation.
   max_decoded_audio_bytes: 2147483648
+  # Retained for generic future datasets; v7 never probes or initialises CUDA.
   device: cuda:0
   shards_per_commit: 8
   target_shard_bytes: 500000000

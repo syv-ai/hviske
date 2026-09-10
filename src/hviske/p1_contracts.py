@@ -45,6 +45,7 @@ class P1RuntimeContract:
     """The immutable implementation and data-processing contract for P1."""
 
     pipeline_version: str
+    alignment_method: str
     ctc_name: str
     ctc_version: str
     ctc_source_commit: str
@@ -88,7 +89,8 @@ class P1RuntimeContract:
 
 
 P1_RUNTIME_CONTRACT = P1RuntimeContract(
-    pipeline_version="p1-segmentation-6",
+    pipeline_version="p1-segmentation-7",
+    alignment_method="timestamp-native:p1-transcripts.words",
     ctc_name="ctc-segmentation",
     ctc_version="1.7.4",
     ctc_source_commit="69bd9b53b7b82ad926d35e7b280f957ed299a7db",
@@ -206,6 +208,7 @@ class OutputField(ContractModel):
 
     name: StrictStr
     type: StrictStr
+    nullable: bool = False
 
 
 class OutputRow(ContractModel):
@@ -226,14 +229,15 @@ class OutputRow(ContractModel):
     speaker_ids: tuple[StrictStr, ...]
     proposal_start_ms: StrictInt = Field(ge=0)
     proposal_end_ms: StrictInt = Field(gt=0)
-    alignment_score: StrictFloat
-    alignment_score_type: StrictStr
-    start_drift_ms: StrictInt
-    end_drift_ms: StrictInt
-    vad_speech_ratio: StrictFloat = Field(ge=0.0, le=1.0)
-    alignment_backend: StrictStr
+    alignment_score: StrictFloat | None = None
+    alignment_score_type: StrictStr = "not_applicable"
+    start_drift_ms: StrictInt | None = None
+    end_drift_ms: StrictInt | None = None
+    vad_speech_ratio: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    alignment_backend: StrictStr = "ctc-segmentation"
     pipeline_version: StrictStr
     pipeline_config_sha256: StrictStr
+    alignment_method: StrictStr = "ctc-segmentation"
 
     @field_validator("audio_sha256", "pipeline_config_sha256", "segment_id")
     def _digest_is_hex(value: str) -> str:
@@ -255,8 +259,20 @@ class OutputRow(ContractModel):
             raise ValueError("proposal boundaries must be ordered")
         if not self.text.strip() or not self.alignment_text.strip():
             raise ValueError("published and alignment text must not be empty")
-        if not math.isfinite(self.alignment_score):
-            raise ValueError("alignment_score must be finite")
+        if self.alignment_score is not None and not math.isfinite(self.alignment_score):
+            raise ValueError("alignment_score must be finite when supplied")
+        if self.alignment_method == "timestamp-native:p1-transcripts.words":
+            if (
+                self.source_start_ms != self.proposal_start_ms
+                or self.source_end_ms != self.proposal_end_ms
+                or self.alignment_score is not None
+                or self.start_drift_ms is not None
+                or self.end_drift_ms is not None
+                or self.vad_speech_ratio is not None
+            ):
+                raise ValueError(
+                    "timestamp-native rows cannot contain acoustic evidence"
+                )
         if not self.audio:
             raise ValueError("audio must contain an encoded FLAC payload")
         return self
@@ -515,7 +531,7 @@ def annotate_source_words(
 
 
 OUTPUT_SCHEMA = OutputSchema(
-    schema_version="p1-segments-v1",
+    schema_version="p1-segments-v2",
     fields=(
         OutputField(name="audio", type="Audio(16000)"),
         OutputField(name="audio_sha256", type="string"),
@@ -532,12 +548,13 @@ OUTPUT_SCHEMA = OutputSchema(
         OutputField(name="speaker_ids", type="list[string]"),
         OutputField(name="proposal_start_ms", type="int64"),
         OutputField(name="proposal_end_ms", type="int64"),
-        OutputField(name="alignment_score", type="float32"),
+        OutputField(name="alignment_score", type="float32", nullable=True),
         OutputField(name="alignment_score_type", type="string"),
-        OutputField(name="start_drift_ms", type="int32"),
-        OutputField(name="end_drift_ms", type="int32"),
-        OutputField(name="vad_speech_ratio", type="float32"),
+        OutputField(name="start_drift_ms", type="int32", nullable=True),
+        OutputField(name="end_drift_ms", type="int32", nullable=True),
+        OutputField(name="vad_speech_ratio", type="float32", nullable=True),
         OutputField(name="alignment_backend", type="string"),
+        OutputField(name="alignment_method", type="string"),
         OutputField(name="pipeline_version", type="string"),
         OutputField(name="pipeline_config_sha256", type="string"),
     ),
@@ -814,6 +831,7 @@ class CanonicalIdentityManifest(ContractModel):
 
     schema_version: StrictStr
     pipeline_version: StrictStr
+    alignment_method: StrictStr = "timestamp-native:p1-transcripts.words"
     source: SourceCoordinates
     vad: VADContract
     ctc: CTCContract
@@ -930,6 +948,7 @@ def validate_p1_runtime_contract(
     *,
     pipeline_version: str,
     ctc: CTCContract,
+    alignment_method: str | None = None,
     normalisation: NormalisationContract,
     dataset_license: DatasetLicenseContract | None = None,
 ) -> None:
@@ -940,6 +959,8 @@ def validate_p1_runtime_contract(
             Version of the P1 pipeline implementation.
         ctc:
             CTC library and model provenance to validate.
+        alignment_method (optional):
+            Active alignment method identity.
         normalisation:
             Text normalisation rules used before alignment.
         dataset_license (optional):
@@ -950,6 +971,10 @@ def validate_p1_runtime_contract(
             If any identity field differs from the active contract.
     """
     contract = P1_RUNTIME_CONTRACT
+    if alignment_method is not None and alignment_method != contract.alignment_method:
+        raise ValueError(
+            "P1 alignment method must be timestamp-native:p1-transcripts.words"
+        )
     if (
         ctc.model.repository.repository == contract.roest_repository
         and normalisation.case_folding != contract.normalisation_case_folding
