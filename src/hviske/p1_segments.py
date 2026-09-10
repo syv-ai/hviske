@@ -835,7 +835,13 @@ def segment_programme(
     Raises:
         SourceValidationError:
             If source audio does not match its declared duration or timestamps fail.
+        ValueError:
+            If a model-backed aligner is supplied to the active v7 pipeline.
     """
+    if pipeline_version == "p1-segmentation-7" and not isinstance(
+        ctc, TimestampAlignmentBackend
+    ):
+        raise ValueError("v7 cannot accept CTC alignment rows")
     try:
         values = prepare_source_audio(
             audio=audio, sampling_rate=sampling_rate, channels=channels
@@ -910,9 +916,7 @@ def segment_programme(
         ):
             reject(proposal, RejectionCategory.DURATION_OUT_OF_RANGE.value)
             continue
-        timestamp_native = getattr(ctc, "alignment_method", None) == (
-            "timestamp-native:p1-transcripts.words"
-        )
+        timestamp_native = pipeline_version == "p1-segmentation-7"
         if timestamp_native:
             alignment_text = proposal.text
             selected_words = validated[
@@ -1347,6 +1351,12 @@ def validate_output_shard(path: Path) -> None:
                     raise ValueError(
                         "v7 row does not declare timestamp-native alignment"
                     )
+                if row.get("alignment_backend") != "timestamp-native":
+                    raise ValueError("v7 row has a non-native backend")
+                if row.get("alignment_score_type") != (
+                    "not_applicable:source_timestamps"
+                ):
+                    raise ValueError("v7 row has an applicable score type")
                 if (
                     row.get("source_start_ms") != row.get("proposal_start_ms")
                     or row.get("source_end_ms") != row.get("proposal_end_ms")

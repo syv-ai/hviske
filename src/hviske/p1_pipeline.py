@@ -106,7 +106,7 @@ class PipelineSettings:
     vad_model_blob: str
     vad_model_sha256: str
     model_revisions: dict[str, object]
-    ctc_contract: CTCContract
+    ctc_contract: CTCContract | None
     segmentation: SegmentationContract
     normalisation: NormalisationContract
     dataset_license: DatasetLicenseContract
@@ -138,13 +138,48 @@ class PipelineSettings:
         max_decoded_audio = root.get("max_decoded_audio_bytes") or runtime.get(
             "max_decoded_audio_bytes", 2 * 1024**3
         )
-        vad_raw = t.cast(dict[str, object], root["vad"])
+        future_alignment = t.cast(dict[str, object], root.get("future_alignment", root))
+        if "vad" not in future_alignment:
+            future_alignment = {
+                **future_alignment,
+                "vad": {
+                    "name": "not_applicable",
+                    "repository": {
+                        "repository": "inactive/future-alignment",
+                        "revision": "0" * 40,
+                    },
+                    "model_path": "",
+                    "model_blob": "0" * 40,
+                    "model_sha256": "0" * 64,
+                    "license": "not_applicable",
+                },
+                "ctc": {
+                    "source_commit": "0" * 40,
+                    "sdist_sha256": "0" * 64,
+                    "license": "not_applicable",
+                    "model": {
+                        "repository": {
+                            "repository": "inactive/future-alignment",
+                            "revision": "0" * 40,
+                        },
+                        "license": "not_applicable",
+                    },
+                },
+                "anomaly_model": {
+                    "repository": {
+                        "repository": "inactive/future-alignment",
+                        "revision": "0" * 40,
+                    },
+                    "license": "not_applicable",
+                },
+            }
+        vad_raw = t.cast(dict[str, object], future_alignment["vad"])
         vad_repo = t.cast(dict[str, object], vad_raw["repository"])
-        ctc_raw = t.cast(dict[str, object], root["ctc"])
+        ctc_raw = t.cast(dict[str, object], future_alignment["ctc"])
         ctc_model = t.cast(dict[str, object], ctc_raw["model"])
         ctc_repo = t.cast(dict[str, object], ctc_model["repository"])
         normalisation_raw = t.cast(dict[str, object], root["normalisation"])
-        anomaly_raw = t.cast(dict[str, object], root["anomaly_model"])
+        anomaly_raw = t.cast(dict[str, object], future_alignment["anomaly_model"])
         output_raw = t.cast(dict[str, object], root["output"])
         dataset_license_raw = t.cast(dict[str, object], root["dataset_license"])
         manifest = CanonicalIdentityManifest(
@@ -213,6 +248,37 @@ class PipelineSettings:
         if manifest.output.schema != OUTPUT_SCHEMA:
             raise ValueError("P1 output schema must match the active v7 schema")
         digest = pipeline_config_sha256(manifest)
+        if manifest.pipeline_version != P1_RUNTIME_CONTRACT.pipeline_version and (
+            manifest.ctc is None
+        ):
+            raise ValueError("future model-backed alignment requires CTC metadata")
+        ctc_contract = manifest.ctc
+        active_model_revisions = (
+            {}
+            if manifest.pipeline_version == P1_RUNTIME_CONTRACT.pipeline_version
+            else {
+                "vad": {
+                    **vad_repo,
+                    "model_path": str(vad_raw["model_path"]),
+                    "model_blob": str(vad_raw["model_blob"]),
+                    "model_sha256": str(vad_raw["model_sha256"]),
+                },
+                "ctc": {
+                    **ctc_contract.model.repository.model_dump(mode="json"),
+                    **ctc_contract.model.model_dump(
+                        mode="json", exclude={"repository"}, exclude_none=True
+                    ),
+                },
+                "ctc_library": {
+                    "name": ctc_contract.name,
+                    "version": ctc_contract.version,
+                    "source_commit": ctc_contract.source_commit,
+                    "sdist_sha256": ctc_contract.sdist_sha256,
+                    "license": ctc_contract.license,
+                },
+                "anomaly": anomaly_raw["repository"],
+            }
+        )
         return cls(
             mode=str(root.get("mode", "build")),
             pipeline_version=str(root["pipeline_version"]),
@@ -253,30 +319,8 @@ class PipelineSettings:
             vad_model_path=str(vad_raw["model_path"]),
             vad_model_blob=str(vad_raw["model_blob"]),
             vad_model_sha256=str(vad_raw["model_sha256"]),
-            model_revisions={
-                "vad": {
-                    **vad_repo,
-                    "model_path": str(vad_raw["model_path"]),
-                    "model_blob": str(vad_raw["model_blob"]),
-                    "model_sha256": str(vad_raw["model_sha256"]),
-                },
-                "ctc": {
-                    **manifest.ctc.model.repository.model_dump(mode="json"),
-                    **manifest.ctc.model.model_dump(
-                        mode="json", exclude={"repository"}, exclude_none=True
-                    ),
-                },
-                "ctc_library": {
-                    "name": manifest.ctc.name,
-                    "version": manifest.ctc.version,
-                    "source_commit": manifest.ctc.source_commit,
-                    "sdist_sha256": manifest.ctc.sdist_sha256,
-                    "license": manifest.ctc.license,
-                },
-                "normalisation": manifest.normalisation.model_dump(mode="json"),
-                "anomaly": anomaly_raw["repository"],
-            },
-            ctc_contract=manifest.ctc,
+            model_revisions=active_model_revisions,
+            ctc_contract=ctc_contract,
             segmentation=manifest.segmentation,
             normalisation=manifest.normalisation,
             dataset_license=manifest.dataset_license,
@@ -418,7 +462,7 @@ def _initialise_report(*, settings: PipelineSettings, hub: object) -> BuildRepor
     scratch = settings.scratch_root
     free_bytes = shutil.disk_usage(scratch).free
     scratch_bytes = directory_size(scratch)
-    target = target_privacy(hub, settings.target_private_repo)
+    target = target_privacy(hub, settings.target_private_repo, settings.pipeline_digest)
     preflight = PreflightReport(
         mode=settings.mode,
         selected_programmes=0,
@@ -436,10 +480,14 @@ def _initialise_report(*, settings: PipelineSettings, hub: object) -> BuildRepor
                 "revision": settings.source_transcript_revision,
             },
         },
-        model_revisions=settings.model_revisions,
-        cuda=cuda_status(settings.device),
+        model_revisions={},
+        cuda={"checked": False, "reason": "not_applicable:timestamp-native"},
         target=target,
-        checks={"target_checked": target["private"] is True},
+        checks={
+            "target_checked": target["private"] is True,
+            "model_provenance_not_applicable": True,
+            "cuda_device_checked": False,
+        },
     )
     return BuildReport(preflight=preflight, selected_programmes=0)
 
@@ -472,46 +520,6 @@ def calculate_scratch_requirement(
         + model_cache
         + ledger_and_safety
     )
-
-
-def cuda_status(device: str) -> dict[str, object]:
-    """Inspect the selected CUDA device without constructing a model.
-
-    Returns:
-        Device availability and memory evidence.
-    """
-    try:
-        torch = importlib.import_module("torch")
-        available = bool(torch.cuda.is_available())
-        index = (
-            torch.cuda.current_device()
-            if device.startswith("cuda") and available
-            else None
-        )
-        if device.startswith("cuda:") and available:
-            index = int(device.split(":", 1)[1])
-            torch.cuda.get_device_properties(index)
-        total = (
-            int(torch.cuda.get_device_properties(index).total_memory)
-            if index is not None
-            else 0
-        )
-        free, _ = torch.cuda.mem_get_info(index) if index is not None else (0, 0)
-        return {
-            "checked": True,
-            "available": available,
-            "device": device,
-            "index": index,
-            "free_bytes": int(free),
-            "total_bytes": total,
-        }
-    except Exception as exc:
-        return {
-            "checked": True,
-            "available": False,
-            "device": device,
-            "error": type(exc).__name__,
-        }
 
 
 def directory_size(root: Path) -> int:
@@ -585,6 +593,11 @@ def _target_card_is_v7(
         "p1-segments-v2",
     )
     if not all(marker in card for marker in required):
+        return False
+    if "Model revisions" in card or any(
+        marker in card.lower()
+        for marker in ("silero", "roest", "whisper", "ctc", "vad")
+    ):
         return False
     return expected_digest is None or (
         f"pipeline_config_sha256: {expected_digest}" in card
@@ -2422,34 +2435,23 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
             "Pinned P1 sources: "
             f"{settings.source_audio_revision}, {settings.source_transcript_revision}."
         ),
-        permitted_use="Private commercial data preparation and model training only.",
+        permitted_use=(
+            "Private commercial data preparation and authorised internal use only."
+        ),
         private_access_terms="Access is restricted to authorised syv.ai members.",
         alignment_method=(
             "pipeline_version: p1-segmentation-7; "
             "alignment_method: timestamp-native:p1-transcripts.words; "
             f"pipeline_config_sha256: {settings.pipeline_digest}; "
-            "Source word timestamps from syvai/p1-transcripts/words are authoritative; "
-            "boundaries are the first timed word start and last timed word end; "
-            "no VAD, CTC, acoustic score, drift, model, or CUDA evidence is used. "
-            "Legacy pinned Silero VAD and CoRal Røst-v3 Wav2Vec2 CTC metadata remains "
-            "retained for future datasets; "
-            f"the {P1_RUNTIME_CONTRACT.roest_tokenizer_case} Roest tokenizer uses "
-            f"{P1_RUNTIME_CONTRACT.normalisation_unicode_form} case-folded canonical "
-            f"alignment text ({P1_RUNTIME_CONTRACT.normalisation_version}), with "
-            "punctuation removed, numbers not expanded, and the source-word map "
-            "preserved; speaker-consistent untimed lexical text uses bounded "
-            "following-word ownership or a terminal previous-word suffix "
-            f"({P1_RUNTIME_CONTRACT.normalisation_source_text_ownership}) and remains "
-            "in exact published and canonical CTC text; proposal durations are checked "
-            "against the hard segmentation bounds before CTC; prepared CTC paths "
-            "that cannot fit the emission window are rejected as data; published "
-            "source-word spans remain verbatim; the "
-            f"CTC model is {P1_RUNTIME_CONTRACT.roest_license}/OpenRAIL-M metadata, "
-            "not Apache-2.0. Roest model weights are internal and are not distributed."
+            "Source word timestamps are authoritative; boundaries are the first "
+            "timed word start and last timed word end. Text follows "
+            f"{P1_RUNTIME_CONTRACT.normalisation_version} and "
+            f"{P1_RUNTIME_CONTRACT.normalisation_source_text_ownership}."
         ),
         field_schema=(
-            "p1-segments-v2 OutputRow schema; alignment_score, drift, and VAD "
-            "evidence are nullable and not applicable to timestamp-native rows."
+            "p1-segments-v2 OutputRow schema; alignment_backend is timestamp-native, "
+            "alignment_score_type is not_applicable:source_timestamps, and all "
+            "acoustic evidence fields are null."
         ),
         known_limitations="Timestamp quality is limited by the source word timestamps.",
         rejection_policy=(
@@ -2470,7 +2472,7 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
             },
             sort_keys=True,
         ),
-        model_revisions=json.dumps(settings.model_revisions, sort_keys=True),
+        model_revisions=None,
         dataset_license=json.dumps(
             settings.dataset_license.model_dump(mode="json"), sort_keys=True
         ),
@@ -2513,10 +2515,14 @@ def preflight_pipeline(
         P1PreflightError:
             If an immutable, storage, or privacy gate fails.
     """
+    timestamp_native = settings.alignment_method == (
+        "timestamp-native:p1-transcripts.words"
+    )
     try:
         validate_p1_runtime_contract(
             pipeline_version=settings.pipeline_version,
-            ctc=_settings_ctc_contract(settings),
+            ctc=None if timestamp_native else _settings_ctc_contract(settings),
+            alignment_method=settings.alignment_method,
             normalisation=settings.normalisation,
             dataset_license=settings.dataset_license,
         )
@@ -2539,11 +2545,8 @@ def preflight_pipeline(
     }
     # The source plan has already resolved both immutable repository revisions.
     source_revision_ok = True
-    timestamp_native = settings.alignment_method == (
-        "timestamp-native:p1-transcripts.words"
-    )
     # The v7 path has no model or device dependency.  In particular, do not call
-    # the legacy revision verifier: it may inspect Hub model metadata and VAD blobs.
+    # the legacy revision verifier: it may inspect inactive future-alignment metadata.
     model_revision_ok = (
         True
         if timestamp_native
@@ -2574,14 +2577,14 @@ def preflight_pipeline(
     )
     checks = {
         "source_revisions": source_revision_ok,
-        "model_revisions": model_revision_ok,
-        "ctc_normalisation_compatible": True,
+        "model_provenance_not_applicable": timestamp_native,
+        "normalisation_compatible": True,
         "free_space": free_bytes >= required,
         "scratch_quota": scratch_bytes <= settings.max_scratch_bytes,
         "scratch_budget": scratch_bytes + required <= settings.max_scratch_bytes,
         "source_object_cap": maximum_source_bytes <= settings.max_source_bytes,
         "cuda_device_checked": (
-            True if timestamp_native else bool(cuda.get("checked", False))
+            False if timestamp_native else bool(cuda.get("checked", False))
         ),
         "target_checked": bool(target.get("checked", False)),
         "target_contract_v7": bool(target.get("contract_v7", False)),
@@ -2606,7 +2609,7 @@ def preflight_pipeline(
         free_bytes=free_bytes,
         scratch_bytes=scratch_bytes,
         source_revisions=source_revisions,
-        model_revisions=settings.model_revisions,
+        model_revisions=({} if timestamp_native else settings.model_revisions),
         cuda=cuda,
         target=target,
         checks=checks,
@@ -2661,3 +2664,43 @@ def check_model_revisions(source: object, revisions: dict[str, object]) -> bool:
             api=api,
         )
     return True
+
+
+def cuda_status(device: str) -> dict[str, object]:
+    """Inspect the selected CUDA device without constructing a model.
+
+    Returns:
+        Device availability and memory evidence.
+    """
+    try:
+        torch = importlib.import_module("torch")
+        available = bool(torch.cuda.is_available())
+        index = (
+            torch.cuda.current_device()
+            if device.startswith("cuda") and available
+            else None
+        )
+        if device.startswith("cuda:") and available:
+            index = int(device.split(":", 1)[1])
+            torch.cuda.get_device_properties(index)
+        total = (
+            int(torch.cuda.get_device_properties(index).total_memory)
+            if index is not None
+            else 0
+        )
+        free, _ = torch.cuda.mem_get_info(index) if index is not None else (0, 0)
+        return {
+            "checked": True,
+            "available": available,
+            "device": device,
+            "index": index,
+            "free_bytes": int(free),
+            "total_bytes": total,
+        }
+    except Exception as exc:
+        return {
+            "checked": True,
+            "available": False,
+            "device": device,
+            "error": type(exc).__name__,
+        }

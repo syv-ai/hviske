@@ -261,7 +261,13 @@ class OutputRow(ContractModel):
             raise ValueError("published and alignment text must not be empty")
         if self.alignment_score is not None and not math.isfinite(self.alignment_score):
             raise ValueError("alignment_score must be finite when supplied")
-        if self.alignment_method == "timestamp-native:p1-transcripts.words":
+        if self.pipeline_version == "p1-segmentation-7":
+            if self.alignment_method != "timestamp-native:p1-transcripts.words":
+                raise ValueError("v7 rows must use timestamp-native alignment")
+            if self.alignment_backend != "timestamp-native":
+                raise ValueError("v7 rows must use the timestamp-native backend")
+            if self.alignment_score_type != "not_applicable:source_timestamps":
+                raise ValueError("v7 rows must have a not-applicable score type")
             if (
                 self.source_start_ms != self.proposal_start_ms
                 or self.source_end_ms != self.proposal_end_ms
@@ -833,12 +839,12 @@ class CanonicalIdentityManifest(ContractModel):
     pipeline_version: StrictStr
     alignment_method: StrictStr = "timestamp-native:p1-transcripts.words"
     source: SourceCoordinates
-    vad: VADContract
-    ctc: CTCContract
-    anomaly_model: ModelContract
     normalisation: NormalisationContract
     segmentation: SegmentationContract
     output: OutputEncodingContract
+    vad: VADContract | None = None
+    ctc: CTCContract | None = None
+    anomaly_model: ModelContract | None = None
     dataset_license: DatasetLicenseContract = Field(
         default_factory=_default_dataset_license
     )
@@ -894,7 +900,29 @@ def _canonical_value(value: object) -> JSONValue:
 
 
 def pipeline_config_sha256(manifest: CanonicalIdentityManifest) -> str:
-    """Return the identity digest for a complete pipeline manifest."""
+    """Return the digest for the active pipeline identity.
+
+    The v7 pipeline consumes source timestamps and therefore has no model-backed
+    alignment identity.  Keep the legacy model fields on the manifest so the
+    generic future aligner remains representable, but do not let them affect v7
+    segment identities.
+    """
+    if manifest.pipeline_version == P1_RUNTIME_CONTRACT.pipeline_version:
+        value = manifest.model_dump(
+            mode="json",
+            include={
+                "schema_version",
+                "pipeline_version",
+                "alignment_method",
+                "source",
+                "normalisation",
+                "segmentation",
+                "output",
+                "dataset_license",
+                "max_decoded_audio_bytes",
+            },
+        )
+        return sha256_digest(value)
     return sha256_digest(manifest)
 
 
@@ -947,7 +975,7 @@ def valid_ledger_transition(current: LedgerState, target: LedgerState) -> bool:
 def validate_p1_runtime_contract(
     *,
     pipeline_version: str,
-    ctc: CTCContract,
+    ctc: CTCContract | None,
     alignment_method: str | None = None,
     normalisation: NormalisationContract,
     dataset_license: DatasetLicenseContract | None = None,
@@ -958,7 +986,8 @@ def validate_p1_runtime_contract(
         pipeline_version:
             Version of the P1 pipeline implementation.
         ctc:
-            CTC library and model provenance to validate.
+            CTC contract for a future model-backed alignment. It is not required by
+            timestamp-native v7.
         alignment_method (optional):
             Active alignment method identity.
         normalisation:
@@ -975,14 +1004,67 @@ def validate_p1_runtime_contract(
         raise ValueError(
             "P1 alignment method must be timestamp-native:p1-transcripts.words"
         )
-    if (
-        ctc.model.repository.repository == contract.roest_repository
-        and normalisation.case_folding != contract.normalisation_case_folding
-    ):
-        raise ValueError(
-            f"Roest's {contract.roest_tokenizer_case} tokenizer requires "
-            "normalisation.case_folding=true"
-        )
+    if pipeline_version == contract.pipeline_version:
+        values: dict[str, tuple[object, object]] = {
+            "normalisation.version": (
+                normalisation.version,
+                contract.normalisation_version,
+            ),
+            "normalisation.source_text_ownership": (
+                normalisation.source_text_ownership,
+                contract.normalisation_source_text_ownership,
+            ),
+            "normalisation.unicode_form": (
+                normalisation.unicode_form,
+                contract.normalisation_unicode_form,
+            ),
+            "normalisation.case_folding": (
+                normalisation.case_folding,
+                contract.normalisation_case_folding,
+            ),
+            "normalisation.punctuation_removed": (
+                normalisation.punctuation_removed,
+                contract.normalisation_punctuation_removed,
+            ),
+            "normalisation.number_expansion": (
+                normalisation.number_expansion,
+                contract.normalisation_number_expansion,
+            ),
+            "normalisation.preserves_source_word_map": (
+                normalisation.preserves_source_word_map,
+                contract.normalisation_preserves_source_word_map,
+            ),
+        }
+        if dataset_license is not None:
+            expected_license = {
+                "template_repository": contract.dataset_license_template_repository,
+                "template_revision": contract.dataset_license_template_revision,
+                "template_url": contract.dataset_license_template_url,
+                "template_sha256": contract.dataset_license_template_sha256,
+                "template_bytes": contract.dataset_license_template_bytes,
+                "adaptation": contract.dataset_license_adaptation,
+                "target_path": contract.dataset_license_target_path,
+                "target_sha256": contract.dataset_license_target_sha256,
+            }
+            values.update(
+                {
+                    f"dataset_license.{name}": (
+                        getattr(dataset_license, name),
+                        expected,
+                    )
+                    for name, expected in expected_license.items()
+                }
+            )
+        mismatches = [
+            name
+            for name, (actual, expected) in values.items()
+            if type(actual) is not type(expected) or actual != expected
+        ]
+        if mismatches:
+            raise ValueError("P1 runtime contract mismatch: " + ", ".join(mismatches))
+        return
+    if ctc is None:
+        raise ValueError("model-backed alignment requires a CTC contract")
     values = {
         "pipeline_version": (pipeline_version, contract.pipeline_version),
         "ctc.name": (ctc.name, contract.ctc_name),

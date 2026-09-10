@@ -391,7 +391,11 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
     card = hub.files["README.md"].decode("utf-8")
     assert "p1-text-normalisation-5" in card
     assert "speaker-consistent-following-word-with-terminal-suffix-v5" in card
-    assert "exact published and canonical CTC text" in card
+    assert "exact published and canonical CTC text" not in card
+    assert all(
+        marker not in card.lower()
+        for marker in ("silero", "roest", "whisper", "ctc", "vad")
+    )
     assert source.iterated is False
 
 
@@ -645,49 +649,15 @@ def test_overlong_transcript_is_a_terminal_transcript_over_audio_rejection(
     assert report.rejection_counts == {"transcript_over_audio": 1}
 
 
-def test_p1_settings_record_roest_model_evidence(tmp_path: Path) -> None:
-    """Pipeline reports and identity evidence name the exact Roest checkpoint."""
+def test_p1_settings_exclude_future_model_evidence(tmp_path: Path) -> None:
+    """Active v7 settings retain no model provenance."""
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
 
-    assert settings.pipeline_version == "p1-segmentation-6"
+    assert settings.pipeline_version == "p1-segmentation-7"
+    assert settings.alignment_method == "timestamp-native:p1-transcripts.words"
     assert settings.segmentation.maximum_duration_ms == 10_000
     assert settings.normalisation.version == "p1-text-normalisation-5"
-    assert settings.normalisation.source_text_ownership == (
-        "speaker-consistent-following-word-with-terminal-suffix-v5"
-    )
-    assert settings.normalisation.case_folding is True
-    assert settings.model_revisions["ctc"] == {
-        "repository": "CoRal-project/roest-v3-wav2vec2-315m",
-        "revision": "beb3e790246d6b9dec1df596b0b21d5c42f4d99c",
-        "license": "openrail",
-        "license_url": (
-            "https://huggingface.co/Alvenir/coral-1-whisper-large/resolve/"
-            "a6c1e24d9f10e6289607a1ba32341b68e8660688/LICENSE"
-        ),
-        "license_repository": "Alvenir/coral-1-whisper-large",
-        "license_revision": "a6c1e24d9f10e6289607a1ba32341b68e8660688",
-        "license_sha256": (
-            "f575b6361ff69b52388967f69219f0cc7f9ae91f96482e5ad038261b2728799e"
-        ),
-        "model_card_url": (
-            "https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m/resolve/"
-            "beb3e790246d6b9dec1df596b0b21d5c42f4d99c/README.md"
-        ),
-        "model_card_sha256": (
-            "64b3a837fdcb580eeebe31d457113f0a84b200ca90ac5fe1f27475d8fc257cfb"
-        ),
-        "license_notes": (
-            "Roest model-card metadata is openrail; its pinned card describes a custom "
-            "OpenRAIL-M licence. P1 uses the checkpoint for ASR alignment only. Model "
-            "weights are internal and are not distributed by this dataset."
-        ),
-        "architecture": "Wav2Vec2ForCTC",
-        "model_type": "wav2vec2",
-        "frame_stride_samples": 320,
-        "vocab_size": 46,
-        "blank_token_id": 45,
-        "word_delimiter_token_id": 36,
-    }
+    assert settings.model_revisions == {}
 
 
 def test_parser_timestamp_failure_is_invalid_timestamp_rejection(
@@ -932,6 +902,22 @@ def _contains_signed_url_material(value: str) -> bool:
     )
 
 
+def test_plan_excludes_future_model_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Planning does not inspect inactive model metadata."""
+    monkeypatch.setattr(
+        "hviske.p1_pipeline.check_model_revisions",
+        lambda *_args, **_kwargs: pytest.fail("inactive model check was called"),
+    )
+    source = MetadataSource()
+    source._client = lambda: object()  # type: ignore[attr-defined]
+
+    report = run_pipeline(config=pipeline_config(tmp_path), source=source)
+
+    assert report.preflight.model_revisions == {}
+
+
 def test_plan_reads_tree_metadata_only(tmp_path: Path) -> None:
     """Plan mode does not build a pointer index or touch a Parquet row."""
     source = MetadataSource()
@@ -940,29 +926,6 @@ def test_plan_reads_tree_metadata_only(tmp_path: Path) -> None:
     assert report.selected_programmes == 0
     assert source.iterated is False
     assert report.preflight.target["present"] is False
-
-
-def test_plan_verifies_github_vad_and_hub_models(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Planning verifies model provenance without loading model weights."""
-    calls: list[tuple[str, str, str]] = []
-
-    def verify_vad(**kwargs: object) -> str:
-        calls.append(("github", str(kwargs["repository"]), str(kwargs["revision"])))
-        return "https://github.test/asset"
-
-    def verify_model(**kwargs: object) -> None:
-        calls.append(("hub", str(kwargs["repository"]), str(kwargs["revision"])))
-
-    monkeypatch.setattr("hviske.p1_models.verify_silero_vad_revision", verify_vad)
-    monkeypatch.setattr("hviske.p1_models.verify_hub_model_revision", verify_model)
-    source = MetadataSource()
-    source._client = lambda: object()  # type: ignore[attr-defined]
-
-    run_pipeline(config=pipeline_config(tmp_path), source=source)
-
-    assert [item[0] for item in calls] == ["github", "hub", "hub"]
 
 
 def test_progress_logs_do_not_include_source_identifiers_or_paths(
@@ -1019,42 +982,10 @@ def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
     assert replaced.exists()
 
 
-def test_roest_requires_case_folding_before_source_or_model_work(
-    tmp_path: Path,
-) -> None:
-    """An incompatible config fails before planning can retrieve source data."""
-    config = pipeline_config(tmp_path, mode="build")
-    config.normalisation.case_folding = False
-
-    class Source:
-        def plan(self, **_: object) -> object:
-            raise AssertionError("source planning must not start")
-
-    with pytest.raises(ValueError, match="lowercase-only tokenizer"):
-        run_pipeline(config=config, source=Source())
-
-
 @pytest.mark.parametrize(
     ("path", "value"),
     [
         ("pipeline_version", "p1-segmentation-mutated"),
-        ("ctc.name", "other-aligner"),
-        ("ctc.version", "1.7.3"),
-        ("ctc.source_commit", "a" * 40),
-        ("ctc.sdist_sha256", "a" * 64),
-        ("ctc.license", "MIT"),
-        ("ctc.model.repository.repository", "other/model"),
-        ("ctc.model.repository.revision", "b" * 40),
-        ("ctc.model.license", "Apache-2.0"),
-        ("ctc.model.license_url", "https://example.com/LICENSE"),
-        ("ctc.model.license_notes", "different licence meaning"),
-        ("ctc.model.architecture", "Wav2Vec2Model"),
-        ("ctc.model.model_type", "hubert"),
-        ("ctc.model.sampling_rate", 8_000),
-        ("ctc.model.frame_stride_samples", 160),
-        ("ctc.model.vocab_size", 45),
-        ("ctc.model.blank_token_id", 0),
-        ("ctc.model.word_delimiter_token_id", 1),
         ("normalisation.version", "p1-text-normalisation-mutated"),
         ("normalisation.source_text_ownership", "legacy"),
         ("normalisation.unicode_form", "NFD"),
@@ -1228,6 +1159,19 @@ def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
     assert "runtime_error" in event_text
     assert "secret transcript" not in caplog.text
     assert "runtime_error" in caplog.text
+
+
+def test_v7_normalisation_contract_fails_before_source_work(tmp_path: Path) -> None:
+    """An incompatible active config fails before planning can retrieve source data."""
+    config = pipeline_config(tmp_path, mode="build")
+    config.normalisation.case_folding = False
+
+    class Source:
+        def plan(self, **_: object) -> object:
+            raise AssertionError("source planning must not start")
+
+    with pytest.raises(ValueError, match="normalisation.case_folding"):
+        run_pipeline(config=config, source=Source())
 
 
 def test_zero_accepted_programme_is_skipped_on_the_second_run(

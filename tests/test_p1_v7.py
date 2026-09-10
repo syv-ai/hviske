@@ -15,8 +15,9 @@ from hviske.p1_contracts import (
     SegmentationContract,
     SourceWord,
 )
-from hviske.p1_pipeline import PipelineSettings, preflight_pipeline
+from hviske.p1_pipeline import PipelineSettings, preflight_pipeline, run_pipeline
 from hviske.p1_segments import TimestampAlignmentBackend, segment_programme
+from tests.test_p1_publish import MemoryHub
 
 
 @pytest.mark.parametrize(("end_ms", "accepted"), [(9_999, True), (10_000, False)])
@@ -51,6 +52,38 @@ def _segmentation() -> SegmentationContract:
     )
 
 
+def test_v7_initialise_never_probes_cuda_or_model_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Initialisation records explicit non-applicability without probing models."""
+    monkeypatch.setattr(
+        "hviske.p1_pipeline.cuda_status",
+        lambda *_args, **_kwargs: pytest.fail("CUDA initialisation probe was called"),
+    )
+    config = _config(tmp_path)
+    config.mode = "initialise"
+    report = run_pipeline(config=config, hub=MemoryHub())
+
+    assert report.preflight.cuda == {
+        "checked": False,
+        "reason": "not_applicable:timestamp-native",
+    }
+    assert report.preflight.model_revisions == {}
+    assert report.preflight.checks["model_provenance_not_applicable"] is True
+
+
+def _config(tmp_path: Path) -> DictConfig:
+    """Load the active v7 configuration with an isolated scratch directory.
+
+    Returns:
+        The v7 configuration with temporary scratch storage.
+    """
+    config = OmegaConf.load("config/p1_segments.yaml")
+    config.mode = "plan"
+    config.runtime.scratch_root = str(tmp_path)
+    return t.cast(DictConfig, config)
+
+
 def test_v7_preflight_never_checks_models_or_cuda(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -75,19 +108,8 @@ def test_v7_preflight_never_checks_models_or_cuda(
     )
 
     assert report.cuda["reason"] == "not_applicable:timestamp-native"
-    assert report.checks["cuda_device_checked"] is True
-
-
-def _config(tmp_path: Path) -> DictConfig:
-    """Load the active v7 configuration with an isolated scratch directory.
-
-    Returns:
-        The v7 configuration with temporary scratch storage.
-    """
-    config = OmegaConf.load("config/p1_segments.yaml")
-    config.mode = "plan"
-    config.runtime.scratch_root = str(tmp_path)
-    return t.cast(DictConfig, config)
+    assert report.checks["cuda_device_checked"] is False
+    assert report.model_revisions == {}
 
 
 def test_v7_uses_exact_word_boundaries_and_no_acoustic_evidence() -> None:
