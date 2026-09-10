@@ -80,7 +80,7 @@ segmentation:
   minimum_duration_ms: 1000
   target_minimum_duration_ms: 2000
   target_maximum_duration_ms: 8000
-  maximum_duration_ms: 9999
+  maximum_duration_ms: 10000
   maximum_drift_ms: 500
   # Pilot-tunable: ctc-segmentation returns mean log probabilities <= 0.
   minimum_alignment_score: -10.0

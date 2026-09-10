@@ -200,7 +200,7 @@ Keep both raw backend scores and derived quality signals. A segment is publishab
 only when all of these gates pass:
 
 - proposal and decoded duration are at least the configured minimum and below the
-  configured maximum (the maximum remains an exclusive bound);
+  configured maximum of 10,000 ms (the maximum remains an exclusive bound);
 - text is non-empty and contains at least one trainable character;
 - timestamps are ordered and within the decoded source duration;
 - CTC alignment confidence exceeds the pilot threshold;
@@ -215,9 +215,13 @@ only when all of these gates pass:
 The `ctc-segmentation` reference implementation scores an utterance from minima over
 chunk-level means of aligned frame probabilities. Before invoking its dynamic
 programming routine, compare the emission-frame count with the prepared ground-truth
-path length (which includes separator and repeated-token transitions). Reject an
-infeasible proposal as `ctc_alignment_failed`; this is a terminal data condition, not
-a model or programming failure. Store the exact backend, formula, revision, and raw
+path length. The minimum is that path length plus one blank frame for each adjacent
+repeated non-blank label in the flattened token sequence where the prepared path has
+no intervening blank (normally repeats within an utterance). Blank IDs and the blank
+separators already inserted between utterances satisfy the same transition and are not
+counted twice. Reject an infeasible proposal as
+`ctc_alignment_failed`; this is a terminal data condition, not a model or programming
+failure. Store the exact backend, formula, revision, and raw
 inputs needed to interpret a score. These scales are not interchangeable; choose
 thresholds from the P1 pilot rather than copying a value across backends.
 
