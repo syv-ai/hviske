@@ -26,6 +26,9 @@
   discover immutable audio pointers during bounded selection, qualify transcripts before
   audio or model work, and classify deterministic source defects without leaking IDs,
   payloads, URLs, or exception details in operational output.
+- Make incompatible ledger migration fully rollback-safe, keep selected source IDs out of
+  reports and CLI logs, classify parser timestamp and empty-timeline defects correctly,
+  and emit aggregate audio-scan progress at every crossed threshold.
 
 ### Added
 

@@ -180,14 +180,15 @@ class Ledger:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 30000")
-        if database != ":memory:":
-            self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.execute("PRAGMA synchronous = FULL")
         try:
-            self._migrate()
-            self._bind_pipeline_digest(pipeline_digest)
+            with self.transaction() as connection:
+                self._migrate(connection)
+                self._bind_pipeline_digest(connection, pipeline_digest)
             if reset_processing:
                 self.reset_abandoned_processing()
+            if database != ":memory:":
+                self._connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:
             self._connection.close()
             raise
@@ -195,6 +196,23 @@ class Ledger:
     def close(self) -> None:
         """Close the database connection."""
         self._connection.close()
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run a caller-supplied group of writes as one durable transaction.
+
+        Yields:
+            The active SQLite connection.
+        """
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._connection
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+            self._sync_database()
 
     def __enter__(self) -> Ledger:
         """Return this ledger for a context-managed session."""
@@ -391,23 +409,6 @@ class Ledger:
                 self._require_row(connection, "batches", "batch_id", resolved_batch_id)
             )
         return batch, tuple(records)
-
-    @contextlib.contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Run a caller-supplied group of writes as one durable transaction.
-
-        Yields:
-            The active SQLite connection.
-        """
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._connection
-        except BaseException:
-            self._connection.rollback()
-            raise
-        else:
-            self._connection.commit()
-            self._sync_database()
 
     def discover_programme(
         self,
@@ -1485,42 +1486,43 @@ class Ledger:
 
     get_batch = batch
 
-    def _bind_pipeline_digest(self, expected: str | None) -> None:
+    def _bind_pipeline_digest(
+        self, connection: sqlite3.Connection, expected: str | None
+    ) -> None:
         """Bind this ledger to one pipeline identity before workers can mutate it.
 
         Raises:
             EvidenceError:
                 If stored records contain conflicting or unexpected digests.
         """
-        with self.transaction() as connection:
-            metadata = connection.execute(
-                f"SELECT value FROM {_METADATA_TABLE} WHERE key = 'pipeline_digest'"
-            ).fetchone()
-            bound = None if metadata is None else str(metadata[0])
-            if bound is not None:
-                self._validate_digest(bound, "pipeline_digest")
-            stored = {
-                str(row[0])
-                for row in connection.execute(
-                    """SELECT pipeline_digest FROM programmes
-                    UNION SELECT pipeline_digest FROM batches"""
-                )
-            }
-            if len(stored) > 1:
-                raise EvidenceError("ledger contains multiple pipeline digests")
-            stored_digest = next(iter(stored), None)
-            if bound is not None and stored_digest not in {None, bound}:
-                raise EvidenceError("ledger metadata disagrees with stored digests")
-            if expected is not None and stored_digest not in {None, expected}:
-                raise EvidenceError("ledger records use a different pipeline digest")
-            if expected is not None and bound not in {None, expected}:
-                raise EvidenceError("ledger is bound to a different pipeline digest")
-            target = expected or bound or stored_digest
-            if target is not None and bound is None:
-                connection.execute(
-                    f"INSERT INTO {_METADATA_TABLE} (key, value) VALUES (?, ?)",
-                    ("pipeline_digest", target),
-                )
+        metadata = connection.execute(
+            f"SELECT value FROM {_METADATA_TABLE} WHERE key = 'pipeline_digest'"
+        ).fetchone()
+        bound = None if metadata is None else str(metadata[0])
+        if bound is not None:
+            self._validate_digest(bound, "pipeline_digest")
+        stored = {
+            str(row[0])
+            for row in connection.execute(
+                """SELECT pipeline_digest FROM programmes
+                UNION SELECT pipeline_digest FROM batches"""
+            )
+        }
+        if len(stored) > 1:
+            raise EvidenceError("ledger contains multiple pipeline digests")
+        stored_digest = next(iter(stored), None)
+        if bound is not None and stored_digest not in {None, bound}:
+            raise EvidenceError("ledger metadata disagrees with stored digests")
+        if expected is not None and stored_digest not in {None, expected}:
+            raise EvidenceError("ledger records use a different pipeline digest")
+        if expected is not None and bound not in {None, expected}:
+            raise EvidenceError("ledger is bound to a different pipeline digest")
+        target = expected or bound or stored_digest
+        if target is not None and bound is None:
+            connection.execute(
+                f"INSERT INTO {_METADATA_TABLE} (key, value) VALUES (?, ?)",
+                ("pipeline_digest", target),
+            )
         self.pipeline_digest = target
 
     @staticmethod
@@ -1592,123 +1594,122 @@ class Ledger:
         except OSError as error:
             raise EvidenceError("local shard path cannot be resolved") from error
 
-    def _migrate(self) -> None:
-        with self.transaction() as connection:
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > _SCHEMA_VERSION:
-                raise LedgerError("ledger schema is newer than this package")
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > _SCHEMA_VERSION:
+            raise LedgerError("ledger schema is newer than this package")
+        connection.execute(
+            f"""CREATE TABLE IF NOT EXISTS {_SEQUENCE_TABLE} (
+                kind TEXT PRIMARY KEY,
+                next_value INTEGER NOT NULL CHECK (next_value > 0)
+            )"""
+        )
+        if version < 1:
             connection.execute(
-                f"""CREATE TABLE IF NOT EXISTS {_SEQUENCE_TABLE} (
-                    kind TEXT PRIMARY KEY,
-                    next_value INTEGER NOT NULL CHECK (next_value > 0)
+                """CREATE TABLE programmes (
+                    programme_id TEXT PRIMARY KEY,
+                    source_file_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    source_revisions TEXT NOT NULL,
+                    pipeline_digest TEXT NOT NULL,
+                    commit_id TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    accepted_count INTEGER NOT NULL DEFAULT 0,
+                    rejected_count INTEGER NOT NULL DEFAULT 0,
+                    source_duration_ms INTEGER,
+                    processed_duration_ms INTEGER,
+                    rejection_counts TEXT NOT NULL DEFAULT '{}',
+                    processing_started_at TEXT,
+                    discovered_at TEXT NOT NULL,
+                    verification_time TEXT,
+                    purge_time TEXT,
+                    source_temp_purged_at TEXT,
+                    source_temp_purge_evidence TEXT NOT NULL DEFAULT '{}',
+                    last_evidence TEXT NOT NULL DEFAULT '{}',
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL
                 )"""
             )
-            if version < 1:
-                connection.execute(
-                    """CREATE TABLE programmes (
-                        programme_id TEXT PRIMARY KEY,
-                        source_file_id TEXT NOT NULL,
-                        state TEXT NOT NULL,
-                        source_revisions TEXT NOT NULL,
-                        pipeline_digest TEXT NOT NULL,
-                        commit_id TEXT,
-                        attempts INTEGER NOT NULL DEFAULT 0,
-                        accepted_count INTEGER NOT NULL DEFAULT 0,
-                        rejected_count INTEGER NOT NULL DEFAULT 0,
-                        source_duration_ms INTEGER,
-                        processed_duration_ms INTEGER,
-                        rejection_counts TEXT NOT NULL DEFAULT '{}',
-                        processing_started_at TEXT,
-                        discovered_at TEXT NOT NULL,
-                        verification_time TEXT,
-                        purge_time TEXT,
-                        source_temp_purged_at TEXT,
-                        source_temp_purge_evidence TEXT NOT NULL DEFAULT '{}',
-                        last_evidence TEXT NOT NULL DEFAULT '{}',
-                        last_error TEXT,
-                        updated_at TEXT NOT NULL
-                    )"""
-                )
-                connection.execute(
-                    """CREATE TABLE batches (
-                        batch_id TEXT PRIMARY KEY,
-                        state TEXT NOT NULL,
-                        pipeline_digest TEXT NOT NULL,
-                        commit_id TEXT,
-                        attempts INTEGER NOT NULL DEFAULT 0,
-                        programme_count INTEGER NOT NULL DEFAULT 0,
-                        row_count INTEGER NOT NULL DEFAULT 0,
-                        rejection_counts TEXT NOT NULL DEFAULT '{}',
-                        duration_ms INTEGER,
-                        processing_started_at TEXT,
-                        verification_time TEXT,
-                        purge_time TEXT,
-                        publication_artifact_purged_at TEXT,
-                        publication_artifact_purge_evidence TEXT NOT NULL DEFAULT '{}',
-                        remote_checked_at TEXT,
-                        remote_present INTEGER,
-                        last_evidence TEXT NOT NULL DEFAULT '{}',
-                        last_error TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    )"""
-                )
-                connection.execute(
-                    """CREATE TABLE shards (
-                        shard_id TEXT PRIMARY KEY,
-                        programme_id TEXT REFERENCES programmes(programme_id),
-                        batch_id TEXT REFERENCES batches(batch_id),
-                        state TEXT NOT NULL,
-                        path TEXT NOT NULL,
-                        byte_size INTEGER NOT NULL,
-                        row_count INTEGER NOT NULL,
-                        sha256 TEXT NOT NULL,
-                        local_path TEXT,
-                        verification_time TEXT,
-                        purge_time TEXT,
-                        last_evidence TEXT NOT NULL DEFAULT '{}',
-                        last_error TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    )"""
-                )
-                connection.execute(
-                    "CREATE INDEX shards_batch ON shards(batch_id, shard_id)"
-                )
-                connection.execute("CREATE INDEX programmes_state ON programmes(state)")
-                connection.execute("CREATE INDEX batches_state ON batches(state)")
-                connection.execute("PRAGMA user_version = 1")
-            if version < 2:
-                columns = {
-                    row[1] for row in connection.execute("PRAGMA table_info(shards)")
-                }
-                if "local_path" not in columns:
-                    connection.execute("ALTER TABLE shards ADD COLUMN local_path TEXT")
-                connection.execute(
-                    """CREATE TABLE IF NOT EXISTS audit_candidates (
-                        candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        batch_id TEXT NOT NULL REFERENCES batches(batch_id),
-                        programme_id TEXT NOT NULL REFERENCES programmes(programme_id),
-                        candidate_json TEXT NOT NULL,
-                        local_path TEXT NOT NULL,
-                        local_row_locator INTEGER NOT NULL
-                            CHECK (local_row_locator >= 0),
-                        created_at TEXT NOT NULL
-                    )"""
-                )
-                connection.execute(
-                    "CREATE INDEX IF NOT EXISTS audit_candidates_batch "
-                    "ON audit_candidates(batch_id, candidate_id)"
-                )
-                connection.execute("PRAGMA user_version = 2")
-            if version < 3:
-                connection.execute(
-                    f"""CREATE TABLE IF NOT EXISTS {_METADATA_TABLE} (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL
-                    )"""
-                )
-                connection.execute("PRAGMA user_version = 3")
+            connection.execute(
+                """CREATE TABLE batches (
+                    batch_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    pipeline_digest TEXT NOT NULL,
+                    commit_id TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    programme_count INTEGER NOT NULL DEFAULT 0,
+                    row_count INTEGER NOT NULL DEFAULT 0,
+                    rejection_counts TEXT NOT NULL DEFAULT '{}',
+                    duration_ms INTEGER,
+                    processing_started_at TEXT,
+                    verification_time TEXT,
+                    purge_time TEXT,
+                    publication_artifact_purged_at TEXT,
+                    publication_artifact_purge_evidence TEXT NOT NULL DEFAULT '{}',
+                    remote_checked_at TEXT,
+                    remote_present INTEGER,
+                    last_evidence TEXT NOT NULL DEFAULT '{}',
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE shards (
+                    shard_id TEXT PRIMARY KEY,
+                    programme_id TEXT REFERENCES programmes(programme_id),
+                    batch_id TEXT REFERENCES batches(batch_id),
+                    state TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    local_path TEXT,
+                    verification_time TEXT,
+                    purge_time TEXT,
+                    last_evidence TEXT NOT NULL DEFAULT '{}',
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX shards_batch ON shards(batch_id, shard_id)"
+            )
+            connection.execute("CREATE INDEX programmes_state ON programmes(state)")
+            connection.execute("CREATE INDEX batches_state ON batches(state)")
+            connection.execute("PRAGMA user_version = 1")
+        if version < 2:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(shards)")
+            }
+            if "local_path" not in columns:
+                connection.execute("ALTER TABLE shards ADD COLUMN local_path TEXT")
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS audit_candidates (
+                    candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+                    programme_id TEXT NOT NULL REFERENCES programmes(programme_id),
+                    candidate_json TEXT NOT NULL,
+                    local_path TEXT NOT NULL,
+                    local_row_locator INTEGER NOT NULL
+                        CHECK (local_row_locator >= 0),
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS audit_candidates_batch "
+                "ON audit_candidates(batch_id, candidate_id)"
+            )
+            connection.execute("PRAGMA user_version = 2")
+        if version < 3:
+            connection.execute(
+                f"""CREATE TABLE IF NOT EXISTS {_METADATA_TABLE} (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )"""
+            )
+            connection.execute("PRAGMA user_version = 3")
 
     @staticmethod
     def _publication_path(value: str) -> str:
