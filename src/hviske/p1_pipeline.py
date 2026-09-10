@@ -2010,6 +2010,7 @@ def publish_pending(
                     local_paths=local_paths,
                     remote_paths=remote_paths,
                     row_counts=row_counts,
+                    parquet_sha256=tuple(_file_sha256(shard.path) for shard in shards),
                 )
 
     evidence = publish_batch(
@@ -2046,6 +2047,14 @@ def publish_pending(
 
 class P1PreflightError(RuntimeError):
     """Raised when a safety gate fails before source audio retrieval."""
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _record_audit_candidates(
@@ -2348,6 +2357,7 @@ def _recover_native_batches(
                     ),
                     remote_paths=tuple(record.path for record in records),
                     row_counts=tuple(record.row_count for record in records),
+                    parquet_sha256=tuple(record.sha256 for record in records),
                 )
         verify_batch(
             t.cast(HubClient, hub),
