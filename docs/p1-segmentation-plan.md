@@ -164,9 +164,11 @@ Apache-2.0. Its 46-token vocabulary includes digits, Danish letters, blank/pad t
 
 WhisperX supports the locality rationale: VAD and transcription proposals are followed
 by a language-specific phoneme model and dynamic time warping. It is not evidence for
-the CTC implementation. The CTC method comes from `ctc-forced-aligner` and
-`ctc-segmentation`. NeMo Forced Aligner is a fallback only if a suitable licensed
-Danish CTC checkpoint is available. Montreal Forced Aligner is not the first choice
+the CTC implementation. The CTC method uses the pinned `ctc-segmentation`
+implementation only. `ctc-forced-aligner` remains excluded because its licence
+metadata is contradictory. NeMo Forced Aligner is a fallback only if a suitable
+licensed Danish CTC checkpoint is available. Montreal Forced Aligner is not the first
+choice
 because it adds lexicon and acoustic-model maintenance without using the supplied word
 timestamps.
 
@@ -199,8 +201,7 @@ only when all of these gates pass:
 - `segment_id` is unique.
 
 The `ctc-segmentation` reference implementation scores an utterance from minima over
-chunk-level means of aligned frame probabilities. `ctc-forced-aligner` derives span
-scores from its aligned emission frames. Store the exact backend, formula, revision,
+chunk-level means of aligned frame probabilities. Store the exact backend, formula, revision,
 and raw inputs needed to interpret a score. These scales are not interchangeable;
 choose thresholds from the P1 pilot rather than copying a value across backends.
 

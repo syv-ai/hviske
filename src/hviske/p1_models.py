@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .p1_contracts import P1_RUNTIME_CONTRACT
 from .p1_segments import CTCEmissionsAlignmentAdapter, VADBackend, VADSignal
 
 logger = logging.getLogger(__name__)
@@ -25,20 +26,19 @@ SILERO_MODEL_PATH = "src/silero_vad/data/silero_vad.jit"
 SILERO_MODEL_BLOB = "5c6988d663950a93a5f0d6c38c2fe024653ec552"
 SILERO_MODEL_SHA256 = "e1122837f4154c511485fe0b9c64455f7b929c96fbb8d79fbdb336383ebd3720"
 
-ROEST_REPOSITORY = "CoRal-project/roest-v3-wav2vec2-315m"
-ROEST_REVISION = "beb3e790246d6b9dec1df596b0b21d5c42f4d99c"
-ROEST_LICENSE = "openrail"
-ROEST_LICENSE_URL = (
-    "https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE"
-)
-ROEST_SAMPLING_RATE = 16_000
-ROEST_FRAME_STRIDE_SAMPLES = 320
-ROEST_FRAME_DURATION_MS = 20.0
-ROEST_VOCAB_SIZE = 46
-ROEST_BLANK_TOKEN_ID = 45
-ROEST_WORD_DELIMITER_TOKEN_ID = 36
-ROEST_REQUIRED_TOKENS = frozenset("0123456789abcdefghijklmnopqrstuvwxyzåæéøü")
-ROEST_TOKENIZER_CASE = "lowercase-only"
+# Compatibility aliases keep the adapter's public constants sourced from one spec.
+ROEST_REPOSITORY = P1_RUNTIME_CONTRACT.roest_repository
+ROEST_REVISION = P1_RUNTIME_CONTRACT.roest_revision
+ROEST_LICENSE = P1_RUNTIME_CONTRACT.roest_license
+ROEST_LICENSE_URL = P1_RUNTIME_CONTRACT.roest_license_url
+ROEST_SAMPLING_RATE = P1_RUNTIME_CONTRACT.roest_sampling_rate
+ROEST_FRAME_STRIDE_SAMPLES = P1_RUNTIME_CONTRACT.roest_frame_stride_samples
+ROEST_FRAME_DURATION_MS = P1_RUNTIME_CONTRACT.roest_frame_duration_ms
+ROEST_VOCAB_SIZE = P1_RUNTIME_CONTRACT.roest_vocab_size
+ROEST_BLANK_TOKEN_ID = P1_RUNTIME_CONTRACT.roest_blank_token_id
+ROEST_WORD_DELIMITER_TOKEN_ID = P1_RUNTIME_CONTRACT.roest_word_delimiter_token_id
+ROEST_REQUIRED_TOKENS = P1_RUNTIME_CONTRACT.roest_required_tokens
+ROEST_TOKENIZER_CASE = P1_RUNTIME_CONTRACT.roest_tokenizer_case
 
 
 class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
@@ -180,10 +180,19 @@ def validate_ctc_model_contract(
             If the model is not the pinned CTC shape or its tokenizer is incomplete.
     """
     architecture = getattr(model_config, "architectures", None)
-    if architecture is None or "Wav2Vec2ForCTC" not in architecture:
-        raise ValueError("P1 CTC model must declare Wav2Vec2ForCTC architecture")
-    if getattr(model_config, "model_type", None) != "wav2vec2":
-        raise ValueError("P1 CTC model must declare model_type wav2vec2")
+    if architecture != [P1_RUNTIME_CONTRACT.roest_architecture]:
+        raise ValueError(
+            "P1 CTC model must declare "
+            f"{P1_RUNTIME_CONTRACT.roest_architecture} architecture"
+        )
+    if (
+        getattr(model_config, "model_type", None)
+        != P1_RUNTIME_CONTRACT.roest_model_type
+    ):
+        raise ValueError(
+            "P1 CTC model must declare model_type "
+            f"{P1_RUNTIME_CONTRACT.roest_model_type}"
+        )
 
     feature_extractor = getattr(processor, "feature_extractor", None)
     sampling_rate = getattr(feature_extractor, "sampling_rate", None)
@@ -193,10 +202,9 @@ def validate_ctc_model_contract(
             f"not {sampling_rate!r}"
         )
     configured_sampling_rate = getattr(model_config, "sampling_rate", None)
-    if (
-        configured_sampling_rate is not None
-        and configured_sampling_rate != sampling_rate
-    ):
+    if configured_sampling_rate != P1_RUNTIME_CONTRACT.roest_sampling_rate:
+        raise ValueError("CTC model sampling rate is not the P1 contract")
+    if configured_sampling_rate != sampling_rate:
         raise ValueError("CTC model and processor sampling rates do not agree")
 
     strides = getattr(model_config, "conv_stride", None)
@@ -207,16 +215,17 @@ def validate_ctc_model_contract(
     ):
         raise ValueError("CTC convolutional strides must be positive integers")
     stride_samples = int(np.prod(strides))
-    if stride_samples != ROEST_FRAME_STRIDE_SAMPLES:
+    if stride_samples != P1_RUNTIME_CONTRACT.roest_frame_stride_samples:
         raise ValueError(
             "unsupported CTC frame stride: "
-            f"expected {ROEST_FRAME_STRIDE_SAMPLES} samples, got {stride_samples}"
+            f"expected {P1_RUNTIME_CONTRACT.roest_frame_stride_samples} samples, "
+            f"got {stride_samples}"
         )
     ratio = getattr(model_config, "inputs_to_logits_ratio", None)
     if ratio is not None and ratio != stride_samples:
         raise ValueError("CTC inputs_to_logits_ratio disagrees with conv_stride")
     frame_duration_ms = 1000.0 * stride_samples / sampling_rate
-    if frame_duration_ms != ROEST_FRAME_DURATION_MS:
+    if frame_duration_ms != P1_RUNTIME_CONTRACT.roest_frame_duration_ms:
         raise ValueError("CTC frame duration is not the P1 20 ms contract")
     if expected_frame_duration_ms is not None and (
         expected_frame_duration_ms != frame_duration_ms
@@ -231,18 +240,40 @@ def validate_ctc_model_contract(
     vocabulary = getattr(tokenizer, "get_vocab", lambda: {})()
     if any(vocabulary.get(token) is None for token in ROEST_REQUIRED_TOKENS):
         raise ValueError("P1 CTC tokenizer does not cover Danish letters and numbers")
-    if vocab_size != ROEST_VOCAB_SIZE or len(vocabulary) != ROEST_VOCAB_SIZE:
-        raise ValueError("P1 CTC tokenizer must expose exactly 46 vocabulary entries")
-    if getattr(model_config, "pad_token_id", None) != ROEST_BLANK_TOKEN_ID:
-        raise ValueError("P1 CTC model must use token 45 as its CTC blank")
-    if getattr(tokenizer, "pad_token_id", None) != ROEST_BLANK_TOKEN_ID:
-        raise ValueError("P1 CTC tokenizer must use token 45 as its CTC blank")
+    if (
+        vocab_size != P1_RUNTIME_CONTRACT.roest_vocab_size
+        or len(vocabulary) != P1_RUNTIME_CONTRACT.roest_vocab_size
+    ):
+        raise ValueError(
+            "P1 CTC tokenizer must expose exactly "
+            f"{P1_RUNTIME_CONTRACT.roest_vocab_size} vocabulary entries"
+        )
+    if (
+        getattr(model_config, "pad_token_id", None)
+        != P1_RUNTIME_CONTRACT.roest_blank_token_id
+    ):
+        raise ValueError(
+            "P1 CTC model must use token "
+            f"{P1_RUNTIME_CONTRACT.roest_blank_token_id} as its CTC blank"
+        )
+    if (
+        getattr(tokenizer, "pad_token_id", None)
+        != P1_RUNTIME_CONTRACT.roest_blank_token_id
+    ):
+        raise ValueError(
+            "P1 CTC tokenizer must use token "
+            f"{P1_RUNTIME_CONTRACT.roest_blank_token_id} as its CTC blank"
+        )
     if getattr(tokenizer, "pad_token", None) != "<pad>":
         raise ValueError("P1 CTC tokenizer blank must be the <pad> token")
     if getattr(tokenizer, "word_delimiter_token", None) != "|":
         raise ValueError("P1 CTC tokenizer must use | as its word delimiter")
-    if vocabulary.get("|") != ROEST_WORD_DELIMITER_TOKEN_ID:
-        raise ValueError("P1 CTC tokenizer must use token 36 as its word delimiter")
+    if vocabulary.get("|") != P1_RUNTIME_CONTRACT.roest_word_delimiter_token_id:
+        raise ValueError(
+            "P1 CTC tokenizer must use token "
+            f"{P1_RUNTIME_CONTRACT.roest_word_delimiter_token_id} "
+            "as its word delimiter"
+        )
     return frame_duration_ms
 
 
@@ -265,9 +296,12 @@ def validate_ctc_normalisation_compatibility(
         ValueError:
             If the pinned Roest model is configured without case folding.
     """
-    if repository == ROEST_REPOSITORY and not case_folding:
+    if (
+        repository == P1_RUNTIME_CONTRACT.roest_repository
+        and case_folding != P1_RUNTIME_CONTRACT.normalisation_case_folding
+    ):
         raise ValueError(
-            f"Roest's {ROEST_TOKENIZER_CASE} tokenizer requires "
+            f"Roest's {P1_RUNTIME_CONTRACT.roest_tokenizer_case} tokenizer requires "
             "normalisation.case_folding=true"
         )
 

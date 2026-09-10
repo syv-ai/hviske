@@ -28,6 +28,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from hviske.p1_contracts import (
+    P1_RUNTIME_CONTRACT,
     CanonicalIdentityManifest,
     CTCContract,
     LedgerState,
@@ -42,9 +43,9 @@ from hviske.p1_contracts import (
     SourceProgramme,
     VADContract,
     pipeline_config_sha256,
+    validate_p1_runtime_contract,
 )
 from hviske.p1_ledger import Ledger
-from hviske.p1_models import validate_ctc_normalisation_compatibility
 from hviske.p1_segments import CTCBackend, VADBackend, segment_programme, write_shards
 from hviske.p1_source import (
     _AUDIO_POINTER_METADATA_KEY,
@@ -96,6 +97,7 @@ class PipelineSettings:
     vad_model_blob: str
     vad_model_sha256: str
     model_revisions: dict[str, object]
+    ctc_contract: CTCContract
     segmentation: SegmentationContract
     normalisation: NormalisationContract
     pipeline_digest: str
@@ -128,10 +130,6 @@ class PipelineSettings:
         ctc_model = t.cast(dict[str, object], ctc_raw["model"])
         ctc_repo = t.cast(dict[str, object], ctc_model["repository"])
         normalisation_raw = t.cast(dict[str, object], root["normalisation"])
-        validate_ctc_normalisation_compatibility(
-            repository=str(ctc_repo["repository"]),
-            case_folding=bool(normalisation_raw.get("case_folding", False)),
-        )
         anomaly_raw = t.cast(dict[str, object], root["anomaly_model"])
         output_raw = t.cast(dict[str, object], root["output"])
         manifest = CanonicalIdentityManifest(
@@ -176,6 +174,11 @@ class PipelineSettings:
             segmentation=SegmentationContract.model_validate(root["segmentation"]),
             output=OutputEncodingContract.model_validate(output_raw),
             max_decoded_audio_bytes=_as_int(max_decoded_audio),
+        )
+        validate_p1_runtime_contract(
+            pipeline_version=manifest.pipeline_version,
+            ctc=manifest.ctc,
+            normalisation=manifest.normalisation,
         )
         digest = pipeline_config_sha256(manifest)
         return cls(
@@ -225,16 +228,22 @@ class PipelineSettings:
                     "model_sha256": str(vad_raw["model_sha256"]),
                 },
                 "ctc": {
-                    **ctc_repo,
-                    "license": str(ctc_model["license"]),
-                    **{
-                        key: value
-                        for key, value in ctc_model.items()
-                        if key != "repository"
-                    },
+                    **manifest.ctc.model.repository.model_dump(mode="json"),
+                    **manifest.ctc.model.model_dump(
+                        mode="json", exclude={"repository"}
+                    ),
                 },
+                "ctc_library": {
+                    "name": manifest.ctc.name,
+                    "version": manifest.ctc.version,
+                    "source_commit": manifest.ctc.source_commit,
+                    "sdist_sha256": manifest.ctc.sdist_sha256,
+                    "license": manifest.ctc.license,
+                },
+                "normalisation": manifest.normalisation.model_dump(mode="json"),
                 "anomaly": anomaly_raw["repository"],
             },
+            ctc_contract=manifest.ctc,
             segmentation=manifest.segmentation,
             normalisation=manifest.normalisation,
             pipeline_digest=digest,
@@ -2326,10 +2335,13 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
         private_access_terms="Access is restricted to authorised syv.ai members.",
         alignment_method=(
             "Pinned Silero VAD and CoRal Røst-v3 Wav2Vec2 CTC segmentation; "
-            "the lowercase-only Roest tokenizer uses NFC case-folded canonical "
-            "alignment text (p1-text-normalisation-3), while published text and "
-            "source-word spans remain verbatim; the CTC model is "
-            "openrail/OpenRAIL-M metadata, not Apache-2.0."
+            f"the {P1_RUNTIME_CONTRACT.roest_tokenizer_case} Roest tokenizer uses "
+            f"{P1_RUNTIME_CONTRACT.normalisation_unicode_form} case-folded canonical "
+            f"alignment text ({P1_RUNTIME_CONTRACT.normalisation_version}), with "
+            "punctuation removed, numbers not expanded, and the source-word map "
+            "preserved; published text and source-word spans remain verbatim; the "
+            f"CTC model is {P1_RUNTIME_CONTRACT.roest_license}/OpenRAIL-M metadata, "
+            "not Apache-2.0."
         ),
         field_schema="p1-segments-v1 OutputRow schema.",
         known_limitations="Pilot thresholds and anomaly statistics require review.",
@@ -2375,9 +2387,10 @@ def preflight_pipeline(
             If an immutable, storage, or privacy gate fails.
     """
     try:
-        validate_ctc_normalisation_compatibility(
-            repository=settings.ctc_model_repository,
-            case_folding=settings.normalisation.case_folding,
+        validate_p1_runtime_contract(
+            pipeline_version=settings.pipeline_version,
+            ctc=_settings_ctc_contract(settings),
+            normalisation=settings.normalisation,
         )
     except ValueError as exc:
         raise P1PreflightError(str(exc)) from exc
@@ -2448,6 +2461,19 @@ def preflight_pipeline(
         target=target,
         checks=checks,
     )
+
+
+def _settings_ctc_contract(settings: PipelineSettings) -> CTCContract:
+    """Return the CTC contract with all externally exposed settings applied."""
+    model = settings.ctc_contract.model.model_copy(
+        update={
+            "repository": RepositoryRevision(
+                repository=settings.ctc_model_repository,
+                revision=settings.ctc_model_revision,
+            )
+        }
+    )
+    return settings.ctc_contract.model_copy(update={"model": model})
 
 
 def check_model_revisions(source: object, revisions: dict[str, object]) -> bool:
