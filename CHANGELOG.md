@@ -4,7 +4,8 @@
 
 ### Fixed
 
-- Decode generic embedded libsndfile audio (including OGG/Opus and FLAC), derive
+- Bound generic compressed-audio expansion by inspecting libsndfile headers and
+  enforcing a configurable 2 GiB decoded float32 PCM cap before allocation; derive
   source duration from decoded frames, and validate transcript bounds against that
   duration rather than unreliable metadata declarations.
 - Recreate validated P1 transcript-index database files and SQLite sidecars between

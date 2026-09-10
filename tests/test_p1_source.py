@@ -108,6 +108,40 @@ def test_audio_parser_rejects_unsupported_bytes_without_payload_in_error() -> No
     assert "not audio" not in str(error.value)
 
 
+def test_compressed_audio_exact_pcm_cap_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The configured PCM cap is inclusive for the exact float32 allocation."""
+    info = type("Info", (), {"frames": 2, "samplerate": 1, "channels": 1})()
+    monkeypatch.setattr(sf, "info", lambda _stream: info)
+    monkeypatch.setattr(
+        sf, "read", lambda *_args, **_kwargs: (np.zeros((2, 1), dtype=np.float32), 1)
+    )
+
+    parsed = parse_audio_row(
+        {"file_id": "x", "audio": {"bytes": b"compressed"}}, max_decoded_audio_bytes=8
+    )
+
+    assert parsed.frame_count == 2
+
+
+def test_compressed_audio_expansion_is_rejected_before_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compressed payload over the PCM cap never reaches the decoder."""
+    info = type("Info", (), {"frames": 3, "samplerate": 1, "channels": 1})()
+    monkeypatch.setattr(sf, "info", lambda _stream: info)
+    monkeypatch.setattr(
+        sf, "read", lambda *_args, **_kwargs: pytest.fail("decode must not be called")
+    )
+
+    with pytest.raises(InvalidSourceRecord, match="decoded PCM exceeds"):
+        parse_audio_row(
+            {"file_id": "x", "audio": {"bytes": b"compressed"}},
+            max_decoded_audio_bytes=8,
+        )
+
+
 def test_discovery_projects_out_audio_column(tmp_path: Path) -> None:
     """Metadata discovery returns no embedded audio payload."""
     _write_source_files(tmp_path)

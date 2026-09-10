@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 _INDEX_PROGRESS_INTERVAL = 10_000
+_DEFAULT_MAX_DECODED_AUDIO_BYTES = 2 * 1024**3
 
 
 class _SignedUrlFilter(logging.Filter):
@@ -128,6 +129,10 @@ class SourceError(RuntimeError):
 
 class InvalidSourceRecord(SourceError, ValueError):
     """Raised when a source row cannot be interpreted safely."""
+
+
+class DecodedAudioTooLarge(InvalidSourceRecord):
+    """Raised before decoding PCM that exceeds the configured hard limit."""
 
 
 class InvalidSourceTimestamp(InvalidSourceRecord):
@@ -450,6 +455,7 @@ class HfP1Source:
         max_source_object_bytes: int = 6_197_291_423,
         max_batch_rows: int = 1024,
         max_batch_bytes: int = 64 * 1024 * 1024,
+        max_decoded_audio_bytes: int = _DEFAULT_MAX_DECODED_AUDIO_BYTES,
     ) -> None:
         """Create an adapter without downloading source data.
 
@@ -461,6 +467,9 @@ class HfP1Source:
             max_source_object_bytes (optional): Hard object-size limit before retrieval.
             max_batch_rows (optional): Maximum projected rows held in one Arrow batch.
             max_batch_bytes (optional): Maximum projected Arrow batch size.
+            max_decoded_audio_bytes (optional): Hard limit for decoded float32 PCM.
+                The default is 2 GiB, which covers the observed roughly 58-minute,
+                48 kHz mono P1 programme while bounding decompression expansion.
 
         Raises:
             ValueError:
@@ -470,6 +479,8 @@ class HfP1Source:
             raise ValueError("max_source_object_bytes must be positive")
         if max_batch_rows <= 0 or max_batch_bytes <= 0:
             raise ValueError("batch bounds must be positive")
+        if max_decoded_audio_bytes <= 0:
+            raise ValueError("max_decoded_audio_bytes must be positive")
         self.token = token
         self.audio_repository = audio_repository
         self.transcript_repository = transcript_repository
@@ -477,6 +488,7 @@ class HfP1Source:
         self.max_source_object_bytes = max_source_object_bytes
         self.max_batch_rows = max_batch_rows
         self.max_batch_bytes = max_batch_bytes
+        self.max_decoded_audio_bytes = max_decoded_audio_bytes
         self._api: object | None = None
         self._fs: object | None = None
 
@@ -936,6 +948,7 @@ class HfP1Source:
             expected_file_id=expected_file_id,
             default_sampling_rate=sampling_rate,
             default_channels=channels,
+            max_decoded_audio_bytes=self.max_decoded_audio_bytes,
         )
 
     def iter_programme_pointers(
@@ -1164,6 +1177,7 @@ def parse_audio_row(
     expected_file_id: str | None = None,
     default_sampling_rate: int | None = None,
     default_channels: int | None = None,
+    max_decoded_audio_bytes: int = _DEFAULT_MAX_DECODED_AUDIO_BYTES,
 ) -> ParsedAudio:
     """Parse an embedded audio row and expose its source sampling rate.
 
@@ -1206,29 +1220,17 @@ def parse_audio_row(
     ):
         raise InvalidSourceRecord(f"audio row {file_id} has an invalid payload")
     if isinstance(value, (bytes, bytearray, memoryview)):
-        try:
-            decoded, decoded_rate = sf.read(
-                io.BytesIO(bytes(value)), dtype="float32", always_2d=True
-            )
-        except Exception as exc:
-            raise InvalidSourceRecord(
-                "audio payload is unsupported or corrupt"
-            ) from exc
-        actual_channels = int(decoded.shape[1])
-        if (
-            decoded.shape[0] == 0
-            or actual_channels == 0
-            or not np.isfinite(decoded).all()
-        ):
-            raise InvalidSourceRecord("audio payload is empty or non-finite")
-        if declared_rate is not None and decoded_rate != int(declared_rate):
-            raise InvalidSourceRecord("audio sampling-rate metadata does not match")
-        if declared_channels is not None and actual_channels != int(declared_channels):
-            raise InvalidSourceRecord("audio channel metadata does not match")
+        decoded, decoded_rate, actual_channels = _decode_compressed_audio(
+            payload=bytes(value),
+            file_id=file_id,
+            declared_rate=declared_rate,
+            declared_channels=declared_channels,
+            max_decoded_audio_bytes=max_decoded_audio_bytes,
+        )
         return ParsedAudio(
             file_id=file_id,
-            value=np.asarray(decoded, dtype=np.float32),
-            sampling_rate=int(decoded_rate),
+            value=decoded,
+            sampling_rate=decoded_rate,
             channels=actual_channels,
         )
     if declared_rate is None:
@@ -1256,6 +1258,133 @@ def parse_audio_row(
     return ParsedAudio(
         file_id=file_id, value=value, sampling_rate=rate, channels=actual_channels
     )
+
+
+def _decode_compressed_audio(
+    *,
+    payload: bytes,
+    file_id: str,
+    declared_rate: object,
+    declared_channels: object,
+    max_decoded_audio_bytes: int,
+) -> tuple[np.ndarray, int, int]:
+    """Inspect, bound, and decode a compressed audio payload.
+
+    Returns:
+        Decoded float32 PCM, its sampling rate, and its channel count.
+
+    Raises:
+        ValueError:
+            If the decoded-audio limit is not positive.
+        DecodedAudioTooLarge:
+            If the predicted or actual PCM allocation exceeds the limit.
+        InvalidSourceRecord:
+            If the payload or its header is malformed or inconsistent.
+    """
+    if max_decoded_audio_bytes <= 0:
+        raise ValueError("max_decoded_audio_bytes must be positive")
+    stream = io.BytesIO(payload)
+    try:
+        info = sf.info(stream)
+    except Exception as exc:
+        raise InvalidSourceRecord("audio payload is unsupported or corrupt") from exc
+    frames = _header_positive_int(info.frames, "frame count", file_id)
+    sampling_rate = _header_positive_int(info.samplerate, "sampling rate", file_id)
+    channels = _header_positive_int(info.channels, "channel count", file_id)
+    declared_rate_int = (
+        int(t.cast(numbers.Integral, declared_rate))
+        if declared_rate is not None
+        else None
+    )
+    declared_channels_int = (
+        int(t.cast(numbers.Integral, declared_channels))
+        if declared_channels is not None
+        else None
+    )
+    if declared_rate_int is not None and sampling_rate != declared_rate_int:
+        raise InvalidSourceRecord("audio sampling-rate metadata does not match")
+    if declared_channels_int is not None and channels != declared_channels_int:
+        raise InvalidSourceRecord("audio channel metadata does not match")
+
+    dtype = np.dtype("float32")
+    expected_shape = (frames, channels)
+    allocation = _pcm_allocation_bytes(
+        shape=expected_shape, dtype=dtype, file_id=file_id
+    )
+    if allocation > max_decoded_audio_bytes:
+        raise DecodedAudioTooLarge(
+            f"audio row {file_id} decoded PCM exceeds the configured limit"
+        )
+    try:
+        stream.seek(0)
+        decoded, decoded_rate = sf.read(stream, dtype=dtype, always_2d=True)
+    except Exception as exc:
+        raise InvalidSourceRecord("audio payload is unsupported or corrupt") from exc
+    actual_rate = _header_positive_int(decoded_rate, "decoded sampling rate", file_id)
+    if actual_rate != sampling_rate:
+        raise InvalidSourceRecord("decoded sampling rate does not match its header")
+    if (
+        not isinstance(decoded, np.ndarray)
+        or decoded.dtype != dtype
+        or decoded.shape != expected_shape
+    ):
+        raise InvalidSourceRecord("audio payload shape does not match its header")
+    actual_allocation = _pcm_allocation_bytes(
+        shape=decoded.shape, dtype=decoded.dtype, file_id=file_id
+    )
+    if actual_allocation > max_decoded_audio_bytes:
+        raise DecodedAudioTooLarge(
+            f"audio row {file_id} decoded PCM exceeds the configured limit"
+        )
+    if not np.isfinite(decoded).all():
+        raise InvalidSourceRecord("audio payload is empty or non-finite")
+    if decoded.shape[0] == 0 or decoded.shape[1] == 0:
+        raise InvalidSourceRecord("audio payload is empty or non-finite")
+    return np.asarray(decoded, dtype=dtype), actual_rate, channels
+
+
+def _header_positive_int(value: object, name: str, file_id: str) -> int:
+    """Validate a positive finite integer from a libsndfile header.
+
+    Returns:
+        The validated integer value.
+
+    Raises:
+        InvalidSourceRecord:
+            If the header value is not a positive finite integer.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise InvalidSourceRecord(f"audio row {file_id} has an invalid {name}")
+    numeric_value = float(value)
+    if not math.isfinite(numeric_value):
+        raise InvalidSourceRecord(f"audio row {file_id} has an invalid {name}")
+    integer_value = int(numeric_value)
+    if integer_value != numeric_value or integer_value <= 0:
+        raise InvalidSourceRecord(f"audio row {file_id} has an invalid {name}")
+    return integer_value
+
+
+def _pcm_allocation_bytes(
+    *, shape: tuple[int, ...], dtype: np.dtype[np.generic], file_id: str
+) -> int:
+    """Calculate a PCM allocation with bounds safe for NumPy dimensions.
+
+    Returns:
+        The allocation size in bytes.
+
+    Raises:
+        DecodedAudioTooLarge:
+            If the shape cannot be represented by NumPy dimensions.
+    """
+    limit = np.iinfo(np.intp).max
+    allocation = 1
+    for dimension in (*shape, dtype.itemsize):
+        if dimension <= 0 or allocation > limit // dimension:
+            raise DecodedAudioTooLarge(
+                f"audio row {file_id} has an unrepresentable decoded allocation"
+            )
+        allocation *= dimension
+    return allocation
 
 
 def parse_transcript_row(

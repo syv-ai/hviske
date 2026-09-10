@@ -76,6 +76,7 @@ class PipelineSettings:
     verification_concurrency: int
     source_max_batch_rows: int
     source_max_batch_bytes: int
+    max_decoded_audio_bytes: int
     programme_limit: int | None
     source_file_id: str | None
     resume: bool
@@ -116,6 +117,9 @@ class PipelineSettings:
         max_source = root.get("max_source_bytes") or runtime["max_source_bytes"]
         max_scratch = root.get("max_scratch_bytes") or runtime["max_scratch_bytes"]
         shard_limit = root.get("shards_per_commit") or runtime["shards_per_commit"]
+        max_decoded_audio = root.get("max_decoded_audio_bytes") or runtime.get(
+            "max_decoded_audio_bytes", 2 * 1024**3
+        )
         vad_raw = t.cast(dict[str, object], root["vad"])
         vad_repo = t.cast(dict[str, object], vad_raw["repository"])
         ctc_raw = t.cast(dict[str, object], root["ctc"])
@@ -152,6 +156,7 @@ class PipelineSettings:
             normalisation=NormalisationContract.model_validate(root["normalisation"]),
             segmentation=SegmentationContract.model_validate(root["segmentation"]),
             output=OutputEncodingContract.model_validate(output_raw),
+            max_decoded_audio_bytes=_as_int(max_decoded_audio),
         )
         digest = pipeline_config_sha256(manifest)
         return cls(
@@ -172,6 +177,7 @@ class PipelineSettings:
             source_max_batch_bytes=_as_int(
                 runtime.get("source_max_batch_bytes", 64 * 1024 * 1024)
             ),
+            max_decoded_audio_bytes=_as_int(max_decoded_audio),
             programme_limit=_optional_int(root.get("programme_limit")),
             source_file_id=_optional_str(root.get("source_file_id")),
             resume=bool(root.get("resume", True)),
@@ -325,6 +331,7 @@ def run_pipeline(
             max_source_object_bytes=settings.max_source_bytes,
             max_batch_rows=settings.source_max_batch_rows,
             max_batch_bytes=settings.source_max_batch_bytes,
+            max_decoded_audio_bytes=settings.max_decoded_audio_bytes,
         )
     if not hasattr(source, "plan"):
         raise TypeError("source must expose the p1_source planning API")
@@ -1216,7 +1223,6 @@ def _process_native_programmes(
                 },
             },
             pipeline_digest=settings.pipeline_digest,
-            source_duration_ms=_as_int(as_mapping(metadata).get("duration_ms", 1)),
         )
         state = ledger.programme(programme_id).state.value
         if state == "rejected" or (
