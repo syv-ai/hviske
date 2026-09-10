@@ -185,7 +185,11 @@ class SourceTextSpan(ContractModel):
 
 
 class SourceWord(ContractModel):
-    """A transcript word with timing and auditable source-text spans."""
+    """A timed word with auditable ownership of adjacent source characters.
+
+    ``separator_text`` belongs to this word, including any leading or inter-word
+    untimed records. ``trailing_text`` belongs to the final timed word.
+    """
 
     text: StrictStr
     start_ms: StrictInt = Field(ge=0)
@@ -194,6 +198,8 @@ class SourceWord(ContractModel):
     source_span: SourceTextSpan | None = None
     separator_span: SourceTextSpan | None = None
     separator_text: StrictStr = ""
+    trailing_span: SourceTextSpan | None = None
+    trailing_text: StrictStr = ""
 
     @model_validator(mode="after")
     def _span_is_ordered(self) -> SourceWord:
@@ -212,6 +218,12 @@ class SourceWord(ContractModel):
             != len(self.separator_text)
         ):
             raise ValueError("separator span does not match separator text")
+        if self.trailing_span is None and self.trailing_text:
+            raise ValueError("trailing text requires a trailing span")
+        if self.trailing_span is not None and (
+            self.trailing_span.end - self.trailing_span.start != len(self.trailing_text)
+        ):
+            raise ValueError("trailing span does not match trailing text")
         return self
 
 
@@ -246,21 +258,33 @@ class SourceProgramme(ContractModel):
                 self,
                 "separator_spans",
                 tuple(
-                    word.separator_span
+                    span
                     for word in annotated
-                    if word.separator_span is not None
+                    for span in (word.separator_span, word.trailing_span)
+                    if span is not None
                 ),
             )
         return self
 
 
 def annotate_source_words(
-    words: tuple[SourceWord, ...] | list[SourceWord], transcript_text: str
+    words: tuple[SourceWord, ...] | list[SourceWord],
+    transcript_text: str,
+    expected_starts: tuple[int, ...] | list[int] | None = None,
 ) -> tuple[SourceWord, ...]:
     """Attach exact character and separator spans to transcript words.
 
     The source text is treated as authoritative.  A word that cannot be found in
-    order is rejected rather than silently normalised or re-spaced.
+    order is rejected rather than silently normalised or re-spaced.  Expected
+    offsets prevent a timed word from stealing an identical untimed token.
+
+    Args:
+        words:
+            Timed transcript words in source order.
+        transcript_text:
+            The authoritative verbatim transcript.
+        expected_starts (optional):
+            Record offsets used to reject ambiguous duplicate lexical matches.
 
     Returns:
         Words carrying their source and separator spans.
@@ -271,10 +295,14 @@ def annotate_source_words(
     """
     cursor = 0
     annotated: list[SourceWord] = []
+    if expected_starts is not None and len(expected_starts) != len(words):
+        raise ValueError("expected source offsets do not match timed words")
     for index, word in enumerate(words):
         start = transcript_text.find(word.text, cursor)
         if start < 0:
             raise ValueError(f"word {index} is not present in transcript text")
+        if expected_starts is not None and start != expected_starts[index]:
+            raise ValueError(f"word {index} has ambiguous source-text ownership")
         source_span = SourceTextSpan(start=start, end=start + len(word.text))
         separator_span = (
             SourceTextSpan(start=cursor, end=start) if start > cursor else None
@@ -289,6 +317,14 @@ def annotate_source_words(
             )
         )
         cursor = start + len(word.text)
+    if annotated and cursor < len(transcript_text):
+        trailing_span = SourceTextSpan(start=cursor, end=len(transcript_text))
+        annotated[-1] = annotated[-1].model_copy(
+            update={
+                "trailing_span": trailing_span,
+                "trailing_text": transcript_text[cursor:],
+            }
+        )
     return tuple(annotated)
 
 
@@ -350,6 +386,8 @@ class RejectionCategory(str, enum.Enum):
     DUPLICATE_SEGMENT_ID = "duplicate_segment_id"
     UNSUPPORTED_TEXT = "unsupported_text"
     MUSIC_DOMINANT = "music_dominant"
+    AMBIGUOUS_SOURCE_TEXT = "ambiguous_source_text"
+    NO_TIMED_WORDS = "no_timed_words"
     NO_ACCEPTED_SEGMENTS = "no_accepted_segments"
 
 
@@ -401,6 +439,7 @@ class NormalisationContract(ContractModel):
     """Versioned text normalisation rules used by the aligner."""
 
     version: StrictStr
+    source_text_ownership: StrictStr = "following-timed-word-with-terminal-suffix-v1"
     unicode_form: StrictStr = "NFC"
     case_folding: bool = False
     punctuation_removed: bool = True

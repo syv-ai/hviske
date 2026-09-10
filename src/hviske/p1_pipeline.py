@@ -861,19 +861,45 @@ def _process_native_programmes(
             transcript = source.fetch_transcript(transcript_pointer)
             enforce_scratch_cap(settings)
             omitted = getattr(transcript, "zero_duration_tokens_omitted", 0)
-            if omitted:
-                report.normalization_counts["zero_duration_tokens_omitted"] = (
-                    report.normalization_counts.get("zero_duration_tokens_omitted", 0)
-                    + omitted
-                )
+            untimed = getattr(transcript, "untimed_tokens_owned", 0)
+            if omitted or untimed:
+                if omitted:
+                    report.normalization_counts["zero_duration_tokens_omitted"] = (
+                        report.normalization_counts.get(
+                            "zero_duration_tokens_omitted", 0
+                        )
+                        + omitted
+                    )
+                if untimed > omitted:
+                    report.normalization_counts["untimed_tokens_owned"] = (
+                        report.normalization_counts.get("untimed_tokens_owned", 0)
+                        + untimed
+                        - omitted
+                    )
                 log.write(
                     {
                         "event": "transcript_normalized",
                         "source_file_id": file_id,
-                        "operation": "omit_zero_duration_tokens",
-                        "count": omitted,
+                        "operation": "assign_source_text_ownership",
+                        "count": untimed,
                     }
                 )
+            ambiguous = getattr(transcript, "ambiguous_source_text_records", 0)
+            if ambiguous and transcript.words:
+                _reject_native_programme(
+                    ledger=ledger,
+                    report=report,
+                    log=log,
+                    programme_id=programme_id,
+                    source_file_id=file_id,
+                    reason=RejectionCategory.AMBIGUOUS_SOURCE_TEXT.value,
+                )
+                purge_source_temporary(getattr(source, "last_temporary", None))
+                logger.info(
+                    "Programme %d terminal outcome: rejected (ambiguous source text)",
+                    programme_number,
+                )
+                continue
             duration = _as_int(as_mapping(metadata).get("duration_ms", 0))
             if duration <= 0:
                 duration = max((word.end_ms for word in transcript.words), default=0)

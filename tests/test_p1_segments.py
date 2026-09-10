@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import typing as t
 from pathlib import Path
 
 import numpy as np
@@ -11,12 +12,14 @@ import pytest
 
 from hviske.p1_contracts import (
     NormalisationContract,
+    RejectionCategory,
     SegmentationContract,
     SourceWord,
     annotate_source_words,
 )
 from hviske.p1_segments import (
     AlignmentResult,
+    CTCBackend,
     VADSignal,
     align_ctc_emissions,
     correct_drift_once,
@@ -29,8 +32,76 @@ from hviske.p1_segments import (
     validate_raw_timestamps,
     write_shards,
 )
+from hviske.p1_source import parse_transcript_row
 
 CONFIG_DIGEST = hashlib.sha256(b"p1-test-config").hexdigest()
+
+
+def test_all_zero_transcript_is_terminally_classifiable() -> None:
+    """A transcript with no timing anchors is an explicit rejection, not empty work."""
+    from hviske.p1_segments import segment_programme
+
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "source",
+            "words": [
+                {"text": "noise", "start_ms": 0, "end_ms": 0},
+                {"text": "...", "type": "spacing", "start_ms": 0, "end_ms": 0},
+            ],
+        }
+    )
+    result = segment_programme(
+        words=parsed.words,
+        audio=np.zeros(32_000, dtype=np.float32),
+        source_file_id="source",
+        source_duration_ms=2_000,
+        segmentation=segmentation_contract(),
+        normalisation=NormalisationContract(version="test"),
+        ctc=t.cast(CTCBackend, object()),
+        pipeline_version="test",
+        pipeline_config_sha256=CONFIG_DIGEST,
+    )
+
+    assert result.rows == ()
+    assert result.rejections == (("", RejectionCategory.NO_TIMED_WORDS.value),)
+
+
+def segmentation_contract(maximum_duration_ms: int = 10_000) -> SegmentationContract:
+    """Return small deterministic test thresholds."""
+    return SegmentationContract(
+        minimum_duration_ms=1_000,
+        target_minimum_duration_ms=2_000,
+        target_maximum_duration_ms=8_000,
+        maximum_duration_ms=maximum_duration_ms,
+        maximum_drift_ms=100,
+        minimum_alignment_score=0.0,
+        minimum_vad_speech_ratio=0.0,
+    )
+
+
+def test_candidates_partition_every_owned_source_character() -> None:
+    """Proposal boundaries and speaker changes neither drop nor duplicate text."""
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "source",
+            "words": [
+                {"text": "[...]", "start_ms": 0, "end_ms": 0},
+                {"text": "one.", "start_ms": 0, "end_ms": 1_000, "speaker": "a"},
+                {"text": "[boundary]", "start_ms": 1_000, "end_ms": 1_000},
+                {"text": "two", "start_ms": 1_000, "end_ms": 2_000, "speaker": "b"},
+                {"text": "...", "start_ms": 2_000, "end_ms": 2_000},
+            ],
+        }
+    )
+    proposals = form_candidate_segments(
+        words=parsed.words, source_file_id="source", contract=segmentation_contract()
+    )
+
+    assert "".join(proposal.text for proposal in proposals) == parsed.text
+    assert [proposal.text for proposal in proposals] == [
+        "[...]one.",
+        "[boundary]two...",
+    ]
 
 
 def test_candidates_partition_words_and_respect_speakers() -> None:
@@ -52,19 +123,6 @@ def test_candidates_partition_words_and_respect_speakers() -> None:
     ]
     assert indexes == list(range(len(source)))
     assert all(len(proposal.speaker_ids) <= 1 for proposal in proposals)
-
-
-def segmentation_contract(maximum_duration_ms: int = 10_000) -> SegmentationContract:
-    """Return small deterministic test thresholds."""
-    return SegmentationContract(
-        minimum_duration_ms=1_000,
-        target_minimum_duration_ms=2_000,
-        target_maximum_duration_ms=8_000,
-        maximum_duration_ms=maximum_duration_ms,
-        maximum_drift_ms=100,
-        minimum_alignment_score=0.0,
-        minimum_vad_speech_ratio=0.0,
-    )
 
 
 def words(*spans: tuple[str, int, int, str | None]) -> tuple[SourceWord, ...]:

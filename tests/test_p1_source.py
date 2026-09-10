@@ -317,6 +317,45 @@ def test_targeted_transcript_index_stops_at_first_valid_pointer(tmp_path: Path) 
     assert index.get("programme-b") is None
 
 
+def test_transcript_parser_assigns_untimed_text_to_adjacent_timed_words() -> None:
+    """Untimed records survive in deterministic prefix and terminal ownership."""
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "x",
+            "words": [
+                {"text": "[...]", "start_ms": 0, "end_ms": 0},
+                {"text": "one", "start_ms": 0, "end_ms": 100},
+                {"text": "  ", "type": "spacing"},
+                {"text": "two", "start_ms": 100, "end_ms": 200},
+                {"text": "..."},
+            ],
+        }
+    )
+
+    assert parsed.text == "[...]one  two..."
+    assert parsed.words[0].separator_text == "[...]"
+    assert parsed.words[1].separator_text == "  "
+    assert parsed.words[-1].trailing_text == "..."
+    assert parsed.words[-1].trailing_span is not None
+    assert parsed.words[-1].trailing_span.start == len("[...]one  two")
+    assert parsed.untimed_tokens_owned == 3
+    assert parsed.ambiguous_source_text_records == 0
+
+
+def test_transcript_parser_fails_closed_on_ambiguous_lexical_ownership() -> None:
+    """A timed duplicate cannot silently steal an untimed lexical record."""
+    with pytest.raises(InvalidSourceRecord, match="ownership"):
+        parse_transcript_row(
+            row={
+                "file_id": "x",
+                "words": [
+                    {"text": "a", "start_ms": 0, "end_ms": 0},
+                    {"text": "a", "start_ms": 0, "end_ms": 100},
+                ],
+            }
+        )
+
+
 def test_transcript_parser_omits_zero_duration_tokens_without_losing_source_text() -> (
     None
 ):
@@ -326,7 +365,7 @@ def test_transcript_parser_omits_zero_duration_tokens_without_losing_source_text
             "file_id": "x",
             "words": [
                 {"text": "left", "start_ms": 0, "end_ms": 100},
-                {"text": "<noise>", "start_ms": 100, "end_ms": 100},
+                {"text": "<noise>", "start_ms": 999, "end_ms": 999},
                 {"text": "right", "start_ms": 100, "end_ms": 200},
             ],
         }
@@ -335,6 +374,7 @@ def test_transcript_parser_omits_zero_duration_tokens_without_losing_source_text
     assert parsed.text == "left<noise>right"
     assert [word.text for word in parsed.words] == ["left", "right"]
     assert parsed.zero_duration_tokens_omitted == 1
+    assert parsed.ambiguous_source_text_records == 1
     assert parsed.words[1].separator_text == "<noise>"
     assert parsed.words[1].separator_span is not None
     assert parsed.words[1].separator_span.start == 4
