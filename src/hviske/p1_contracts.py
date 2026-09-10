@@ -14,6 +14,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TypeAlias
 
 from pydantic import (
@@ -33,6 +34,80 @@ _BLOB_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 
 JSONScalar: TypeAlias = None | bool | int | float | str
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
+
+
+@dataclass(frozen=True)
+class P1RuntimeContract:
+    """The immutable implementation and data-processing contract for P1."""
+
+    pipeline_version: str
+    ctc_name: str
+    ctc_version: str
+    ctc_source_commit: str
+    ctc_sdist_sha256: str
+    ctc_license: str
+    roest_repository: str
+    roest_revision: str
+    roest_license: str
+    roest_license_url: str
+    roest_license_meaning: str
+    roest_architecture: str
+    roest_model_type: str
+    roest_sampling_rate: int
+    roest_frame_stride_samples: int
+    roest_frame_duration_ms: float
+    roest_vocab_size: int
+    roest_blank_token_id: int
+    roest_word_delimiter_token_id: int
+    roest_required_tokens: frozenset[str]
+    roest_tokenizer_case: str
+    normalisation_version: str
+    normalisation_source_text_ownership: str
+    normalisation_unicode_form: str
+    normalisation_case_folding: bool
+    normalisation_punctuation_removed: bool
+    normalisation_number_expansion: bool
+    normalisation_preserves_source_word_map: bool
+
+
+P1_RUNTIME_CONTRACT = P1RuntimeContract(
+    pipeline_version="p1-segmentation-4",
+    ctc_name="ctc-segmentation",
+    ctc_version="1.7.4",
+    ctc_source_commit="69bd9b53b7b82ad926d35e7b280f957ed299a7db",
+    ctc_sdist_sha256=(
+        "19d383ea5f22438ebb1699d72b22078b63f351a33fa50bedb19c14077ba6a116"
+    ),
+    ctc_license="Apache-2.0",
+    roest_repository="CoRal-project/roest-v3-wav2vec2-315m",
+    roest_revision="beb3e790246d6b9dec1df596b0b21d5c42f4d99c",
+    roest_license="openrail",
+    roest_license_url=(
+        "https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE"
+    ),
+    roest_license_meaning=(
+        "Model card metadata is openrail; the card describes a custom OpenRAIL-M "
+        "licence permitting commercial use with restrictions on speech synthesis "
+        "and biometric identification. P1 uses the model for ASR alignment only."
+    ),
+    roest_architecture="Wav2Vec2ForCTC",
+    roest_model_type="wav2vec2",
+    roest_sampling_rate=16_000,
+    roest_frame_stride_samples=320,
+    roest_frame_duration_ms=20.0,
+    roest_vocab_size=46,
+    roest_blank_token_id=45,
+    roest_word_delimiter_token_id=36,
+    roest_required_tokens=frozenset("0123456789abcdefghijklmnopqrstuvwxyzåæéøü"),
+    roest_tokenizer_case="lowercase-only",
+    normalisation_version="p1-text-normalisation-3",
+    normalisation_source_text_ownership="following-timed-word-with-terminal-suffix-v1",
+    normalisation_unicode_form="NFC",
+    normalisation_case_folding=True,
+    normalisation_punctuation_removed=True,
+    normalisation_number_expansion=False,
+    normalisation_preserves_source_word_map=True,
+)
 
 
 class ContractModel(BaseModel):
@@ -674,3 +749,107 @@ def segment_id(
 def valid_ledger_transition(current: LedgerState, target: LedgerState) -> bool:
     """Return whether a ledger state transition is permitted."""
     return target in _ALLOWED_TRANSITIONS[current]
+
+
+def validate_p1_runtime_contract(
+    *, pipeline_version: str, ctc: CTCContract, normalisation: NormalisationContract
+) -> None:
+    """Reject configuration that diverges from the active P1 contract.
+
+    Args:
+        pipeline_version:
+            Version of the P1 pipeline implementation.
+        ctc:
+            CTC library and model provenance to validate.
+        normalisation:
+            Text normalisation rules used before alignment.
+
+    Raises:
+        ValueError:
+            If any identity field differs from the active contract.
+    """
+    contract = P1_RUNTIME_CONTRACT
+    if (
+        ctc.model.repository.repository == contract.roest_repository
+        and normalisation.case_folding != contract.normalisation_case_folding
+    ):
+        raise ValueError(
+            f"Roest's {contract.roest_tokenizer_case} tokenizer requires "
+            "normalisation.case_folding=true"
+        )
+    values = {
+        "pipeline_version": (pipeline_version, contract.pipeline_version),
+        "ctc.name": (ctc.name, contract.ctc_name),
+        "ctc.version": (ctc.version, contract.ctc_version),
+        "ctc.source_commit": (ctc.source_commit, contract.ctc_source_commit),
+        "ctc.sdist_sha256": (ctc.sdist_sha256, contract.ctc_sdist_sha256),
+        "ctc.license": (ctc.license, contract.ctc_license),
+        "ctc.model.repository.repository": (
+            ctc.model.repository.repository,
+            contract.roest_repository,
+        ),
+        "ctc.model.repository.revision": (
+            ctc.model.repository.revision,
+            contract.roest_revision,
+        ),
+        "ctc.model.license": (ctc.model.license, contract.roest_license),
+        "ctc.model.license_url": (ctc.model.license_url, contract.roest_license_url),
+        "ctc.model.license_notes": (
+            ctc.model.license_notes,
+            contract.roest_license_meaning,
+        ),
+        "ctc.model.architecture": (ctc.model.architecture, contract.roest_architecture),
+        "ctc.model.model_type": (ctc.model.model_type, contract.roest_model_type),
+        "ctc.model.sampling_rate": (
+            ctc.model.sampling_rate,
+            contract.roest_sampling_rate,
+        ),
+        "ctc.model.frame_stride_samples": (
+            ctc.model.frame_stride_samples,
+            contract.roest_frame_stride_samples,
+        ),
+        "ctc.model.vocab_size": (ctc.model.vocab_size, contract.roest_vocab_size),
+        "ctc.model.blank_token_id": (
+            ctc.model.blank_token_id,
+            contract.roest_blank_token_id,
+        ),
+        "ctc.model.word_delimiter_token_id": (
+            ctc.model.word_delimiter_token_id,
+            contract.roest_word_delimiter_token_id,
+        ),
+        "normalisation.version": (
+            normalisation.version,
+            contract.normalisation_version,
+        ),
+        "normalisation.source_text_ownership": (
+            normalisation.source_text_ownership,
+            contract.normalisation_source_text_ownership,
+        ),
+        "normalisation.unicode_form": (
+            normalisation.unicode_form,
+            contract.normalisation_unicode_form,
+        ),
+        "normalisation.case_folding": (
+            normalisation.case_folding,
+            contract.normalisation_case_folding,
+        ),
+        "normalisation.punctuation_removed": (
+            normalisation.punctuation_removed,
+            contract.normalisation_punctuation_removed,
+        ),
+        "normalisation.number_expansion": (
+            normalisation.number_expansion,
+            contract.normalisation_number_expansion,
+        ),
+        "normalisation.preserves_source_word_map": (
+            normalisation.preserves_source_word_map,
+            contract.normalisation_preserves_source_word_map,
+        ),
+    }
+    mismatches = [
+        name
+        for name, (actual, expected) in values.items()
+        if type(actual) is not type(expected) or actual != expected
+    ]
+    if mismatches:
+        raise ValueError("P1 runtime contract mismatch: " + ", ".join(mismatches))

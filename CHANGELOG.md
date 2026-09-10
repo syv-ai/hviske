@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Enforce the complete P1 Roest and ctc-segmentation provenance contract before
+  source planning, and use one immutable contract specification for adapters and
+  publication metadata.
 - Require NFC case folding for P1's lowercase-only Roest CTC tokenizer, bump the
   normalisation contract to version 3, and preserve original casing in published
   text and reversible source-word spans.

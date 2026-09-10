@@ -1014,6 +1014,59 @@ def test_roest_requires_case_folding_before_source_or_model_work(
         run_pipeline(config=config, source=Source())
 
 
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("pipeline_version", "p1-segmentation-mutated"),
+        ("ctc.name", "other-aligner"),
+        ("ctc.version", "1.7.3"),
+        ("ctc.source_commit", "a" * 40),
+        ("ctc.sdist_sha256", "a" * 64),
+        ("ctc.license", "MIT"),
+        ("ctc.model.repository.repository", "other/model"),
+        ("ctc.model.repository.revision", "b" * 40),
+        ("ctc.model.license", "Apache-2.0"),
+        ("ctc.model.license_url", "https://example.com/LICENSE"),
+        ("ctc.model.license_notes", "different licence meaning"),
+        ("ctc.model.architecture", "Wav2Vec2Model"),
+        ("ctc.model.model_type", "hubert"),
+        ("ctc.model.sampling_rate", 8_000),
+        ("ctc.model.frame_stride_samples", 160),
+        ("ctc.model.vocab_size", 45),
+        ("ctc.model.blank_token_id", 0),
+        ("ctc.model.word_delimiter_token_id", 1),
+        ("normalisation.version", "p1-text-normalisation-mutated"),
+        ("normalisation.source_text_ownership", "legacy"),
+        ("normalisation.unicode_form", "NFD"),
+        ("normalisation.case_folding", False),
+        ("normalisation.punctuation_removed", False),
+        ("normalisation.number_expansion", True),
+        ("normalisation.preserves_source_word_map", False),
+    ],
+)
+def test_runtime_contract_mutations_fail_before_source_planning_or_payload_work(
+    path: str, value: object, tmp_path: Path
+) -> None:
+    """Every identity mutation fails before planning, audio, or model work."""
+    config = pipeline_config(tmp_path, mode="build")
+    OmegaConf.update(config, path, value, merge=False)
+    calls = {"plan": 0, "audio": 0, "model": 0}
+
+    class Source:
+        def fetch_audio(self, **_: object) -> object:
+            calls["audio"] += 1
+            raise AssertionError("contract failure must precede audio retrieval")
+
+        def plan(self, **_: object) -> object:
+            calls["plan"] += 1
+            raise AssertionError("contract failure must precede source planning")
+
+    with pytest.raises(ValueError):
+        run_pipeline(config=config, source=Source())
+
+    assert calls == {"plan": 0, "audio": 0, "model": 0}
+
+
 def test_selection_dedup_rebuild_reclaims_high_water_file(tmp_path: Path) -> None:
     """A fresh selection database does not retain the previous high water mark."""
     path = tmp_path / "selection.sqlite"
