@@ -415,10 +415,19 @@ _ALLOWED_TRANSITIONS: dict[LedgerState, frozenset[LedgerState]] = {
 
 
 class ModelContract(ContractModel):
-    """Pinned model and its declared licence."""
+    """Pinned model, declared licence, and optional architecture evidence."""
 
     repository: RepositoryRevision
     license: StrictStr
+    license_url: StrictStr | None = None
+    license_notes: StrictStr | None = None
+    architecture: StrictStr | None = None
+    model_type: StrictStr | None = None
+    sampling_rate: StrictInt | None = None
+    frame_stride_samples: StrictInt | None = None
+    vocab_size: StrictInt | None = None
+    blank_token_id: StrictInt | None = None
+    word_delimiter_token_id: StrictInt | None = None
 
 
 class CTCContract(ContractModel):

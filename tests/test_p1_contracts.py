@@ -28,7 +28,7 @@ TRANSCRIPT_REVISION = "41132579816d86e889635f84f30511279f026359"
 VAD_REVISION = "867c2aa692646a1f1de3e94a15c9dd9f614c0acb"
 VAD_MODEL = "5c6988d663950a93a5f0d6c38c2fe024653ec552b"
 CTC_REVISION = "69bd9b53b7b82ad926d35e7b280f957ed299a7db"
-CTC_MODEL_REVISION = "cc62398a83d2eb071f789dfaea019a9ff3211c6c"
+CTC_MODEL_REVISION = "beb3e790246d6b9dec1df596b0b21d5c42f4d99c"
 ANOMALY_REVISION = "973afd24965f72e36ca33b3055d56a652f456b4d"
 
 
@@ -113,10 +113,20 @@ def make_manifest() -> CanonicalIdentityManifest:
             license="Apache-2.0",
             model=ModelContract(
                 repository=RepositoryRevision(
-                    repository="NbAiLab/wav2vec2-large-danish-npsc-nst",
+                    repository="CoRal-project/roest-v3-wav2vec2-315m",
                     revision=CTC_MODEL_REVISION,
                 ),
-                license="Apache-2.0",
+                license="openrail",
+                license_url=(
+                    "https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE"
+                ),
+                architecture="Wav2Vec2ForCTC",
+                model_type="wav2vec2",
+                sampling_rate=16000,
+                frame_stride_samples=320,
+                vocab_size=46,
+                blank_token_id=45,
+                word_delimiter_token_id=36,
             ),
         ),
         anomaly_model=ModelContract(

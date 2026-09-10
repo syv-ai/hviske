@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Replace the P1 CTC acoustic-model pin with the immutable CoRal Røst-v3 Wav2Vec2
+  checkpoint, record its openrail/OpenRAIL-M licence metadata, and derive its 20 ms
+  alignment frame duration from the validated model configuration.
 - Normalise accepted P1 audio to the deterministic millisecond-duration sample
   boundary, enforce the configured decoded-audio cap for compressed and injected
   arrays, and classify transcript endpoints beyond decoded audio separately from

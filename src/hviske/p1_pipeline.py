@@ -124,9 +124,8 @@ class PipelineSettings:
         vad_raw = t.cast(dict[str, object], root["vad"])
         vad_repo = t.cast(dict[str, object], vad_raw["repository"])
         ctc_raw = t.cast(dict[str, object], root["ctc"])
-        ctc_repo = t.cast(
-            dict[str, object], t.cast(dict[str, object], ctc_raw["model"])["repository"]
-        )
+        ctc_model = t.cast(dict[str, object], ctc_raw["model"])
+        ctc_repo = t.cast(dict[str, object], ctc_model["repository"])
         anomaly_raw = t.cast(dict[str, object], root["anomaly_model"])
         output_raw = t.cast(dict[str, object], root["output"])
         manifest = CanonicalIdentityManifest(
@@ -147,7 +146,20 @@ class PipelineSettings:
                 license=str(ctc_raw["license"]),
                 model=ModelContract(
                     repository=RepositoryRevision.model_validate(ctc_repo),
-                    license=str(t.cast(dict[str, object], ctc_raw["model"])["license"]),
+                    license=str(ctc_model["license"]),
+                    license_url=_optional_str(ctc_model.get("license_url")),
+                    license_notes=_optional_str(ctc_model.get("license_notes")),
+                    architecture=_optional_str(ctc_model.get("architecture")),
+                    model_type=_optional_str(ctc_model.get("model_type")),
+                    sampling_rate=_optional_int(ctc_model.get("sampling_rate")),
+                    frame_stride_samples=_optional_int(
+                        ctc_model.get("frame_stride_samples")
+                    ),
+                    vocab_size=_optional_int(ctc_model.get("vocab_size")),
+                    blank_token_id=_optional_int(ctc_model.get("blank_token_id")),
+                    word_delimiter_token_id=_optional_int(
+                        ctc_model.get("word_delimiter_token_id")
+                    ),
                 ),
             ),
             anomaly_model=ModelContract(
@@ -206,7 +218,15 @@ class PipelineSettings:
                     "model_blob": str(vad_raw["model_blob"]),
                     "model_sha256": str(vad_raw["model_sha256"]),
                 },
-                "ctc": ctc_repo,
+                "ctc": {
+                    **ctc_repo,
+                    "license": str(ctc_model["license"]),
+                    **{
+                        key: value
+                        for key, value in ctc_model.items()
+                        if key != "repository"
+                    },
+                },
                 "anomaly": anomaly_raw["repository"],
             },
             segmentation=manifest.segmentation,
@@ -2297,7 +2317,10 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
         ),
         permitted_use="Private commercial data preparation and model training only.",
         private_access_terms="Access is restricted to authorised syv.ai members.",
-        alignment_method="Pinned Silero VAD and Danish CTC segmentation.",
+        alignment_method=(
+            "Pinned Silero VAD and CoRal Røst-v3 Wav2Vec2 CTC segmentation; "
+            "the CTC model is openrail/OpenRAIL-M metadata, not Apache-2.0."
+        ),
         field_schema="p1-segments-v1 OutputRow schema.",
         known_limitations="Pilot thresholds and anomaly statistics require review.",
         rejection_policy=(

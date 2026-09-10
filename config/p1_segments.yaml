@@ -1,7 +1,7 @@
 # Phase 1C contract configuration. Every revision is immutable and complete.
 # Use mode=plan for a Hub-metadata-only preflight; initialise creates the private
 # target card, while pilot and production are bounded builds.
-pipeline_version: p1-segmentation-3
+pipeline_version: p1-segmentation-4
 mode: plan
 programme_limit: null
 source_file_id: null
@@ -40,9 +40,21 @@ ctc:
   license: Apache-2.0
   model:
     repository:
-      repository: NbAiLab/wav2vec2-large-danish-npsc-nst
-      revision: cc62398a83d2eb071f789dfaea019a9ff3211c6c
-    license: Apache-2.0
+      repository: CoRal-project/roest-v3-wav2vec2-315m
+      revision: beb3e790246d6b9dec1df596b0b21d5c42f4d99c
+    license: openrail
+    license_url: https://huggingface.co/Alvenir/coral-1-whisper-large/blob/main/LICENSE
+    license_notes: >-
+      Model card metadata is openrail; the card describes a custom OpenRAIL-M
+      licence permitting commercial use with restrictions on speech synthesis
+      and biometric identification. P1 uses the model for ASR alignment only.
+    architecture: Wav2Vec2ForCTC
+    model_type: wav2vec2
+    sampling_rate: 16000
+    frame_stride_samples: 320
+    vocab_size: 46
+    blank_token_id: 45
+    word_delimiter_token_id: 36
 
 anomaly_model:
   repository:
