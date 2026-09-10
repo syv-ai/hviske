@@ -132,6 +132,10 @@ class ShardBatchResult:
     source_recoverable: bool
 
 
+class UnsupportedAlignmentText(ValueError):
+    """Raised when alignment text cannot be represented by the CTC vocabulary."""
+
+
 @dataclass(frozen=True)
 class VADSignal:
     """Frame-independent VAD evidence used for edge snapping and quality gates.
@@ -910,6 +914,9 @@ def segment_programme(
                     sampling_rate=16000,
                 ),
             )
+        except UnsupportedAlignmentText:
+            reject(proposal, RejectionCategory.UNSUPPORTED_TEXT.value)
+            continue
         except CTCAlignmentInfeasible:
             reject(proposal, RejectionCategory.CTC_ALIGNMENT_FAILED.value)
             continue
@@ -1540,6 +1547,7 @@ __all__ = [
     "CandidateDecision",
     "CTCBackend",
     "CTCEmissionsAlignmentAdapter",
+    "UnsupportedAlignmentText",
     "CTCSegmentationAdapter",
     "CTCAlignmentAdapter",
     "EncodedAudio",
