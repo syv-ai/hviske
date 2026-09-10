@@ -331,8 +331,8 @@ def test_verification_failure_retains_local_shard(tmp_path: Path) -> None:
         tmp_path / "scratch" / "ledger.sqlite", reset_processing=False
     ) as ledger:
         programme = ledger.programme("p1-programme-1")
-        assert programme.state.value == "retryable"
-        assert programme.last_error == "runtime_error"
+        assert programme.state.value == "sharded"
+        assert programme.last_error is None
         pending = ledger.pending_batches()
         assert len(pending) == 1
         batch = pending[0]

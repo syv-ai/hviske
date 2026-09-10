@@ -20,6 +20,8 @@
   publication recovery, and emit manifests consumable by the validation CLI.
 - Commit accepted audit local locators with sharded ledger transitions so crash
   recovery can publish and resolve the audit manifest.
+- Bind P1 ledgers to one pipeline digest and make sharded and committed publication
+  states restart-safe without retryable downgrades or premature local purging.
 
 ### Added
 

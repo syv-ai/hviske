@@ -396,8 +396,11 @@ _ALLOWED_TRANSITIONS: dict[LedgerState, frozenset[LedgerState]] = {
     LedgerState.PROCESSING: frozenset(
         {LedgerState.SHARDED, LedgerState.RETRYABLE, LedgerState.REJECTED}
     ),
-    LedgerState.SHARDED: frozenset({LedgerState.COMMITTED, LedgerState.RETRYABLE}),
-    LedgerState.COMMITTED: frozenset({LedgerState.VERIFIED, LedgerState.RETRYABLE}),
+    # Once shard bytes are durable, recovery must use those bytes rather than
+    # re-entering processing. A committed batch likewise has an immutable Hub
+    # coordinate and can only advance through verification.
+    LedgerState.SHARDED: frozenset({LedgerState.COMMITTED}),
+    LedgerState.COMMITTED: frozenset({LedgerState.VERIFIED}),
     LedgerState.VERIFIED: frozenset({LedgerState.PURGED}),
     LedgerState.PURGED: frozenset(),
     LedgerState.REJECTED: frozenset(),

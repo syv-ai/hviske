@@ -559,7 +559,7 @@ def _run_native_pipeline(
         ctc = make_ctc_backend(settings)
         logger.info("P1 model stage: CTC backend ready")
     ledger_path = scratch / "ledger.sqlite"
-    with Ledger(ledger_path) as ledger:
+    with Ledger(ledger_path, pipeline_digest=settings.pipeline_digest) as ledger:
         _recover_native_batches(
             source=source,
             settings=settings,
@@ -1086,7 +1086,7 @@ def _process_native_programmes(
         except Exception as exc:
             category = _safe_exception_category(exc)
             current = ledger.programme(programme_id)
-            if current.state.value in {"processing", "sharded", "committed"}:
+            if current.state.value == "processing":
                 ledger.transition_programme(
                     programme_id, target=_state("retryable"), last_error=category
                 )

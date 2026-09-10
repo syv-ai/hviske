@@ -519,14 +519,64 @@ def publish_batch(
     Raises:
         AllowListError:
             If a local file or batch size is unsafe.
+        PublicationError:
+            If durable ledger evidence does not match the local batch.
     """
-    if not shards:
-        raise AllowListError("a publication batch must contain at least one shard")
-    if len(shards) + 1 >= 100:
+    if shards and len(shards) + 1 >= 100:
         raise AllowListError("a Hub commit must contain fewer than 100 operations")
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
+    ledger_record = None if ledger is None else ledger.batch(batch_id)
+    if ledger_record is not None and ledger_record.state in {
+        LedgerState.COMMITTED,
+        LedgerState.VERIFIED,
+        LedgerState.PURGED,
+    }:
+        # A committed batch is recovered from its immutable ledger evidence. In
+        # particular, do not inspect or re-upload local shards before verifying it.
+        records = ledger.shards(batch_id)
+        manifest_path = next(
+            (
+                Path(record.local_path).parent / _manifest_repo_path(batch_id)
+                for record in records
+                if record.local_path is not None
+            ),
+            None,
+        )
+        local_paths = tuple(
+            Path(record.local_path)
+            for record in records
+            if record.local_path is not None
+        )
+        return verify_batch(
+            api,
+            repo_id,
+            batch_id,
+            ledger=ledger,
+            validator=validator,
+            schema_validator=schema_validator,
+            expected_schema=expected_schema,
+            purge_callback=purge_callback,
+            manifest_path=manifest_path,
+            local_paths=local_paths,
+        )
+    if not shards:
+        raise AllowListError("a publication batch must contain at least one shard")
     local_evidence = tuple(_local_evidence(shard) for shard in shards)
     _assert_unique_paths(local_evidence)
+    if ledger_record is not None and ledger_record.state is LedgerState.SHARDED:
+        durable_evidence = tuple(
+            ShardEvidence(
+                path=record.path,
+                byte_size=record.byte_size,
+                row_count=record.row_count,
+                sha256=record.sha256,
+            )
+            for record in ledger.shards(batch_id)
+        )
+        if local_evidence != durable_evidence:
+            raise PublicationError(
+                "local shard bytes differ from durable ledger evidence"
+            )
     counts = rejection_counts if rejection_counts is not None else {}
     _assert_safe_metadata(counts)
 
@@ -557,24 +607,6 @@ def publish_batch(
         row_count=0,
         sha256=_sha256_bytes(manifest),
     )
-    if ledger is not None and ledger.batch(batch_id).state in {
-        LedgerState.COMMITTED,
-        LedgerState.VERIFIED,
-        LedgerState.PURGED,
-    }:
-        return verify_batch(
-            api,
-            repo_id,
-            batch_id,
-            local_evidence=local_evidence,
-            manifest_path=manifest_path,
-            ledger=ledger,
-            validator=validator,
-            schema_validator=schema_validator,
-            expected_schema=expected_schema,
-            purge_callback=purge_callback,
-            local_paths=tuple(shard.path for shard in shards),
-        )
     _refuse_remote_collisions(api, repo_id, (*local_evidence, manifest_evidence))
     operations = tuple(
         [

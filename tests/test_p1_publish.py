@@ -360,6 +360,77 @@ def test_exposed_digest_avoids_remote_download() -> None:
         assert not hub.streamed
 
 
+def test_failed_verification_resumes_without_reupload_or_early_purge(
+    tmp_path: Path,
+) -> None:
+    """A committed batch resumes from its manifest and immutable commit."""
+    path = tmp_path / "one.parquet"
+    write_valid_shard(path)
+    database = tmp_path / "ledger.sqlite"
+    hub = MemoryHub()
+    failed = True
+
+    with Ledger(database) as ledger:
+        ledger.register_batch("batch", pipeline_digest="a" * 64)
+        ledger.register_shard(
+            "shard",
+            path="one.parquet",
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            byte_size=path.stat().st_size,
+            row_count=1,
+            local_path=path,
+            batch_id="batch",
+        )
+        ledger.transition_batch("batch", LedgerState.PROCESSING)
+        ledger.transition_batch("batch", LedgerState.SHARDED)
+
+        def validator(_dataset: object, _path: str) -> None:
+            """Fail the first verification and allow the recovery attempt.
+
+            Raises:
+                VerificationError:
+                    On the first invocation to exercise restart recovery.
+            """
+            nonlocal failed
+            if failed:
+                failed = False
+                raise VerificationError("fail once")
+
+        with pytest.raises(VerificationError, match="fail once"):
+            publish_batch(
+                hub,
+                "org/p1",
+                "batch",
+                [LocalShard(path, "one.parquet", 1)],
+                ledger=ledger,
+                validator=validator,
+            )
+        assert ledger.batch("batch").state is LedgerState.COMMITTED
+        assert ledger.batch("batch").commit_id == hub.commit_id
+        assert path.exists()
+        manifest_path = tmp_path / "manifests" / "batch.json"
+        assert manifest_path.exists()
+
+        def purge(paths: tuple[Path, ...]) -> None:
+            """Delete only the publisher's verified artefacts."""
+            for candidate in paths:
+                candidate.unlink()
+
+        evidence = publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            ledger=ledger,
+            validator=validator,
+            purge_callback=purge,
+        )
+        assert evidence.state is LedgerState.PURGED
+        assert len(hub.commits) == 1
+        assert not path.exists()
+        assert not manifest_path.exists()
+
+
 def test_hf_digest_stream_uses_explicit_dataset_namespace() -> None:
     """The filesystem adapter never ambiguously addresses a model repository."""
     adapter = object.__new__(HfApiAdapter)

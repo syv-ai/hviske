@@ -133,6 +133,44 @@ def add_batch(ledger: Ledger, batch_id: str = "batch-1") -> None:
     ledger.attach_shard(batch_id, "shard-1")
 
 
+def test_ledger_binds_one_pipeline_digest_before_mutation(tmp_path: Path) -> None:
+    """A restart with a different pipeline identity cannot alter the ledger."""
+    database = tmp_path / "ledger.sqlite"
+    with Ledger(database, pipeline_digest=DIGEST) as ledger:
+        add_programme(ledger)
+
+    with pytest.raises(EvidenceError, match="different pipeline digest"):
+        Ledger(database, pipeline_digest="b" * 64)
+
+    with Ledger(database) as ledger:
+        assert ledger.pipeline_digest == DIGEST
+        assert ledger.programme("programme-1").pipeline_digest == DIGEST
+
+
+def test_legacy_ledger_requires_one_matching_digest(tmp_path: Path) -> None:
+    """A legacy ledger binds only when every stored identity agrees."""
+    matching = tmp_path / "matching.sqlite"
+    with Ledger(matching) as ledger:
+        add_programme(ledger)
+        ledger._connection.execute("DELETE FROM ledger_metadata")
+    with Ledger(matching, pipeline_digest=DIGEST) as ledger:
+        assert ledger.pipeline_digest == DIGEST
+
+    conflicting = tmp_path / "conflicting.sqlite"
+    with Ledger(conflicting) as ledger:
+        add_programme(ledger)
+        ledger.register_batch("batch", pipeline_digest=DIGEST)
+        ledger._connection.execute(
+            "UPDATE batches SET pipeline_digest = ?", ("b" * 64,)
+        )
+        ledger._connection.execute("DELETE FROM ledger_metadata")
+    with pytest.raises(EvidenceError, match="multiple pipeline digests"):
+        Ledger(conflicting, pipeline_digest=DIGEST)
+    connection = sqlite3.connect(conflicting)
+    assert connection.execute("SELECT COUNT(*) FROM ledger_metadata").fetchone()[0] == 0
+    connection.close()
+
+
 def test_local_reconciliation_requires_exact_digest_and_regular_file(
     tmp_path: Path,
 ) -> None:
@@ -257,7 +295,7 @@ def test_rejected_programmes_and_retryable_transitions_are_durable(
         assert rejected.rejection_counts == {"decode_error": 1}
 
 
-def test_remote_reconciliation_avoids_reupload_or_marks_retryable(
+def test_remote_reconciliation_avoids_reupload_and_preserves_commit(
     tmp_path: Path,
 ) -> None:
     """The remote hook sees immutable commit and publication-relative paths."""
@@ -289,7 +327,9 @@ def test_remote_reconciliation_avoids_reupload_or_marks_retryable(
         ledger.transition_batch("batch-2", LedgerState.SHARDED)
         ledger.transition_batch("batch-2", LedgerState.COMMITTED, commit_id=COMMIT)
         assert not ledger.reconcile_remote("batch-2", lambda _commit, _paths: False)
-        assert ledger.batch("batch-2").state is LedgerState.RETRYABLE
+        assert ledger.batch("batch-2").state is LedgerState.COMMITTED
+        with pytest.raises(InvalidTransition):
+            ledger.transition_batch("batch-2", LedgerState.RETRYABLE)
 
 
 def test_restart_enumerates_unattached_local_shards_and_committed_batches(
@@ -334,7 +374,7 @@ def test_schema_is_atomic_and_metadata_only(tmp_path: Path) -> None:
     database = tmp_path / "ledger.sqlite"
     with Ledger(database) as ledger:
         version = ledger._connection.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 2
+        assert version == 3
         columns = {
             row[1]
             for row in ledger._connection.execute("PRAGMA table_info(programmes)")
@@ -342,7 +382,7 @@ def test_schema_is_atomic_and_metadata_only(tmp_path: Path) -> None:
         assert "transcript_text" not in columns
         assert "audio_bytes" not in columns
     connection = sqlite3.connect(database)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     connection.close()
 
 
@@ -374,6 +414,19 @@ def test_sequences_are_durable_monotonic_and_work_is_reconstructable(
         work = ledger.reconstruct_work()
         assert work[0][0].state is LedgerState.COMMITTED
         assert work[0][1][0].shard_id == "shard-00000001"
+
+
+def test_sharded_and_committed_work_is_not_retryable(tmp_path: Path) -> None:
+    """Only processing failures may enter the retryable state."""
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        add_batch(ledger)
+        ledger.transition_batch("batch-1", LedgerState.PROCESSING)
+        ledger.transition_batch("batch-1", LedgerState.SHARDED)
+        with pytest.raises(InvalidTransition):
+            ledger.transition_batch("batch-1", LedgerState.RETRYABLE)
+        ledger.transition_batch("batch-1", LedgerState.COMMITTED, commit_id=COMMIT)
+        with pytest.raises(InvalidTransition):
+            ledger.transition_batch("batch-1", LedgerState.RETRYABLE)
 
 
 def test_transaction_rolls_back_state_and_evidence(tmp_path: Path) -> None:
