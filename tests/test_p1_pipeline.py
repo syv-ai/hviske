@@ -646,6 +646,8 @@ def test_p1_settings_record_roest_model_evidence(tmp_path: Path) -> None:
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
 
     assert settings.pipeline_version == "p1-segmentation-4"
+    assert settings.normalisation.version == "p1-text-normalisation-3"
+    assert settings.normalisation.case_folding is True
     assert settings.model_revisions["ctc"] == {
         "repository": "CoRal-project/roest-v3-wav2vec2-315m",
         "revision": "beb3e790246d6b9dec1df596b0b21d5c42f4d99c",
@@ -995,6 +997,21 @@ def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
 
     assert not good.exists()
     assert replaced.exists()
+
+
+def test_roest_requires_case_folding_before_source_or_model_work(
+    tmp_path: Path,
+) -> None:
+    """An incompatible config fails before planning can retrieve source data."""
+    config = pipeline_config(tmp_path, mode="build")
+    config.normalisation.case_folding = False
+
+    class Source:
+        def plan(self, **_: object) -> object:
+            raise AssertionError("source planning must not start")
+
+    with pytest.raises(ValueError, match="lowercase-only tokenizer"):
+        run_pipeline(config=config, source=Source())
 
 
 def test_selection_dedup_rebuild_reclaims_high_water_file(tmp_path: Path) -> None:

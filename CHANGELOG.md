@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Require NFC case folding for P1's lowercase-only Roest CTC tokenizer, bump the
+  normalisation contract to version 3, and preserve original casing in published
+  text and reversible source-word spans.
 - Replace the P1 CTC acoustic-model pin with the immutable CoRal Røst-v3 Wav2Vec2
   checkpoint, record its openrail/OpenRAIL-M licence metadata, and derive its 20 ms
   alignment frame duration from the validated model configuration.

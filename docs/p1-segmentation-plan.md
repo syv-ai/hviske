@@ -108,8 +108,10 @@ or substantially non-monotonic. Record the exact rejection reason in the ledger.
 Create a canonical `alignment_text` separately from the verbatim training text. Record
 a reversible mapping from every retained alignment unit to its source word. The mapping
 must make case folding, punctuation removal, number expansion, unsupported characters,
-and optional romanisation auditable. Never infer published text by reversing aligner
-normalisation.
+and optional romanisation auditable. The pinned Roest tokenizer is lowercase-only, so
+P1 normalisation version 3 requires case folding for canonical CTC text. Published
+`text`, source spans, and the word map remain verbatim and case-preserving; never infer
+published text by reversing aligner normalisation.
 
 ### Form candidate segments
 
@@ -458,7 +460,9 @@ Retain only:
 
 - source, model, and code revisions, including the CTC licence designation and URL;
 - versioned configuration and normalisation rules, including the CTC architecture,
-  sampling rate, convolution stride, vocabulary size, blank, and delimiter IDs;
+  sampling rate, convolution stride, vocabulary size, blank, and delimiter IDs; the
+  pipeline digest covers the lowercase-only Roest compatibility invariant and
+  `p1-text-normalisation-3` case-folding setting;
 - metadata-only SQLite ledger and batch manifests;
 - shard paths, sizes, row counts, SHA-256 digests, and Hub commit IDs;
 - aggregate quality reports and manual-audit decisions;
