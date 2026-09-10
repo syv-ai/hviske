@@ -368,6 +368,7 @@ class CTCEmissionsAlignmentAdapter:
         frame_duration_ms: float,
         blank_id: int = 0,
         segmenter: c.Callable[..., AlignmentResult] | None = None,
+        validate_word_map: bool = False,
     ) -> None:
         """Configure injected emission and tokenisation functions.
 
@@ -382,12 +383,16 @@ class CTCEmissionsAlignmentAdapter:
                 CTC blank class.
             segmenter:
                 Optional pinned ``ctc-segmentation`` callable.
+            validate_word_map:
+                Whether to require one returned boundary for each source word.
+                Defaults to ``False`` for compatibility with injected segmenters.
         """
         self._emissions_provider = emissions_provider
         self._tokeniser = tokeniser
         self._frame_duration_ms = frame_duration_ms
         self._blank_id = blank_id
         self._segmenter = segmenter
+        self._validate_word_map = validate_word_map
 
     def align(
         self,
@@ -402,6 +407,10 @@ class CTCEmissionsAlignmentAdapter:
 
         Returns:
             Absolute alignment boundaries and backend score.
+
+        Raises:
+            ValueError:
+                If the injected segmenter rejects the alignment inputs.
         """
         del end_ms
         emissions = self._emissions_provider(audio, sampling_rate)
@@ -410,20 +419,24 @@ class CTCEmissionsAlignmentAdapter:
             tuple(int(token) for token in self._tokeniser(word)) for word in words
         ]
         if self._segmenter is not None:
-            return self._segmenter(
+            result = self._segmenter(
                 emissions,
                 tokenised_words,
                 start_ms,
                 self._frame_duration_ms,
                 self._blank_id,
             )
-        return align_ctc_word_tokens(
-            emissions=emissions,
-            tokenised_words=tokenised_words,
-            start_ms=start_ms,
-            frame_duration_ms=self._frame_duration_ms,
-            blank_id=self._blank_id,
-        )
+        else:
+            result = align_ctc_word_tokens(
+                emissions=emissions,
+                tokenised_words=tokenised_words,
+                start_ms=start_ms,
+                frame_duration_ms=self._frame_duration_ms,
+                blank_id=self._blank_id,
+            )
+        if self._validate_word_map and len(word_map) != len(result.word_boundaries):
+            raise ValueError("word map does not match tokenised alignment words")
+        return result
 
 
 def align_ctc_word_tokens(

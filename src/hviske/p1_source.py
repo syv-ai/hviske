@@ -86,22 +86,6 @@ class SourceShard:
 
 
 @dataclasses.dataclass(frozen=True)
-class AudioPointer:
-    """A source-audio row location discovered without reading the audio column."""
-
-    file_id: str
-    shard: SourceShard
-    row_group: int
-    row_index: int
-    metadata: tuple[tuple[str, str], ...] = ()
-
-    @property
-    def remote_row_pointer(self) -> tuple[str, int, int]:
-        """Immutable shard, row-group, and row offset."""
-        return self.shard.path, self.row_group, self.row_index
-
-
-@dataclasses.dataclass(frozen=True)
 class TranscriptIndexRejection:
     """Metadata-only evidence for a row omitted from the pointer index."""
 
@@ -112,8 +96,36 @@ class TranscriptIndexRejection:
     row_index: int
 
 
+class _RemoteRowPointerMixin:
+    """Provide one implementation for immutable remote row coordinates."""
+
+    @property
+    def remote_row_pointer(self) -> tuple[str, int, int]:
+        """Immutable shard, row-group, and row offset."""
+        return self._remote_row_path(), self.row_group, self.row_index
+
+    def _remote_row_path(self) -> str:
+        """Return the object path represented by this pointer."""
+        raise NotImplementedError
+
+
 @dataclasses.dataclass(frozen=True)
-class TranscriptPointer:
+class AudioPointer(_RemoteRowPointerMixin):
+    """A source-audio row location discovered without reading the audio column."""
+
+    file_id: str
+    shard: SourceShard
+    row_group: int
+    row_index: int
+    metadata: tuple[tuple[str, str], ...] = ()
+
+    def _remote_row_path(self) -> str:
+        """Return the audio shard path represented by this pointer."""
+        return self.shard.path
+
+
+@dataclasses.dataclass(frozen=True)
+class TranscriptPointer(_RemoteRowPointerMixin):
     """A remote row location; no transcript content is retained."""
 
     file_id: str
@@ -124,10 +136,9 @@ class TranscriptPointer:
     byte_size: int
     metadata: tuple[tuple[str, str], ...] = ()
 
-    @property
-    def remote_row_pointer(self) -> tuple[str, int, int]:
-        """Immutable shard, row-group, and row offset."""
-        return self.path, self.row_group, self.row_index
+    def _remote_row_path(self) -> str:
+        """Return the transcript object path represented by this pointer."""
+        return self.path
 
 
 TranscriptWord = SourceWord
