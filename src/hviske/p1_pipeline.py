@@ -257,6 +257,7 @@ class BuildReport:
     shard_count: int = 0
     max_in_flight: int = 0
     rejection_counts: dict[str, int] = field(default_factory=dict)
+    normalization_counts: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         """Return metadata-only run evidence."""
@@ -269,6 +270,7 @@ class BuildReport:
             "shard_count": self.shard_count,
             "max_in_flight": self.max_in_flight,
             "rejection_counts": self.rejection_counts,
+            "normalization_counts": self.normalization_counts,
         }
 
 
@@ -717,6 +719,7 @@ def _process_native_programmes(
             If a selected programme produces no shard or has invalid state.
     """
     from hviske.p1_ledger import ShardAllocation
+    from hviske.p1_source import InvalidSourceTimestamp
 
     for file_id, metadata, locator in candidates:
         report.max_in_flight = max(report.max_in_flight, 1)
@@ -749,9 +752,38 @@ def _process_native_programmes(
             ledger.start_processing(programme_id)
             transcript = source.fetch_transcript(transcript_pointer)
             enforce_scratch_cap(settings)
+            omitted = getattr(transcript, "zero_duration_tokens_omitted", 0)
+            if omitted:
+                report.normalization_counts["zero_duration_tokens_omitted"] = (
+                    report.normalization_counts.get("zero_duration_tokens_omitted", 0)
+                    + omitted
+                )
+                log.write(
+                    {
+                        "event": "transcript_normalized",
+                        "source_file_id": file_id,
+                        "operation": "omit_zero_duration_tokens",
+                        "count": omitted,
+                    }
+                )
             duration = _as_int(as_mapping(metadata).get("duration_ms", 0))
             if duration <= 0:
                 duration = max((word.end_ms for word in transcript.words), default=0)
+            try:
+                _validate_native_timestamps(
+                    words=transcript.words, duration_ms=duration
+                )
+            except InvalidSourceTimestamp:
+                _reject_native_programme(
+                    ledger=ledger,
+                    report=report,
+                    log=log,
+                    programme_id=programme_id,
+                    source_file_id=file_id,
+                    reason=RejectionCategory.INVALID_TIMESTAMPS.value,
+                )
+                purge_source_temporary(getattr(source, "last_temporary", None))
+                continue
             programme = SourceProgramme(
                 file_id=file_id,
                 duration_ms=duration,
@@ -892,31 +924,32 @@ def _process_native_programmes(
                 audit_reservoir=audit_reservoir,
             )
             report.processed += 1
+        except InvalidSourceTimestamp:
+            _reject_native_programme(
+                ledger=ledger,
+                report=report,
+                log=log,
+                programme_id=programme_id,
+                source_file_id=file_id,
+                reason=RejectionCategory.INVALID_TIMESTAMPS.value,
+            )
+            purge_source_temporary(getattr(source, "last_temporary", None))
+            continue
         except Exception as exc:
+            category = _safe_exception_category(exc)
             current = ledger.programme(programme_id)
-            if current.state.value != "rejected":
-                report.rejected += 1
-                report.rejection_counts[RejectionCategory.DECODE_ERROR.value] = (
-                    report.rejection_counts.get(RejectionCategory.DECODE_ERROR.value, 0)
-                    + 1
-                )
-            if current.state.value not in {
-                "sharded",
-                "committed",
-                "verified",
-                "purged",
-                "rejected",
-            }:
+            if current.state.value in {"processing", "sharded", "committed"}:
                 ledger.transition_programme(
-                    programme_id, target=_state("retryable"), last_error=str(exc)[:500]
+                    programme_id, target=_state("retryable"), last_error=category
                 )
             log.write(
                 {
                     "event": "programme_error",
                     "source_file_id": file_id,
-                    "reason": "decode_error",
+                    "reason": category,
                 }
             )
+            raise
         finally:
             gc.collect()
         enforce_scratch_cap(settings)
@@ -1242,6 +1275,72 @@ def _unlink_recovered(
             if checksum_builder.hexdigest() != digest:
                 continue
         path.unlink()
+
+
+def _reject_native_programme(
+    *,
+    ledger: Ledger,
+    report: BuildReport,
+    log: MetadataLog,
+    programme_id: str,
+    source_file_id: str,
+    reason: str,
+) -> None:
+    """Persist a terminal source rejection without recording source content."""
+    ledger.reject_programme(
+        programme_id,
+        reason=reason,
+        rejection_counts={reason: 1},
+        accepted_count=0,
+        rejected_count=1,
+    )
+    report.processed += 1
+    report.rejected += 1
+    report.rejection_counts[reason] = report.rejection_counts.get(reason, 0) + 1
+    log.write(
+        {
+            "event": "programme_rejected",
+            "source_file_id": source_file_id,
+            "reason": reason,
+        }
+    )
+
+
+def _safe_exception_category(exc: Exception) -> str:
+    """Return a bounded error category without serialising exception details."""
+    if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
+        return "infrastructure_error"
+    if isinstance(exc, (RuntimeError, TypeError, ValueError)):
+        return "runtime_error"
+    return "unexpected_error"
+
+
+def _validate_native_timestamps(*, words: c.Iterable[object], duration_ms: int) -> None:
+    """Validate the source timeline before constructing ``SourceProgramme``.
+
+    Raises:
+        InvalidSourceTimestamp:
+            If a word is malformed, overlaps a previous word, or exceeds the
+            programme duration.
+    """
+    from hviske.p1_source import InvalidSourceTimestamp
+
+    previous_end = 0
+    for word in words:
+        start = getattr(word, "start_ms", None)
+        end = getattr(word, "end_ms", None)
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or start < 0
+            or end <= start
+            or start < previous_end
+            or end > duration_ms
+        ):
+            raise InvalidSourceTimestamp("source word timeline is invalid")
+        previous_end = end
 
 
 def enforce_scratch_cap(settings: PipelineSettings) -> None:

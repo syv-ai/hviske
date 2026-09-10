@@ -93,6 +93,7 @@ class ParsedTranscript:
     text: str
     words: tuple[SourceWord, ...]
     metadata: tuple[tuple[str, str], ...] = ()
+    zero_duration_tokens_omitted: int = 0
 
 
 class SourceError(RuntimeError):
@@ -101,6 +102,10 @@ class SourceError(RuntimeError):
 
 class InvalidSourceRecord(SourceError, ValueError):
     """Raised when a source row cannot be interpreted safely."""
+
+
+class InvalidSourceTimestamp(InvalidSourceRecord):
+    """Raised when source word timestamps cannot form a valid timeline."""
 
 
 class SourceObjectTooLarge(SourceError, ValueError):
@@ -1113,6 +1118,8 @@ def parse_transcript_row(
     Raises:
         InvalidSourceRecord:
             If the row or one of its timed words is malformed.
+        InvalidSourceTimestamp:
+            If timed words cannot form a non-overlapping timeline.
     """
     file_id = _file_id(row)
     if file_id is None or (
@@ -1133,6 +1140,7 @@ def parse_transcript_row(
     words: list[SourceWord] = []
     pieces: list[str] = []
     previous_end = 0
+    zero_duration_tokens_omitted = 0
     for position, raw in enumerate(raw_words):
         if not isinstance(raw, c.Mapping):
             raise InvalidSourceRecord(f"word {position} is not a mapping")
@@ -1156,10 +1164,13 @@ def parse_transcript_row(
             continue
         start = _milliseconds(raw, "start", position)
         end = _milliseconds(raw, "end", position)
-        if start < 0 or end <= start or start < previous_end:
-            raise InvalidSourceRecord(f"word {position} has an invalid span")
+        if start < 0 or end < start or start < previous_end:
+            raise InvalidSourceTimestamp(f"word {position} has an invalid span")
         if programme_duration_ms is not None and end > programme_duration_ms:
-            raise InvalidSourceRecord(f"word {position} lies outside source audio")
+            raise InvalidSourceTimestamp(f"word {position} lies outside source audio")
+        if end == start:
+            zero_duration_tokens_omitted += 1
+            continue
         previous_end = end
         speaker = raw.get("speaker_id", raw.get("speaker"))
         if speaker is not None and (
@@ -1186,7 +1197,12 @@ def parse_transcript_row(
         raise InvalidSourceRecord(
             f"transcript {file_id} words do not reconstruct its verbatim text"
         ) from exc
-    return ParsedTranscript(file_id=file_id, text=text, words=annotated_words)
+    return ParsedTranscript(
+        file_id=file_id,
+        text=text,
+        words=annotated_words,
+        zero_duration_tokens_omitted=zero_duration_tokens_omitted,
+    )
 
 
 def _first_present(row: c.Mapping[str, object], names: c.Sequence[str]) -> object:
@@ -1201,17 +1217,17 @@ def _milliseconds(row: c.Mapping[str, object], name: str, position: int) -> int:
     if value is None:
         value = row.get(name)
         if isinstance(value, bool) or not isinstance(value, numbers.Real):
-            raise InvalidSourceRecord(f"word {position} has invalid {name} seconds")
+            raise InvalidSourceTimestamp(f"word {position} has invalid {name} seconds")
         numeric = float(value)
         if not math.isfinite(numeric):
-            raise InvalidSourceRecord(f"word {position} has non-finite {name}")
+            raise InvalidSourceTimestamp(f"word {position} has non-finite {name}")
         return int(
             (decimal.Decimal(str(value)) * 1000).quantize(
                 decimal.Decimal("1"), rounding=decimal.ROUND_HALF_UP
             )
         )
     if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-        raise InvalidSourceRecord(f"word {position} has invalid {name}_ms")
+        raise InvalidSourceTimestamp(f"word {position} has invalid {name}_ms")
     return int(value)
 
 
@@ -1219,6 +1235,7 @@ __all__ = [
     "AudioPointer",
     "HfP1Source",
     "InvalidSourceRecord",
+    "InvalidSourceTimestamp",
     "P1Source",
     "ParsedAudio",
     "ParsedTranscript",
