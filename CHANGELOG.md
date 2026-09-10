@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Preserve zero-duration P1 transcript text while omitting only non-spacing timed
+  tokens, classify invalid source timestamps as terminal rejections, and abort
+  unexpectedly failed programmes with safe retryable ledger evidence.
 - Harden P1 transport logging by suppressing verbose dependency records and
   redacting signed URLs from root and file handlers.
 - Parse Hugging Face string-compatible CommitInfo objects using their immutable

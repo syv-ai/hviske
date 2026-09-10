@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
+from hviske.p1_contracts import SourceWord
 from hviske.p1_ledger import Ledger
 from hviske.p1_pipeline import (
     BuildReport,
@@ -31,7 +32,14 @@ from hviske.p1_segments import (
     ShardBatchResult,
     VADBackend,
 )
-from hviske.p1_source import SourcePlan, SourceShard, harden_p1_logging
+from hviske.p1_source import (
+    ParsedAudio,
+    ParsedTranscript,
+    SourcePlan,
+    SourceShard,
+    harden_p1_logging,
+    parse_transcript_row,
+)
 from tests.test_p1_publish import MemoryHub
 
 
@@ -102,6 +110,68 @@ class MetadataSource:
             audio_shards=(SourceShard("data/audio.parquet", 10),),
             transcript_objects=(("data/transcripts.parquet", 10, None),),
         )
+
+
+def test_overlong_transcript_is_a_terminal_invalid_timestamp_rejection(
+    tmp_path: Path,
+) -> None:
+    """Transcript words beyond audio are rejected before programme construction."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+
+    class Source:
+        last_temporary = None
+
+        def fetch_transcript(self, _pointer: object) -> ParsedTranscript:
+            return ParsedTranscript(
+                file_id="file-1",
+                text="too long",
+                words=(SourceWord(text="too", start_ms=0, end_ms=1_001),),
+            )
+
+    database = tmp_path / "ledger.sqlite"
+    report = _pipeline_test_report()
+    with Ledger(database) as ledger:
+        _process_native_programmes(
+            source=Source(),
+            settings=settings,
+            candidates=_pipeline_test_candidate(),
+            ledger=ledger,
+            hub=object(),
+            vad=cast(VADBackend, object()),
+            ctc=cast(CTCBackend, object()),
+            report=report,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+        )
+        record = ledger.programme("p1-file-1")
+        assert record.state.value == "rejected"
+        assert record.last_error == "invalid_timestamps"
+        assert record.rejection_counts == {"invalid_timestamps": 1}
+    assert report.processed == 1
+    assert report.rejection_counts == {"invalid_timestamps": 1}
+
+
+def _pipeline_test_candidate() -> list[tuple[str, object, object]]:
+    """Return one metadata-only candidate for direct native-programme tests."""
+    shard = type("Shard", (), {"path": "source/part.parquet", "byte_size": 1_000})()
+    return [("file-1", {"duration_ms": 1_000}, (shard, object()))]
+
+
+def _pipeline_test_report() -> BuildReport:
+    """Return a report suitable for direct native-programme tests."""
+    preflight = PreflightReport(
+        mode="build",
+        selected_programmes=1,
+        maximum_source_bytes=0,
+        required_scratch_bytes=0,
+        free_bytes=1,
+        scratch_bytes=0,
+        source_revisions={},
+        model_revisions={},
+        cuda={},
+        target={},
+        checks={},
+    )
+    return BuildReport(preflight=preflight, selected_file_ids=("file-1",))
 
 
 def test_pilot_selection_is_bounded_and_not_first_rows(tmp_path: Path) -> None:
@@ -268,6 +338,55 @@ def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
     assert replaced.exists()
 
 
+def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
+    tmp_path: Path,
+) -> None:
+    """Unexpected failures abort the run and persist only a safe error category."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+
+    class Source:
+        last_temporary = None
+
+        def fetch_audio(self, *, pointer: object) -> object:
+            del pointer
+            raise RuntimeError("secret transcript payload must not leak")
+
+        def fetch_transcript(self, _pointer: object) -> ParsedTranscript:
+            return ParsedTranscript(
+                file_id="file-1",
+                text="secret transcript",
+                words=(SourceWord(text="secret", start_ms=0, end_ms=100),),
+            )
+
+        def iter_programme_pointers(self, *, shard: object) -> object:
+            del shard
+            return iter((type("Pointer", (), {"file_id": "file-1"})(),))
+
+    database = tmp_path / "ledger.sqlite"
+    events = tmp_path / "events.jsonl"
+    report = _pipeline_test_report()
+    with pytest.raises(RuntimeError):
+        with Ledger(database) as ledger:
+            _process_native_programmes(
+                source=Source(),
+                settings=settings,
+                candidates=_pipeline_test_candidate(),
+                ledger=ledger,
+                hub=object(),
+                vad=cast(VADBackend, object()),
+                ctc=cast(CTCBackend, object()),
+                report=report,
+                log=MetadataLog(events),
+            )
+    with Ledger(database) as ledger:
+        record = ledger.programme("p1-file-1")
+        assert record.state.value == "retryable"
+        assert record.last_error == "runtime_error"
+    event_text = events.read_text(encoding="utf-8")
+    assert "secret transcript" not in event_text
+    assert "runtime_error" in event_text
+
+
 def test_zero_accepted_programme_is_skipped_on_the_second_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -361,3 +480,73 @@ def test_zero_accepted_programme_is_skipped_on_the_second_run(
         )
     assert source_calls == 1
     assert report.rejected == 1
+
+
+def test_zero_duration_normalisation_is_reported_as_metadata_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pipeline reports omission counts without recording token content."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+
+    class Source:
+        last_temporary = None
+
+        def fetch_audio(self, *, pointer: object) -> ParsedAudio:
+            del pointer
+            return ParsedAudio(
+                file_id="file-1", value=np.zeros(16_000), sampling_rate=16_000
+            )
+
+        def fetch_transcript(self, _pointer: object) -> ParsedTranscript:
+            return parse_transcript_row(
+                row={
+                    "file_id": "file-1",
+                    "words": [
+                        {"text": "a", "start_ms": 0, "end_ms": 100},
+                        {"text": "<hidden>", "start_ms": 100, "end_ms": 100},
+                        {"text": "b", "start_ms": 100, "end_ms": 200},
+                    ],
+                }
+            )
+
+        def iter_programme_pointers(self, *, shard: object) -> object:
+            del shard
+            return iter(
+                (
+                    type(
+                        "Pointer",
+                        (),
+                        {"file_id": "file-1", "row_group": 0, "row_index": 0},
+                    )(),
+                )
+            )
+
+    monkeypatch.setattr(
+        "hviske.p1_pipeline.segment_programme",
+        lambda **_: SegmentationResult(rows=(), rejections=(), correction_count=0),
+    )
+    monkeypatch.setattr(
+        "hviske.p1_pipeline.write_shards",
+        lambda *_, **__: ShardBatchResult(shards=(), source_recoverable=False),
+    )
+    events = tmp_path / "events.jsonl"
+    report = _pipeline_test_report()
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        _process_native_programmes(
+            source=Source(),
+            settings=settings,
+            candidates=_pipeline_test_candidate(),
+            ledger=ledger,
+            hub=object(),
+            vad=cast(VADBackend, object()),
+            ctc=cast(CTCBackend, object()),
+            report=report,
+            log=MetadataLog(events),
+        )
+    assert report.normalization_counts == {"zero_duration_tokens_omitted": 1}
+    assert report.as_dict()["normalization_counts"] == {
+        "zero_duration_tokens_omitted": 1
+    }
+    event_text = events.read_text(encoding="utf-8")
+    assert "transcript_normalized" in event_text
+    assert "<hidden>" not in event_text

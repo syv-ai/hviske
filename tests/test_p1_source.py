@@ -15,6 +15,7 @@ import soundfile as sf
 from hviske.p1_source import (
     HfP1Source,
     InvalidSourceRecord,
+    InvalidSourceTimestamp,
     SourceObjectTooLarge,
     SourceShard,
     parse_audio_row,
@@ -230,6 +231,49 @@ def test_targeted_audio_selection_reads_one_48khz_row(tmp_path: Path) -> None:
     assert audio.file_id == "programme-a"
     assert audio.value == b"a"
     assert audio.sampling_rate == 48_000
+
+
+def test_transcript_parser_omits_zero_duration_tokens_without_losing_source_text() -> (
+    None
+):
+    """Zero-duration tokens remain in exact separator spans and are counted."""
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "x",
+            "words": [
+                {"text": "left", "start_ms": 0, "end_ms": 100},
+                {"text": "<noise>", "start_ms": 100, "end_ms": 100},
+                {"text": "right", "start_ms": 100, "end_ms": 200},
+            ],
+        }
+    )
+
+    assert parsed.text == "left<noise>right"
+    assert [word.text for word in parsed.words] == ["left", "right"]
+    assert parsed.zero_duration_tokens_omitted == 1
+    assert parsed.words[1].separator_text == "<noise>"
+    assert parsed.words[1].separator_span is not None
+    assert parsed.words[1].separator_span.start == 4
+    assert parsed.words[1].separator_span.end == 11
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        [{"text": "bad", "start_ms": -1, "end_ms": 1}],
+        [{"text": "bad", "start_ms": 2, "end_ms": 1}],
+        [
+            {"text": "one", "start_ms": 0, "end_ms": 10},
+            {"text": "two", "start_ms": 9, "end_ms": 20},
+        ],
+    ],
+)
+def test_transcript_parser_rejects_invalid_timestamp_spans(
+    words: list[dict[str, object]],
+) -> None:
+    """Negative, reversed, and positive-overlap source spans fail explicitly."""
+    with pytest.raises(InvalidSourceTimestamp):
+        parse_transcript_row(row={"file_id": "x", "words": words})
 
 
 def test_transcript_parser_rejects_invalid_words_and_preserves_verbatim_text() -> None:
