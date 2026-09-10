@@ -732,9 +732,13 @@ def segment_programme(
             category=RejectionCategory.MISSING_AUDIO,
         ) from exc
     expected_samples = source_duration_ms * 16
-    if values.size != expected_samples:
+    # The programme duration is rounded to milliseconds from source frames.  At
+    # 16 kHz that rounding can differ from the resampled sample count by up to half
+    # a millisecond; rejecting those samples would turn a valid compressed source
+    # into a false missing-audio error.
+    if abs(values.size - expected_samples) > 8:
         raise SourceValidationError(
-            "source audio length does not match its declared duration",
+            "source audio length does not match its decoded duration",
             category=RejectionCategory.MISSING_AUDIO,
         )
     validated = validate_source_words(
@@ -970,6 +974,7 @@ def make_output_row(
         source_file_id=proposal.source_file_id,
         source_start_ms=final_start,
         source_end_ms=final_end,
+        source_duration_ms=source_duration_ms,
         duration_ms=duration,
         speaker_ids=proposal.speaker_ids,
         proposal_start_ms=proposal.proposal_start_ms,
@@ -1145,6 +1150,7 @@ def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
             ("source_file_id", pa.string()),
             ("source_start_ms", pa.int64()),
             ("source_end_ms", pa.int64()),
+            ("source_duration_ms", pa.int64()),
             ("duration_ms", pa.int32()),
             ("speaker_ids", pa.list_(pa.string())),
             ("proposal_start_ms", pa.int64()),
@@ -1173,6 +1179,7 @@ def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
         "source_file_id": {"dtype": "string", "_type": "Value"},
         "source_start_ms": {"dtype": "int64", "_type": "Value"},
         "source_end_ms": {"dtype": "int64", "_type": "Value"},
+        "source_duration_ms": {"dtype": "int64", "_type": "Value"},
         "duration_ms": {"dtype": "int32", "_type": "Value"},
         "speaker_ids": {
             "feature": {"dtype": "string", "_type": "Value"},
@@ -1204,6 +1211,7 @@ def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
             "source_file_id": [row.source_file_id for row in rows],
             "source_start_ms": [row.source_start_ms for row in rows],
             "source_end_ms": [row.source_end_ms for row in rows],
+            "source_duration_ms": [row.source_duration_ms for row in rows],
             "duration_ms": [row.duration_ms for row in rows],
             "speaker_ids": [list(row.speaker_ids) for row in rows],
             "proposal_start_ms": [row.proposal_start_ms for row in rows],

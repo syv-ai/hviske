@@ -29,7 +29,10 @@ The first implementation must pin these source revisions:
 The measured transcript side contains 16,640 unique programme rows. Two rows have no
 usable text and must be recorded as rejected rather than treated as fatal. The usable
 rows include word timestamps and speaker identifiers. Programme durations range from
-120 to 9,060 seconds, with a median of 1,500 seconds.
+120 to 9,060 seconds, with a median of 1,500 seconds.  The source row's duration
+metadata is only a planning hint: for embedded compressed audio, libsndfile decodes
+bytes first and the frame count plus sampling rate supplies the authoritative
+programme duration. Transcript bounds are checked against that decoded duration.
 
 The source coordinates, alignment backend, model revision, normalisation rules, and
 pipeline version form the reproducibility identity. A change to any of them requires a
@@ -54,6 +57,7 @@ Each `train` row has these fields:
 | `source_file_id` | string | P1 programme join key. |
 | `source_start_ms` | int64 | Final clip start in the source programme. |
 | `source_end_ms` | int64 | Final clip end in the source programme. |
+| `source_duration_ms` | int64 | Authoritative decoded source-programme duration. |
 | `duration_ms` | int32 | Exact decoded clip duration. |
 | `speaker_ids` | list[string] | Speakers represented in the clip. |
 | `proposal_start_ms` | int64 | Start from the supplied word timestamps. |

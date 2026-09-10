@@ -938,9 +938,18 @@ def _validate_row(row: object, shard_path: str) -> None:
     duration = row.get("duration_ms")
     source_start = row.get("source_start_ms")
     source_end = row.get("source_end_ms")
-    if not isinstance(duration, int) or not isinstance(source_start, int):
+    source_duration = row.get("source_duration_ms")
+    if (
+        not isinstance(duration, int)
+        or not isinstance(source_start, int)
+        or not isinstance(source_duration, int)
+    ):
         raise VerificationError(f"audio duration metadata is invalid: {shard_path}")
-    if not isinstance(source_end, int) or source_end - source_start != duration:
+    if (
+        not isinstance(source_end, int)
+        or source_end - source_start != duration
+        or source_end > source_duration
+    ):
         raise VerificationError(f"source duration is inconsistent: {shard_path}")
     if decoded.shape[0] != duration * 16:
         raise VerificationError(f"decoded duration is inconsistent: {shard_path}")

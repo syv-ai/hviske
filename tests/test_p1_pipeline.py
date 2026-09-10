@@ -153,6 +153,128 @@ def _pipeline_test_report(selected_programmes: int = 0) -> BuildReport:
     return BuildReport(preflight=preflight, selected_programmes=selected_programmes)
 
 
+def test_decoded_duration_overrun_is_invalid_timestamp_before_alignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A word beyond decoded audio is rejected without invoking segmentation."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+    calls = 0
+
+    class Source:
+        last_temporary = None
+
+        def fetch_audio(self, *, pointer: object) -> ParsedAudio:
+            del pointer
+            return ParsedAudio(
+                file_id="file-1", value=np.zeros(340_056), sampling_rate=1_000
+            )
+
+        def fetch_transcript(self, _pointer: object) -> ParsedTranscript:
+            return ParsedTranscript(
+                file_id="file-1",
+                text="word",
+                words=(SourceWord(text="word", start_ms=0, end_ms=340_057),),
+            )
+
+    def segment(**_: object) -> SegmentationResult:
+        nonlocal calls
+        calls += 1
+        return SegmentationResult(rows=(), rejections=(), correction_count=0)
+
+    monkeypatch.setattr("hviske.p1_pipeline.segment_programme", segment)
+    report = _pipeline_test_report()
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        _process_native_programmes(
+            source=Source(),
+            settings=settings,
+            candidates=_pipeline_test_candidate(),
+            ledger=ledger,
+            hub=object(),
+            vad=cast(VADBackend, object()),
+            ctc=cast(CTCBackend, object()),
+            report=report,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+        )
+        record = ledger.programme("p1-file-1")
+
+    assert record.source_duration_ms == 340_056
+    assert record.last_error == "invalid_timestamps"
+    assert calls == 0
+
+
+def _pipeline_test_candidate(
+    declared_duration_ms: int = 1_000,
+) -> list[tuple[str, object, object]]:
+    """Return one metadata-only candidate for direct native-programme tests."""
+    shard = type("Shard", (), {"path": "source/part.parquet", "byte_size": 1_000})()
+    return [("file-1", {"duration_ms": declared_duration_ms}, (shard, object()))]
+
+
+def pipeline_config(tmp_path: Path, mode: str = "plan") -> DictConfig:
+    """Return a small test-owned pipeline configuration."""
+    config = OmegaConf.load("config/p1_segments.yaml")
+    config.mode = mode
+    config.runtime.scratch_root = str(tmp_path / "scratch")
+    config.runtime.device = "cpu"
+    return cast(DictConfig, config)
+
+
+def test_decoded_duration_replaces_declared_metadata_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A longer decoded source accepts timestamps beyond its stale declaration."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+    captured: dict[str, object] = {}
+
+    class Source:
+        last_temporary = None
+
+        def fetch_audio(self, *, pointer: object) -> ParsedAudio:
+            del pointer
+            return ParsedAudio(
+                file_id="file-1",
+                value=np.zeros(340_056, dtype=np.float32),
+                sampling_rate=1_000,
+            )
+
+        def fetch_transcript(self, _pointer: object) -> ParsedTranscript:
+            return ParsedTranscript(
+                file_id="file-1",
+                text="word",
+                words=(SourceWord(text="word", start_ms=0, end_ms=339_950),),
+            )
+
+    def segment(**kwargs: object) -> SegmentationResult:
+        captured.update(kwargs)
+        return SegmentationResult(rows=(), rejections=(), correction_count=0)
+
+    monkeypatch.setattr("hviske.p1_pipeline.segment_programme", segment)
+    monkeypatch.setattr(
+        "hviske.p1_pipeline.write_shards",
+        lambda *_, **__: ShardBatchResult(shards=(), source_recoverable=False),
+    )
+    report = _pipeline_test_report()
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        _process_native_programmes(
+            source=Source(),
+            settings=settings,
+            candidates=_pipeline_test_candidate(declared_duration_ms=300_000),
+            ledger=ledger,
+            hub=object(),
+            vad=cast(VADBackend, object()),
+            ctc=cast(CTCBackend, object()),
+            report=report,
+            log=MetadataLog(tmp_path / "events.jsonl"),
+        )
+        record = ledger.programme("p1-file-1")
+
+    assert record.source_duration_ms == 340_056
+    assert record.last_error == "no_accepted_segments"
+    assert captured["source_duration_ms"] == 340_056
+    source_locator = cast(dict[str, object], captured["source_locator"])
+    assert source_locator["source_duration_ms"] == 340_056
+
+
 def test_empty_timed_words_precede_ambiguous_source_text(tmp_path: Path) -> None:
     """Lexical text with no timed words stops before ambiguity classification."""
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
@@ -190,21 +312,6 @@ def test_empty_timed_words_precede_ambiguous_source_text(tmp_path: Path) -> None
 
     assert record.last_error == "no_timed_words"
     assert report.rejection_counts == {"no_timed_words": 1}
-
-
-def _pipeline_test_candidate() -> list[tuple[str, object, object]]:
-    """Return one metadata-only candidate for direct native-programme tests."""
-    shard = type("Shard", (), {"path": "source/part.parquet", "byte_size": 1_000})()
-    return [("file-1", {"duration_ms": 1_000}, (shard, object()))]
-
-
-def pipeline_config(tmp_path: Path, mode: str = "plan") -> DictConfig:
-    """Return a small test-owned pipeline configuration."""
-    config = OmegaConf.load("config/p1_segments.yaml")
-    config.mode = mode
-    config.runtime.scratch_root = str(tmp_path / "scratch")
-    config.runtime.device = "cpu"
-    return cast(DictConfig, config)
 
 
 def test_existing_scratch_is_included_in_hard_budget(tmp_path: Path) -> None:
@@ -452,6 +559,12 @@ def test_overlong_transcript_is_a_terminal_invalid_timestamp_rejection(
 
     class Source:
         last_temporary = None
+
+        def fetch_audio(self, *, pointer: object) -> ParsedAudio:
+            del pointer
+            return ParsedAudio(
+                file_id="file-1", value=np.zeros(1_000), sampling_rate=1_000
+            )
 
         def fetch_transcript(self, _pointer: object) -> ParsedTranscript:
             return ParsedTranscript(
