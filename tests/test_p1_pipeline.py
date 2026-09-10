@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import io
+import logging
 from pathlib import Path
 from typing import cast
 
@@ -29,7 +31,7 @@ from hviske.p1_segments import (
     ShardBatchResult,
     VADBackend,
 )
-from hviske.p1_source import SourcePlan, SourceShard
+from hviske.p1_source import SourcePlan, SourceShard, harden_p1_logging
 from tests.test_p1_publish import MemoryHub
 
 
@@ -134,6 +136,81 @@ def test_pilot_selection_is_bounded_and_not_first_rows(tmp_path: Path) -> None:
     )
     assert [item[0] for item in first] == [item[0] for item in second]
     assert [item[0] for item in first] != ["programme-0", "programme-1", "programme-2"]
+
+
+def test_pipeline_hardens_hydra_root_and_file_logging(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Transport records cannot leak signed URLs through Hydra-style handlers."""
+    root_logger = logging.getLogger()
+    file_path = tmp_path / "p1.log"
+    file_handler = logging.FileHandler(file_path)
+    late_stream = io.StringIO()
+    late_handler = logging.StreamHandler(late_stream)
+    root_logger.addHandler(file_handler)
+    transport_names = ("httpx", "httpcore", "huggingface_hub", "fsspec")
+    transport_loggers = tuple(logging.getLogger(name) for name in transport_names)
+    previous_levels = tuple(item.level for item in transport_loggers)
+    transport_logger = transport_loggers[0]
+    signed_url = (
+        "https://cas-server.xethub.hf.co/reconstruction/object"
+        "?X-Xet-Cas-Uid=cas-uid&Policy=policy-value&Signature=signature-value"
+        "&X-Amz-Signature=aws-signature-value&token=token-value"
+    )
+    levels_hardened = False
+    try:
+        with caplog.at_level(logging.INFO, logger="hviske.p1_pipeline"):
+            run_pipeline(config=pipeline_config(tmp_path), source=MetadataSource())
+            levels_hardened = all(
+                item.level == logging.WARNING for item in transport_loggers
+            )
+            transport_logger.warning(
+                'HTTP Request: GET %s "HTTP/1.1 200 OK"', signed_url
+            )
+            logging.getLogger("hviske.p1_pipeline").info(
+                "P1 metadata event retained: source revision checked"
+            )
+            root_logger.addHandler(late_handler)
+            harden_p1_logging()
+            transport_logger.warning("Xet transport retry: %s", signed_url)
+        file_handler.flush()
+        late_handler.flush()
+        log_output = caplog.text + file_path.read_text() + late_stream.getvalue()
+    finally:
+        root_logger.removeHandler(file_handler)
+        root_logger.removeHandler(late_handler)
+        file_handler.close()
+        late_handler.close()
+        for item, level in zip(transport_loggers, previous_levels):
+            item.setLevel(level)
+
+    assert levels_hardened
+    assert not _contains_signed_url_material(log_output)
+    assert _contains_log_text(log_output, "P1 metadata event retained")
+
+
+def _contains_log_text(value: str, expected: str) -> bool:
+    """Return whether a safe metadata event survived transport hardening."""
+    return expected in value
+
+
+def _contains_signed_url_material(value: str) -> bool:
+    """Return whether a captured log contains any fixture credential material."""
+    return any(
+        marker in value
+        for marker in (
+            "X-Xet-Cas-Uid",
+            "Policy",
+            "Signature",
+            "X-Amz-Signature",
+            "cas-uid",
+            "policy-value",
+            "signature-value",
+            "aws-signature-value",
+            "token-value",
+            "?X-Xet-Cas-Uid=",
+        )
+    )
 
 
 def test_plan_reads_tree_metadata_only(tmp_path: Path) -> None:

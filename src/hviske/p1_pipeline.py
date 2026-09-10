@@ -289,6 +289,9 @@ def run_pipeline(
         TypeError:
             If the source does not expose the native planning API.
     """
+    from hviske.p1_source import harden_p1_logging
+
+    harden_p1_logging()
     settings = PipelineSettings.from_config(config)
     if settings.mode == "initialise":
         configure_scratch(settings.scratch_root)

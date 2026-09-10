@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Harden P1 transport logging by suppressing verbose dependency records and
+  redacting signed URLs from root and file handlers.
 - Parse Hugging Face string-compatible CommitInfo objects using their immutable
   object identifiers during P1 publication.
 - Harden P1 VAD framing, corpus-wide audit sampling, rejection completion,
