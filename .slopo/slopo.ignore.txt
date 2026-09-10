@@ -1,13 +1,16 @@
 # Reviewed Slopo exceptions for Hviske.
-# These are intentional duplication: model setup implementations share stable
-# interfaces, collators implement parallel ASR contracts, and dataset builders
-# are standalone download recipes. Re-review hashes after refactors.
+# These are intentional baseline duplications in origin/main: model-family
+# interfaces share stable contracts, while dataset builders are standalone
+# download recipes. Refresh hashes when Funcsort or another refactor moves code.
 
+# Stable model and collator interfaces already present on origin/main.
 a4c1bdebda37  # shared load_compute_metrics interface implementations
-958682d721a1  # shared training-argument construction across model families
 81208b2e4349  # parallel CTC and seq2seq collator implementations
-8c0e607cca5d  # standalone dataset download helpers
+518c88b1747e  # Cohere processor prompt interface delegates to its canonical builder
+43f711ac5e6b  # shared training-argument construction across model families
+a7bb477caaae  # shared saved-model loading interface across model families
+b19e53d771f1  # shared data-collator factory interface across model families
 
+# Standalone dataset recipes already present on origin/main.
+8c0e607cca5d  # standalone dataset download helpers
 effa5d00231d  # standalone dataset build entry points
-362a7b07ca39  # model-specific data-collator factory interfaces
-ed5cea4180a5  # model-specific saved-model loading interfaces

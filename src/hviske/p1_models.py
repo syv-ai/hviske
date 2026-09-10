@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .p1_segments import AlignmentResult, CTCBackend, VADBackend, VADSignal
+from .p1_segments import CTCEmissionsAlignmentAdapter, VADBackend, VADSignal
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ SILERO_MODEL_BLOB = "5c6988d663950a93a5f0d6c38c2fe024653ec552"
 SILERO_MODEL_SHA256 = "e1122837f4154c511485fe0b9c64455f7b929c96fbb8d79fbdb336383ebd3720"
 
 
-class HuggingFaceCTCBackend(CTCBackend):
+class HuggingFaceCTCBackend(CTCEmissionsAlignmentAdapter):
     """Pinned Danish wav2vec2 emissions plus real ctc-segmentation alignment."""
 
     def __init__(
@@ -58,56 +58,35 @@ class HuggingFaceCTCBackend(CTCBackend):
         if blank_id is None:
             raise ValueError("the CTC tokenizer must declare its blank/pad token")
         self._blank_id = int(blank_id)
+        super().__init__(
+            emissions_provider=self._compute_emissions,
+            tokeniser=self._tokenise_word,
+            frame_duration_ms=self._frame_duration_ms,
+            blank_id=self._blank_id,
+            validate_word_map=True,
+        )
 
-    def align(
-        self,
-        audio: np.ndarray,
-        alignment_text: str,
-        word_map: tuple[str, ...],
-        start_ms: int,
-        end_ms: int,
-        sampling_rate: int,
-    ) -> AlignmentResult:
-        """Produce word boundaries with the reference CTC segmentation algorithm.
+    def _compute_emissions(self, audio: np.ndarray, sampling_rate: int) -> np.ndarray:
+        """Run the pinned model and return frame-by-class log probabilities.
 
         Returns:
-            Alignment boundaries and the package's minimum mean log-probability
-            scores.
-
-        Raises:
-            ValueError:
-                If tokenisation does not produce one alignment for each word.
+            Frame-by-class CTC log probabilities.
         """
-        del end_ms
         inputs = self._processor(
             audio, sampling_rate=sampling_rate, return_tensors="pt"
         )
         inputs = inputs.to(self._device)
         with self._torch.no_grad():
             logits = self._model(**inputs).logits.squeeze(0)
-            emissions = self._torch.log_softmax(logits, dim=-1).cpu().numpy()
-        words = alignment_text.split()
-        tokenised_words = [
-            tuple(
-                int(token)
-                for token in self._processor.tokenizer(
-                    word, add_special_tokens=False
-                ).input_ids
-            )
-            for word in words
-        ]
-        from .p1_segments import align_ctc_word_tokens
+            return self._torch.log_softmax(logits, dim=-1).cpu().numpy()
 
-        result = align_ctc_word_tokens(
-            emissions=emissions,
-            tokenised_words=tokenised_words,
-            start_ms=start_ms,
-            frame_duration_ms=self._frame_duration_ms,
-            blank_id=self._blank_id,
-        )
-        if len(word_map) != len(result.word_boundaries):
-            raise ValueError("word map does not match tokenised alignment words")
-        return result
+    def _tokenise_word(self, word: str) -> c.Sequence[int]:
+        """Tokenise one canonical alignment word without special tokens.
+
+        Returns:
+            Token IDs for the word.
+        """
+        return self._processor.tokenizer(word, add_special_tokens=False).input_ids
 
 
 def verify_hub_model_revision(
