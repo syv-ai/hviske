@@ -8,6 +8,8 @@
   local shard validation, source playback locators, and crash-safe recovery.
 - Make terminal programme rejection resumable, persist audit candidates across
   publication recovery, and emit manifests consumable by the validation CLI.
+- Commit accepted audit local locators with sharded ledger transitions so crash
+  recovery can publish and resolve the audit manifest.
 
 ### Added
 
