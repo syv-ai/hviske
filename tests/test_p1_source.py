@@ -61,6 +61,32 @@ def test_audio_parser_decodes_genuine_48khz_flac_native_shape() -> None:
     assert np.allclose(audio.value[:, 0], native[:, 0], atol=1 / 32_768)
 
 
+def test_audio_parser_decodes_genuine_ogg_opus_without_metadata() -> None:
+    """OGG/Opus headers provide the source rate and channel count."""
+    if "OGG" not in sf.available_formats() or "OPUS" not in sf.available_subtypes(
+        "OGG"
+    ):
+        pytest.skip("libsndfile has no OGG/Opus support")
+    payload = io.BytesIO()
+    sf.write(
+        payload,
+        np.zeros((48_000, 1), dtype=np.float32),
+        48_000,
+        format="OGG",
+        subtype="OPUS",
+    )
+
+    parsed = parse_audio_row(
+        {"file_id": "x", "audio": {"bytes": payload.getvalue(), "path": "x.ogg"}}
+    )
+
+    assert parsed.sampling_rate == 48_000
+    assert parsed.channels == 1
+    assert parsed.frame_count == 48_000
+    assert parsed.duration_ms == 1_000
+    assert isinstance(parsed.value, np.ndarray)
+
+
 def test_audio_parser_derives_flac_metadata_when_declarations_are_absent() -> None:
     """FLAC headers are authoritative when optional row metadata is absent."""
     payload = io.BytesIO()
@@ -70,7 +96,16 @@ def test_audio_parser_derives_flac_metadata_when_declarations_are_absent() -> No
 
     assert parsed.sampling_rate == 22_050
     assert parsed.channels == 1
+    assert parsed.frame_count == 12
+    assert parsed.duration_ms == 1
     assert isinstance(parsed.value, np.ndarray)
+
+
+def test_audio_parser_rejects_unsupported_bytes_without_payload_in_error() -> None:
+    """Unsupported or corrupt bytes produce a stable, payload-free error."""
+    with pytest.raises(InvalidSourceRecord, match="unsupported or corrupt") as error:
+        parse_audio_row({"file_id": "x", "audio": {"bytes": b"not audio"}})
+    assert "not audio" not in str(error.value)
 
 
 def test_discovery_projects_out_audio_column(tmp_path: Path) -> None:
@@ -97,18 +132,21 @@ def _write_source_files(root: Path) -> tuple[Path, Path]:
     transcript_root = root / "syvai" / "p1-transcripts" / "data"
     audio_root.mkdir(parents=True)
     transcript_root.mkdir(parents=True)
+    encoded = io.BytesIO()
+    sf.write(encoded, np.zeros((48, 1), dtype=np.float32), 48_000, format="FLAC")
+    payload = encoded.getvalue()
     audio_rows = [
         {
             "file_id": "programme-b",
             "title": "B",
             "duration_ms": 1_000,
-            "audio": {"bytes": b"b", "sampling_rate": 48_000},
+            "audio": {"bytes": payload, "sampling_rate": 48_000},
         },
         {
             "file_id": "programme-a",
             "title": "A",
             "duration_ms": 1_000,
-            "audio": {"bytes": b"a", "sampling_rate": 48_000},
+            "audio": {"bytes": payload, "sampling_rate": 48_000},
         },
     ]
     transcript_rows = [
@@ -414,7 +452,8 @@ def test_targeted_audio_selection_reads_one_48khz_row(tmp_path: Path) -> None:
     )
     audio = source.fetch_audio(pointer=pointer)
     assert audio.file_id == "programme-a"
-    assert audio.value == b"a"
+    assert isinstance(audio.value, np.ndarray)
+    assert audio.frame_count == 48
     assert audio.sampling_rate == 48_000
 
 

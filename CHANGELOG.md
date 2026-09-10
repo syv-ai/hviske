@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Decode generic embedded libsndfile audio (including OGG/Opus and FLAC), derive
+  source duration from decoded frames, and validate transcript bounds against that
+  duration rather than unreliable metadata declarations.
 - Recreate validated P1 transcript-index database files and SQLite sidecars between
   builds, reclaiming high-water space without following unsafe filesystem entries.
 - Enforce the P1 scratch quota during pointer-index and selection-dedup growth, and

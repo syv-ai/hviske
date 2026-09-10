@@ -652,6 +652,38 @@ class Ledger:
     register_batch_with_shards = allocate_batch_with_shards
     allocate_and_attach_shards = allocate_batch_with_shards
 
+    def record_source_duration(
+        self, programme_id: str, source_duration_ms: int
+    ) -> ProgrammeRecord:
+        """Persist the decoded source duration atomically.
+
+        The metadata duration is only a planning hint.  Once audio has been decoded,
+        this value becomes the durable source-duration authority used for recovery and
+        audit evidence.
+
+        Returns:
+            The updated programme record.
+        """
+        self._validate_nonnegative(source_duration_ms, "source_duration_ms")
+        now = self._now()
+        with self.transaction() as connection:
+            self._require_row(connection, "programmes", "programme_id", programme_id)
+            connection.execute(
+                """UPDATE programmes SET source_duration_ms = ?, last_evidence = ?,
+                updated_at = ? WHERE programme_id = ?""",
+                (
+                    source_duration_ms,
+                    json.dumps(
+                        {"source_duration_ms": source_duration_ms},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                    programme_id,
+                ),
+            )
+        return self.programme(programme_id)
+
     def reject_programme(
         self,
         programme_id: str,
@@ -691,6 +723,8 @@ class Ledger:
             The resulting programme record.
         """
         return self.transition_programme(programme_id, LedgerState.PROCESSING)
+
+    record_decoded_source_duration = record_source_duration
 
     record_shard = register_shard
     create_shard = register_shard

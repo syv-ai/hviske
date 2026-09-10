@@ -237,6 +237,25 @@ class ParsedAudio:
     sampling_rate: int
     channels: int = 1
 
+    @property
+    def duration_ms(self) -> int | None:
+        """Nearest-millisecond decoded duration when available."""
+        frames = self.frame_count
+        if frames is None or self.sampling_rate <= 0:
+            return None
+        return (frames * 1000 + self.sampling_rate // 2) // self.sampling_rate
+
+    @property
+    def frame_count(self) -> int | None:
+        """Decoded frames when this row contains an in-memory array."""
+        if not isinstance(self.value, np.ndarray):
+            return None
+        if self.value.ndim == 1:
+            return int(self.value.shape[0])
+        if self.value.ndim == 2:
+            return int(self.value.shape[0])
+        return None
+
 
 class TranscriptPointerIndex:
     """Disk-backed file-id to transcript-row index.
@@ -1177,29 +1196,35 @@ def parse_audio_row(
             or int(value) <= 0
         ):
             raise InvalidSourceRecord(f"audio row {file_id} has an invalid {name}")
-    value = audio.get("array", audio.get("bytes", audio.get("path")))
+    value = audio.get("array")
+    if value is None:
+        value = audio.get("bytes")
+    if value is None:
+        value = audio.get("path")
     if value is None or not isinstance(
-        value, (bytes, str, Path, np.ndarray, list, tuple)
+        value, (bytes, bytearray, memoryview, str, Path, np.ndarray, list, tuple)
     ):
         raise InvalidSourceRecord(f"audio row {file_id} has an invalid payload")
-    if isinstance(value, bytes) and value.startswith(b"fLaC"):
+    if isinstance(value, (bytes, bytearray, memoryview)):
         try:
             decoded, decoded_rate = sf.read(
-                io.BytesIO(value), dtype="float32", always_2d=True
+                io.BytesIO(bytes(value)), dtype="float32", always_2d=True
             )
-        except (RuntimeError, sf.LibsndfileError) as exc:
+        except Exception as exc:
             raise InvalidSourceRecord(
-                f"audio row {file_id} contains invalid FLAC"
+                "audio payload is unsupported or corrupt"
             ) from exc
         actual_channels = int(decoded.shape[1])
+        if (
+            decoded.shape[0] == 0
+            or actual_channels == 0
+            or not np.isfinite(decoded).all()
+        ):
+            raise InvalidSourceRecord("audio payload is empty or non-finite")
         if declared_rate is not None and decoded_rate != int(declared_rate):
-            raise InvalidSourceRecord(
-                f"audio row {file_id} rate metadata does not match FLAC"
-            )
+            raise InvalidSourceRecord("audio sampling-rate metadata does not match")
         if declared_channels is not None and actual_channels != int(declared_channels):
-            raise InvalidSourceRecord(
-                f"audio row {file_id} channel metadata does not match FLAC"
-            )
+            raise InvalidSourceRecord("audio channel metadata does not match")
         return ParsedAudio(
             file_id=file_id,
             value=np.asarray(decoded, dtype=np.float32),
@@ -1218,6 +1243,8 @@ def parse_audio_row(
             actual_channels = int(value.shape[1])
         else:
             raise InvalidSourceRecord(f"audio row {file_id} has an invalid shape")
+        if value.shape[0] == 0 or actual_channels == 0:
+            raise InvalidSourceRecord("audio payload is empty")
         if declared_channels is not None and actual_channels != int(declared_channels):
             raise InvalidSourceRecord(
                 f"audio row {file_id} channel metadata does not match"
@@ -1227,7 +1254,7 @@ def parse_audio_row(
     if isinstance(value, str):
         value = Path(value)
     return ParsedAudio(
-        file_id=file_id, value=value, sampling_rate=int(rate), channels=actual_channels
+        file_id=file_id, value=value, sampling_rate=rate, channels=actual_channels
     )
 
 

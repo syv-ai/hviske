@@ -61,6 +61,7 @@ class OutputRow(ContractModel):
     source_file_id: StrictStr
     source_start_ms: StrictInt = Field(ge=0)
     source_end_ms: StrictInt = Field(gt=0)
+    source_duration_ms: StrictInt = Field(gt=0)
     duration_ms: StrictInt = Field(gt=0)
     speaker_ids: tuple[StrictStr, ...]
     proposal_start_ms: StrictInt = Field(ge=0)
@@ -86,6 +87,8 @@ class OutputRow(ContractModel):
             raise ValueError("P1 output language must be da")
         if self.source_end_ms <= self.source_start_ms:
             raise ValueError("source boundaries must be ordered")
+        if self.source_end_ms > self.source_duration_ms:
+            raise ValueError("source boundaries must fit programme duration")
         if self.duration_ms != self.source_end_ms - self.source_start_ms:
             raise ValueError("duration_ms must equal the source interval")
         if self.proposal_end_ms <= self.proposal_start_ms:
@@ -341,6 +344,7 @@ OUTPUT_SCHEMA = OutputSchema(
         OutputField(name="source_file_id", type="string"),
         OutputField(name="source_start_ms", type="int64"),
         OutputField(name="source_end_ms", type="int64"),
+        OutputField(name="source_duration_ms", type="int64"),
         OutputField(name="duration_ms", type="int32"),
         OutputField(name="speaker_ids", type="list[string]"),
         OutputField(name="proposal_start_ms", type="int64"),

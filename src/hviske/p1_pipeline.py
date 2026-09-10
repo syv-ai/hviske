@@ -1341,41 +1341,21 @@ def _process_native_programmes(
                 )
                 purge_source_temporary(getattr(source, "last_temporary", None))
                 continue
-            duration = _as_int(as_mapping(metadata).get("duration_ms", 0))
-            if duration <= 0:
-                duration = max((word.end_ms for word in transcript.words), default=0)
             try:
-                _validate_native_timestamps(
-                    words=transcript.words, duration_ms=duration
-                )
+                # Transcript qualification is deliberately independent of metadata
+                # duration.  The source audio is the only duration authority.
+                _validate_native_timestamps(words=transcript.words)
             except InvalidSourceTimestamp:
-                over_audio = any(
-                    isinstance(getattr(word, "end_ms", None), int)
-                    and not isinstance(getattr(word, "end_ms", None), bool)
-                    and getattr(word, "end_ms") > duration
-                    for word in transcript.words
-                )
-                reason = (
-                    RejectionCategory.TRANSCRIPT_OVER_AUDIO.value
-                    if over_audio and isinstance(audio_pointer, AudioPointer)
-                    else RejectionCategory.INVALID_TIMESTAMPS.value
-                )
                 _reject_native_programme(
                     ledger=ledger,
                     report=report,
                     log=log,
                     programme_id=programme_id,
                     source_file_id=file_id,
-                    reason=reason,
+                    reason=RejectionCategory.INVALID_TIMESTAMPS.value,
                 )
                 purge_source_temporary(getattr(source, "last_temporary", None))
                 continue
-            programme = SourceProgramme(
-                file_id=file_id,
-                duration_ms=duration,
-                words=tuple(transcript.words),
-                transcript_text=transcript.text,
-            )
             if isinstance(audio_pointer, AudioPointer):
                 if audio_pointer.file_id != file_id:
                     _reject_native_programme(
@@ -1404,7 +1384,11 @@ def _process_native_programmes(
             enforce_scratch_cap(settings)
             try:
                 audio = _decoded_native_audio(parsed_audio, file_id=file_id)
-            except (InvalidSourceRecord, TypeError):
+                duration = _decoded_duration_ms(
+                    audio=audio,
+                    sampling_rate=int(getattr(parsed_audio, "sampling_rate", 0)),
+                )
+            except (InvalidSourceRecord, TypeError, ValueError):
                 _reject_native_programme(
                     ledger=ledger,
                     report=report,
@@ -1426,6 +1410,28 @@ def _process_native_programmes(
                 )
                 purge_source_temporary(getattr(source, "last_temporary", None))
                 continue
+            ledger.record_source_duration(programme_id, duration)
+            try:
+                _validate_native_timestamps(
+                    words=transcript.words, duration_ms=duration
+                )
+            except InvalidSourceTimestamp:
+                _reject_native_programme(
+                    ledger=ledger,
+                    report=report,
+                    log=log,
+                    programme_id=programme_id,
+                    source_file_id=file_id,
+                    reason=RejectionCategory.INVALID_TIMESTAMPS.value,
+                )
+                purge_source_temporary(getattr(source, "last_temporary", None))
+                continue
+            programme = SourceProgramme(
+                file_id=file_id,
+                duration_ms=duration,
+                words=tuple(transcript.words),
+                transcript_text=transcript.text,
+            )
             if vad is None:
                 logger.info("P1 model stage: loading VAD backend")
                 vad = make_silero_vad(settings)
@@ -1454,6 +1460,7 @@ def _process_native_programmes(
                     "source_row_group": getattr(audio_pointer, "row_group", 0),
                     "source_row_index": getattr(audio_pointer, "row_index", 0),
                     "source_shard_byte_size": shard.byte_size,
+                    "source_duration_ms": programme.duration_ms,
                 },
             )
             report.accepted_segments += len(result.rows)
@@ -1596,6 +1603,32 @@ def _process_native_programmes(
             gc.collect()
         enforce_scratch_cap(settings)
     enforce_scratch_cap(settings)
+
+
+def _decoded_duration_ms(*, audio: np.ndarray, sampling_rate: int) -> int:
+    """Derive a nearest-millisecond duration from decoded frames.
+
+    The decoded source array is frames-by-channels (or a mono vector).  Channel count
+    must never affect the frame count used for duration.
+
+    Returns:
+        The nearest-millisecond duration of the decoded source.
+
+    Raises:
+        ValueError:
+            If the decoded array or sampling rate is unusable.
+    """
+    if sampling_rate <= 0:
+        raise ValueError("decoded audio has an invalid sampling rate")
+    if audio.ndim == 1:
+        frames = audio.shape[0]
+    elif audio.ndim == 2 and audio.shape[1] > 0:
+        frames = audio.shape[0]
+    else:
+        raise ValueError("decoded audio has an invalid shape")
+    if frames <= 0:
+        raise ValueError("decoded audio is empty")
+    return (int(frames) * 1000 + sampling_rate // 2) // sampling_rate
 
 
 def _decoded_native_audio(parsed_audio: object, *, file_id: str) -> np.ndarray:
@@ -1959,12 +1992,18 @@ def _safe_exception_category(exc: Exception) -> str:
     return "unexpected_error"
 
 
-def _validate_native_timestamps(*, words: c.Iterable[object], duration_ms: int) -> None:
+def _validate_native_timestamps(
+    *, words: c.Iterable[object], duration_ms: int | None = None
+) -> None:
     """Validate the source timeline before constructing ``SourceProgramme``.
+
+    ``duration_ms`` is optional because transcript qualification must happen before
+    audio retrieval.  When supplied, it is the decoded audio duration, never metadata
+    from the source row.
 
     Raises:
         InvalidSourceTimestamp:
-            If a word is malformed, overlaps a previous word, or exceeds the
+            If a word is malformed, overlaps a previous word, or exceeds the decoded
             programme duration.
     """
     from hviske.p1_source import InvalidSourceTimestamp
@@ -1981,7 +2020,7 @@ def _validate_native_timestamps(*, words: c.Iterable[object], duration_ms: int) 
             or start < 0
             or end <= start
             or start < previous_end
-            or end > duration_ms
+            or (duration_ms is not None and end > duration_ms)
         ):
             raise InvalidSourceTimestamp("source word timeline is invalid")
         previous_end = end
