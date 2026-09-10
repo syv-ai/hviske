@@ -116,7 +116,7 @@ def test_audio_scan_progress_reports_threshold_crossings(
 
 def test_build_report_serialises_only_selected_programme_count() -> None:
     """Report representations never expose selected source identifiers."""
-    report = _pipeline_test_report()
+    report = _pipeline_test_report(selected_programmes=1)
     payload = report.as_dict()
     dataclass_payload = dataclasses.asdict(report)
     representations = (repr(report), repr(dataclass_payload), repr(payload))
@@ -131,11 +131,11 @@ def test_build_report_serialises_only_selected_programme_count() -> None:
     assert "file-1" not in json.dumps(payload)
 
 
-def _pipeline_test_report() -> BuildReport:
+def _pipeline_test_report(selected_programmes: int = 0) -> BuildReport:
     """Return a report suitable for direct native-programme tests."""
     preflight = PreflightReport(
         mode="build",
-        selected_programmes=1,
+        selected_programmes=selected_programmes,
         maximum_source_bytes=0,
         required_scratch_bytes=0,
         free_bytes=1,
@@ -146,7 +146,7 @@ def _pipeline_test_report() -> BuildReport:
         target={},
         checks={},
     )
-    return BuildReport(preflight=preflight, selected_programmes=1)
+    return BuildReport(preflight=preflight, selected_programmes=selected_programmes)
 
 
 def test_empty_timed_words_precede_ambiguous_source_text(tmp_path: Path) -> None:
@@ -729,6 +729,8 @@ def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
         record = ledger.programme("p1-file-1")
         assert record.state.value == "retryable"
         assert record.last_error == "runtime_error"
+    assert report.selected_programmes == 1
+    assert report.processed == 0
     event_text = events.read_text(encoding="utf-8")
     assert "secret transcript" not in event_text
     assert "runtime_error" in event_text
@@ -781,7 +783,7 @@ def test_zero_accepted_programme_is_skipped_on_the_second_run(
     )
     preflight = PreflightReport(
         mode="build",
-        selected_programmes=1,
+        selected_programmes=0,
         maximum_source_bytes=0,
         required_scratch_bytes=0,
         free_bytes=1,
@@ -792,7 +794,7 @@ def test_zero_accepted_programme_is_skipped_on_the_second_run(
         target={},
         checks={},
     )
-    report = BuildReport(preflight=preflight, selected_programmes=1)
+    report = BuildReport(preflight=preflight, selected_programmes=0)
     source_shard = type(
         "Shard", (), {"path": "source/part.parquet", "byte_size": 1_000}
     )()
@@ -815,6 +817,10 @@ def test_zero_accepted_programme_is_skipped_on_the_second_run(
             "rejected",
             "no_accepted_segments",
         )
+    assert report.selected_programmes == 1
+    assert report.processed == 1
+
+    second_report = BuildReport(preflight=preflight, selected_programmes=0)
     with Ledger(database) as ledger:
         _process_native_programmes(
             source=Source(),
@@ -824,10 +830,12 @@ def test_zero_accepted_programme_is_skipped_on_the_second_run(
             hub=object(),
             vad=cast(VADBackend, object()),
             ctc=cast(CTCBackend, object()),
-            report=report,
+            report=second_report,
             log=MetadataLog(tmp_path / "events.jsonl"),
         )
     assert source_calls == 1
+    assert second_report.selected_programmes == 1
+    assert second_report.processed == 0
     assert report.rejected == 1
 
 
