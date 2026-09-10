@@ -614,6 +614,7 @@ class Ledger:
         reason: RejectionCategory | str,
         accepted_count: int = 0,
         rejected_count: int = 1,
+        rejection_counts: Mapping[RejectionCategory | str, int] | None = None,
     ) -> ProgrammeRecord:
         """Permanently reject a programme with a counted reason.
 
@@ -621,10 +622,13 @@ class Ledger:
             The resulting programme record.
         """
         category = self._rejection_category(reason)
+        counts = (
+            {category: rejected_count} if rejection_counts is None else rejection_counts
+        )
         return self.transition_programme(
             programme_id,
             LedgerState.REJECTED,
-            rejection_counts={category: rejected_count},
+            rejection_counts=counts,
             accepted_count=accepted_count,
             rejected_count=rejected_count,
             last_error=category,

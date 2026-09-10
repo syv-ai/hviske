@@ -192,6 +192,8 @@ def _metadata_digest(row: MetadataRow) -> str:
         "row_locator",
         "row_index",
         "parquet_row",
+        "local_path",
+        "local_row_locator",
         "id",
         "remote_path",
     }
@@ -1269,6 +1271,8 @@ def _metadata_copy(row: MetadataRow) -> dict[str, object]:
         "row_locator",
         "row_index",
         "parquet_row",
+        "local_path",
+        "local_row_locator",
         "rejection_reason",
         "reject_reason",
     }
@@ -1292,6 +1296,11 @@ def _validate_candidate_locator(row: MetadataRow, status: str) -> None:
         ValueError:
             If the status-specific immutable locator is incomplete.
     """
+    if status == "accepted" and _string(row, "local_path") is not None:
+        local_locator = _integer(row, "local_row_locator")
+        if local_locator is None or local_locator < 0:
+            raise ValueError("accepted candidates require a local row locator")
+        return
     if _parquet_path(row) is not None and (
         status == "accepted" or not _has_source_locator(row)
     ):
@@ -1483,10 +1492,27 @@ class AuditReservoir:
             self.rows = [t.cast(dict[str, object], item) for item in value]
 
     def add(self, candidates: RowStream) -> None:
-        """Merge candidates and persist the bounded, stratified selection."""
+        """Merge candidates and persist the bounded, stratified selection.
+
+        Raises:
+            ValueError:
+                If a candidate has no valid temporary or immutable locator.
+        """
         combined_by_identity: dict[tuple[str, str], MetadataRow] = {}
         for row in [*self.rows, *candidates]:
-            combined_by_identity[(_status(row), _identity(row))] = row
+            key = (_status(row), _identity(row))
+            existing = combined_by_identity.get(key)
+            if existing is not None and _parquet_path(existing) is not None:
+                incoming_path = _parquet_path(row)
+                incoming_revision = _string(row, "revision", "hub_revision")
+                existing_revision = _string(existing, "revision", "hub_revision")
+                if incoming_path is None:
+                    continue
+                if incoming_path != _parquet_path(existing) or (
+                    incoming_revision != existing_revision
+                ):
+                    raise ValueError("audit candidate remote locator is immutable")
+            combined_by_identity[key] = row
         combined = list(combined_by_identity.values())
         reservoirs = {
             status: _StratifiedReservoir(quota) for status, quota in self.quotas.items()
@@ -1511,6 +1537,81 @@ class AuditReservoir:
             if _status(row) == status
         ]
         self._write_state()
+
+    def update_remote_locators(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        local_paths: c.Sequence[Path | str],
+        remote_paths: c.Sequence[str],
+        row_counts: c.Sequence[int],
+    ) -> int:
+        """Resolve selected local candidates to immutable remote locations.
+
+        Local identity is retained in the crash-safe reservoir until the commit SHA
+        and publication-relative path are known.  This makes a restart after a
+        verification failure able to finish the same audit selection without
+        sampling the accepted rows again.
+
+        Returns:
+            Number of selected candidates resolved to remote locators.
+
+        Raises:
+            ValueError:
+                If shard locator sequences or the immutable revision are invalid.
+        """
+        if not _COMMIT_SHA.fullmatch(revision):
+            raise ValueError("audit candidates require a complete immutable revision")
+        if not (len(local_paths) == len(remote_paths) == len(row_counts)):
+            raise ValueError("local and remote shard evidence must have equal lengths")
+        by_identity: dict[tuple[str, int], tuple[str, str]] = {}
+        for local, remote, count in zip(
+            local_paths, remote_paths, row_counts, strict=True
+        ):
+            if count < 0:
+                raise ValueError("audit shard row counts must not be negative")
+            local_key = str(Path(local).expanduser().resolve(strict=False))
+            for row_locator in range(count):
+                by_identity[(local_key, row_locator)] = (remote, repository)
+
+        resolved = 0
+        for row in self.rows:
+            if _status(row) != "accepted":
+                continue
+            local = _string(row, "local_path")
+            row_locator = _integer(row, "local_row_locator")
+            if local is None or row_locator is None:
+                continue
+            target = by_identity.get(
+                (str(Path(local).expanduser().resolve(strict=False)), row_locator)
+            )
+            if target is None:
+                continue
+            remote, target_repository = target
+            existing_path = _parquet_path(row)
+            existing_revision = _string(row, "revision", "hub_revision")
+            if existing_path is not None:
+                if existing_path != remote or existing_revision != revision:
+                    raise ValueError("audit candidate remote locator is immutable")
+                continue
+            row.update(
+                {
+                    "repository": target_repository,
+                    "revision": revision,
+                    "parquet_path": remote,
+                    "remote_parquet_path": remote,
+                    "row_locator": row_locator,
+                }
+            )
+            row.pop("local_path", None)
+            row.pop("local_row_locator", None)
+            resolved += 1
+        if resolved:
+            self._write_state()
+        return resolved
+
+    resolve_remote_locators = update_remote_locators
 
     def finalise(self, path: Path | str) -> list[dict[str, object]]:
         """Write the sole final blinded manifest after all commits are known.

@@ -204,6 +204,28 @@ def test_rejected_programmes_and_retryable_transitions_are_durable(
         assert rejected.rejection_counts == {"decode_error": 1}
 
 
+def test_rejected_programme_is_terminal_across_two_runs(tmp_path: Path) -> None:
+    """A restart skips rejected work and cannot reopen its terminal state."""
+    database = tmp_path / "ledger.sqlite"
+    with Ledger(database) as ledger:
+        add_programme(ledger)
+        ledger.start_processing("programme-1")
+        rejected = ledger.reject_programme(
+            "programme-1", reason=RejectionCategory.NO_ACCEPTED_SEGMENTS
+        )
+        assert rejected.state is LedgerState.REJECTED
+        assert rejected.attempts == 1
+
+    with Ledger(database) as restarted:
+        record = restarted.programme("programme-1")
+        assert record.state is LedgerState.REJECTED
+        assert record.attempts == 1
+        with pytest.raises(InvalidTransition):
+            restarted.start_processing("programme-1")
+        with pytest.raises(InvalidTransition):
+            restarted.transition_programme("programme-1", LedgerState.RETRYABLE)
+
+
 def test_remote_reconciliation_avoids_reupload_or_marks_retryable(
     tmp_path: Path,
 ) -> None:
