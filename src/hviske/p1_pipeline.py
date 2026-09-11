@@ -2030,6 +2030,8 @@ def publish_pending(
             t.cast(HubClient, hub),
             settings.target_private_repo,
             batch_id,
+            expected_pipeline_version=settings.pipeline_version,
+            expected_pipeline_config_sha256=settings.pipeline_digest,
             ledger=ledger,
         )
         if ledger.batch(batch_id).state is _state("verified"):
@@ -2100,6 +2102,8 @@ def publish_pending(
         settings.target_private_repo,
         batch_id,
         shards,
+        expected_pipeline_version=settings.pipeline_version,
+        expected_pipeline_config_sha256=settings.pipeline_digest,
         programme_count=record.programme_count,
         rejection_counts={
             RejectionCategory(key): value
@@ -2453,6 +2457,8 @@ def _recover_native_batches(
             t.cast(HubClient, hub),
             settings.target_private_repo,
             batch.batch_id,
+            expected_pipeline_version=settings.pipeline_version,
+            expected_pipeline_config_sha256=settings.pipeline_digest,
             ledger=ledger,
             manifest_path=manifest_path,
             local_paths=paths,

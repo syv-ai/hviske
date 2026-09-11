@@ -10,8 +10,10 @@ within programme and stratum groups. The default seed is `p1-v8-dozen`; `--pilot
 is required and must identify the complete final publication commit.
 
 The model-free gate verifies private immutable retrieval, Parquet, metadata and audio
-hashes, the exact `p1-segments-v2` schema, the `p1-segmentation-8` identity, a single
-pipeline digest, PCM16 FLAC mono 16 kHz audio, exact duration and source bounds,
+hashes, the exact `p1-segments-v2` schema, the `p1-segmentation-8` identity, and the
+pipeline configuration digest recorded in the audit evidence (or supplied with
+`--pipeline-config-sha256`). It also verifies PCM16 FLAC mono 16 kHz audio, exact
+duration and source bounds,
 non-empty trainable text, and one timed-anchor speaker. It does not load or invoke
 ASR, CTC, VAD, Whisper, Transformers, CUDA, or model caches. Transcription
 agreement is not a P1 acceptance criterion.

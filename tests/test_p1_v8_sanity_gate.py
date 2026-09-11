@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
+import sys
+import typing as t
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +30,37 @@ def _flac() -> bytes:
     stream = io.BytesIO()
     sf.write(stream, np.full(16_000, 0.1, dtype=np.float32), 16_000, format="FLAC")
     return stream.getvalue()
+
+
+def test_active_p1_imports_and_sanity_help_are_model_free() -> None:
+    """P1 imports and CLI help do not load model runtimes."""
+    modules = "import hviske.p1_pipeline, hviske.p1_v8_sanity_gate"
+    check = (
+        f"{modules}; import sys; "
+        "print('torch' in sys.modules, 'transformers' in sys.modules)"
+    )
+    imported = subprocess.run(
+        [sys.executable, "-c", check], capture_output=True, text=True, check=False
+    )
+    assert imported.returncode == 0
+    assert imported.stdout.strip() == "False False"
+
+    help_check = """
+import runpy
+import sys
+sys.argv = ["run_p1_v8_sanity_gate.py", "--help"]
+try:
+    runpy.run_path("src/scripts/run_p1_v8_sanity_gate.py", run_name="__main__")
+except SystemExit:
+    pass
+print("torch" in sys.modules, "transformers" in sys.modules)
+"""
+    helped = subprocess.run(
+        [sys.executable, "-c", help_check], capture_output=True, text=True, check=False
+    )
+    assert helped.returncode == 0
+    assert "usage:" in helped.stdout
+    assert helped.stdout.rstrip().endswith("False False")
 
 
 _AUDIO = _flac()
@@ -107,7 +141,11 @@ def test_audit_manifest_retrieves_published_parquet_rows(tmp_path: Path) -> None
             return {"private": True, "sha": _REVISION}
 
     retriever = PinnedHubClipRetriever(
-        _PublishedHub(), repository=repository, revision=revision
+        _PublishedHub(),
+        repository=repository,
+        revision=revision,
+        expected_pipeline_version="p1-segmentation-8",
+        expected_pipeline_config_sha256="c" * 64,
     )
     report = run_v8_sanity_gate(
         manifest,
@@ -192,6 +230,8 @@ def _candidates(count: int) -> list[dict[str, object]]:
             {
                 "audit_id": f"anonymous-{index}",
                 "segment_id": row["segment_id"],
+                "pipeline_version": row["pipeline_version"],
+                "pipeline_config_sha256": row["pipeline_config_sha256"],
                 "status": "accepted",
                 "source_file_id": row["source_file_id"],
                 "stratum": ["duration-target", f"programme-{index % 3}"],
@@ -205,6 +245,25 @@ def _candidates(count: int) -> list[dict[str, object]]:
             }
         )
     return result
+
+
+def test_gate_failure_report_does_not_claim_unexecuted_checks_pass(
+    tmp_path: Path,
+) -> None:
+    """A row-level schema failure leaves all unproven checks false."""
+    candidates = _candidates(12)
+    retriever = _Retriever(candidates)
+    retriever.rows[candidates[0]["segment_id"]]["revision"] = _REVISION
+    report = run_v8_sanity_gate(
+        candidates, retriever=retriever, report_path=tmp_path / "failed.json"
+    )
+
+    assert report["pass"] is False
+    checks = t.cast(dict[str, bool], report["checks"])
+    assert checks["private_immutable_revision"] is True
+    assert checks["exact_schema"] is False
+    assert checks["flac_pcm16_16khz_mono"] is False
+    assert checks["trainable_text"] is False
 
 
 def test_gate_is_deterministic_and_report_contains_aggregate_only(

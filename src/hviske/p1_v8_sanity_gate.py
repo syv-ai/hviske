@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import re
+import typing as t
 from pathlib import Path, PurePosixPath
 
 import numpy as np
@@ -39,6 +40,8 @@ def run_v8_sanity_gate(
     pilot_head: str | None = None,
     seed: str | int = "p1-v8-dozen",
     report_path: Path | str | None = None,
+    expected_pipeline_version: str = PIPELINE_VERSION,
+    expected_pipeline_config_sha256: str | None = None,
 ) -> dict[str, object]:
     """Run the model-free post-pilot v8 structural gate.
 
@@ -55,6 +58,10 @@ def run_v8_sanity_gate(
             Stable sample-selection seed. Defaults to ``p1-v8-dozen``.
         report_path (optional):
             Aggregate JSON destination. No candidate identifiers are written there.
+        expected_pipeline_version (optional):
+            Active pipeline version. Defaults to the v8 contract version.
+        expected_pipeline_config_sha256 (optional):
+            Active configuration digest, or the sole digest in audit evidence.
 
     Returns:
         An aggregate structural report safe to retain outside the private dataset.
@@ -67,9 +74,24 @@ def run_v8_sanity_gate(
     accepted = [row for row in rows if _is_accepted_candidate(row)]
     expected_head = _resolve_pilot_head(accepted, pilot_head)
     selected = _select_candidates(accepted, seed=seed)
+    expected_digest = _resolve_pipeline_digest(
+        selected, expected_pipeline_config_sha256
+    )
     report = _empty_report(expected_head=expected_head, seed=seed, selected=selected)
+    report["pipeline_version"] = expected_pipeline_version
     if len(selected) < SAMPLE_SIZE:
         report["counts"] = {"accepted": len(accepted), "selected": len(selected)}
+        _write_report(report_path, report)
+        return report
+
+    if expected_pipeline_version != PIPELINE_VERSION or expected_digest is None:
+        report["counts"] = {
+            "accepted": len(accepted),
+            "selected": len(selected),
+            "retrieved": 0,
+            "structural_failures": len(selected),
+            "pipeline_digests": 0,
+        }
         _write_report(report_path, report)
         return report
 
@@ -87,7 +109,9 @@ def run_v8_sanity_gate(
         return report
     try:
         verify_repository()
-    except Exception:
+        t.cast(dict[str, bool], report["checks"])["private_immutable_revision"] = True
+    except Exception as error:
+        logger.warning("v8 repository verification failed: %s", error)
         report["counts"] = {
             "accepted": len(accepted),
             "selected": len(selected),
@@ -112,23 +136,44 @@ def run_v8_sanity_gate(
             )
             row = _retrieve_row(retriever, rebound_candidate)
             retrievals += 1
-            audio = _validate_row(row=row, candidate=candidate)
+            audio = _validate_row(
+                row=row,
+                candidate=candidate,
+                expected_pipeline_version=expected_pipeline_version,
+                expected_pipeline_config_sha256=expected_digest,
+            )
             duration = row.get("duration_ms")
             if not isinstance(duration, int) or isinstance(duration, bool):
                 raise ValueError("retrieved row has invalid duration metadata")
             _decode_audio(audio, duration_ms=duration)
             digest = row.get("pipeline_config_sha256")
-            if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
-                raise ValueError("retrieved row has an invalid pipeline digest")
+            if not isinstance(digest, str) or digest != expected_digest:
+                raise ValueError("retrieved row has a different pipeline digest")
             digests.add(digest)
-        except Exception:
+        except Exception as error:
             structural_failures += 1
             logger.warning(
-                "v8 sanity sample %d/%d failed structural checks", ordinal, SAMPLE_SIZE
+                "v8 sanity sample %d/%d failed structural checks: %s",
+                ordinal,
+                SAMPLE_SIZE,
+                error,
             )
             continue
         logger.info("v8 sanity sample %d/%d validated", ordinal, SAMPLE_SIZE)
 
+    checks = t.cast(dict[str, bool], report["checks"])
+    if retrievals == SAMPLE_SIZE and structural_failures == 0:
+        for name in (
+            "hashes",
+            "flac_pcm16_16khz_mono",
+            "exact_schema",
+            "timestamp_native_v8",
+            "exact_duration_and_bounds",
+            "trainable_text",
+            "timed_anchor_single_speaker",
+        ):
+            checks[name] = True
+        checks["one_pipeline_digest"] = len(digests) == 1
     report["counts"] = {
         "accepted": len(accepted),
         "selected": len(selected),
@@ -184,15 +229,15 @@ def _empty_report(
         "sample_size": SAMPLE_SIZE,
         "seed": str(seed),
         "checks": {
-            "private_immutable_revision": True,
-            "hashes": True,
-            "flac_pcm16_16khz_mono": True,
-            "exact_schema": True,
-            "one_pipeline_digest": True,
-            "timestamp_native_v8": True,
-            "exact_duration_and_bounds": True,
-            "trainable_text": True,
-            "timed_anchor_single_speaker": True,
+            "private_immutable_revision": False,
+            "hashes": False,
+            "flac_pcm16_16khz_mono": False,
+            "exact_schema": False,
+            "one_pipeline_digest": False,
+            "timestamp_native_v8": False,
+            "exact_duration_and_bounds": False,
+            "trainable_text": False,
+            "timed_anchor_single_speaker": False,
         },
         "counts": {"accepted": 0, "selected": 0},
         "pass": False,
@@ -244,6 +289,24 @@ def _resolve_pilot_head(
     if pilot_head is None:
         raise ValueError("an explicit final pilot HEAD is required")
     return pilot_head
+
+
+def _resolve_pipeline_digest(
+    selected: c.Sequence[MetadataRow], expected: str | None
+) -> str | None:
+    """Resolve the active digest from explicit evidence or audit candidates.
+
+    Returns:
+        The validated digest when evidence is unambiguous, otherwise ``None``.
+    """
+    if expected is not None:
+        return expected if _SHA256.fullmatch(expected) else None
+    digests = {
+        value
+        for row in selected
+        if isinstance(value := row.get("pipeline_config_sha256"), str)
+    }
+    return next(iter(digests)) if len(digests) == 1 else None
 
 
 def _retrieve_row(retriever: object, candidate: MetadataRow) -> dict[str, object]:
@@ -337,27 +400,17 @@ def _validate_candidate_locator(
         raise ValueError("candidate Parquet hash is missing")
 
 
-def _validate_row(*, row: dict[str, object], candidate: MetadataRow) -> bytes:
+def _validate_row(
+    *,
+    row: dict[str, object],
+    candidate: MetadataRow,
+    expected_pipeline_version: str,
+    expected_pipeline_config_sha256: str,
+) -> bytes:
     expected_fields = {field.name for field in OUTPUT_SCHEMA.fields}
-    transport_fields = {
-        "_p1_audio_sha256",
-        "_p1_metadata_sha256",
-        "audit_id",
-        "metadata_sha256",
-        "parquet_path",
-        "parquet_sha256",
-        "remote_parquet_path",
-        "repository",
-        "revision",
-        "row_locator",
-        "status",
-        "stratum",
-    }
-    if not expected_fields.issubset(row) or (
-        set(row) - expected_fields - transport_fields
-    ):
+    if set(row) != expected_fields:
         raise ValueError("retrieved row does not have the exact v8 schema")
-    if row.get("pipeline_version") != PIPELINE_VERSION:
+    if row.get("pipeline_version") != expected_pipeline_version:
         raise ValueError("retrieved row has the wrong pipeline version")
     if row.get("language") != "da":
         raise ValueError("retrieved row has the wrong language")
@@ -418,6 +471,8 @@ def _validate_row(*, row: dict[str, object], candidate: MetadataRow) -> bytes:
         value = row.get(field)
         if not isinstance(value, str) or not _SHA256.fullmatch(value):
             raise ValueError("retrieved row has invalid identity metadata")
+    if row.get("pipeline_config_sha256") != expected_pipeline_config_sha256:
+        raise ValueError("retrieved row has a different pipeline digest")
     actual_audio = hashlib.sha256(audio).hexdigest()
     if (
         not isinstance(expected_audio, str)

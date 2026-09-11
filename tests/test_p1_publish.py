@@ -66,6 +66,8 @@ def test_batch_verifies_every_path_and_streams_every_shard(tmp_path: Path) -> No
             LocalShard(first, "shards/one.parquet", 1),
             LocalShard(second, "shards/two.parquet", 1),
         ],
+        expected_pipeline_version="test",
+        expected_pipeline_config_sha256="b" * 64,
         validator=validate,
     )
 
@@ -166,7 +168,7 @@ class MemoryHub:
         self.loaded.append((shard_path, streaming))
         if self.decode_empty:
             return iter(())
-        return iter(({"audio": {"array": [0.0]}, "text": "hej"},))
+        return iter(pq.read_table(io.BytesIO(self.files[shard_path])).to_pylist())
 
     def repo_info(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
@@ -345,7 +347,14 @@ def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
         path.write_bytes(b"x")
         shards.append(LocalShard(path, f"{index}.parquet", 1))
     with pytest.raises(AllowListError):
-        publish_batch(MemoryHub(), "org/p1", "batch", shards)
+        publish_batch(
+            MemoryHub(),
+            "org/p1",
+            "batch",
+            shards,
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+        )
 
 
 def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> None:
@@ -372,6 +381,8 @@ def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> 
                 "org/p1",
                 "batch",
                 [LocalShard(path, "one.parquet", 1)],
+                expected_pipeline_version="test",
+                expected_pipeline_config_sha256="b" * 64,
                 ledger=ledger,
                 validator=lambda _dataset, _path: (_ for _ in ()).throw(
                     VerificationError("injected crash")
@@ -385,6 +396,8 @@ def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> 
             "batch",
             ledger=ledger,
             manifest_path=tmp_path / "manifests" / "batch-001.json",
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
         )
         assert verified.state is LedgerState.VERIFIED
         assert ledger.batch("batch").state is LedgerState.VERIFIED
@@ -428,7 +441,14 @@ def test_digest_failure_retains_local_artefacts(tmp_path: Path) -> None:
     write_valid_shard(path)
     hub = MemoryHub(corrupt_stream=True)
     with pytest.raises(VerificationError):
-        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+        publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+        )
     assert path.exists()
     assert (tmp_path / "manifests" / "batch.json").exists()
 
@@ -468,7 +488,14 @@ def test_exposed_digest_avoids_remote_download() -> None:
         path = Path(directory) / "one.parquet"
         write_valid_shard(path)
         hub = MemoryHub(expose_digest=True)
-        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+        publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+        )
         assert not hub.streamed
 
 
@@ -514,6 +541,8 @@ def test_failed_verification_resumes_without_reupload_or_early_purge(
                 "org/p1",
                 "batch",
                 [LocalShard(path, "one.parquet", 1)],
+                expected_pipeline_version="test",
+                expected_pipeline_config_sha256="b" * 64,
                 ledger=ledger,
                 validator=validator,
             )
@@ -533,6 +562,8 @@ def test_failed_verification_resumes_without_reupload_or_early_purge(
             "org/p1",
             "batch",
             [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
             ledger=ledger,
             validator=validator,
             purge_callback=purge,
@@ -589,7 +620,14 @@ def test_invalid_commit_is_not_accepted(tmp_path: Path) -> None:
     write_valid_shard(path)
     hub = MemoryHub(commit_id="main")
     with pytest.raises(VerificationError):
-        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+        publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+        )
     assert path.exists()
 
 
@@ -626,11 +664,20 @@ def test_local_validation_enforces_exact_schema_audio_and_duration(
     )
     path = tmp_path / "valid.parquet"
     pq.write_table(_rows_table([row]), path)
-    validate_local_shard(path, expected_row_count=1)
+    validate_local_shard(
+        path,
+        expected_pipeline_version="test",
+        expected_pipeline_config_sha256="b" * 64,
+        expected_row_count=1,
+    )
     broken = tmp_path / "broken.parquet"
     pq.write_table(_rows_table([row.model_copy(update={"duration_ms": 9})]), broken)
     with pytest.raises(VerificationError, match="duration"):
-        validate_local_shard(broken)
+        validate_local_shard(
+            broken,
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+        )
     second_row = _rows_table([row, row])
     duration_column = second_row.column_names.index("duration_ms")
     second_row = second_row.set_column(
@@ -639,7 +686,25 @@ def test_local_validation_enforces_exact_schema_audio_and_duration(
     multi_row = tmp_path / "multi-row.parquet"
     pq.write_table(second_row, multi_row)
     with pytest.raises(VerificationError, match="duration"):
-        validate_local_shard(multi_row, expected_row_count=2)
+        validate_local_shard(
+            multi_row,
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+            expected_row_count=2,
+        )
+
+    for field, value in (
+        ("pipeline_version", "arbitrary-future-version"),
+        ("pipeline_config_sha256", "c" * 64),
+    ):
+        mismatched = tmp_path / f"mismatched-{field}.parquet"
+        pq.write_table(_rows_table([row.model_copy(update={field: value})]), mismatched)
+        with pytest.raises(VerificationError, match="pipeline"):
+            validate_local_shard(
+                mismatched,
+                expected_pipeline_version="test",
+                expected_pipeline_config_sha256="b" * 64,
+            )
 
 
 def test_missing_repository_is_created_private_before_initialisation() -> None:
@@ -657,7 +722,14 @@ def test_post_commit_privacy_failure_stops_before_verification(tmp_path: Path) -
     write_valid_shard(path)
     hub = MemoryHub(flip_public=True)
     with pytest.raises(PrivacyError):
-        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+        publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+        )
     assert not hub.loaded
 
 
@@ -681,6 +753,8 @@ def test_purge_requires_and_follows_durable_verification(tmp_path: Path) -> None
             "org/p1",
             "batch",
             [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
             purge_callback=lambda paths: events.append("purge"),
         )
     assert path.exists()
@@ -696,6 +770,8 @@ def test_purge_requires_and_follows_durable_verification(tmp_path: Path) -> None
         "org/p1",
         "batch",
         [LocalShard(path, "one.parquet", 1)],
+        expected_pipeline_version="test",
+        expected_pipeline_config_sha256="b" * 64,
         durable_verification=lambda _: events.append("durable"),
         purge_callback=purge,
     )
@@ -733,6 +809,8 @@ def test_racing_competitor_cannot_overwrite_or_lose_ledger_batch(
                 "org/p1",
                 "batch",
                 [LocalShard(path, "one.parquet", 1)],
+                expected_pipeline_version="test",
+                expected_pipeline_config_sha256="b" * 64,
                 ledger=ledger,
             )
 
@@ -747,6 +825,8 @@ def test_racing_competitor_cannot_overwrite_or_lose_ledger_batch(
                 "org/p1",
                 "batch",
                 [LocalShard(path, "one.parquet", 1)],
+                expected_pipeline_version="test",
+                expected_pipeline_config_sha256="b" * 64,
                 ledger=ledger,
             )
         assert ledger.batch("batch").state is LedgerState.SHARDED
@@ -844,7 +924,14 @@ def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
     write_valid_shard(path)
     hub = MemoryHub(existing_paths=("one.parquet",))
     with pytest.raises(AllowListError, match="collision"):
-        publish_batch(hub, "org/p1", "batch", [LocalShard(path, "one.parquet", 1)])
+        publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+        )
     assert not hub.commits
 
 
@@ -866,6 +953,8 @@ def test_stream_decode_failure_retains_the_pending_batch(tmp_path: Path) -> None
             "org/p1",
             "batch",
             [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
             durable_verification=lambda evidence: None,
             purge_callback=purge,
         )
@@ -881,7 +970,12 @@ def test_symlinks_and_unexpected_staging_entries_are_rejected(tmp_path: Path) ->
     link.symlink_to(real)
     with pytest.raises(AllowListError):
         publish_batch(
-            MemoryHub(), "org/p1", "batch", [LocalShard(link, "link.parquet", 1)]
+            MemoryHub(),
+            "org/p1",
+            "batch",
+            [LocalShard(link, "link.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
         )
 
     unexpected = tmp_path / "unexpected.txt"
