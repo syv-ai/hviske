@@ -260,7 +260,12 @@ def make_card() -> str:
         source_provenance="Pinned source programmes",
         permitted_use="Internal ASR research",
         private_access_terms="Access is limited to the project organisation",
-        alignment_method="VAD followed by CTC alignment",
+        alignment_method=(
+            "pipeline_version: p1-segmentation-7; "
+            "alignment_method: timestamp-native:p1-transcripts.words; "
+            f"pipeline_config_sha256: {'c' * 64}; "
+            "Source word timestamps are authoritative."
+        ),
         field_schema="audio, text and deterministic metadata",
         known_limitations="Danish speech only",
         rejection_policy="Reject undecodable or poorly aligned material",
@@ -284,6 +289,9 @@ def test_card_is_readable_and_contract_driven() -> None:
     metadata = yaml.safe_load(card.split("---", 2)[1])
 
     assert metadata == {
+        "pretty_name": "P1 segmented Danish speech",
+        "language": ["da"],
+        "task_categories": ["automatic-speech-recognition"],
         "license": "other",
         "license_name": "p1-dataset-license",
         "license_link": "LICENSE",
@@ -291,12 +299,26 @@ def test_card_is_readable_and_contract_driven() -> None:
     assert "## Key facts" in card
     assert "## Data format and schema" in card
     assert "## Timestamp-native segmentation" in card
-    assert "Source words and their timestamps" in card
+    assert "source words and timestamps are authoritative" in card
     assert "No acoustic model refines P1" in card
+    assert "This private repository is being published incrementally" in card
+    assert "Consumers must pin an immutable revision" in card
+    assert "intentionally includes no payload examples" in card
+    assert "source identifiers" not in card
+    assert "The supplied field-schema note is" not in card
+    assert "Nullable fields are null" not in card
     assert "## Source and licence provenance" in card
     assert "| Audio | `syvai/p1` |" in card
     assert "| Transcripts | `syvai/p1-transcripts` |" in card
     assert "Template repository" in card
+    assert "<summary>Reproducibility details</summary>" in card
+    assert "<summary>Licence provenance</summary>" in card
+    reproducibility = card.split("<summary>Reproducibility details</summary>", 1)[1]
+    reproducibility = reproducibility.split("</details>", 1)[0]
+    assert "pipeline_config_sha256" in reproducibility
+    licence = card.split("<summary>Licence provenance</summary>", 1)[1]
+    licence = licence.split("</details>", 1)[0]
+    assert "Template repository" in licence
     assert '{"audio"' not in card
     assert 'data_files="data/train/*.parquet"' in card
     assert 'revision="<immutable-commit-sha>"' in card
@@ -306,7 +328,7 @@ def test_card_is_readable_and_contract_driven() -> None:
     assert "Exact, verbatim source-owned text" in card
     assert "Exact source-text ownership chunks for alignment units" in card
     key_facts = card.split("## Key facts", 1)[1].split("## Data format", 1)[0]
-    assert "| Alignment | See alignment details below |" in key_facts
+    assert "| Alignment | Timestamp-native source word boundaries |" in key_facts
     assert "VAD followed by CTC alignment" not in key_facts
     assert "The configured alignment identity and details are:" in card
     assert "Future alignment material" in card
