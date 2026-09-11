@@ -1,0 +1,13 @@
+# One-command P1 production preset.  Runtime-only supervisor controls do not enter
+# the canonical pipeline digest.
+defaults:
+  - p1_segments
+  - _self_
+
+mode: production
+supervisor:
+  process_count: 8
+  retry_delay_seconds: 5.0
+  max_attempts: 3
+  shutdown_grace_seconds: 30.0
+  run_root: null

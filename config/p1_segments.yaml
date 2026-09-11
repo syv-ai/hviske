@@ -138,3 +138,12 @@ runtime:
   shards_per_commit: 8
   target_shard_bytes: 500000000
   target_private_repo: syvai/p1-segments
+
+# Runtime-only parent controls.  They are excluded from the canonical pipeline
+# digest.  The production entry point derives one child configuration per partition.
+supervisor:
+  process_count: 8
+  retry_delay_seconds: 5.0
+  max_attempts: 3
+  shutdown_grace_seconds: 30.0
+  run_root: null
