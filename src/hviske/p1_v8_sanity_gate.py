@@ -19,8 +19,8 @@ from pathlib import Path, PurePosixPath
 import numpy as np
 import soundfile as sf
 
-from .p1_contracts import OUTPUT_SCHEMA
-from .p1_validation import _embedded_audio, _metadata_digest
+from .p1_contracts import OUTPUT_SCHEMA, OutputRow
+from .p1_validation import _metadata_digest
 
 logger = logging.getLogger(__name__)
 
@@ -407,9 +407,7 @@ def _validate_row(
     expected_pipeline_version: str,
     expected_pipeline_config_sha256: str,
 ) -> bytes:
-    expected_fields = {field.name for field in OUTPUT_SCHEMA.fields}
-    if set(row) != expected_fields:
-        raise ValueError("retrieved row does not have the exact v8 schema")
+    audio = _validate_exact_schema(row=row)
     if row.get("pipeline_version") != expected_pipeline_version:
         raise ValueError("retrieved row has the wrong pipeline version")
     if row.get("language") != "da":
@@ -464,7 +462,6 @@ def _validate_row(
         or row.get("vad_speech_ratio") is not None
     ):
         raise ValueError("retrieved row has non-native v8 alignment evidence")
-    audio = _embedded_audio(row)
     expected_audio = candidate.get("audio_sha256")
     expected_metadata = candidate.get("metadata_sha256")
     for field in ("segment_id", "pipeline_config_sha256"):
@@ -492,6 +489,53 @@ def _validate_row(
 
 def _has_trainable_text(value: object) -> bool:
     return isinstance(value, str) and any(char.isalnum() for char in value)
+
+
+def _validate_exact_schema(*, row: dict[str, object]) -> bytes:
+    """Validate one retrieved row against the strict P1 output contract.
+
+    The remote Arrow representation uses lists and an HF Audio mapping, whereas the
+    in-process contract uses tuples and encoded bytes.  Convert only those transport
+    wrappers before asking the authoritative Pydantic contract to validate types and
+    structure.  No audio decoding or content is performed here.
+
+    Returns:
+        Embedded audio bytes for the subsequent encoding checks.
+
+    Raises:
+        ValueError:
+            If a field has the wrong type, nullability, or structure.
+    """
+    expected_fields = {field.name for field in OUTPUT_SCHEMA.fields}
+    if set(row) != expected_fields:
+        raise ValueError("retrieved row does not have the exact v8 schema")
+
+    audio_value = row.get("audio")
+    if not isinstance(audio_value, c.Mapping):
+        raise ValueError("retrieved row has an invalid audio structure")
+    if set(audio_value) - {"bytes", "path"}:
+        raise ValueError("retrieved row has an invalid audio structure")
+    payload = audio_value.get("bytes")
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("retrieved row has an invalid audio structure")
+    path = audio_value.get("path")
+    if path is not None and not isinstance(path, str):
+        raise ValueError("retrieved row has an invalid audio structure")
+
+    validated = dict(row)
+    validated["audio"] = payload
+    for name in ("alignment_word_map", "speaker_ids"):
+        value = row.get(name)
+        if not isinstance(value, list):
+            raise ValueError(f"retrieved row has an invalid {name} structure")
+        validated[name] = tuple(value)
+    try:
+        OutputRow.model_validate(validated)
+    except Exception as error:
+        raise ValueError(
+            "retrieved row has invalid field types or nullability"
+        ) from error
+    return payload
 
 
 def _write_report(path: Path | str | None, report: dict[str, object]) -> None:

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 import soundfile as sf
 
 from hviske.p1_contracts import OutputRow
@@ -292,3 +293,33 @@ def test_gate_is_deterministic_and_report_contains_aggregate_only(
     assert "part.parquet" not in report_text
     assert "hej verden" not in report_text
     assert "source_file_id" not in report_text
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("alignment_word_map", 1),
+        ("speaker_ids", ["speaker", 1]),
+        ("alignment_score_type", None),
+        ("vad_speech_ratio", "not-a-ratio"),
+    ],
+)
+def test_gate_rejects_malformed_exact_schema_values(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Malformed list, nullable, and scalar values cannot pass exact_schema."""
+    candidates = _candidates(12)
+    retriever = _Retriever(candidates)
+    segment_id = t.cast(str, candidates[0]["segment_id"])
+    malformed = dict(retriever.rows[segment_id])
+    malformed[field] = value
+    retriever.rows[segment_id] = malformed
+    candidates[0]["metadata_sha256"] = _metadata_digest(malformed)
+
+    report = run_v8_sanity_gate(
+        candidates, retriever=retriever, report_path=tmp_path / "failed.json"
+    )
+
+    assert report["pass"] is False
+    checks = t.cast(dict[str, bool], report["checks"])
+    assert checks["exact_schema"] is False

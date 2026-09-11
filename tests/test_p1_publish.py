@@ -95,6 +95,7 @@ class MemoryHub:
     decode_empty: bool = False
     missing: bool = False
     corrupt_stream: bool = False
+    streaming_override: tuple[str, object] | None = None
     existing_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -167,8 +168,12 @@ class MemoryHub:
         """Return a one-row streaming dataset."""
         self.loaded.append((shard_path, streaming))
         if self.decode_empty:
-            return iter(())
-        return iter(pq.read_table(io.BytesIO(self.files[shard_path])).to_pylist())
+            return []
+        rows = pq.read_table(io.BytesIO(self.files[shard_path])).to_pylist()
+        if self.streaming_override is not None:
+            field, value = self.streaming_override
+            rows[0][field] = value
+        return rows
 
     def repo_info(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
@@ -230,6 +235,30 @@ def write_valid_shard(path: Path) -> None:
         pipeline_config_sha256="b" * 64,
     )
     pq.write_table(_rows_table([row]), path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("pipeline_version", "future"), ("pipeline_config_sha256", "d" * 64)],
+)
+def test_builtin_streaming_identity_checks_run_without_schema_or_custom_validator(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Custom streaming validators cannot replace built-in identity checks."""
+    path = tmp_path / "one.parquet"
+    write_valid_shard(path)
+    hub = MemoryHub(streaming_override=(field, value))
+
+    with pytest.raises(VerificationError, match="pipeline"):
+        publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+            validator=lambda _dataset, _path: None,
+        )
 
 
 def test_card_contains_required_terms_and_no_credentials() -> None:
