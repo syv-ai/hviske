@@ -41,9 +41,9 @@ _CREDENTIAL_VALUES = re.compile(r"(?:hf_[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{10,}
 _SCHEMA_DESCRIPTIONS = {
     "audio": "16 kHz mono FLAC audio",
     "audio_sha256": "SHA-256 digest of audio",
-    "text": "Normalised training text",
+    "text": "Exact, verbatim source-owned text",
     "alignment_text": "Text used for word alignment",
-    "alignment_word_map": "Word-to-source-word mapping",
+    "alignment_word_map": "Exact source-text ownership chunks for alignment units",
     "language": "Language code (always da)",
     "segment_id": "Stable segment identity",
     "source_file_id": "Source file key (audit metadata)",
@@ -188,7 +188,7 @@ def build_dataset_card(
         f"| Schema | `{OUTPUT_SCHEMA.schema_version}` |\n"
         f"| Audio | Mono FLAC at 16 kHz |\n"
         f"| Pipeline | `{P1_RUNTIME_CONTRACT.pipeline_version}` |\n"
-        f"| Alignment | {_markdown_cell(alignment_method)} |\n"
+        f"| Alignment | {_alignment_summary(alignment_method)} |\n"
         f"| Permitted use | {_markdown_cell(permitted_use)} |\n"
         f"| Access terms | {_markdown_cell(private_access_terms)} |\n"
         "| Field schema | See the exact contract below |\n\n"
@@ -206,7 +206,8 @@ def build_dataset_card(
         "Each segment follows the first and last selected source word boundaries.\n"
         "No acoustic model refines P1 boundaries.\n"
         "Acoustic alignment evidence is not part of the active v7 output.\n\n"
-        f"The configured method is `{_markdown_cell(alignment_method)}`."
+        "The configured alignment identity and details are:\n\n"
+        f"{_render_card_text(alignment_method)}"
         f"{model_section}\n\n"
         "## Source and licence provenance\n\n"
         "### Source provenance\n\n"
@@ -227,7 +228,7 @@ def build_dataset_card(
         "from datasets import load_dataset\n\n"
         "dataset = load_dataset(\n"
         '    "syvai/p1-segments",\n'
-        '    data_files="shards/<shard>.parquet",\n'
+        '    data_files="data/train/*.parquet",\n'
         '    revision="<immutable-commit-sha>",\n'
         "    streaming=True,\n"
         ")\n"
@@ -235,6 +236,21 @@ def build_dataset_card(
         "## Licence\n\n"
         "Private access, use, and distribution are subject to [LICENSE](LICENSE).\n"
     )
+
+
+def _alignment_summary(alignment_method: str) -> str:
+    """Return a compact table value for the configured alignment method.
+
+    Args:
+        alignment_method:
+            Complete alignment identity and method details.
+
+    Returns:
+        A short summary; the complete value is rendered outside the table.
+    """
+    if "timestamp-native:p1-transcripts.words" in alignment_method:
+        return "Timestamp-native source word boundaries"
+    return "See alignment details below"
 
 
 def _assert_safe_metadata(value: object, token: str | None = None) -> None:
@@ -808,8 +824,10 @@ def _assert_initialise_target_is_safe(
         raise PublicationError(
             "refusing to overwrite a target card without the compatible v7 identity"
         )
-    expected_digest = re.search(r"pipeline_config_sha256: ([0-9a-f]{64})", card)
-    actual_digest = re.search(r"pipeline_config_sha256: ([0-9a-f]{64})", existing_card)
+    expected_digest = re.search(r"pipeline_config_sha256:\s*([0-9a-f]{64})", card)
+    actual_digest = re.search(
+        r"pipeline_config_sha256:\s*([0-9a-f]{64})", existing_card
+    )
     if expected_digest is not None and (
         actual_digest is None or actual_digest.group(1) != expected_digest.group(1)
     ):
