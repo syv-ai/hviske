@@ -59,6 +59,23 @@ Hydra `config_path` values such as `../../config` are relative to the declaring
 script, not the launch CWD. CWD-relative inputs, outputs, and caches, including
 the evaluation CSV and `.hviske-cache`, follow the launch CWD.
 
+## Development posture
+
+Hviske is currently used for dataset preparation and model experiments, not a
+production deployment. Optimise for iteration speed, useful training-data breadth,
+and speaker variation rather than production-grade hardening.
+
+- Accept small errors, approximate alignments or transcriptions, and uncommon edge
+  cases when they do not materially invalidate a model experiment.
+- Do not add elaborate validation gates, production safeguards, or repeated
+  builder-reviewer cycles for non-critical polish. A focused implementation and
+  relevant tests are normally enough.
+- For training datasets, prefer retaining useful examples with explicit best-effort
+  semantics over rejecting data merely because every annotation cannot be proven.
+- Remain strict about credentials and private data, destructive remote operations,
+  unreadable or structurally corrupt artefacts, unbounded resource use, and changes
+  that would make an experiment irreproducible.
+
 ## Testing and quality
 
 The full test suite uses real Hugging Face datasets and short training runs.
