@@ -1294,13 +1294,12 @@ def verify_batch(
             _assert_exact_schema(actual_schema, expected_schema, item.path)
         elif actual_schema is not None:
             _assert_exact_schema(actual_schema, _EXPECTED_FEATURES, item.path)
-        if actual_schema is not None or validator is None:
-            validate_streaming_sample(
-                dataset,
-                item.path,
-                expected_pipeline_version=expected_pipeline_version,
-                expected_pipeline_config_sha256=expected_pipeline_config_sha256,
-            )
+        validate_streaming_sample(
+            dataset,
+            item.path,
+            expected_pipeline_version=expected_pipeline_version,
+            expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+        )
         if validator is not None:
             validator(dataset, item.path)
         if schema_validator is not None:
