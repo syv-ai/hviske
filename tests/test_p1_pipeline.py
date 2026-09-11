@@ -32,6 +32,7 @@ from hviske.p1_pipeline import (
     enforce_scratch_cap,
     preflight_pipeline,
     run_pipeline,
+    target_privacy,
 )
 from hviske.p1_segments import (
     CTCBackend,
@@ -382,7 +383,7 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
     """Initialisation creates the private target without source retrieval."""
     source = MetadataSource()
     hub = MemoryHub()
-    run_pipeline(
+    report = run_pipeline(
         config=pipeline_config(tmp_path, mode="initialise"), source=source, hub=hub
     )
 
@@ -392,10 +393,14 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
     assert "p1-text-normalisation-5" in card
     assert "speaker-consistent-following-word-with-terminal-suffix-v5" in card
     assert "exact published and canonical CTC text" not in card
-    assert all(
-        marker not in card.lower()
-        for marker in ("silero", "roest", "whisper", "ctc", "vad")
+    assert "vad_speech_ratio" in card
+    assert 'data_files="data/train/*.parquet"' in card
+    assert "| Alignment | Timestamp-native source word boundaries |" in card
+    assert (
+        "pipeline_config_sha256"
+        not in card.split("## Key facts", 1)[1].split("## Data format", 1)[0]
     )
+    assert report.preflight.target["contract_v7"] is True
     assert source.iterated is False
 
 
@@ -1172,6 +1177,37 @@ def test_v7_normalisation_contract_fails_before_source_work(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="normalisation.case_folding"):
         run_pipeline(config=config, source=Source())
+
+
+@pytest.mark.parametrize(
+    "legacy_statement",
+    [
+        "P1 uses VAD segmentation.",
+        "P1 uses CTC alignment.",
+        "P1 uses Whisper alignment.",
+        "P1 runs alignment on CUDA.",
+        "P1 uses model-backed alignment.",
+        "## Model revisions\n\n- **Repository:** legacy/model",
+    ],
+)
+def test_v7_target_validation_rejects_legacy_model_provenance(
+    legacy_statement: str, tmp_path: Path
+) -> None:
+    """An active identity cannot mask legacy or model-backed provenance."""
+    settings = PipelineSettings.from_config(
+        pipeline_config(tmp_path, mode="initialise")
+    )
+    hub = MemoryHub()
+    run_pipeline(
+        config=pipeline_config(tmp_path, mode="initialise"),
+        source=MetadataSource(),
+        hub=hub,
+    )
+    hub.files["README.md"] += f"\n\n{legacy_statement}\n".encode()
+
+    target = target_privacy(hub, settings.target_private_repo, settings.pipeline_digest)
+
+    assert target["contract_v7"] is False
 
 
 def test_zero_accepted_programme_is_skipped_on_the_second_run(

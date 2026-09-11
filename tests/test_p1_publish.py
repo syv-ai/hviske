@@ -298,10 +298,17 @@ def test_card_is_readable_and_contract_driven() -> None:
     assert "| Transcripts | `syvai/p1-transcripts` |" in card
     assert "Template repository" in card
     assert '{"audio"' not in card
+    assert 'data_files="data/train/*.parquet"' in card
     assert 'revision="<immutable-commit-sha>"' in card
     assert "streaming=True" in card
     assert 'revision="main"' not in card
     assert all(field.name in card for field in OUTPUT_SCHEMA.fields)
+    assert "Exact, verbatim source-owned text" in card
+    assert "Exact source-text ownership chunks for alignment units" in card
+    key_facts = card.split("## Key facts", 1)[1].split("## Data format", 1)[0]
+    assert "| Alignment | See alignment details below |" in key_facts
+    assert "VAD followed by CTC alignment" not in key_facts
+    assert "The configured alignment identity and details are:" in card
     assert "Future alignment material" in card
     assert "ctc@" in card
 

@@ -16,6 +16,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -594,14 +595,66 @@ def _target_card_is_v7(
     )
     if not all(marker in card for marker in required):
         return False
-    if "Model revisions" in card or any(
-        marker in card.lower()
-        for marker in ("silero", "roest", "whisper", "ctc", "vad")
-    ):
+    if _card_declares_inactive_model_provenance(card):
         return False
-    return expected_digest is None or (
-        f"pipeline_config_sha256: {expected_digest}" in card
+    return (
+        expected_digest is None
+        or re.search(rf"pipeline_config_sha256:\s*{re.escape(expected_digest)}", card)
+        is not None
     )
+
+
+def _card_declares_inactive_model_provenance(card: str) -> bool:
+    """Check card statements for active legacy or model-backed processing.
+
+    Schema field names such as ``vad_speech_ratio`` are contract metadata, not
+    provenance. Only headings, labelled values, and positive processing statements
+    are treated as declarations.
+
+    Args:
+        card:
+            Dataset card Markdown.
+
+    Returns:
+        Whether the card declares inactive model or device provenance.
+    """
+    technology = re.compile(r"\b(?:vad|ctc|whisper|cuda|silero|roest)\b", re.I)
+    model_provenance = re.compile(
+        r"\bmodel[- ]backed\b|\bmodel[_ -]+"
+        r"(?:revisions?|provenance|repository|id)\b",
+        re.I,
+    )
+    processing_cue = re.compile(
+        r"\b(?:alignment(?:[_ -]+(?:method|backend))?|aligner|aligned|backend|"
+        r"device|segmentation|active|enabled|legacy|uses?|using|requires?|runs?|"
+        r"running|powered|backed|produced|generated)\b",
+        re.I,
+    )
+    technology_label = re.compile(
+        r"^(?:#{1,6}\s+|[-*]\s+(?:\*\*)?|\|\s*)?"
+        r"(?:active\s+|legacy\s+)?(?:vad|ctc|whisper|cuda|silero|roest)"
+        r"(?:\*\*)?(?:\s*[:|]|\s+(?:model|alignment|segmentation|backend|device)\b|\s*$)",
+        re.I,
+    )
+    negated_use = re.compile(
+        r"\b(?:no|not|never|without)\b[^.]{0,60}"
+        r"\b(?:vad|ctc|whisper|cuda|silero|roest)\b",
+        re.I,
+    )
+
+    for raw_line in card.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if model_provenance.search(line) or technology_label.search(line):
+            return True
+        if (
+            technology.search(line)
+            and processing_cue.search(line)
+            and not negated_use.search(line)
+        ):
+            return True
+    return False
 
 
 def _run_native_pipeline(
