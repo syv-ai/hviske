@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import io
 import json
 import logging
@@ -10,12 +11,14 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
+from huggingface_hub.errors import HfHubHTTPError
 from omegaconf import DictConfig, OmegaConf
 
-from hviske.p1_contracts import SourceWord
+from hviske.p1_contracts import LedgerState, SourceWord
 from hviske.p1_ledger import Ledger
 from hviske.p1_pipeline import (
     BuildReport,
@@ -33,6 +36,7 @@ from hviske.p1_pipeline import (
     enforce_scratch_cap,
     partition_for_file_id,
     preflight_pipeline,
+    publish_pending,
     run_pipeline,
     target_privacy,
 )
@@ -54,7 +58,7 @@ from hviske.p1_source import (
     parse_transcript_row,
 )
 from hviske.p1_validation import stratified_sample
-from tests.test_p1_publish import MemoryHub
+from tests.test_p1_publish import LocalShard, MemoryHub, write_valid_shard
 
 
 @pytest.mark.parametrize(
@@ -1073,6 +1077,35 @@ def test_progress_logs_do_not_include_source_identifiers_or_paths(
     assert "private/audio.parquet" not in progress
 
 
+def test_publication_does_not_retry_non_hub_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Data and ledger failures pass through without a Hub retry."""
+    attempts = 0
+
+    def publish(**_kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("schema failure")
+
+    def sleep(_delay: float) -> None:
+        raise AssertionError("non-Hub errors must not sleep")
+
+    monkeypatch.setattr("hviske.p1_pipeline._publish_pending_unlocked", publish)
+    monkeypatch.setattr("hviske.p1_pipeline.time.sleep", sleep)
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+    with pytest.raises(ValueError, match="schema failure"):
+        publish_pending(
+            hub=object(),
+            settings=settings,
+            ledger=cast(Ledger, object()),
+            batch_id="batch",
+            pending=(),
+            pending_ids=(),
+        )
+    assert attempts == 1
+
+
 def test_publication_lock_releases_after_exception(tmp_path: Path) -> None:
     """The shared lock can be acquired again after a failed publication stage.
 
@@ -1087,6 +1120,119 @@ def test_publication_lock_releases_after_exception(tmp_path: Path) -> None:
     with _publication_lock(lock_path):
         pass
     assert lock_path.stat().st_size == 0
+
+
+def test_publication_retries_committed_batch_through_verification_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Hub error after commit re-enters the publisher's durable recovery path."""
+    path = tmp_path / "one.parquet"
+    write_valid_shard(path)
+    digest = "b" * 64
+    settings = dataclasses.replace(
+        PipelineSettings.from_config(pipeline_config(tmp_path, mode="build")),
+        pipeline_version="test",
+        alignment_method="test",
+        pipeline_digest=digest,
+    )
+    failed = True
+
+    class FlakyHub(MemoryHub):
+        def load_dataset(
+            self, repo_id: str, *, shard_path: str, revision: str, streaming: bool
+        ) -> object:
+            nonlocal failed
+            if failed:
+                failed = False
+                raise HfHubHTTPError(
+                    "verification transport detail",
+                    response=httpx.Response(
+                        502, request=httpx.Request("GET", "https://hub.test/data")
+                    ),
+                )
+            return super().load_dataset(
+                repo_id, shard_path=shard_path, revision=revision, streaming=streaming
+            )
+
+    hub = FlakyHub()
+
+    def sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("hviske.p1_pipeline.time.sleep", sleep)
+    with Ledger(tmp_path / "ledger.sqlite", pipeline_digest=digest) as ledger:
+        ledger.register_batch("batch", pipeline_digest=digest)
+        ledger.register_shard(
+            "shard",
+            path="one.parquet",
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            byte_size=path.stat().st_size,
+            row_count=1,
+            local_path=path,
+            batch_id="batch",
+        )
+        ledger.transition_batch("batch", LedgerState.PROCESSING)
+        ledger.transition_batch("batch", LedgerState.SHARDED)
+        evidence = publish_pending(
+            hub=hub,
+            settings=settings,
+            ledger=ledger,
+            batch_id="batch",
+            pending=(LocalShard(path, "one.parquet", 1),),
+            pending_ids=(),
+        )
+        assert evidence.state is LedgerState.PURGED
+        assert ledger.batch("batch").state is LedgerState.PURGED
+
+    assert len(hub.commits) == 1
+    assert not path.exists()
+
+
+def test_publication_retries_hub_error_and_releases_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hub retries happen outside the shared lock and redact transport details."""
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+    attempts = 0
+    acquired_during_sleep: list[bool] = []
+    delays: list[float] = []
+
+    def publish(**_kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HfHubHTTPError(
+                "source-id https://hub.test/private?token=secret",
+                response=httpx.Response(
+                    503, request=httpx.Request("POST", "https://hub.test/private")
+                ),
+            )
+        return "verified"
+
+    def sleep(delay: float) -> None:
+        delays.append(delay)
+        with _publication_lock(settings.publish_lock_path):
+            acquired_during_sleep.append(True)
+
+    monkeypatch.setattr("hviske.p1_pipeline._publish_pending_unlocked", publish)
+    monkeypatch.setattr("hviske.p1_pipeline.time.sleep", sleep)
+    with caplog.at_level(logging.WARNING, logger="hviske.p1_pipeline"):
+        result = publish_pending(
+            hub=object(),
+            settings=settings,
+            ledger=cast(Ledger, object()),
+            batch_id="batch",
+            pending=(),
+            pending_ids=(),
+        )
+
+    assert result == "verified"
+    assert attempts == 2
+    assert delays == [5.0]
+    assert acquired_during_sleep == [True]
+    assert "503" in caplog.text
+    assert "hub.test" not in caplog.text
+    assert "source-id" not in caplog.text
 
 
 def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:
