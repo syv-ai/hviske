@@ -56,8 +56,8 @@ Each `train` row has these fields:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `audio` | `Audio(16000)` | Audio feature backed by a mono FLAC payload. |
-| `audio_sha256` | string | Digest of the encoded FLAC payload. |
+| `audio` | `Audio(16000)` | Audio feature backed by embedded mono OGG/Opus bytes. |
+| `audio_sha256` | string | Digest of the encoded OGG/Opus payload. |
 | `text` | string | Verbatim segment text before model normalisation. |
 | `alignment_text` | string | Canonical text supplied to the aligner. |
 | `alignment_word_map` | list[string] | Mapping from alignment units to exact owned source-text chunks. |
@@ -99,10 +99,10 @@ framing and prevents concatenation collisions. A changed identity component prod
 new configuration digest and new segment IDs.
 
 Write shards under `data/train/part-NNNNN.parquet`. Target approximately 500 MB per
-file, matching existing repository conventions. Store lossless FLAC payloads and write
-Hugging Face feature metadata where the Parquet publication path supports it. Validate
-the exact uploaded schema. If streaming load does not reconstruct the feature, cast the
-column explicitly with `Audio(sampling_rate=16000)` in the Hviske loader.
+file, matching existing repository conventions. Store compact OGG/Opus payloads and
+write Hugging Face feature metadata where the Parquet publication path supports it.
+Validate the exact uploaded schema. If streaming load does not reconstruct the feature,
+cast the column explicitly with `Audio(sampling_rate=16000)` in the Hviske loader.
 
 ## Alignment design
 
@@ -220,7 +220,7 @@ A timestamp-native segment is publishable only when all of these gates pass:
 - score, drift, and other secondary-evidence fields are null rather than fabricated;
 - no word is duplicated or dropped within an accepted contiguous transcript region;
 - timed-anchor speaker overlap and music heuristics pass;
-- FLAC encoding and a fresh 16 kHz mono decode succeed;
+- OGG/Opus encoding and a fresh 16 kHz mono decode succeed;
 - `segment_id` is unique.
 
 ### Future alignment: model-backed scoring (inactive)

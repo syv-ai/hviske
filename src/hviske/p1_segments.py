@@ -54,7 +54,7 @@ class CandidateDecision:
 
 @dataclass(frozen=True)
 class EncodedAudio:
-    """A validated mono 16 kHz FLAC payload."""
+    """A validated mono 16 kHz encoded audio payload."""
 
     payload: bytes
     duration_ms: int
@@ -808,6 +808,125 @@ def _retain_alignment_characters(value: str) -> str:
     )
 
 
+def encode_flac(samples: np.ndarray, sampling_rate: int = 16000) -> EncodedAudio:
+    """Encode mono audio as lossless FLAC and validate it with a fresh decode.
+
+    Returns:
+        Encoded payload, exact sample count, duration, and payload digest.
+
+    Raises:
+        ValueError:
+            If the input is not non-empty mono 16 kHz audio or fresh decoding fails.
+    """
+    if sampling_rate != 16000:
+        raise ValueError("P1 audio must be sampled at 16000 Hz")
+    values = np.asarray(samples)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("audio must be a non-empty mono array")
+    output = io.BytesIO()
+    sf.write(
+        output,
+        values.astype(np.float32),
+        sampling_rate,
+        format="FLAC",
+        subtype="PCM_16",
+    )
+    payload = output.getvalue()
+    decoded = decode_flac(payload=payload)
+    if decoded.size != values.size:
+        raise ValueError("fresh FLAC decode changed sample count")
+    return EncodedAudio(
+        payload=payload,
+        duration_ms=int(round(values.size * 1000 / sampling_rate)),
+        sample_count=int(values.size),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def decode_flac(payload: bytes) -> np.ndarray:
+    """Decode and validate a FLAC payload as fresh mono 16 kHz audio.
+
+    Returns:
+        Decoded mono float32 samples.
+
+    Raises:
+        ValueError:
+            If the payload is not a valid mono 16 kHz FLAC stream.
+    """
+    try:
+        with sf.SoundFile(io.BytesIO(payload)) as decoded_file:
+            decoded = decoded_file.read(dtype="float32", always_2d=True)
+            if (
+                decoded_file.format != "FLAC"
+                or decoded_file.subtype != "PCM_16"
+                or decoded_file.samplerate != 16000
+                or decoded_file.channels != 1
+            ):
+                raise ValueError("fresh decode is not PCM_16 FLAC mono 16 kHz")
+    except (RuntimeError, sf.LibsndfileError) as exc:
+        raise ValueError("payload is not a readable FLAC stream") from exc
+    return decoded[:, 0]
+
+
+def encode_ogg_opus(samples: np.ndarray, sampling_rate: int = 16000) -> EncodedAudio:
+    """Encode mono audio as OGG/Opus and validate it with a fresh decode.
+
+    Returns:
+        Encoded payload, exact sample count, duration, and payload digest.
+
+    Raises:
+        ValueError:
+            If the input is not non-empty finite mono 16 kHz audio or fresh
+            decoding fails.
+    """
+    if sampling_rate != 16000:
+        raise ValueError("P1 audio must be sampled at 16000 Hz")
+    values = np.asarray(samples)
+    if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("audio must be a non-empty finite mono array")
+    output = io.BytesIO()
+    sf.write(
+        output, values.astype(np.float32), sampling_rate, format="OGG", subtype="OPUS"
+    )
+    payload = output.getvalue()
+    decoded = decode_ogg_opus(payload=payload)
+    if decoded.size != values.size:
+        raise ValueError("fresh OGG/Opus decode changed sample count")
+    return EncodedAudio(
+        payload=payload,
+        duration_ms=int(round(values.size * 1000 / sampling_rate)),
+        sample_count=int(values.size),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def decode_ogg_opus(payload: bytes) -> np.ndarray:
+    """Decode and validate an OGG/Opus payload as fresh mono 16 kHz audio.
+
+    Returns:
+        Decoded mono finite float32 samples.
+
+    Raises:
+        ValueError:
+            If the payload is not a valid mono 16 kHz OGG/Opus stream.
+    """
+    try:
+        with sf.SoundFile(io.BytesIO(payload)) as decoded_file:
+            decoded = decoded_file.read(dtype="float32", always_2d=True)
+            if (
+                decoded_file.format != "OGG"
+                or decoded_file.subtype != "OPUS"
+                or decoded_file.samplerate != 16000
+                or decoded_file.channels != 1
+                or decoded.shape[0] == 0
+                or not np.isfinite(decoded).all()
+            ):
+                raise ValueError("fresh decode is not finite OGG/Opus mono 16 kHz")
+    except (RuntimeError, sf.LibsndfileError) as exc:
+        raise ValueError("payload is not a readable OGG/Opus stream") from exc
+    return decoded[:, 0]
+
+
 def segment_programme(
     words: c.Sequence[SourceWord],
     audio: np.ndarray,
@@ -1164,7 +1283,10 @@ def make_output_row(
     first_sample = int(round(final_start * 16))
     last_sample = int(round(final_end * 16))
     try:
-        encoded = encode_flac(samples=np.asarray(audio)[first_sample:last_sample])
+        encoder = (
+            encode_ogg_opus if pipeline_version == "p1-segmentation-8" else encode_flac
+        )
+        encoded = encoder(samples=np.asarray(audio)[first_sample:last_sample])
     except (RuntimeError, ValueError, sf.LibsndfileError):
         return CandidateDecision(
             row=None, rejection=RejectionCategory.DECODE_ERROR.value
@@ -1214,66 +1336,6 @@ def make_output_row(
 
 def _is_trainable_character(char: str) -> bool:
     return char.isalpha() or char.isdigit()
-
-
-def encode_flac(samples: np.ndarray, sampling_rate: int = 16000) -> EncodedAudio:
-    """Encode mono audio as lossless FLAC and validate it with a fresh decode.
-
-    Returns:
-        Encoded payload, exact sample count, duration, and payload digest.
-
-    Raises:
-        ValueError:
-            If the input is not non-empty mono 16 kHz audio or fresh decoding fails.
-    """
-    if sampling_rate != 16000:
-        raise ValueError("P1 audio must be sampled at 16000 Hz")
-    values = np.asarray(samples)
-    if values.ndim != 1 or values.size == 0:
-        raise ValueError("audio must be a non-empty mono array")
-    output = io.BytesIO()
-    sf.write(
-        output,
-        values.astype(np.float32),
-        sampling_rate,
-        format="FLAC",
-        subtype="PCM_16",
-    )
-    payload = output.getvalue()
-    decoded = decode_flac(payload=payload)
-    if decoded.size != values.size:
-        raise ValueError("fresh FLAC decode changed sample count")
-    return EncodedAudio(
-        payload=payload,
-        duration_ms=int(round(values.size * 1000 / sampling_rate)),
-        sample_count=int(values.size),
-        sha256=hashlib.sha256(payload).hexdigest(),
-    )
-
-
-def decode_flac(payload: bytes) -> np.ndarray:
-    """Decode and validate a FLAC payload as fresh mono 16 kHz audio.
-
-    Returns:
-        Decoded mono float32 samples.
-
-    Raises:
-        ValueError:
-            If the payload is not a valid mono 16 kHz FLAC stream.
-    """
-    try:
-        with sf.SoundFile(io.BytesIO(payload)) as decoded_file:
-            decoded = decoded_file.read(dtype="float32", always_2d=True)
-            if (
-                decoded_file.format != "FLAC"
-                or decoded_file.subtype != "PCM_16"
-                or decoded_file.samplerate != 16000
-                or decoded_file.channels != 1
-            ):
-                raise ValueError("fresh decode is not PCM_16 FLAC mono 16 kHz")
-    except (RuntimeError, sf.LibsndfileError) as exc:
-        raise ValueError("payload is not a readable FLAC stream") from exc
-    return decoded[:, 0]
 
 
 def prepare_source_audio(
@@ -1347,7 +1409,12 @@ def validate_output_shard(path: Path) -> None:
             if not isinstance(audio, dict) or not isinstance(audio.get("bytes"), bytes):
                 raise ValueError("audio is not an HF Audio struct with embedded bytes")
             payload = audio["bytes"]
-            decoded = decode_flac(payload)
+            decoder = (
+                decode_ogg_opus
+                if row.get("pipeline_version") == "p1-segmentation-8"
+                else decode_flac
+            )
+            decoded = decoder(payload)
             if hashlib.sha256(payload).hexdigest() != row["audio_sha256"]:
                 raise ValueError("audio_sha256 does not match the encoded payload")
             if len(decoded) != int(row["duration_ms"]) * 16:
@@ -1668,7 +1735,9 @@ __all__ = [
     "align_ctc_emissions",
     "correct_drift_once",
     "decode_flac",
+    "decode_ogg_opus",
     "encode_flac",
+    "encode_ogg_opus",
     "form_candidate_segments",
     "candidate_segments",
     "make_output_row",

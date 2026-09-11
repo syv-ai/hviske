@@ -2264,7 +2264,7 @@ def retrieve_one_for_review(
         raise TypeError("clip retriever must return bytes or a Path")
     if not result:
         raise ValueError("retrieved clip is empty")
-    handle, target = tempfile.mkstemp(prefix="p1-review-", suffix=".flac", dir=root)
+    handle, target = tempfile.mkstemp(prefix="p1-review-", suffix=".ogg", dir=root)
     with os.fdopen(handle, "wb") as output:
         output.write(result)
         output.flush()

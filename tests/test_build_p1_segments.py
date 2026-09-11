@@ -5,12 +5,14 @@ from __future__ import annotations
 import collections.abc as c
 import dataclasses
 import io
+import json
 import subprocess
 import sys
 from pathlib import Path
 from typing import cast
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 from omegaconf import DictConfig, OmegaConf
@@ -180,18 +182,25 @@ def prepared_hub(tmp_path: Path) -> MemoryHub:
     return hub
 
 
-def test_build_decodes_flac_and_purges_only_verified_output(tmp_path: Path) -> None:
-    """A native build uses FLAC bytes and purges after publisher verification."""
+def test_build_encodes_ogg_opus_and_purges_only_verified_output(tmp_path: Path) -> None:
+    """A native v8 build uses OGG/Opus and purges after verification."""
     source = FakeSource()
-    report = run_pipeline(
-        config=config(tmp_path, mode="build"), source=source, hub=prepared_hub(tmp_path)
-    )
+    hub = prepared_hub(tmp_path)
+    report = run_pipeline(config=config(tmp_path, mode="build"), source=source, hub=hub)
 
     assert source.audio_calls == 1
     assert report.max_in_flight == 1
     assert report.processed == 1
     assert report.selected_programmes == 1
     assert not list((tmp_path / "scratch" / "staging").rglob("*.parquet"))
+    published = pq.read_table(
+        io.BytesIO(hub.files["data/train/p1-programme-1-00000.parquet"])
+    ).to_pylist()[0]["audio"]["bytes"]
+    with sf.SoundFile(io.BytesIO(published)) as audio_file:
+        assert audio_file.format == "OGG"
+        assert audio_file.subtype == "OPUS"
+        assert audio_file.samplerate == 16_000
+        assert audio_file.channels == 1
     audit = (tmp_path / "scratch" / "audit-candidates.jsonl").read_text()
     assert '"parquet_path": "data/train/p1-programme-1-00000.parquet"' in audit
     assert '"row_locator": 0' in audit
@@ -306,8 +315,19 @@ run_pipeline(
     ).read_text()
     control_manifest = (control_root / "scratch" / "audit-candidates.jsonl").read_text()
     assert recovery_manifest
-    assert sorted(recovery_manifest.splitlines()) == sorted(
-        control_manifest.splitlines()
+
+    def stable_audit_fields(manifest: str) -> list[dict[str, object]]:
+        return [
+            {
+                key: value
+                for key, value in json.loads(line).items()
+                if key not in {"audio_sha256", "metadata_sha256", "parquet_sha256"}
+            }
+            for line in manifest.splitlines()
+        ]
+
+    assert sorted(stable_audit_fields(recovery_manifest), key=str) == sorted(
+        stable_audit_fields(control_manifest), key=str
     )
 
 

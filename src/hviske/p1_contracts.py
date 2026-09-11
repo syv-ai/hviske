@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import io
 import json
 import math
 import re
@@ -17,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TypeAlias
 
+import soundfile as sf
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -282,7 +284,29 @@ class OutputRow(ContractModel):
                     "timestamp-native rows cannot contain acoustic evidence"
                 )
         if not self.audio:
-            raise ValueError("audio must contain an encoded FLAC payload")
+            raise ValueError("audio must contain an encoded OGG/Opus payload")
+        if self.pipeline_version == "p1-segmentation-8":
+            try:
+                with sf.SoundFile(io.BytesIO(self.audio)) as audio_file:
+                    decoded = audio_file.read(dtype="float32", always_2d=True)
+                    valid_audio = (
+                        audio_file.format == "OGG"
+                        and audio_file.subtype == "OPUS"
+                        and audio_file.samplerate == 16_000
+                        and audio_file.channels == 1
+                        and decoded.shape[0] == self.duration_ms * 16
+                        and decoded.shape[0] > 0
+                        and all(
+                            math.isfinite(float(value)) for value in decoded.ravel()
+                        )
+                    )
+            except Exception as error:
+                raise ValueError("v8 audio must be readable OGG/Opus") from error
+            if not valid_audio:
+                raise ValueError(
+                    "v8 audio must be non-empty finite OGG/Opus mono 16 kHz "
+                    "with the expected sample count"
+                )
         return self
 
 
@@ -725,7 +749,7 @@ class NormalisationContract(ContractModel):
 class OutputEncodingContract(ContractModel):
     """Audio and shard encoding identity."""
 
-    audio_format: StrictStr = "flac"
+    audio_format: StrictStr = "ogg-opus"
     sampling_rate: StrictInt = Field(default=16000, gt=0)
     channels: StrictInt = Field(default=1, gt=0)
     shard_format: StrictStr = "parquet"

@@ -27,9 +27,15 @@ from hviske.p1_validation import (
 _REVISION = "a" * 40
 
 
-def _flac() -> bytes:
+def _ogg_opus() -> bytes:
     stream = io.BytesIO()
-    sf.write(stream, np.full(16_000, 0.1, dtype=np.float32), 16_000, format="FLAC")
+    sf.write(
+        stream,
+        np.full(16_000, 0.1, dtype=np.float32),
+        16_000,
+        format="OGG",
+        subtype="OPUS",
+    )
     return stream.getvalue()
 
 
@@ -64,7 +70,7 @@ print("torch" in sys.modules, "transformers" in sys.modules)
     assert helped.stdout.rstrip().endswith("False False")
 
 
-_AUDIO = _flac()
+_AUDIO = _ogg_opus()
 _AUDIO_SHA256 = hashlib.sha256(_AUDIO).hexdigest()
 
 
@@ -263,7 +269,7 @@ def test_gate_failure_report_does_not_claim_unexecuted_checks_pass(
     checks = t.cast(dict[str, bool], report["checks"])
     assert checks["private_immutable_revision"] is True
     assert checks["exact_schema"] is False
-    assert checks["flac_pcm16_16khz_mono"] is False
+    assert checks["ogg_opus_16khz_mono"] is False
     assert checks["trainable_text"] is False
 
 

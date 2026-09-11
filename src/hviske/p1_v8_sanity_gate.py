@@ -165,7 +165,7 @@ def run_v8_sanity_gate(
     if retrievals == SAMPLE_SIZE and structural_failures == 0:
         for name in (
             "hashes",
-            "flac_pcm16_16khz_mono",
+            "ogg_opus_16khz_mono",
             "exact_schema",
             "timestamp_native_v8",
             "exact_duration_and_bounds",
@@ -194,12 +194,12 @@ def run_v8_sanity_gate(
 def _decode_audio(audio: bytes, *, duration_ms: int) -> np.ndarray:
     with sf.SoundFile(io.BytesIO(audio)) as audio_file:
         if (
-            audio_file.format != "FLAC"
-            or audio_file.subtype != "PCM_16"
+            audio_file.format != "OGG"
+            or audio_file.subtype != "OPUS"
             or audio_file.samplerate != 16_000
             or audio_file.channels != 1
         ):
-            raise ValueError("audio is not PCM_16 FLAC mono 16 kHz")
+            raise ValueError("audio is not OGG/Opus mono 16 kHz")
         decoded = audio_file.read(dtype="float32", always_2d=True)
     if (
         not np.isfinite(decoded).all()
@@ -231,7 +231,7 @@ def _empty_report(
         "checks": {
             "private_immutable_revision": False,
             "hashes": False,
-            "flac_pcm16_16khz_mono": False,
+            "ogg_opus_16khz_mono": False,
             "exact_schema": False,
             "one_pipeline_digest": False,
             "timestamp_native_v8": False,

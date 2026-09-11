@@ -109,7 +109,7 @@ dataset_license:
   target_sha256: e06010caf8ea36292a241339c08eedc7ea399778954cf9a546e989d421a48cd6
 
 output:
-  audio_format: flac
+  audio_format: ogg-opus
   sampling_rate: 16000
   channels: 1
   shard_format: parquet
