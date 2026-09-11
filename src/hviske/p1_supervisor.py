@@ -15,6 +15,7 @@ import logging
 import multiprocessing
 import queue
 import re
+import shutil
 import signal
 import time
 import typing as t
@@ -23,7 +24,13 @@ from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
 
-from .p1_pipeline import PipelineSettings, _safe_exception_category, run_pipeline
+from .p1_pipeline import (
+    PipelineSettings,
+    _safe_exception_category,
+    calculate_scratch_requirement,
+    directory_size,
+    run_pipeline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +39,8 @@ _DEFAULT_RETRY_DELAY_SECONDS = 5.0
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_SHUTDOWN_GRACE_SECONDS = 30.0
 _MAX_RETRY_DELAY_SECONDS = 300.0
+_TERMINAL_STATUS_GRACE_SECONDS = 0.5
+_STATUS_POLL_SECONDS = 0.01
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
@@ -246,6 +255,7 @@ def run_supervisor(
     supervisor_root.mkdir(parents=True, exist_ok=True)
     marker_root.mkdir(parents=True, exist_ok=True)
     _remove_old_markers(supervisor_root=supervisor_root, marker_root=marker_root)
+    _validate_aggregate_scratch_capacity(configs=partition_configs, run_root=run_root)
 
     states = [_PartitionState(config=item) for item in partition_configs]
     logs = _StatusLogs(root=supervisor_root, process_count=controls.process_count)
@@ -293,6 +303,7 @@ def run_supervisor(
                 states=states,
                 terminal=terminal,
                 logs=logs,
+                status_queue=status_queue,
                 retry_at=retry_at,
                 completed=completed,
                 failed=failed,
@@ -341,10 +352,19 @@ def run_supervisor(
             exit_code=1 if failed or interrupted else 0,
         )
     finally:
-        _restore_signal_handlers(previous_handlers)
-        logs.close()
-        status_queue.close()
-        status_queue.join_thread()
+        try:
+            _terminate_active(
+                active=active, grace_seconds=controls.shutdown_grace_seconds
+            )
+        finally:
+            _restore_signal_handlers(previous_handlers)
+            try:
+                logs.close()
+            finally:
+                try:
+                    status_queue.close()
+                finally:
+                    status_queue.join_thread()
 
 
 @dataclass
@@ -448,6 +468,7 @@ def _reap_partitions(
     states: list[_PartitionState],
     terminal: dict[tuple[int, int], StatusPayload],
     logs: _StatusLogs,
+    status_queue: object,
     retry_at: dict[int, float],
     completed: set[int],
     failed: set[int],
@@ -461,7 +482,14 @@ def _reap_partitions(
         process.join()
         del active[partition_index]
         state = states[partition_index]
-        status = terminal.pop((partition_index, state.attempt), None)
+        status_key = (partition_index, state.attempt)
+        _await_terminal_status(
+            status_queue=status_queue,
+            logs=logs,
+            terminal=terminal,
+            status_key=status_key,
+        )
+        status = terminal.pop(status_key, None)
         succeeded = (
             process.exitcode == 0 and status is not None and status["outcome"] == "DONE"
         )
@@ -482,6 +510,25 @@ def _reap_partitions(
         retry_at[partition_index] = time.monotonic() + min(
             retry_delay_seconds * (2 ** (state.attempt - 1)), _MAX_RETRY_DELAY_SECONDS
         )
+
+
+def _await_terminal_status(
+    *,
+    status_queue: object,
+    logs: _StatusLogs,
+    terminal: dict[tuple[int, int], StatusPayload],
+    status_key: tuple[int, int],
+) -> None:
+    """Allow a child queue feeder to publish its terminal status after exit."""
+    deadline = time.monotonic() + _TERMINAL_STATUS_GRACE_SECONDS
+    while status_key not in terminal:
+        _drain_statuses(status_queue=status_queue, logs=logs, terminal=terminal)
+        if status_key in terminal:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(_STATUS_POLL_SECONDS, remaining))
 
 
 def _crash_status(*, partition_index: int, attempt: int) -> StatusPayload:
@@ -552,6 +599,38 @@ def _terminate_active(
     active.clear()
 
 
+def _validate_aggregate_scratch_capacity(
+    *, configs: c.Sequence[DictConfig], run_root: Path
+) -> None:
+    """Reject an aggregate run that cannot fit on the shared scratch filesystem.
+
+    Raises:
+        ValueError:
+            If configured aggregate scratch limits or free space are insufficient.
+    """
+    resolved = [PipelineSettings.from_config(config) for config in configs]
+    required = 0
+    maximum = 0
+    for item in resolved:
+        per_worker = calculate_scratch_requirement(
+            settings=item,
+            maximum_source_bytes=item.max_source_bytes,
+            shard_count=item.shards_per_commit,
+        )
+        required += per_worker * item.workers
+        maximum += item.max_scratch_bytes
+    existing = directory_size(run_root)
+    free_bytes = shutil.disk_usage(run_root).free
+    if existing + required > maximum:
+        raise ValueError(
+            "aggregate scratch budget exceeds configured max_scratch_bytes"
+        )
+    if free_bytes < required:
+        raise ValueError(
+            f"insufficient aggregate free space: need {required}, have {free_bytes}"
+        )
+
+
 def _write_markers(
     *,
     supervisor_root: Path,
@@ -563,23 +642,38 @@ def _write_markers(
     done_lines: list[str] = []
     failed_lines: list[str] = []
     for index, state in enumerate(states):
+        marker_body = f"partition={index}\nattempts={state.attempt}\n"
         if index in completed:
             target = marker_root / f"partition-{index}.DONE"
-            done_lines.append(f"partition={index} attempts={state.attempt}")
+            marker_body_for_aggregate = f"partition={index} attempts={state.attempt}"
+            done_lines.append(marker_body_for_aggregate)
+            (marker_root / f"partition-{index}.FAILED").unlink(missing_ok=True)
         else:
             target = marker_root / f"partition-{index}.FAILED"
             failed_lines.append(f"partition={index} attempts={state.attempt}")
-        target.write_text(
-            f"partition={index}\nattempts={state.attempt}\n", encoding="utf-8"
+            (marker_root / f"partition-{index}.DONE").unlink(missing_ok=True)
+        _write_marker_atomically(path=target, content=marker_body)
+
+    all_completed = completed == set(range(len(states))) and not failed
+    aggregate_done = supervisor_root / "DONE"
+    aggregate_failed = supervisor_root / "FAILED"
+    if all_completed:
+        aggregate_failed.unlink(missing_ok=True)
+        _write_marker_atomically(
+            path=aggregate_done, content="\n".join(done_lines) + "\n"
         )
-    if done_lines:
-        (supervisor_root / "DONE").write_text(
-            "\n".join(done_lines) + "\n", encoding="utf-8"
+    else:
+        aggregate_done.unlink(missing_ok=True)
+        _write_marker_atomically(
+            path=aggregate_failed, content="\n".join(failed_lines) + "\n"
         )
-    if failed_lines:
-        (supervisor_root / "FAILED").write_text(
-            "\n".join(failed_lines) + "\n", encoding="utf-8"
-        )
+
+
+def _write_marker_atomically(*, path: Path, content: str) -> None:
+    """Replace a marker without exposing a partially written completion record."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
 
 
 def derive_partition_configs(

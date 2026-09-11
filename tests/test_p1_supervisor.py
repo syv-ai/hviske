@@ -5,6 +5,8 @@ from __future__ import annotations
 import collections.abc as c
 import multiprocessing
 import queue
+import threading
+import time
 import typing as t
 from pathlib import Path
 
@@ -13,6 +15,35 @@ from omegaconf import DictConfig, OmegaConf
 
 import hviske.p1_supervisor as supervisor
 from hviske.p1_pipeline import PipelineSettings
+
+
+def test_aggregate_scratch_capacity_is_checked_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parent reserves every partition's conservative scratch budget."""
+    config = _config(tmp_path)
+    configs = supervisor.derive_partition_configs(
+        config=config,
+        settings=supervisor.SupervisorSettings(process_count=2, run_root=tmp_path),
+    )
+    monkeypatch.setattr(
+        supervisor, "calculate_scratch_requirement", lambda **kwargs: 100
+    )
+    monkeypatch.setattr(
+        supervisor.shutil, "disk_usage", lambda path: type("Usage", (), {"free": 150})()
+    )
+
+    with pytest.raises(ValueError, match="aggregate free space"):
+        supervisor._validate_aggregate_scratch_capacity(
+            configs=configs, run_root=tmp_path
+        )
+
+
+def _config(tmp_path: Path) -> DictConfig:
+    config = OmegaConf.load("config/p1_segments.yaml")
+    config.runtime.scratch_root = str(tmp_path / "run")
+    config.supervisor.process_count = 3
+    return t.cast(DictConfig, config)
 
 
 def test_child_ipc_is_bounded_status_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,6 +117,119 @@ class _StubbornProcess:
         self.terminated = True
 
 
+def test_mixed_partition_outcome_removes_stale_aggregate_done(tmp_path: Path) -> None:
+    """Mixed outcomes publish only FAILED while retaining partition markers."""
+    supervisor_root = tmp_path / "supervisor"
+    marker_root = supervisor_root / "markers"
+    marker_root.mkdir(parents=True)
+    (supervisor_root / "DONE").write_text("stale", encoding="utf-8")
+    states = [
+        supervisor._PartitionState(config=OmegaConf.create({}), attempt=1),
+        supervisor._PartitionState(config=OmegaConf.create({}), attempt=2),
+    ]
+
+    supervisor._write_markers(
+        supervisor_root=supervisor_root,
+        marker_root=marker_root,
+        completed={0},
+        failed={1},
+        states=states,
+    )
+
+    assert not (supervisor_root / "DONE").exists()
+    assert (supervisor_root / "FAILED").exists()
+    assert (marker_root / "partition-0.DONE").exists()
+    assert (marker_root / "partition-1.FAILED").exists()
+
+
+def test_parent_exception_terminates_children_before_closing_ipc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unexpected parent errors still reap every child before queue teardown."""
+    context = _LiveContext()
+    monkeypatch.setattr(supervisor.multiprocessing, "get_context", lambda name: context)
+
+    def explode(**kwargs: object) -> None:
+        del kwargs
+        raise RuntimeError("parent failure")
+
+    monkeypatch.setattr(supervisor, "_drain_statuses", explode)
+    with pytest.raises(RuntimeError, match="parent failure"):
+        supervisor.run_supervisor(
+            config=_config(tmp_path),
+            settings=supervisor.SupervisorSettings(
+                process_count=1,
+                max_attempts=1,
+                shutdown_grace_seconds=0,
+                run_root=tmp_path / "run",
+            ),
+        )
+
+    assert context.process.terminated
+    assert context.process.joined
+
+
+class _FakeQueue:
+    def __init__(self) -> None:
+        self.values: list[object] = []
+
+    def close(self) -> None:
+        pass
+
+    def get_nowait(self) -> object:
+        if not self.values:
+            raise queue.Empty
+        return self.values.pop(0)
+
+    def join_thread(self) -> None:
+        pass
+
+    def put(self, value: object, *, timeout: float) -> None:
+        del timeout
+        self.values.append(value)
+
+
+class _LiveProcess:
+    exitcode = None
+
+    def __init__(self) -> None:
+        self.alive = True
+        self.terminated = False
+        self.joined = False
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+        self.joined = True
+
+    def kill(self) -> None:
+        self.alive = False
+
+    def start(self) -> None:
+        pass
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.alive = False
+
+
+class _LiveContext:
+    def __init__(self) -> None:
+        self.process = _LiveProcess()
+
+    def Process(
+        self, *, target: c.Callable[..., None], args: tuple[object, ...], name: str
+    ) -> _LiveProcess:
+        del target, args, name
+        return self.process
+
+    def Queue(self, *, maxsize: int) -> _FakeQueue:
+        del maxsize
+        return _FakeQueue()
+
+
 def test_partition_configs_have_one_digest_unique_scratch_and_common_lock(
     tmp_path: Path,
 ) -> None:
@@ -104,11 +248,68 @@ def test_partition_configs_have_one_digest_unique_scratch_and_common_lock(
     assert {item.workers for item in resolved} == {1}
 
 
-def _config(tmp_path: Path) -> DictConfig:
-    config = OmegaConf.load("config/p1_segments.yaml")
-    config.runtime.scratch_root = str(tmp_path / "run")
-    config.supervisor.process_count = 3
-    return t.cast(DictConfig, config)
+def test_reap_waits_for_asynchronous_terminal_status(tmp_path: Path) -> None:
+    """A feeder-delayed DONE status is observed after the child has exited."""
+    context = multiprocessing.get_context("spawn")
+    status_queue = context.Queue(maxsize=2)
+    status: supervisor.StatusPayload = {
+        "partition_index": 0,
+        "attempt": 1,
+        "outcome": "DONE",
+        "category": "none",
+        "exception_class": "none",
+        "status": "done",
+        "started_at": "now",
+        "finished_at": "now",
+    }
+
+    def publish_later() -> None:
+        time.sleep(0.03)
+        status_queue.put(status)
+
+    publisher = threading.Thread(target=publish_later)
+    publisher.start()
+    process = _AlreadyExitedProcess()
+    logs = supervisor._StatusLogs(root=tmp_path, process_count=1)
+    states = [supervisor._PartitionState(config=OmegaConf.create({}), attempt=1)]
+    active = {0: t.cast(multiprocessing.Process, process)}
+    completed: set[int] = set()
+    failed: set[int] = set()
+    try:
+        supervisor._reap_partitions(
+            active=active,
+            states=states,
+            terminal={},
+            logs=logs,
+            status_queue=status_queue,
+            retry_at={},
+            completed=completed,
+            failed=failed,
+            max_attempts=1,
+            retry_delay_seconds=0,
+            stop_requested=False,
+        )
+    finally:
+        publisher.join()
+        logs.close()
+        status_queue.close()
+        status_queue.join_thread()
+
+    assert completed == {0}
+    assert not failed
+    assert process.joined
+
+
+class _AlreadyExitedProcess:
+    exitcode = 0
+    joined = False
+
+    def is_alive(self) -> bool:
+        return False
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+        self.joined = True
 
 
 def test_supervisor_exhausts_retries_and_writes_failed_marker(
@@ -160,26 +361,6 @@ class _FakeProcess:
     def start(self) -> None:
         self._target(*self._args)
         self.exitcode = 0
-
-
-class _FakeQueue:
-    def __init__(self) -> None:
-        self.values: list[object] = []
-
-    def close(self) -> None:
-        pass
-
-    def get_nowait(self) -> object:
-        if not self.values:
-            raise queue.Empty
-        return self.values.pop(0)
-
-    def join_thread(self) -> None:
-        pass
-
-    def put(self, value: object, *, timeout: float) -> None:
-        del timeout
-        self.values.append(value)
 
 
 class _FakeContext:
