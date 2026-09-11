@@ -204,6 +204,7 @@ def test_build_encodes_ogg_opus_and_purges_only_verified_output(tmp_path: Path) 
     audit = (tmp_path / "scratch" / "audit-candidates.jsonl").read_text()
     assert '"parquet_path": "data/train/p1-programme-1-00000.parquet"' in audit
     assert '"row_locator": 0' in audit
+    assert any(path.startswith("manifests/p0-batch-") for path in hub.files)
 
 
 def test_plan_dispatches_metadata_only_source_tree_access(tmp_path: Path) -> None:

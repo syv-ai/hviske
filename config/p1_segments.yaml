@@ -118,7 +118,12 @@ runtime:
   scratch_root: /scratch/syvai/p1-segmentation-v8
   max_source_bytes: 6197291423
   max_scratch_bytes: 68719476736
+  # Each externally launched partition keeps one in-process programme worker.
   workers: 1
+  partition_count: 1
+  partition_index: 0
+  # Shared by all partition scratch directories; runtime-only, not pipeline identity.
+  publish_lock_path: null
   queue_slots: 1
   upload_concurrency: 1
   verification_concurrency: 1
