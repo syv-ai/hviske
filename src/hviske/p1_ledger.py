@@ -170,6 +170,10 @@ class Ledger:
                 when all its records already use it.
             reset_processing (optional):
                 Whether to reset processing rows on open. Defaults to True.
+
+        Raises:
+            LedgerError:
+                If the file-backed database cannot use DELETE journal mode.
         """
         if pipeline_digest is not None:
             self._validate_digest(pipeline_digest, "pipeline_digest")
@@ -178,17 +182,21 @@ class Ledger:
         database = str(path)
         self._connection = sqlite3.connect(database, isolation_level=None, timeout=30)
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA busy_timeout = 30000")
-        self._connection.execute("PRAGMA synchronous = FULL")
         try:
+            if database != ":memory:":
+                journal_mode = self._connection.execute(
+                    "PRAGMA journal_mode = DELETE"
+                ).fetchone()
+                if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+                    raise LedgerError("unable to select SQLite DELETE journal mode")
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA busy_timeout = 30000")
+            self._connection.execute("PRAGMA synchronous = FULL")
             with self.transaction() as connection:
                 self._migrate(connection)
                 self._bind_pipeline_digest(connection, pipeline_digest)
             if reset_processing:
                 self.reset_abandoned_processing()
-            if database != ":memory:":
-                self._connection.execute("PRAGMA journal_mode = WAL")
         except BaseException:
             self._connection.close()
             raise
@@ -1777,7 +1785,7 @@ class Ledger:
     def _sync_database(self) -> None:
         if self.path == Path(":memory:"):
             return
-        for filename in (self.path, Path(f"{self.path}-wal")):
+        for filename in (self.path,):
             try:
                 descriptor = os.open(filename, os.O_RDONLY)
             except OSError:

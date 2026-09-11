@@ -133,6 +133,36 @@ def add_batch(ledger: Ledger, batch_id: str = "batch-1") -> None:
     ledger.attach_shard(batch_id, "shard-1")
 
 
+def test_file_ledger_uses_delete_journal_without_sidecars(tmp_path: Path) -> None:
+    """File ledgers use rollback journals for normal and failed transactions.
+
+    Raises:
+        RuntimeError:
+            Deliberately aborts the transaction under test.
+    """
+    database = tmp_path / "ledger.sqlite"
+
+    with Ledger(database) as ledger:
+        assert (
+            ledger._connection.execute("PRAGMA journal_mode").fetchone()[0].lower()
+            == "delete"
+        )
+        assert ledger._connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+        add_programme(ledger)
+        with pytest.raises(RuntimeError, match="abort transaction"):
+            with ledger.transaction() as connection:
+                connection.execute(
+                    "UPDATE programmes SET last_error = ?", ("must roll back",)
+                )
+                raise RuntimeError("abort transaction")
+        assert ledger.programme("programme-1").last_error is None
+        assert not Path(f"{database}-wal").exists()
+        assert not Path(f"{database}-shm").exists()
+
+    assert not Path(f"{database}-wal").exists()
+    assert not Path(f"{database}-shm").exists()
+
+
 def test_incompatible_legacy_migration_rolls_back_every_schema_change(
     tmp_path: Path,
 ) -> None:
@@ -407,12 +437,21 @@ def test_restart_resets_abandoned_processing_and_preserves_attempts(
     add_programme(first)
     first.start_processing("programme-1")
     first.close()
+    assert not Path(f"{database}-wal").exists()
+    assert not Path(f"{database}-shm").exists()
 
     with Ledger(database) as second:
+        assert (
+            second._connection.execute("PRAGMA journal_mode").fetchone()[0].lower()
+            == "delete"
+        )
         record = second.programme("programme-1")
         assert record.state is LedgerState.RETRYABLE
         assert record.attempts == 1
         assert second.start_processing("programme-1").attempts == 2
+
+    assert not Path(f"{database}-wal").exists()
+    assert not Path(f"{database}-shm").exists()
 
 
 def test_schema_is_atomic_and_metadata_only(tmp_path: Path) -> None:
