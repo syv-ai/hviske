@@ -971,6 +971,8 @@ def publish_batch(
     batch_id: str,
     shards: c.Sequence[LocalShard],
     *,
+    expected_pipeline_version: str,
+    expected_pipeline_config_sha256: str,
     programme_count: int = 0,
     rejection_counts: dict[RejectionCategory, int] | None = None,
     validator: c.Callable[[object, str], None] | None = None,
@@ -993,6 +995,10 @@ def publish_batch(
             Stable local batch identifier.
         shards:
             Explicit local Parquet files in this batch.
+        expected_pipeline_version:
+            Pipeline version required in every local and remote row.
+        expected_pipeline_config_sha256:
+            Configuration digest required in every local and remote row.
         programme_count (optional):
             Number of source programmes represented by the batch.
         rejection_counts (optional):
@@ -1026,6 +1032,9 @@ def publish_batch(
         PublicationError:
             If durable ledger evidence does not match the local batch.
     """
+    _validate_expected_identity(
+        expected_pipeline_version, expected_pipeline_config_sha256
+    )
     if shards and len(shards) + 1 >= 100:
         raise AllowListError("a Hub commit must contain fewer than 100 operations")
     target_info = api.repo_info(repo_id=repo_id, repo_type="dataset")
@@ -1057,6 +1066,8 @@ def publish_batch(
             repo_id,
             batch_id,
             ledger=ledger,
+            expected_pipeline_version=expected_pipeline_version,
+            expected_pipeline_config_sha256=expected_pipeline_config_sha256,
             validator=validator,
             schema_validator=schema_validator,
             expected_schema=expected_schema,
@@ -1066,7 +1077,14 @@ def publish_batch(
         )
     if not shards:
         raise AllowListError("a publication batch must contain at least one shard")
-    local_evidence = tuple(_local_evidence(shard) for shard in shards)
+    local_evidence = tuple(
+        _local_evidence(
+            shard,
+            expected_pipeline_version=expected_pipeline_version,
+            expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+        )
+        for shard in shards
+    )
     _assert_unique_paths(local_evidence)
     if ledger_record is not None and ledger_record.state is LedgerState.SHARDED:
         durable_evidence = tuple(
@@ -1150,6 +1168,8 @@ def publish_batch(
         commit_id=commit_id,
         programme_count=programme_count,
         rejection_counts=counts,
+        expected_pipeline_version=expected_pipeline_version,
+        expected_pipeline_config_sha256=expected_pipeline_config_sha256,
         validator=validator,
         schema_validator=schema_validator,
         expected_schema=expected_schema,
@@ -1167,6 +1187,8 @@ def verify_batch(
     repo_id: str,
     batch_id: str,
     *,
+    expected_pipeline_version: str,
+    expected_pipeline_config_sha256: str,
     local_evidence: c.Sequence[ShardEvidence] | None = None,
     manifest_path: Path | None = None,
     commit_id: str | None = None,
@@ -1198,6 +1220,9 @@ def verify_batch(
         VerificationError:
             If any remote object, manifest, schema, or audio decode is invalid.
     """
+    _validate_expected_identity(
+        expected_pipeline_version, expected_pipeline_config_sha256
+    )
     if ledger is not None:
         record = ledger.batch(batch_id)
         if record.commit_id is None:
@@ -1270,7 +1295,12 @@ def verify_batch(
         elif actual_schema is not None:
             _assert_exact_schema(actual_schema, _EXPECTED_FEATURES, item.path)
         if actual_schema is not None or validator is None:
-            validate_streaming_sample(dataset, item.path)
+            validate_streaming_sample(
+                dataset,
+                item.path,
+                expected_pipeline_version=expected_pipeline_version,
+                expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+            )
         if validator is not None:
             validator(dataset, item.path)
         if schema_validator is not None:
@@ -1340,7 +1370,12 @@ def _has_parquet_footer(path: Path) -> bool:
     return header == b"PAR1" and footer == b"PAR1"
 
 
-def _local_evidence(shard: LocalShard) -> ShardEvidence:
+def _local_evidence(
+    shard: LocalShard,
+    *,
+    expected_pipeline_version: str,
+    expected_pipeline_config_sha256: str,
+) -> ShardEvidence:
     if shard.row_count < 0:
         raise AllowListError(f"negative row count for {shard.repo_path}")
     _assert_repo_path(shard.repo_path)
@@ -1348,7 +1383,12 @@ def _local_evidence(shard: LocalShard) -> ShardEvidence:
         raise AllowListError(f"only Parquet shards may be uploaded: {shard.repo_path}")
     if shard.path.is_symlink() or not shard.path.is_file():
         raise AllowListError(f"shard is not a regular non-symlink file: {shard.path}")
-    validate_local_shard(shard.path, expected_row_count=shard.row_count)
+    validate_local_shard(
+        shard.path,
+        expected_row_count=shard.row_count,
+        expected_pipeline_version=expected_pipeline_version,
+        expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+    )
     digest, size = _stream_local(shard.path)
     return ShardEvidence(
         path=shard.repo_path, byte_size=size, row_count=shard.row_count, sha256=digest
@@ -1377,7 +1417,13 @@ def _stream_local(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def validate_local_shard(path: Path, *, expected_row_count: int | None = None) -> None:
+def validate_local_shard(
+    path: Path,
+    *,
+    expected_pipeline_version: str,
+    expected_pipeline_config_sha256: str,
+    expected_row_count: int | None = None,
+) -> None:
     """Validate one local shard before it is eligible for upload.
 
     The Parquet Arrow schema and Hugging Face feature metadata are compared as one
@@ -1388,6 +1434,10 @@ def validate_local_shard(path: Path, *, expected_row_count: int | None = None) -
     Args:
         path:
             Local Parquet shard.
+        expected_pipeline_version:
+            Pipeline version required in every row.
+        expected_pipeline_config_sha256:
+            Configuration digest required in every row.
         expected_row_count (optional):
             Row count recorded by the assembler. Defaults to no count check.
 
@@ -1395,6 +1445,9 @@ def validate_local_shard(path: Path, *, expected_row_count: int | None = None) -
         VerificationError:
             If the schema, row count, audio payload, digest, or duration is invalid.
     """
+    _validate_expected_identity(
+        expected_pipeline_version, expected_pipeline_config_sha256
+    )
     if path.is_symlink() or not path.is_file():
         raise VerificationError(f"local shard is not a regular file: {path}")
     try:
@@ -1408,10 +1461,20 @@ def validate_local_shard(path: Path, *, expected_row_count: int | None = None) -
         batch = next(batches, None)
         if batch is None or batch.num_rows == 0:
             raise VerificationError(f"empty local shard: {path}")
-        _validate_row(batch.to_pylist()[0], str(path))
+        _validate_row(
+            batch.to_pylist()[0],
+            str(path),
+            expected_pipeline_version=expected_pipeline_version,
+            expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+        )
         for batch in batches:
             for row in batch.to_pylist():
-                _validate_row(row, str(path))
+                _validate_row(
+                    row,
+                    str(path),
+                    expected_pipeline_version=expected_pipeline_version,
+                    expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+                )
     except VerificationError:
         raise
     except Exception as error:
@@ -1419,12 +1482,40 @@ def validate_local_shard(path: Path, *, expected_row_count: int | None = None) -
     return
 
 
-def _validate_row(row: object, shard_path: str) -> None:
+def _validate_expected_identity(version: str, digest: str) -> None:
+    """Require an explicit version and configuration digest for publication checks.
+
+    Raises:
+        ValueError:
+            If either identity component is missing or malformed.
+    """
+    if not isinstance(version, str) or not version:
+        raise ValueError("expected pipeline version is required")
+    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        raise ValueError("expected pipeline configuration digest must be SHA-256")
+
+
+def _validate_row(
+    row: object,
+    shard_path: str,
+    *,
+    expected_pipeline_version: str,
+    expected_pipeline_config_sha256: str,
+) -> None:
     if not isinstance(row, dict):
         raise VerificationError(f"decoded row is not a mapping: {shard_path}")
     expected_names = {field.name for field in OUTPUT_SCHEMA.fields}
     if set(row) != expected_names:
         raise VerificationError(f"exact P1 fields mismatch for {shard_path}")
+    _validate_expected_identity(
+        expected_pipeline_version, expected_pipeline_config_sha256
+    )
+    if row.get("pipeline_version") != expected_pipeline_version:
+        raise VerificationError(f"pipeline version mismatch for {shard_path}")
+    if row.get("pipeline_config_sha256") != expected_pipeline_config_sha256:
+        raise VerificationError(
+            f"pipeline configuration digest mismatch for {shard_path}"
+        )
     audio = row.get("audio")
     if not isinstance(audio, dict):
         raise VerificationError(f"audio is not a structured feature: {shard_path}")
@@ -1766,7 +1857,13 @@ def validate_staging_directory(
     return tuple(root / path for path in allowed_paths)
 
 
-def validate_streaming_sample(dataset: object, shard_path: str) -> None:
+def validate_streaming_sample(
+    dataset: object,
+    shard_path: str,
+    *,
+    expected_pipeline_version: str,
+    expected_pipeline_config_sha256: str,
+) -> None:
     """Decode one deterministic sample from a streaming shard dataset.
 
     Args:
@@ -1774,11 +1871,18 @@ def validate_streaming_sample(dataset: object, shard_path: str) -> None:
             Dataset returned by ``load_dataset(..., streaming=True)``.
         shard_path:
             Remote shard path, used in the diagnostic.
+        expected_pipeline_version:
+            Pipeline version required in the decoded row.
+        expected_pipeline_config_sha256:
+            Configuration digest required in the decoded row.
 
     Raises:
         VerificationError:
             If the shard is empty or iteration cannot decode a sample.
     """
+    _validate_expected_identity(
+        expected_pipeline_version, expected_pipeline_config_sha256
+    )
     try:
         sample = next(iter(t.cast(c.Iterator[object], dataset)))
     except Exception as error:
@@ -1789,26 +1893,29 @@ def validate_streaming_sample(dataset: object, shard_path: str) -> None:
         raise VerificationError(f"empty streaming shard: {shard_path}")
     if not isinstance(sample, dict):
         raise VerificationError(f"schema cannot decode a P1 row: {shard_path}")
-    if hasattr(sample, "keys") and set(sample) not in (
-        {field.name for field in OUTPUT_SCHEMA.fields},
-        {"audio", "text"},
-    ):
+    if set(sample) != {field.name for field in OUTPUT_SCHEMA.fields}:
         raise VerificationError(f"exact P1 fields mismatch for {shard_path}")
+    if sample.get("pipeline_version") != expected_pipeline_version:
+        raise VerificationError(f"pipeline version mismatch for {shard_path}")
+    if sample.get("pipeline_config_sha256") != expected_pipeline_config_sha256:
+        raise VerificationError(
+            f"pipeline configuration digest mismatch for {shard_path}"
+        )
     audio = sample.get("audio")
     if not isinstance(audio, dict):
         raise VerificationError(f"audio is not a structured feature: {shard_path}")
     payload = audio.get("bytes")
     if isinstance(payload, bytes):
-        _validate_row(sample, shard_path)
+        _validate_row(
+            sample,
+            shard_path,
+            expected_pipeline_version=expected_pipeline_version,
+            expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+        )
         return
-    legacy_sample = set(sample) == {"audio", "text"}
-    # A test double or a loader configured with decode=True may expose the decoded
-    # array only.  It can prove shape and rate, but never the encoded-payload hash.
+    # A loader configured with decode=True may expose the decoded array only. It can
+    # prove shape and rate, but never the encoded-payload hash required for P1.
     array = audio.get("array")
-    if legacy_sample:
-        if array is None or (hasattr(array, "__len__") and len(array) == 0):
-            raise VerificationError(f"audio payload is empty: {shard_path}")
-        return
     sample_rate = audio.get("sampling_rate")
     if array is None or sample_rate != 16000:
         raise VerificationError(

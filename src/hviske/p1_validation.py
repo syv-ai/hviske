@@ -321,6 +321,8 @@ def _metadata_copy(row: MetadataRow) -> dict[str, object]:
     """
     allowed = {
         "segment_id",
+        "pipeline_version",
+        "pipeline_config_sha256",
         "id",
         "source_file_id",
         "source_repository",
@@ -824,6 +826,8 @@ def create_blinded_audit_manifest(
             ),
             stratum=_stratum_key(row),
             metadata_sha256=_metadata_digest_for_candidate(row),
+            pipeline_version=_string(row, "pipeline_version"),
+            pipeline_config_sha256=_string(row, "pipeline_config_sha256"),
             audio_sha256=_string(row, "_p1_audio_sha256", "audio_sha256"),
             parquet_sha256=_string(
                 row, "parquet_sha256", "shard_sha256", "_p1_parquet_sha256"
@@ -873,6 +877,8 @@ class AuditCandidate:
     row_locator: int = 0
     stratum: tuple[str, ...] = ()
     metadata_sha256: str = ""
+    pipeline_version: str | None = None
+    pipeline_config_sha256: str | None = None
     audio_sha256: str | None = None
     parquet_sha256: str | None = None
     source_file_id: str | None = None
@@ -942,6 +948,10 @@ class AuditCandidate:
             "stratum": list(self.stratum),
             "metadata_sha256": self.metadata_sha256,
         }
+        if self.pipeline_version is not None:
+            result["pipeline_version"] = self.pipeline_version
+        if self.pipeline_config_sha256 is not None:
+            result["pipeline_config_sha256"] = self.pipeline_config_sha256
         if self.parquet_path is not None:
             result.update(
                 {
@@ -1024,6 +1034,8 @@ class PinnedHubClipRetriever:
         repository: str | None = None,
         repo_id: str | None = None,
         revision: str,
+        expected_pipeline_version: str | None = None,
+        expected_pipeline_config_sha256: str | None = None,
     ) -> None:
         """Initialise a retriever pinned to a complete Hub commit SHA.
 
@@ -1033,12 +1045,24 @@ class PinnedHubClipRetriever:
         """
         if not _COMMIT_SHA.fullmatch(revision):
             raise ValueError("revision must be a complete 40-character commit SHA")
+        if (expected_pipeline_version is None) != (
+            expected_pipeline_config_sha256 is None
+        ):
+            raise ValueError(
+                "expected pipeline version and digest must be supplied together"
+            )
+        if expected_pipeline_config_sha256 is not None and not _SHA256.fullmatch(
+            expected_pipeline_config_sha256
+        ):
+            raise ValueError("expected pipeline configuration digest must be SHA-256")
         selected_repository = repository or repo_id
         if not selected_repository:
             raise ValueError("repository must be supplied")
         self.hub = hub
         self.repository = selected_repository
         self.revision = revision
+        self.expected_pipeline_version = expected_pipeline_version
+        self.expected_pipeline_config_sha256 = expected_pipeline_config_sha256
         self._repository_verified = False
 
     def retrieve(self, entry: MetadataRow) -> bytes:
@@ -1105,6 +1129,16 @@ class PinnedHubClipRetriever:
         expected_metadata = _string(entry, "metadata_sha256")
         if expected_metadata and expected_metadata != _metadata_digest(row):
             raise ValueError("retrieved row metadata hash does not match candidate")
+        if self.expected_pipeline_version is not None:
+            expected_fields = {field.name for field in OUTPUT_SCHEMA.fields}
+            if set(row) != expected_fields:
+                raise ValueError("retrieved row does not have the exact output schema")
+            if row.get("pipeline_version") != self.expected_pipeline_version:
+                raise ValueError("retrieved row has a different pipeline version")
+            if row.get("pipeline_config_sha256") != (
+                self.expected_pipeline_config_sha256
+            ):
+                raise ValueError("retrieved row has a different pipeline digest")
         audio = _embedded_audio(row)
         expected_audio = _string(entry, "audio_sha256")
         if expected_audio and hashlib.sha256(audio).hexdigest() != expected_audio:

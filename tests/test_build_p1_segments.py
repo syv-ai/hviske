@@ -17,7 +17,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from hviske.p1_ledger import Ledger
 from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
-from hviske.p1_segments import AlignmentResult, VADSignal
 from hviske.p1_source import (
     AudioPointer,
     ParsedAudio,
@@ -66,8 +65,6 @@ def test_allocation_failure_never_leaves_programme_sharded(
             config=config(tmp_path, mode="build"),
             source=source,
             hub=prepared_hub(tmp_path),
-            ctc=FakeCtc(),
-            vad=FakeVad(),
         )
 
     with Ledger(
@@ -77,23 +74,6 @@ def test_allocation_failure_never_leaves_programme_sharded(
         programme = ledger.programme("p1-programme-1")
         assert programme.state.value == "retryable"
         assert programme.last_error == "runtime_error"
-
-
-class FakeCtc:
-    """Model-free aligner used by the production-shaped build smoke test."""
-
-    def align(
-        self,
-        audio: np.ndarray,
-        alignment_text: str,
-        word_map: tuple[str, ...],
-        start_ms: int,
-        end_ms: int,
-        sampling_rate: int,
-    ) -> AlignmentResult:
-        """Return proposal boundaries without a model call."""
-        del audio, alignment_text, word_map, sampling_rate
-        return AlignmentResult(start_ms, end_ms, 1.0, "fake", ())
 
 
 class FakeIndex:
@@ -178,20 +158,6 @@ class FakeSource:
         )
 
 
-class FakeVad:
-    """Model-free VAD adapter."""
-
-    def analyse(self, audio: np.ndarray, sampling_rate: int) -> VADSignal:
-        """Keep the smoke test independent of Silero weights.
-
-        Returns:
-            Full-programme speech evidence.
-        """
-        del sampling_rate
-        duration = len(audio) * 1000 // 16_000
-        return VADSignal(((0, duration),), duration)
-
-
 def config(tmp_path: Path, mode: str = "plan") -> DictConfig:
     """Load the pinned config with a test-owned scratch root.
 
@@ -218,11 +184,7 @@ def test_build_decodes_flac_and_purges_only_verified_output(tmp_path: Path) -> N
     """A native build uses FLAC bytes and purges after publisher verification."""
     source = FakeSource()
     report = run_pipeline(
-        config=config(tmp_path, mode="build"),
-        source=source,
-        hub=prepared_hub(tmp_path),
-        ctc=FakeCtc(),
-        vad=FakeVad(),
+        config=config(tmp_path, mode="build"), source=source, hub=prepared_hub(tmp_path)
     )
 
     assert source.audio_calls == 1
@@ -257,9 +219,7 @@ def test_quality_rejection_is_terminal_and_keeps_source_audit_locator(
     hub = MemoryHub()
     initialise_target(hub=hub, settings=PipelineSettings.from_config(build_config))
 
-    report = run_pipeline(
-        config=build_config, source=source, hub=hub, ctc=FakeCtc(), vad=FakeVad()
-    )
+    report = run_pipeline(config=build_config, source=source, hub=hub)
 
     with Ledger(
         tmp_path / "scratch" / "ledger.sqlite", reset_processing=False
@@ -280,7 +240,7 @@ import sys
 from pathlib import Path
 from hviske.p1_ledger import Ledger
 from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
-from tests.test_build_p1_segments import FakeCtc, FakeSource, FakeVad, config
+from tests.test_build_p1_segments import FakeSource, config
 from tests.test_p1_publish import MemoryHub
 
 root = Path(sys.argv[1])
@@ -300,8 +260,6 @@ run_pipeline(
     config=config(root, mode="build"),
     source=FakeSource(),
     hub=hub,
-    ctc=FakeCtc(),
-    vad=FakeVad(),
 )
 """
     crashed = subprocess.run(
@@ -315,7 +273,7 @@ run_pipeline(
 import sys
 from pathlib import Path
 from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
-from tests.test_build_p1_segments import FakeCtc, FakeSource, FakeVad, config
+from tests.test_build_p1_segments import FakeSource, config
 from tests.test_p1_publish import MemoryHub
 
 root = Path(sys.argv[1])
@@ -328,8 +286,6 @@ run_pipeline(
     config=config(root, mode="build"),
     source=FakeSource(),
     hub=hub,
-    ctc=FakeCtc(),
-    vad=FakeVad(),
 )
 """
     recovered = subprocess.run(
@@ -344,8 +300,6 @@ run_pipeline(
         config=config(control_root, mode="build"),
         source=FakeSource(),
         hub=prepared_hub(tmp_path),
-        ctc=FakeCtc(),
-        vad=FakeVad(),
     )
     recovery_manifest = (
         tmp_path / "recovery" / "scratch" / "audit-candidates.jsonl"
@@ -365,11 +319,7 @@ def test_unlimited_production_counts_consumed_candidates_without_ids(
     production_config = config(tmp_path, mode="production")
     production_config.programme_limit = None
     report = run_pipeline(
-        config=production_config,
-        source=source,
-        hub=prepared_hub(tmp_path),
-        ctc=FakeCtc(),
-        vad=FakeVad(),
+        config=production_config, source=source, hub=prepared_hub(tmp_path)
     )
 
     payload = report.as_dict()
@@ -395,8 +345,6 @@ def test_verification_failure_retains_local_shard(tmp_path: Path) -> None:
             config=config(tmp_path, mode="build"),
             source=source,
             hub=prepared_verify_hub(tmp_path),
-            ctc=FakeCtc(),
-            vad=FakeVad(),
         )
 
     local_shards = list((tmp_path / "scratch" / "staging").rglob("*.parquet"))

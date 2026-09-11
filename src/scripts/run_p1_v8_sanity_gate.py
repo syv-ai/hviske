@@ -10,7 +10,11 @@ import typing as t
 from pathlib import Path
 
 from hviske.p1_publish import HfApiAdapter
-from hviske.p1_v8_sanity_gate import PILOT_REPOSITORY, run_v8_sanity_gate
+from hviske.p1_v8_sanity_gate import (
+    PILOT_REPOSITORY,
+    PIPELINE_VERSION,
+    run_v8_sanity_gate,
+)
 from hviske.p1_validation import PinnedHubClipRetriever
 
 logger = logging.getLogger(__name__)
@@ -50,13 +54,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--seed", default="p1-v8-dozen", help="deterministic stratified sampling seed"
     )
+    parser.add_argument(
+        "--pipeline-config-sha256",
+        help=(
+            "expected active pipeline configuration digest; defaults to audit evidence"
+        ),
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     try:
         candidates = _read_jsonl(args.input)
+        digest = args.pipeline_config_sha256
+        if digest is None:
+            candidate_digests = {
+                value
+                for candidate in candidates
+                if isinstance(value := candidate.get("pipeline_config_sha256"), str)
+            }
+            digest = (
+                next(iter(candidate_digests)) if len(candidate_digests) == 1 else None
+            )
         retriever = PinnedHubClipRetriever(
-            HfApiAdapter(), repository=PILOT_REPOSITORY, revision=args.pilot_head
+            HfApiAdapter(),
+            repository=PILOT_REPOSITORY,
+            revision=args.pilot_head,
+            expected_pipeline_version=PIPELINE_VERSION,
+            expected_pipeline_config_sha256=digest,
         )
         report = run_v8_sanity_gate(
             candidates,
@@ -64,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
             pilot_head=args.pilot_head,
             seed=args.seed,
             report_path=args.report,
+            expected_pipeline_version=PIPELINE_VERSION,
+            expected_pipeline_config_sha256=digest,
         )
     except Exception:
         logger.error("P1 v8 sanity gate could not run")
