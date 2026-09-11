@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+import textwrap
 import typing as t
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -37,6 +38,32 @@ _CREDENTIAL_KEYS = re.compile(
     r"(?:token|secret|password|credential|authorization|api[_-]?key)", re.I
 )
 _CREDENTIAL_VALUES = re.compile(r"(?:hf_[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{10,})")
+_SCHEMA_DESCRIPTIONS = {
+    "audio": "16 kHz mono FLAC audio",
+    "audio_sha256": "SHA-256 digest of audio",
+    "text": "Normalised training text",
+    "alignment_text": "Text used for word alignment",
+    "alignment_word_map": "Word-to-source-word mapping",
+    "language": "Language code (always da)",
+    "segment_id": "Stable segment identity",
+    "source_file_id": "Source file key (audit metadata)",
+    "source_start_ms": "Source start (ms)",
+    "source_end_ms": "Source end (ms)",
+    "source_duration_ms": "Source duration (ms)",
+    "duration_ms": "Segment duration (ms)",
+    "speaker_ids": "Speaker labels for the segment",
+    "proposal_start_ms": "Proposal start (ms)",
+    "proposal_end_ms": "Proposal end (ms)",
+    "alignment_score": "Acoustic alignment score when applicable",
+    "alignment_score_type": "Meaning of the alignment score",
+    "start_drift_ms": "Start drift from the proposal (ms)",
+    "end_drift_ms": "End drift from the proposal (ms)",
+    "vad_speech_ratio": "Voice-activity ratio when applicable",
+    "alignment_backend": "Backend that produced the boundaries",
+    "alignment_method": "Alignment method identifier",
+    "pipeline_version": "P1 pipeline contract version",
+    "pipeline_config_sha256": "Pipeline configuration SHA-256",
+}
 
 
 def _expected_features() -> Features:
@@ -83,7 +110,7 @@ def build_dataset_card(
     model_revisions: str | None = None,
     dataset_license: str | None = None,
 ) -> str:
-    """Build the required metadata-only private P1 dataset card.
+    """Build a concise, metadata-only private P1 dataset card.
 
     Args:
         source_provenance:
@@ -104,48 +131,43 @@ def build_dataset_card(
             Immutable source dataset revisions.
         model_revisions (optional):
             Immutable model revisions for a model-backed future alignment.
-            Timestamp-native cards omit this section.
         dataset_license (optional):
             Immutable target dataset licence provenance.
 
     Returns:
         Dataset card Markdown with no credential-bearing metadata.
     """
-    values = {
-        "Source provenance": source_provenance,
+    license_metadata: object = (
+        _default_dataset_license()
+        if dataset_license is None
+        else _parse_card_metadata(dataset_license)
+    )
+
+    metadata = {
+        "Source provenance": _parse_card_metadata(source_provenance),
         "Permitted use": permitted_use,
         "Private-access terms": private_access_terms,
         "Alignment method": alignment_method,
         "Field schema": field_schema,
         "Known limitations": known_limitations,
         "Rejection policy": rejection_policy,
-        "Source revisions": source_revisions,
+        "Source revisions": _parse_card_metadata(source_revisions),
+        "Dataset licence provenance": license_metadata,
     }
     if model_revisions is not None:
-        values["Model revisions"] = model_revisions
-    if dataset_license is None:
-        dataset_license = json.dumps(
-            {
-                "template_repository": (
-                    P1_RUNTIME_CONTRACT.dataset_license_template_repository
-                ),
-                "template_revision": (
-                    P1_RUNTIME_CONTRACT.dataset_license_template_revision
-                ),
-                "template_url": (P1_RUNTIME_CONTRACT.dataset_license_template_url),
-                "template_sha256": (
-                    P1_RUNTIME_CONTRACT.dataset_license_template_sha256
-                ),
-                "template_bytes": P1_RUNTIME_CONTRACT.dataset_license_template_bytes,
-                "adaptation": P1_RUNTIME_CONTRACT.dataset_license_adaptation,
-                "target_path": P1_RUNTIME_CONTRACT.dataset_license_target_path,
-                "target_sha256": P1_RUNTIME_CONTRACT.dataset_license_target_sha256,
-            },
-            sort_keys=True,
+        metadata["Model revisions"] = _parse_card_metadata(model_revisions)
+    _assert_safe_metadata(metadata)
+
+    model_section = ""
+    if model_revisions is not None:
+        model_section = (
+            "\n\n### Future alignment material\n\n"
+            "The following pinned model information is retained for a possible future "
+            "alignment only.\n"
+            "No acoustic model refines P1.\n\n"
+            f"{_render_card_metadata(metadata['Model revisions'])}"
         )
-    values["Dataset licence provenance"] = dataset_license
-    _assert_safe_metadata(values)
-    sections = [f"## {name}\n\n{value}" for name, value in values.items()]
+
     return (
         "---\n"
         "license: other\n"
@@ -153,8 +175,64 @@ def build_dataset_card(
         "license_link: LICENSE\n"
         "---\n\n"
         "# P1 segmented Danish speech\n\n"
-        + "\n\n".join(sections)
-        + "\n\n## Licence\n\n"
+        "P1 is a private, derived dataset of timestamp-segmented Danish\n"
+        "speech for authorised ASR work.\n"
+        "This card contains metadata only: it does not publish source audio,\n"
+        "transcripts, or source identifiers.\n\n"
+        "> **Private access notice:** The repository is private.\n"
+        f"> {_render_card_text(private_access_terms, width=86)}\n\n"
+        "## Key facts\n\n"
+        "| Fact | Value |\n"
+        "| --- | --- |\n"
+        "| Language | Danish (`da`) |\n"
+        f"| Schema | `{OUTPUT_SCHEMA.schema_version}` |\n"
+        f"| Audio | Mono FLAC at 16 kHz |\n"
+        f"| Pipeline | `{P1_RUNTIME_CONTRACT.pipeline_version}` |\n"
+        f"| Alignment | {_markdown_cell(alignment_method)} |\n"
+        f"| Permitted use | {_markdown_cell(permitted_use)} |\n"
+        f"| Access terms | {_markdown_cell(private_access_terms)} |\n"
+        "| Field schema | See the exact contract below |\n\n"
+        "## Data format and schema\n\n"
+        f"The published rows use `{OUTPUT_SCHEMA.schema_version}` and the exact "
+        "contract below.\n"
+        "The supplied field-schema note is:\n\n"
+        f"{_render_card_text(field_schema)}\n\n"
+        "Nullable fields are null in the active timestamp-native pipeline.\n"
+        "The contract requires the applicable fields to be null.\n\n"
+        f"{_render_schema_table()}\n\n"
+        "## Timestamp-native segmentation\n\n"
+        "P1 uses timestamp-native segmentation. Source words and their timestamps\n"
+        "are authoritative.\n"
+        "Each segment follows the first and last selected source word boundaries.\n"
+        "No acoustic model refines P1 boundaries.\n"
+        "Acoustic alignment evidence is not part of the active v7 output.\n\n"
+        f"The configured method is `{_markdown_cell(alignment_method)}`."
+        f"{model_section}\n\n"
+        "## Source and licence provenance\n\n"
+        "### Source provenance\n\n"
+        f"{_render_card_metadata(metadata['Source provenance'])}\n\n"
+        "### Source revisions\n\n"
+        f"{_render_source_revisions(metadata['Source revisions'])}\n\n"
+        "### Dataset licence provenance\n\n"
+        f"{_render_card_metadata(metadata['Dataset licence provenance'])}\n\n"
+        "## Limitations and rejection policy\n\n"
+        "### Limitations\n\n"
+        f"{_render_card_text(known_limitations)}\n\n"
+        "### Rejection policy\n\n"
+        f"{_render_card_text(rejection_policy)}\n\n"
+        "## Loading\n\n"
+        "Use the full commit SHA recorded for the verified batch.\n"
+        "Do not use a moving branch such as `main`:\n\n"
+        "```python\n"
+        "from datasets import load_dataset\n\n"
+        "dataset = load_dataset(\n"
+        '    "syvai/p1-segments",\n'
+        '    data_files="shards/<shard>.parquet",\n'
+        '    revision="<immutable-commit-sha>",\n'
+        "    streaming=True,\n"
+        ")\n"
+        "```\n\n"
+        "## Licence\n\n"
         "Private access, use, and distribution are subject to [LICENSE](LICENSE).\n"
     )
 
@@ -178,6 +256,193 @@ def _assert_safe_metadata(value: object, token: str | None = None) -> None:
 
 class PublicationError(RuntimeError):
     """Base error for an unsafe or unverified publication."""
+
+
+def _default_dataset_license() -> dict[str, object]:
+    """Return the immutable dataset licence contract as structured metadata.
+
+    Returns:
+        The contract fields used to identify the target licence.
+    """
+    return {
+        "template_repository": P1_RUNTIME_CONTRACT.dataset_license_template_repository,
+        "template_revision": P1_RUNTIME_CONTRACT.dataset_license_template_revision,
+        "template_url": P1_RUNTIME_CONTRACT.dataset_license_template_url,
+        "template_sha256": P1_RUNTIME_CONTRACT.dataset_license_template_sha256,
+        "template_bytes": P1_RUNTIME_CONTRACT.dataset_license_template_bytes,
+        "adaptation": P1_RUNTIME_CONTRACT.dataset_license_adaptation,
+        "target_path": P1_RUNTIME_CONTRACT.dataset_license_target_path,
+        "target_sha256": P1_RUNTIME_CONTRACT.dataset_license_target_sha256,
+    }
+
+
+def _markdown_cell(value: str) -> str:
+    """Make caller-provided text safe to place in a Markdown table cell.
+
+    Args:
+        value:
+            Text to place in a table cell.
+
+    Returns:
+        Text with table-breaking characters escaped.
+    """
+    return value.replace("|", r"\|").replace("\n", " ")
+
+
+def _parse_card_metadata(value: object) -> object:
+    """Parse JSON metadata while retaining support for existing prose values.
+
+    Args:
+        value:
+            Existing JSON or prose metadata supplied to the card builder.
+
+    Returns:
+        Structured metadata when JSON is supplied, otherwise the original value.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _render_card_metadata(value: object, *, indent: str = "") -> str:
+    """Render structured provenance as readable Markdown bullets.
+
+    Args:
+        value:
+            Parsed metadata to render.
+        indent (optional):
+            Existing Markdown indentation. Defaults to an empty string.
+
+    Returns:
+        Human-readable Markdown for the metadata.
+    """
+    if isinstance(value, dict):
+        lines: list[str] = []
+        for key, child in value.items():
+            label = _humanise_key(str(key))
+            rendered = _render_card_metadata(child, indent=indent + "  ")
+            if isinstance(child, (dict, list)):
+                lines.append(f"{indent}- **{label}:**")
+                lines.extend(f"{indent}  {line}" for line in rendered.splitlines())
+            else:
+                rendered_lines = rendered.splitlines() or [""]
+                lines.append(f"{indent}- **{label}:** {rendered_lines[0]}")
+                lines.extend(f"{indent}  {line}" for line in rendered_lines[1:])
+        return "\n".join(lines)
+    if isinstance(value, list):
+        lines: list[str] = []
+        for item in value:
+            rendered = _render_card_metadata(item, indent=indent + "  ")
+            if isinstance(item, (dict, list)):
+                lines.append(f"{indent}-")
+                lines.extend(rendered.splitlines())
+            else:
+                lines.append(f"{indent}- {rendered}")
+        return "\n".join(lines)
+    return _format_card_scalar(value)
+
+
+def _format_card_scalar(value: object) -> str:
+    """Format a scalar provenance value without serialising it as JSON.
+
+    Args:
+        value:
+            Scalar metadata value.
+
+    Returns:
+        Text representation suitable for Markdown.
+    """
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if value is None:
+        return "null"
+    return _render_card_text(str(value), width=72)
+
+
+def _render_card_text(value: str, *, width: int = 88) -> str:
+    """Wrap caller-provided prose for readable card paragraphs.
+
+    Args:
+        value:
+            Prose to wrap.
+        width (optional):
+            Maximum line width. Defaults to 88.
+
+    Returns:
+        Wrapped prose without changing its words.
+    """
+    lines: list[str] = []
+    for line in value.splitlines() or [value]:
+        lines.extend(
+            textwrap.wrap(
+                line, width=width, break_long_words=False, break_on_hyphens=False
+            )
+            or [""]
+        )
+    return "\n".join(lines)
+
+
+def _humanise_key(value: str) -> str:
+    """Turn a contract key into a short human-readable label.
+
+    Args:
+        value:
+            Contract key to label.
+
+    Returns:
+        A sentence-case label.
+    """
+    return value.replace("_", " ").capitalize()
+
+
+def _render_schema_table() -> str:
+    """Render the contract-defined training fields as a readable Markdown table.
+
+    Returns:
+        A Markdown table generated from the active output schema contract.
+    """
+    rows = ["| Field | Type | Nullable | Description |", "| --- | --- | --- | --- |"]
+    for field in OUTPUT_SCHEMA.fields:
+        nullable = "yes" if field.nullable else "no"
+        description = _SCHEMA_DESCRIPTIONS.get(field.name, "Contract-defined field")
+        rows.append(f"| `{field.name}` | `{field.type}` | {nullable} | {description} |")
+    return "\n".join(rows)
+
+
+def _render_source_revisions(value: object) -> str:
+    """Render source repositories and revisions without exposing source records.
+
+    Args:
+        value:
+            Parsed source provenance metadata.
+
+    Returns:
+        A source table when repository coordinates are available, or readable bullets.
+    """
+    if isinstance(value, dict) and value:
+        rows = ["| Source | Repository | Immutable revision |", "| --- | --- | --- |"]
+        table = True
+        for name, details in value.items():
+            if not isinstance(details, dict):
+                table = False
+                break
+            repository = details.get("repository")
+            revision = details.get("revision")
+            if set(details) != {"repository", "revision"}:
+                table = False
+                break
+            if not isinstance(repository, str) or not isinstance(revision, str):
+                table = False
+                break
+            rows.append(
+                f"| {_humanise_key(str(name))} | `{repository}` | `{revision}` |"
+            )
+        if table and len(rows) > 2:
+            return "\n".join(rows)
+    return _render_card_metadata(value)
 
 
 @dataclass(frozen=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections.abc as c
 import hashlib
 import io
+import json
 import tempfile
 import typing as t
 from dataclasses import dataclass
@@ -17,10 +18,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
+import yaml
 from huggingface_hub import CommitInfo, HfFileSystem
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
-from hviske.p1_contracts import LedgerState, OutputRow, ShardEvidence
+from hviske.p1_contracts import OUTPUT_SCHEMA, LedgerState, OutputRow, ShardEvidence
 from hviske.p1_ledger import Ledger
 from hviske.p1_publish import (
     AllowListError,
@@ -262,9 +264,46 @@ def make_card() -> str:
         field_schema="audio, text and deterministic metadata",
         known_limitations="Danish speech only",
         rejection_policy="Reject undecodable or poorly aligned material",
-        source_revisions="dataset@" + "a" * 40,
+        source_revisions=json.dumps(
+            {
+                "audio": {"repository": "syvai/p1", "revision": "a" * 40},
+                "transcripts": {
+                    "repository": "syvai/p1-transcripts",
+                    "revision": "b" * 40,
+                },
+            },
+            sort_keys=True,
+        ),
         model_revisions="ctc@" + "b" * 40,
     )
+
+
+def test_card_is_readable_and_contract_driven() -> None:
+    """Cards present provenance, schema, and safe loading instructions clearly."""
+    card = make_card()
+    metadata = yaml.safe_load(card.split("---", 2)[1])
+
+    assert metadata == {
+        "license": "other",
+        "license_name": "p1-dataset-license",
+        "license_link": "LICENSE",
+    }
+    assert "## Key facts" in card
+    assert "## Data format and schema" in card
+    assert "## Timestamp-native segmentation" in card
+    assert "Source words and their timestamps" in card
+    assert "No acoustic model refines P1" in card
+    assert "## Source and licence provenance" in card
+    assert "| Audio | `syvai/p1` |" in card
+    assert "| Transcripts | `syvai/p1-transcripts` |" in card
+    assert "Template repository" in card
+    assert '{"audio"' not in card
+    assert 'revision="<immutable-commit-sha>"' in card
+    assert "streaming=True" in card
+    assert 'revision="main"' not in card
+    assert all(field.name in card for field in OUTPUT_SCHEMA.fields)
+    assert "Future alignment material" in card
+    assert "ctc@" in card
 
 
 def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
