@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from huggingface_hub.errors import HfHubHTTPError
 from omegaconf import DictConfig, OmegaConf
 
 from hviske.p1_contracts import (
@@ -71,6 +72,10 @@ from hviske.p1_source import (
 logger = logging.getLogger(__name__)
 
 _PROGRESS_INTERVAL = 10_000
+_PUBLICATION_RETRY_MAX_ATTEMPTS = 8
+_PUBLICATION_RETRY_BASE_SECONDS = 5.0
+_PUBLICATION_RETRY_MAX_DELAY_SECONDS = 60.0
+_PUBLICATION_RETRY_PARTITION_STAGGER_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -2090,18 +2095,57 @@ def publish_pending(
 
     Returns:
         Verified publication evidence.
+
+    Raises:
+        HfHubHTTPError:
+            If all bounded Hub publication attempts fail.
+        AssertionError:
+            If the bounded retry loop exits without returning or raising.
     """
-    with _publication_lock(settings.publish_lock_path):
-        return _publish_pending_unlocked(
-            hub=hub,
-            settings=settings,
-            ledger=ledger,
-            batch_id=batch_id,
-            pending=pending,
-            pending_ids=pending_ids,
-            audit_rows=audit_rows,
-            audit_reservoir=audit_reservoir,
-        )
+    for attempt in range(1, _PUBLICATION_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            with _publication_lock(settings.publish_lock_path):
+                return _publish_pending_unlocked(
+                    hub=hub,
+                    settings=settings,
+                    ledger=ledger,
+                    batch_id=batch_id,
+                    pending=pending,
+                    pending_ids=pending_ids,
+                    audit_rows=audit_rows,
+                    audit_reservoir=audit_reservoir,
+                )
+        except HfHubHTTPError as error:
+            delay = (
+                _publication_retry_delay(settings=settings, attempt=attempt)
+                if attempt < _PUBLICATION_RETRY_MAX_ATTEMPTS
+                else 0.0
+            )
+            logger.warning(
+                "P1 Hub publication attempt=%d/%d partition=%d "
+                "exception_class=%s status_code=%s delay_seconds=%.1f",
+                attempt,
+                _PUBLICATION_RETRY_MAX_ATTEMPTS,
+                settings.partition_index,
+                type(error).__name__,
+                _hub_status_code(error),
+                delay,
+            )
+            if attempt == _PUBLICATION_RETRY_MAX_ATTEMPTS:
+                raise
+            time.sleep(delay)
+    raise AssertionError("publication retry loop must return or raise")
+
+
+def _hub_status_code(error: HfHubHTTPError) -> int | None:
+    """Extract only the numeric HTTP status from a Hub transport error.
+
+    Returns:
+        Numeric HTTP status when the Hub response exposes one.
+    """
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
 
 
 @contextlib.contextmanager
@@ -2114,6 +2158,16 @@ def _publication_lock(path: Path) -> c.Iterator[None]:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _publication_retry_delay(*, settings: PipelineSettings, attempt: int) -> float:
+    """Return a bounded, deterministic delay for one Hub publication retry."""
+    exponential = min(
+        _PUBLICATION_RETRY_BASE_SECONDS * 2 ** (attempt - 1),
+        _PUBLICATION_RETRY_MAX_DELAY_SECONDS,
+    )
+    partition_slot = settings.partition_index % max(settings.partition_count, 1)
+    return exponential + (partition_slot * _PUBLICATION_RETRY_PARTITION_STAGGER_SECONDS)
 
 
 def _publish_pending_unlocked(
