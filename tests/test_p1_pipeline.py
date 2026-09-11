@@ -27,9 +27,11 @@ from hviske.p1_pipeline import (
     _decoded_native_audio,
     _native_candidates,
     _process_native_programmes,
+    _publication_lock,
     _SelectionDedup,
     _unlink_recovered,
     enforce_scratch_cap,
+    partition_for_file_id,
     preflight_pipeline,
     run_pipeline,
     target_privacy,
@@ -701,6 +703,112 @@ def test_parser_timestamp_failure_is_invalid_timestamp_rejection(
     assert report.rejection_counts == {"invalid_timestamps": 1}
 
 
+def test_partition_runtime_preserves_identity_limit_and_target_selection(
+    tmp_path: Path,
+) -> None:
+    """Runtime partition settings do not change identity or selection controls."""
+    config = pipeline_config(tmp_path / "default")
+    partitioned = pipeline_config(tmp_path / "partitioned")
+    partitioned.runtime.partition_count = 4
+    partitioned.runtime.partition_index = 2
+    partitioned.runtime.publish_lock_path = str(tmp_path / "shared" / "publish.lock")
+    baseline = PipelineSettings.from_config(config)
+    settings = PipelineSettings.from_config(partitioned)
+    assert settings.pipeline_digest == baseline.pipeline_digest
+    assert settings.scratch_root == tmp_path / "partitioned" / "scratch" / "partition-2"
+    assert settings.partition_count == 4
+    assert settings.partition_index == 2
+    assert baseline.programme_limit is None
+    assert baseline.source_file_id is None
+
+    file_ids = ("first", "wanted", "last")
+
+    class Source:
+        def iter_programme_metadata(self, *, shard: object) -> object:
+            del shard
+            return ({"file_id": file_id} for file_id in file_ids)
+
+    class Index:
+        def get(self, file_id: str) -> object:
+            return file_id
+
+    owner = partition_for_file_id("wanted", 4)
+    candidates = _native_candidates(
+        source=Source(),
+        shards=(SourceShard("audio.parquet", 1),),
+        index=Index(),
+        programme_limit=None,
+        source_file_id="wanted",
+        pilot=False,
+        log=MetadataLog(tmp_path / "target-events.jsonl"),
+        scratch_root=tmp_path / "target",
+        partition_count=4,
+        partition_index=owner,
+    )
+    assert [candidate.file_id for candidate in candidates] == ["wanted"]
+
+    limited = _native_candidates(
+        source=Source(),
+        shards=(SourceShard("audio.parquet", 1),),
+        index=Index(),
+        programme_limit=2,
+        source_file_id=None,
+        pilot=False,
+        log=MetadataLog(tmp_path / "limit-events.jsonl"),
+        scratch_root=tmp_path / "limit",
+    )
+    assert [candidate.file_id for candidate in limited] == list(file_ids[:2])
+
+
+def test_partitions_have_disjoint_complete_and_deterministic_selection(
+    tmp_path: Path,
+) -> None:
+    """Partitioning assigns each metadata candidate exactly once."""
+    file_ids = ("file-a", "file-b", "file-c", "file-d", "file-e")
+
+    class Source:
+        def iter_programme_metadata(self, *, shard: object) -> object:
+            del shard
+            return ({"file_id": file_id} for file_id in file_ids)
+
+    class Index:
+        def get(self, file_id: str) -> object:
+            return file_id
+
+    def selected(
+        partition_index: int, root: Path, programme_limit: int | None = None
+    ) -> set[str]:
+        candidates = _native_candidates(
+            source=Source(),
+            shards=(SourceShard("audio.parquet", 1),),
+            index=Index(),
+            programme_limit=programme_limit,
+            source_file_id=None,
+            pilot=False,
+            log=MetadataLog(root / "events.jsonl"),
+            scratch_root=root,
+            partition_count=4,
+            partition_index=partition_index,
+        )
+        return {candidate.file_id for candidate in candidates}
+
+    selections = [
+        selected(index, tmp_path / f"partition-{index}") for index in range(4)
+    ]
+    assert set.union(*selections) == set(file_ids)
+    assert sum(map(len, selections)) == len(file_ids)
+    for left_index, left in enumerate(selections):
+        for right in selections[left_index + 1 :]:
+            assert left.isdisjoint(right)
+    assert selected(2, tmp_path / "repeat") == selected(2, tmp_path / "repeat-2")
+    limited = [
+        selected(index, tmp_path / f"limited-{index}", programme_limit=2)
+        for index in range(4)
+    ]
+    assert set.union(*limited) == set(file_ids[:2])
+    assert sum(map(len, limited)) == 2
+
+
 def test_pilot_scans_each_shard_once_and_recovers_exact_pointers(
     tmp_path: Path,
 ) -> None:
@@ -963,6 +1071,22 @@ def test_progress_logs_do_not_include_source_identifiers_or_paths(
     assert target not in progress
     assert "signature=secret" not in progress
     assert "private/audio.parquet" not in progress
+
+
+def test_publication_lock_releases_after_exception(tmp_path: Path) -> None:
+    """The shared lock can be acquired again after a failed publication stage.
+
+    Raises:
+        RuntimeError:
+            Simulated failure used to verify lock release.
+    """
+    lock_path = tmp_path / "publish.lock"
+    with pytest.raises(RuntimeError):
+        with _publication_lock(lock_path):
+            raise RuntimeError("simulated publication failure")
+    with _publication_lock(lock_path):
+        pass
+    assert lock_path.stat().st_size == 0
 
 
 def test_recovery_purges_only_matching_survivors(tmp_path: Path) -> None:

@@ -7,7 +7,9 @@ disk-backed transcript pointer index and retrieves one selected programme at a t
 from __future__ import annotations
 
 import collections.abc as c
+import contextlib
 import dataclasses
+import fcntl
 import gc
 import hashlib
 import importlib
@@ -78,6 +80,9 @@ class PipelineSettings:
     mode: str
     pipeline_version: str
     scratch_root: Path
+    publish_lock_path: Path
+    partition_count: int
+    partition_index: int
     max_source_bytes: int
     max_scratch_bytes: int
     shards_per_commit: int
@@ -280,11 +285,32 @@ class PipelineSettings:
                 "anomaly": anomaly_raw["repository"],
             }
         )
+        common_scratch_root = Path(str(runtime["scratch_root"])).expanduser().resolve()
+        partition_count = _as_int(runtime.get("partition_count", 1))
+        partition_index = _as_int(runtime.get("partition_index", 0))
+        if partition_count < 1:
+            raise ValueError("partition_count must be positive")
+        if not 0 <= partition_index < partition_count:
+            raise ValueError("partition_index must be within partition_count")
+        lock_value = runtime.get("publish_lock_path")
+        publish_lock_path = (
+            Path(str(lock_value)).expanduser().resolve()
+            if lock_value is not None
+            else common_scratch_root / "publish.lock"
+        )
+        scratch_root = (
+            common_scratch_root / f"partition-{partition_index}"
+            if partition_count > 1
+            else common_scratch_root
+        )
         return cls(
             mode=str(root.get("mode", "build")),
             pipeline_version=str(root["pipeline_version"]),
             alignment_method=manifest.alignment_method,
-            scratch_root=Path(str(runtime["scratch_root"])).expanduser().resolve(),
+            scratch_root=scratch_root,
+            publish_lock_path=publish_lock_path,
+            partition_count=partition_count,
+            partition_index=partition_index,
             max_source_bytes=_as_int(max_source),
             max_scratch_bytes=_as_int(max_scratch),
             shards_per_commit=_as_int(shard_limit),
@@ -702,7 +728,9 @@ def _run_native_pipeline(
     if settings.mode == "pilot" and settings.programme_limit is None:
         raise ValueError("pilot mode requires programme_limit")
     if settings.workers != 1:
-        raise ValueError("P1 permits exactly one programme worker")
+        raise ValueError(
+            "each P1 partition process permits exactly one programme worker"
+        )
     scratch = configure_scratch(
         settings.scratch_root,
         model_free=settings.alignment_method == "timestamp-native:p1-transcripts.words",
@@ -783,6 +811,8 @@ def _run_native_pipeline(
             log=log,
             scratch_root=settings.scratch_root,
             scratch_guard=scratch_guard,
+            partition_count=settings.partition_count,
+            partition_index=settings.partition_index,
         )
         if isinstance(candidates, list):
             logger.info(
@@ -903,6 +933,8 @@ def _native_candidates(
     log: MetadataLog,
     scratch_root: Path | None = None,
     scratch_guard: c.Callable[[], None] | None = None,
+    partition_count: int = 1,
+    partition_index: int = 0,
 ) -> c.Iterable[NativeCandidate]:
     """Select joined transcript and audio pointers with bounded metadata scans.
 
@@ -913,9 +945,17 @@ def _native_candidates(
 
     Returns:
         A bounded list or streaming iterator of joined source candidates.
+
+    Raises:
+        ValueError:
+            If the partition settings are invalid.
     """
     from hviske.p1_source import SourceSelectionError, SourceShard
 
+    if partition_count < 1:
+        raise ValueError("partition_count must be positive")
+    if not 0 <= partition_index < partition_count:
+        raise ValueError("partition_index must be within partition_count")
     pointer_iterator = getattr(source, "iter_programme_pointers", None)
     metadata_iterator = getattr(source, "iter_programme_metadata", None)
     dedup_root = scratch_root or log.path.parent
@@ -1041,6 +1081,7 @@ def _native_candidates(
         rows_scanned = 0
         shards_scanned = 0
         missing_transcript_count = 0
+        unique_candidates_seen = 0
         next_progress = _PROGRESS_INTERVAL
 
         def emit_progress() -> None:
@@ -1060,13 +1101,27 @@ def _native_candidates(
                     for pointer in pointer_iterator(shard=shard):
                         rows_scanned += 1
                         emit_progress()
+                        file_id = getattr(pointer, "file_id", None)
+                        owned = isinstance(file_id, str) and (
+                            partition_for_file_id(file_id, partition_count)
+                            == partition_index
+                        )
                         candidate = candidate_from_pointer(pointer, shard_index)
                         if candidate is None:
-                            file_id = getattr(pointer, "file_id", None)
-                            if isinstance(file_id, str) and file_id:
+                            if owned and isinstance(file_id, str) and file_id:
                                 missing_transcript_count += 1
                             continue
                         if not dedup.add_if_new(candidate.file_id):
+                            continue
+                        unique_candidates_seen += 1
+                        if not owned:
+                            continue
+                        if (
+                            source_file_id is None
+                            and not pilot
+                            and programme_limit is not None
+                            and unique_candidates_seen > programme_limit
+                        ):
                             continue
                         if include_pointer_metadata:
                             metadata = dict(candidate.metadata)
@@ -1083,15 +1138,29 @@ def _native_candidates(
                     for row_index, raw in enumerate(metadata_iterator(shard=shard)):
                         rows_scanned += 1
                         emit_progress()
+                        file_id = as_mapping(raw).get("file_id")
+                        owned = isinstance(file_id, str) and (
+                            partition_for_file_id(file_id, partition_count)
+                            == partition_index
+                        )
                         candidate = metadata_candidate(
                             raw, shard, shard_index, row_index
                         )
                         if candidate is None:
-                            file_id = as_mapping(raw).get("file_id")
-                            if isinstance(file_id, str) and file_id:
+                            if owned and isinstance(file_id, str) and file_id:
                                 missing_transcript_count += 1
                             continue
                         if not dedup.add_if_new(candidate.file_id):
+                            continue
+                        unique_candidates_seen += 1
+                        if not owned:
+                            continue
+                        if (
+                            source_file_id is None
+                            and not pilot
+                            and programme_limit is not None
+                            and unique_candidates_seen > programme_limit
+                        ):
                             continue
                         if include_pointer_metadata:
                             metadata = dict(candidate.metadata)
@@ -1360,6 +1429,30 @@ def as_mapping(value: object) -> dict[str, object]:
                 result[key] = item
         return result
     raise TypeError("source rows must be mappings")
+
+
+def partition_for_file_id(file_id: str, partition_count: int) -> int:
+    """Return the deterministic worker partition for a private file ID.
+
+    Args:
+        file_id:
+            Private source file identifier. It is never logged by this function.
+        partition_count:
+            Number of external partition processes.
+
+    Returns:
+        Zero-based partition index.
+
+    Raises:
+        ValueError:
+            If the file ID is empty or the partition count is invalid.
+    """
+    if not file_id:
+        raise ValueError("file_id must not be empty")
+    if partition_count < 1:
+        raise ValueError("partition_count must be positive")
+    digest = hashlib.sha256(file_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big") % partition_count
 
 
 def _process_native_programmes(
@@ -1794,6 +1887,7 @@ def _process_native_programmes(
                     for _, reason in result.rejections
                 },
                 audit_candidates=audit_candidates,
+                batch_prefix=f"p{settings.partition_index}-batch",
             )
             if audit_reservoir is not None and audit_candidates:
                 getattr(audit_reservoir, "add")(audit_candidates)
@@ -1978,6 +2072,51 @@ def _publish_native_pending(
 
 
 def publish_pending(
+    *,
+    hub: object,
+    settings: PipelineSettings,
+    ledger: Ledger,
+    batch_id: str,
+    pending: c.Sequence[object],
+    pending_ids: c.Sequence[str],
+    audit_rows: c.Sequence[object] = (),
+    audit_reservoir: object | None = None,
+) -> object:
+    """Publish a complete ledger batch under the shared process lock.
+
+    The lock covers target inspection, commit, verification, and local purge.
+    Preparation and encoding happen before this function and remain independent between
+    partitions.
+
+    Returns:
+        Verified publication evidence.
+    """
+    with _publication_lock(settings.publish_lock_path):
+        return _publish_pending_unlocked(
+            hub=hub,
+            settings=settings,
+            ledger=ledger,
+            batch_id=batch_id,
+            pending=pending,
+            pending_ids=pending_ids,
+            audit_rows=audit_rows,
+            audit_reservoir=audit_reservoir,
+        )
+
+
+@contextlib.contextmanager
+def _publication_lock(path: Path) -> c.Iterator[None]:
+    """Serialise Hub publication across independently launched processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _publish_pending_unlocked(
     *,
     hub: object,
     settings: PipelineSettings,
