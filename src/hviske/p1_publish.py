@@ -6,6 +6,7 @@ import collections.abc as c
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import tempfile
@@ -39,7 +40,7 @@ _CREDENTIAL_KEYS = re.compile(
 )
 _CREDENTIAL_VALUES = re.compile(r"(?:hf_[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{10,})")
 _SCHEMA_DESCRIPTIONS = {
-    "audio": "16 kHz mono FLAC audio",
+    "audio": "16 kHz mono OGG/Opus audio",
     "audio_sha256": "SHA-256 digest of audio",
     "text": "Exact, verbatim source-owned text",
     "alignment_text": "Text used for word alignment",
@@ -193,7 +194,7 @@ def build_dataset_card(
         "| --- | --- |\n"
         "| Language | Danish (`da`) |\n"
         f"| Schema | `{OUTPUT_SCHEMA.schema_version}` |\n"
-        f"| Audio | Mono FLAC at 16 kHz |\n"
+        f"| Audio | Mono OGG/Opus at 16 kHz |\n"
         f"| Pipeline | `{P1_RUNTIME_CONTRACT.pipeline_version}` |\n"
         f"| Alignment | {_alignment_summary(alignment_method)} |\n"
         f"| Permitted use | {_markdown_cell(permitted_use)} |\n"
@@ -1427,8 +1428,8 @@ def validate_local_shard(
 
     The Parquet Arrow schema and Hugging Face feature metadata are compared as one
     object, so missing, extra, and type-wrong fields cannot pass. Every row is
-    decoded to prove the mono 16 kHz FLAC contract without retaining a complete
-    shard in memory.
+    decoded to prove the active mono 16 kHz OGG/Opus contract without retaining a
+    complete shard in memory.
 
     Args:
         path:
@@ -1520,17 +1521,31 @@ def _validate_row(
         raise VerificationError(f"audio is not a structured feature: {shard_path}")
     payload = audio.get("bytes")
     if not isinstance(payload, bytes) or not payload:
-        raise VerificationError(f"audio payload is not embedded FLAC: {shard_path}")
+        raise VerificationError(f"audio payload is not embedded audio: {shard_path}")
     try:
-        decoded, sample_rate = sf.read(
-            io.BytesIO(payload), dtype="float32", always_2d=True
-        )
+        with sf.SoundFile(io.BytesIO(payload)) as audio_file:
+            decoded = audio_file.read(dtype="float32", always_2d=True)
+            if row.get("pipeline_version") == "p1-segmentation-8" and (
+                audio_file.format != "OGG" or audio_file.subtype != "OPUS"
+            ):
+                raise VerificationError(
+                    f"v8 audio payload is not embedded OGG/Opus: {shard_path}"
+                )
+            sample_rate = audio_file.samplerate
+            channels = audio_file.channels
+    except VerificationError:
+        raise
     except Exception as error:
         raise VerificationError(
             f"audio payload cannot be decoded: {shard_path}"
         ) from error
-    if sample_rate != 16000 or decoded.shape[1] != 1:
-        raise VerificationError(f"audio is not mono 16 kHz: {shard_path}")
+    if (
+        sample_rate != 16000
+        or channels != 1
+        or decoded.shape[0] == 0
+        or not all(math.isfinite(float(value)) for value in decoded.ravel())
+    ):
+        raise VerificationError(f"audio is not finite mono 16 kHz: {shard_path}")
     if hashlib.sha256(payload).hexdigest() != row.get("audio_sha256"):
         raise VerificationError(f"audio payload digest mismatch: {shard_path}")
     duration = row.get("duration_ms")

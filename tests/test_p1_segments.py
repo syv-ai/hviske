@@ -29,7 +29,9 @@ from hviske.p1_segments import (
     align_ctc_emissions,
     align_ctc_word_tokens,
     correct_drift_once,
+    decode_ogg_opus,
     encode_flac,
+    encode_ogg_opus,
     form_candidate_segments,
     normalise_alignment_text,
     prepare_source_audio,
@@ -333,7 +335,7 @@ def test_exact_ten_seconds_is_not_accepted_by_duration_gate() -> None:
 
 
 def test_flac_is_freshly_decodable() -> None:
-    """The encoded payload is lossless PCM-in-FLAC at the required rate."""
+    """The generic source encoder remains lossless PCM-in-FLAC."""
     result = encode_flac(np.zeros(16_000, dtype=np.float32))
     assert result.duration_ms == 1_000
     assert result.sha256 == hashlib.sha256(result.payload).hexdigest()
@@ -354,6 +356,22 @@ def test_malformed_timestamps_are_rejected() -> None:
             ],
             programme_duration_ms=1_000,
         )
+
+
+def test_ogg_opus_is_freshly_decodable() -> None:
+    """Active output is OGG/Opus with exact duration and sample count."""
+    result = encode_ogg_opus(np.zeros(16_000, dtype=np.float32))
+    with sf.SoundFile(io.BytesIO(result.payload)) as audio_file:
+        assert audio_file.format == "OGG"
+        assert audio_file.subtype == "OPUS"
+        assert audio_file.samplerate == 16_000
+        assert audio_file.channels == 1
+    assert decode_ogg_opus(result.payload).size == 16_000
+    assert result.duration_ms == 1_000
+    assert result.sample_count == 16_000
+    assert result.sha256 == hashlib.sha256(result.payload).hexdigest()
+    samples = np.random.default_rng(0).uniform(-0.5, 0.5, 16_000).astype(np.float32)
+    assert len(encode_ogg_opus(samples).payload) < len(encode_flac(samples).payload)
 
 
 def test_output_text_preserves_case_when_alignment_text_is_folded() -> None:

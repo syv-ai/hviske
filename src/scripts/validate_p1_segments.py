@@ -296,7 +296,7 @@ def _source_clip_callback(entry: t.Mapping[str, object]) -> bytes:
     """Retrieve and encode exactly one rejected source interval.
 
     Returns:
-        A temporary-review FLAC payload.
+        A temporary-review OGG/Opus payload.
 
     Raises:
         ValueError:
@@ -342,7 +342,13 @@ def _source_clip_callback(entry: t.Mapping[str, object]) -> bytes:
     if last <= first:
         raise ValueError("source interval is empty")
     output = io.BytesIO()
-    sf.write(output, audio.value[first:last], audio.sampling_rate, format="FLAC")
+    sf.write(
+        output,
+        audio.value[first:last],
+        audio.sampling_rate,
+        format="OGG",
+        subtype="OPUS",
+    )
     return output.getvalue()
 
 
