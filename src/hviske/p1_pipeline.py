@@ -122,7 +122,7 @@ class PipelineSettings:
 
         Raises:
             ValueError:
-                If the v7 runtime, output schema, or immutable identity is invalid.
+                If the v8 runtime, output schema, or immutable identity is invalid.
         """
         config_object = (
             config if isinstance(config, DictConfig) else OmegaConf.create(config)
@@ -247,7 +247,7 @@ class PipelineSettings:
         if manifest.schema_version != OUTPUT_SCHEMA.schema_version:
             raise ValueError("P1 output schema version must be p1-segments-v2")
         if manifest.output.schema != OUTPUT_SCHEMA:
-            raise ValueError("P1 output schema must match the active v7 schema")
+            raise ValueError("P1 output schema must match the active v8 schema")
         digest = pipeline_config_sha256(manifest)
         if manifest.pipeline_version != P1_RUNTIME_CONTRACT.pipeline_version and (
             manifest.ctc is None
@@ -394,6 +394,7 @@ class BuildReport:
     max_in_flight: int = 0
     rejection_counts: dict[str, int] = field(default_factory=dict)
     normalization_counts: dict[str, int] = field(default_factory=dict)
+    ownership_counts: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         """Return metadata-only run evidence."""
@@ -407,6 +408,7 @@ class BuildReport:
             "max_in_flight": self.max_in_flight,
             "rejection_counts": self.rejection_counts,
             "normalization_counts": self.normalization_counts,
+            "ownership_counts": self.ownership_counts,
         }
 
 
@@ -426,13 +428,23 @@ def run_pipeline(
     Raises:
         TypeError:
             If the source does not expose the native planning API.
+        ValueError:
+            If v8 receives an injected model-backed backend.
     """
     from hviske.p1_source import harden_p1_logging
 
     harden_p1_logging()
     settings = PipelineSettings.from_config(config)
+    if settings.pipeline_version == "p1-segmentation-8" and (
+        vad is not None or ctc is not None
+    ):
+        raise ValueError("v8 does not accept injected model-backed backends")
     if settings.mode == "initialise":
-        configure_scratch(settings.scratch_root)
+        configure_scratch(
+            settings.scratch_root,
+            model_free=settings.alignment_method
+            == "timestamp-native:p1-transcripts.words",
+        )
         if hub is None:
             hub = make_hub()
         initialise_target(hub=hub, settings=settings)
@@ -511,7 +523,11 @@ def calculate_scratch_requirement(
         * 1024
         * (settings.upload_concurrency + settings.verification_concurrency)
     )
-    model_cache = 2 * 1024 * 1024 * 1024
+    model_cache = (
+        0
+        if settings.alignment_method == "timestamp-native:p1-transcripts.words"
+        else 2 * 1024 * 1024 * 1024
+    )
     ledger_and_safety = 256 * 1024 * 1024
     return (
         source_and_decode
@@ -558,25 +574,25 @@ def target_privacy(
         if isinstance(info, dict)
         else getattr(info, "private", None)
     )
-    contract_v7 = _target_card_is_v7(
+    contract_v8 = _target_card_is_v8(
         hub=hub, repo_id=repo_id, expected_digest=expected_digest
     )
     return {
         "checked": True,
         "present": True,
         "private": private is True,
-        "contract_v7": contract_v7,
+        "contract_v8": contract_v8,
         "repo_id": repo_id,
     }
 
 
-def _target_card_is_v7(
+def _target_card_is_v8(
     *, hub: object | None, repo_id: str, expected_digest: str | None
 ) -> bool:
     """Check the remote card without retaining its text in pipeline state.
 
     Returns:
-        Whether the remote card proves the active v7 identity.
+        Whether the remote card proves the active v8 identity.
     """
     reader = getattr(hub, "stream_file", None)
     if not callable(reader):
@@ -589,10 +605,12 @@ def _target_card_is_v7(
     except Exception:
         return False
     required = (
-        "pipeline_version: p1-segmentation-7",
+        "pipeline_version: p1-segmentation-8",
         "timestamp-native:p1-transcripts.words",
         "p1-segments-v2",
     )
+    if "pipeline_version: p1-segmentation-7" in card:
+        return False
     if not all(marker in card for marker in required):
         return False
     if _card_declares_inactive_model_provenance(card):
@@ -675,13 +693,20 @@ def _run_native_pipeline(
             If the mode or worker configuration is unsafe.
     """
     settings = PipelineSettings.from_config(config)
+    if settings.pipeline_version == "p1-segmentation-8" and (
+        vad is not None or ctc is not None
+    ):
+        raise ValueError("v8 does not accept injected model-backed backends")
     if settings.mode not in {"plan", "pilot", "production", "build", "initialise"}:
         raise ValueError("mode must be plan, pilot, production, build, or initialise")
     if settings.mode == "pilot" and settings.programme_limit is None:
         raise ValueError("pilot mode requires programme_limit")
     if settings.workers != 1:
         raise ValueError("P1 permits exactly one programme worker")
-    scratch = configure_scratch(settings.scratch_root)
+    scratch = configure_scratch(
+        settings.scratch_root,
+        model_free=settings.alignment_method == "timestamp-native:p1-transcripts.words",
+    )
     log = MetadataLog(scratch / "p1-events.jsonl")
     from hviske.p1_source import SourcePlan
     from hviske.p1_validation import AuditReservoir
@@ -1520,16 +1545,20 @@ def _process_native_programmes(
                 continue
             ambiguous = getattr(transcript, "ambiguous_source_text_records", 0)
             if ambiguous:
-                _reject_native_programme(
-                    ledger=ledger,
-                    report=report,
-                    log=log,
-                    programme_id=programme_id,
-                    source_file_id=file_id,
-                    reason=RejectionCategory.AMBIGUOUS_SOURCE_TEXT.value,
+                report.ownership_counts["best_effort_uncertain"] = (
+                    report.ownership_counts.get("best_effort_uncertain", 0) + ambiguous
                 )
-                purge_source_temporary(getattr(source, "last_temporary", None))
-                continue
+                report.normalization_counts["ambiguous_source_text_records"] = (
+                    report.normalization_counts.get("ambiguous_source_text_records", 0)
+                    + ambiguous
+                )
+                log.write(
+                    {
+                        "event": "transcript_ownership",
+                        "ownership": "best_effort_uncertain",
+                        "count": ambiguous,
+                    }
+                )
             try:
                 # Transcript qualification is deliberately independent of metadata
                 # duration.  The source audio is the only duration authority.
@@ -1637,7 +1666,7 @@ def _process_native_programmes(
                 transcript_text=transcript.text,
             )
             if settings.alignment_method == "timestamp-native:p1-transcripts.words":
-                # P1 v7 deliberately consumes the source word timestamps.  Keep the
+                # P1 v8 deliberately consumes the source word timestamps.  Keep the
                 # generic model-backed path below intact for future datasets, but do
                 # not even construct its backends for the active source.
                 active_vad = None
@@ -1968,18 +1997,18 @@ def publish_pending(
         ValueError:
             If the batch has no local shards.
         P1PreflightError:
-            If the target card does not prove the active v7 contract.
+            If the target card does not prove the active v8 contract.
     """
     from hviske.p1_publish import HubClient, LocalShard, publish_batch
 
     if settings.alignment_method == "timestamp-native:p1-transcripts.words":
-        if not _target_card_is_v7(
+        if not _target_card_is_v8(
             hub=hub,
             repo_id=settings.target_private_repo,
             expected_digest=settings.pipeline_digest,
         ):
             raise P1PreflightError(
-                "refusing payload commit: target card is not the P1 v7 contract"
+                "refusing payload commit: target card is not the P1 v8 contract"
             )
 
     shards = t.cast(c.Sequence[LocalShard], pending)
@@ -2468,28 +2497,38 @@ def _recover_native_batches(
         ledger.finalise_batch_children(batch.batch_id)
 
 
-def configure_scratch(root: Path) -> Path:
-    """Create the dedicated scratch tree and route supported caches into it.
+def configure_scratch(root: Path, *, model_free: bool = False) -> Path:
+    """Create scratch storage, optionally without model-cache directories.
 
     Returns:
         The resolved scratch root.
     """
     root = Path(root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    for name in ("hf", "datasets", "hub", "transformers", "torch", "tmp", "staging"):
+    names = ("hf", "datasets", "hub", "tmp", "staging")
+    if not model_free:
+        names += ("transformers", "torch")
+    for name in names:
         (root / name).mkdir(exist_ok=True)
-    os.environ.update(
-        {
-            "HF_HOME": str(root / "hf"),
-            "HF_DATASETS_CACHE": str(root / "datasets"),
-            "HUGGINGFACE_HUB_CACHE": str(root / "hub"),
-            "TRANSFORMERS_CACHE": str(root / "transformers"),
-            "TORCH_HOME": str(root / "torch"),
-            "TMPDIR": str(root / "tmp"),
-            "TEMP": str(root / "tmp"),
-            "TMP": str(root / "tmp"),
-        }
-    )
+    environment = {
+        "HF_HOME": str(root / "hf"),
+        "HF_DATASETS_CACHE": str(root / "datasets"),
+        "HUGGINGFACE_HUB_CACHE": str(root / "hub"),
+        "TMPDIR": str(root / "tmp"),
+        "TEMP": str(root / "tmp"),
+        "TMP": str(root / "tmp"),
+    }
+    if not model_free:
+        environment.update(
+            {
+                "TRANSFORMERS_CACHE": str(root / "transformers"),
+                "TORCH_HOME": str(root / "torch"),
+            }
+        )
+    else:
+        os.environ.pop("TRANSFORMERS_CACHE", None)
+        os.environ.pop("TORCH_HOME", None)
+    os.environ.update(environment)
     return root
 
 
@@ -2511,7 +2550,7 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
         ),
         private_access_terms="Access is restricted to authorised syv.ai members.",
         alignment_method=(
-            "pipeline_version: p1-segmentation-7; "
+            "pipeline_version: p1-segmentation-8; "
             "alignment_method: timestamp-native:p1-transcripts.words; "
             f"pipeline_config_sha256: {settings.pipeline_digest}; "
             "Source word timestamps are authoritative; boundaries are the first "
@@ -2527,8 +2566,10 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
         known_limitations="Timestamp quality is limited by the source word timestamps.",
         rejection_policy=(
             "Invalid, empty, short or overlong timestamp proposals, source timeline "
-            "defects, speaker mixing, and undecodable programmes are recorded in the "
-            "ledger; unexpected source and programming failures remain fatal."
+            "defects, and undecodable programmes are recorded in the ledger. Untimed "
+            "lexical records whose speaker cannot be proven are retained using "
+            "best-effort ownership and counted as uncertain metadata; unexpected "
+            "source and programming failures remain fatal."
         ),
         source_revisions=json.dumps(
             {
@@ -2616,7 +2657,7 @@ def preflight_pipeline(
     }
     # The source plan has already resolved both immutable repository revisions.
     source_revision_ok = True
-    # The v7 path has no model or device dependency.  In particular, do not call
+    # The v8 path has no model or device dependency.  In particular, do not call
     # the legacy revision verifier: it may inspect inactive future-alignment metadata.
     model_revision_ok = (
         True
@@ -2658,7 +2699,7 @@ def preflight_pipeline(
             False if timestamp_native else bool(cuda.get("checked", False))
         ),
         "target_checked": bool(target.get("checked", False)),
-        "target_contract_v7": bool(target.get("contract_v7", False)),
+        "target_contract_v8": bool(target.get("contract_v8", False)),
     }
     if not source_revision_ok:
         raise P1PreflightError("source revision is not available at the pinned SHA")
@@ -2667,10 +2708,10 @@ def preflight_pipeline(
     if settings.mode != "plan" and not target.get("private", False):
         raise P1PreflightError("target repository is not demonstrably private")
     if settings.mode not in {"plan", "initialise"} and not target.get(
-        "contract_v7", False
+        "contract_v8", False
     ):
         raise P1PreflightError(
-            "target card does not prove the P1 v7 timestamp-native contract"
+            "target card does not prove the P1 v8 timestamp-native contract"
         )
     return PreflightReport(
         mode=settings.mode,

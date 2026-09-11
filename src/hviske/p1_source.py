@@ -1418,9 +1418,11 @@ def parse_transcript_row(
 
     Spacing and untimed records contribute their literal text but do not become
     timing anchors. Their source characters are owned by the following timed word,
-    or by the final timed word when they trail the transcript. Lexical ownership is
-    accepted only when bounded lookahead finds a speaker-consistent timed anchor.
-    Timestamp seconds are rounded to the nearest millisecond using decimal input,
+    or by the final timed word when they trail the transcript. Lexical ownership
+    follows the deterministic source-order rule even when bounded lookahead cannot
+    prove speaker consistency; those records are reported as best-effort uncertain
+    ownership. Timestamp seconds are rounded to the nearest millisecond using
+    decimal input,
     avoiding binary-float truncation at boundaries.
 
     Args:

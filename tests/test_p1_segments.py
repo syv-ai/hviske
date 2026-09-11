@@ -266,7 +266,7 @@ def test_danish_mapping_is_reversible() -> None:
             ("København", 2_000, 3_000, None),
         ),
         contract=NormalisationContract(
-            version="p1-text-normalisation-5",
+            version="p1-text-normalisation-6",
             case_folding=True,
             punctuation_removed=True,
         ),
@@ -384,7 +384,7 @@ def test_output_text_preserves_case_when_alignment_text_is_folded() -> None:
         source_duration_ms=3_000,
         segmentation=segmentation_contract(),
         normalisation=NormalisationContract(
-            version="p1-text-normalisation-5", case_folding=True
+            version="p1-text-normalisation-6", case_folding=True
         ),
         ctc=CTC(),
         pipeline_version="test",
@@ -456,7 +456,7 @@ def test_owned_lexical_text_reaches_ctc_and_published_text_exactly() -> None:
         source_duration_ms=2_000,
         segmentation=segmentation_contract(),
         normalisation=NormalisationContract(
-            version="p1-text-normalisation-5", case_folding=True
+            version="p1-text-normalisation-6", case_folding=True
         ),
         ctc=CTC(),
         pipeline_version="p1-segmentation-6",
@@ -856,7 +856,7 @@ def test_zero_duration_duplicate_keeps_timed_source_occurrence() -> None:
         source_duration_ms=programme.duration_ms,
         segmentation=segmentation_contract(),
         normalisation=NormalisationContract(
-            version="p1-text-normalisation-5", case_folding=True
+            version="p1-text-normalisation-6", case_folding=True
         ),
         ctc=CTC(),
         pipeline_version="test",

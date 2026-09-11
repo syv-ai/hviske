@@ -207,7 +207,7 @@ def config(tmp_path: Path, mode: str = "plan") -> DictConfig:
 
 
 def prepared_hub(tmp_path: Path) -> MemoryHub:
-    """Return a fake target initialised with the active v7 metadata card."""
+    """Return a fake target initialised with the active v8 metadata card."""
     hub = MemoryHub()
     settings = PipelineSettings.from_config(config(tmp_path, mode="build"))
     initialise_target(hub=hub, settings=settings)

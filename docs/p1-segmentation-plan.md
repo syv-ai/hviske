@@ -36,10 +36,10 @@ programme duration. Transcript bounds are checked against that decoded duration.
 
 The source coordinates, timestamp method, normalisation rules, output schema, and
 pipeline version form the reproducibility identity. The active implementation is
-`p1-segmentation-7` with method
+`p1-segmentation-8` with method
 `timestamp-native:p1-transcripts.words`. A change to any of these items requires a
-new derived dataset revision and new deterministic segment identifiers. Existing v6
-outputs are not mixed with v7 and will be deleted and recreated remotely.
+new derived dataset revision and new deterministic segment identifiers. Existing v7
+outputs are not mixed with v8 and will be deleted and recreated remotely.
 
 ## Output contract
 
@@ -62,29 +62,29 @@ Each `train` row has these fields:
 | `source_end_ms` | int64 | Exact last timed-word end in the source programme. |
 | `source_duration_ms` | int64 | Authoritative decoded source-programme duration. |
 | `duration_ms` | int32 | Exact decoded clip duration. |
-| `speaker_ids` | list[string] | Speakers represented in the clip. |
+| `speaker_ids` | list[string] | Timed-anchor speakers; uncertain untimed ownership may be approximate. |
 | `proposal_start_ms` | int64 | Start from the supplied word timestamps. |
 | `proposal_end_ms` | int64 | End from the supplied word timestamps. |
 | `alignment_score` | float32, nullable | Always null for timestamp-native rows. |
-| `alignment_score_type` | string | `not_applicable:source_timestamps` for v7 rows. |
+| `alignment_score_type` | string | `not_applicable:source_timestamps` for v8 rows. |
 | `start_drift_ms` | int32, nullable | Null for timestamp-native rows. |
 | `end_drift_ms` | int32, nullable | Null for timestamp-native rows. |
-| `vad_speech_ratio` | float32, nullable | Always null for v7. |
-| `alignment_backend` | string | `timestamp-native` for v7 rows. |
+| `vad_speech_ratio` | float32, nullable | Always null for v8. |
+| `alignment_backend` | string | `timestamp-native` for v8 rows. |
 | `alignment_method` | string | `timestamp-native:p1-transcripts.words`. |
-| `pipeline_version` | string | `p1-segmentation-7`. |
-| `pipeline_config_sha256` | string | Digest of the active v7 identity manifest. |
+| `pipeline_version` | string | `p1-segmentation-8`. |
+| `pipeline_config_sha256` | string | Digest of the active v8 identity manifest. |
 
 Do not include credentials, cache paths, machine names, or transient job identifiers.
 Preserve enough provenance to reproduce or audit every segment.
 
 First build a canonical identity manifest containing the immutable source revisions,
 active timestamp method, text normalisation, segmentation thresholds, output encoding,
-and schema version. Model-backed alignment metadata is outside the v7 identity.
+and schema version. Model-backed alignment metadata is outside the v8 identity.
 Serialise it with UTF-8,
 Unicode NFC, sorted keys, no insignificant whitespace, JSON escaping, and exact numeric
 types. Store its SHA-256 digest as `pipeline_config_sha256`. The target card must
-repeat the v7 method, schema, and digest before any payload commit.
+repeat the v8 method, schema, and digest before any payload commit.
 
 Build `segment_id` from a second canonical JSON object containing that digest,
 `source_file_id`, final integer millisecond boundaries, and exact published `text`.
@@ -111,13 +111,15 @@ Normalise timestamps into one monotonic millisecond timebase. Reject a programme
 before alignment when timestamps are missing, non-finite, outside the audio duration,
 or substantially non-monotonic. Record the exact rejection reason in the ledger.
 
-For v7, the positive-duration records in the source `words` feature are the alignment
+For v8, the positive-duration records in the source `words` feature are the alignment
 units. The exact candidate `text` remains verbatim and retains all separator,
 untimed, and zero-duration ownership. Leading and interior text belongs to the
-following positive-duration word, while terminal text belongs to the final previous
-word; ownership is accepted only with speaker-consistent bounded lookahead. No
-secondary alignment evidence or model loading occurs on this path. Generic
-model-backed alignment code remains available only for future datasets.
+following positive timed word; terminal suffix text belongs to the preceding final
+timed word. Ownership follows source order even when speaker-consistent bounded
+lookahead cannot prove the lexical record's speaker.
+The exact characters are retained once, and uncertain ownership is counted only as
+aggregate metadata. No secondary alignment evidence or model loading occurs on this
+path. Generic model-backed alignment code remains available only for future datasets.
 
 ### Form candidate segments
 
@@ -126,8 +128,10 @@ Build candidates from consecutive words with these rules:
 - Target speech-bearing clips between 2 and 8 seconds.
 - Enforce a final duration below 10 seconds, never equal to 10 seconds.
 - Prefer punctuation and source timestamp gaps as boundaries.
-- Never cross a speaker change.
+- Never cross a change between positive timed anchors with different speakers.
 - Do not split a word or duplicate a word across adjacent candidates.
+- Keep positive timed-anchor proposal runs single-speaker. `speaker_ids` describes
+  timed anchors; text owned from uncertain untimed records may be approximate.
 - Add bounded context around each proposal for alignment, but remove it from the
   published clip.
 - Preserve the original text. Apply Hviske's model normalisation only during training.
@@ -137,16 +141,17 @@ hard-coded assumptions. Store them in a versioned configuration file.
 
 ### Timestamp-native alignment
 
-The active v7 path uses no refinement model. It accepts each speaker-safe candidate
+The active v8 path uses no refinement model. It accepts each speaker-safe candidate
 when its duration is in the half-open range 1,000 ms <= duration < 10,000 ms and
 publishes boundaries exactly at the first timed word start and last timed word end.
-The source audio clock is authoritative, and the terminal source word endpoint is
-validated against decoded audio before segmentation.
+A programme is not rejected merely because lexical ownership cannot be proven by
+speaker metadata. The source audio clock is authoritative, and the terminal source
+word endpoint is validated against decoded audio before segmentation.
 
 ### Future model-backed alignment (inactive)
 
 The following generic material is retained unchanged for future datasets; it is not
-constructed, verified, or invoked by v7. Refine and verify each local
+constructed, verified, or invoked by v8. Refine and verify each local
 candidate with a Danish-capable CTC forced aligner only when implementing that future
 path. The legacy implementation uses the pinned `ctc-segmentation` source and the
 [`CoRal-project/roest-v3-wav2vec2-315m`](https://huggingface.co/CoRal-project/roest-v3-wav2vec2-315m)
@@ -203,10 +208,12 @@ A timestamp-native segment is publishable only when all of these gates pass:
 - text is non-empty and contains at least one trainable character;
 - timestamps are ordered and within the decoded source duration;
 - timestamp boundaries are the exact first/last timed word endpoints;
-- source word ownership is complete, contiguous, speaker-safe, and terminally valid;
+- source word ownership is complete, contiguous, deterministic, and terminally valid;
+- positive timed-anchor runs remain single-speaker; uncertain untimed ownership is
+  retained and counted in aggregate rather than used as a rejection gate;
 - score, drift, and other secondary-evidence fields are null rather than fabricated;
 - no word is duplicated or dropped within an accepted contiguous transcript region;
-- speaker-overlap and music heuristics pass;
+- timed-anchor speaker overlap and music heuristics pass;
 - FLAC encoding and a fresh 16 kHz mono decode succeed;
 - `segment_id` is unique.
 
@@ -287,8 +294,9 @@ On restart:
 
 Selection retains the exact audio row pointer discovered by the metadata scan and
 joins it to the disk-backed transcript pointer. Processing first performs structural
-transcript checks: empty, untimed, ambiguous, malformed, and invalid-timestamp
-records are terminal rejections before audio retrieval. A
+transcript checks: empty, untimed, malformed, and invalid-timestamp records are
+terminal rejections before audio retrieval. Ambiguous lexical ownership is retained,
+reported as aggregate uncertainty, and is not a programme rejection. A
 qualified transcript then permits bounded audio decoding. Transcript-versus-audio
 duration validation happens after that decode; the decoded
 audio is the duration authority, not a declared metadata duration. Unexpected failures
@@ -379,7 +387,7 @@ P1 training must load the derived segmented dataset directly.
 - Reconfirm both immutable source revisions and schemas.
 - Measure source object-size and duration maxima without downloading the full split.
 - Confirm target repository ownership, privacy, licence wording, and storage quota.
-- Keep any model-backed alignment design isolated from the active v7 pipeline.
+- Keep any model-backed alignment design isolated from the active v8 pipeline.
 - Define the scratch budget and failure policy.
 
 **Gate:** no audio processing starts until privacy, licensing, storage, and bounded
@@ -482,7 +490,7 @@ segmented P1 dataset.
 
 ## Evidence to retain
 
-Retain only for the active v7 dataset:
+Retain only for the active v8 dataset:
 
 - immutable source revisions and code/configuration identity;
 - the pinned CoRal-v3 dataset-licence template revision and digest, the exact
@@ -502,8 +510,8 @@ Retain only for the active v7 dataset:
   ```
 
 - versioned configuration and normalisation rules; the active pipeline digest covers
-  the timestamp method, `p1-text-normalisation-5` rules, and
-  `speaker-consistent-following-word-with-terminal-suffix-v5` source-text ownership;
+  the timestamp method, `p1-text-normalisation-6` rules, and
+  `best-effort-following-word-with-terminal-suffix-v6` source-text ownership;
 - metadata-only SQLite ledger and batch manifests;
 - shard paths, sizes, row counts, SHA-256 digests, and Hub commit IDs;
 - aggregate quality reports and manual-audit decisions;

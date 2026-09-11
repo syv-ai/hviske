@@ -1,7 +1,7 @@
-# Phase 1C contract configuration. Active v7 identity is source-timestamp based.
+# Phase 1C contract configuration. Active v8 identity is source-timestamp based.
 # Use mode=plan for a Hub-metadata-only preflight; initialise creates the private
 # target card, while pilot and production are bounded builds.
-pipeline_version: p1-segmentation-7
+pipeline_version: p1-segmentation-8
 alignment_method: timestamp-native:p1-transcripts.words
 mode: plan
 programme_limit: null
@@ -24,7 +24,7 @@ source:
   text_column: transcript_text
 
 # Model-backed alignment material is retained only for a future pipeline. It is
-# deliberately outside the active v7 identity and is never inspected by v7.
+# deliberately outside the active v8 identity and is never inspected by v8.
 future_alignment:
   vad:
     name: silero-vad
@@ -76,8 +76,8 @@ future_alignment:
     - ctc-forced-aligner
 
 normalisation:
-  version: p1-text-normalisation-5
-  source_text_ownership: speaker-consistent-following-word-with-terminal-suffix-v5
+  version: p1-text-normalisation-6
+  source_text_ownership: best-effort-following-word-with-terminal-suffix-v6
   unicode_form: NFC
   case_folding: true
   punctuation_removed: true
@@ -90,7 +90,7 @@ segmentation:
   target_maximum_duration_ms: 8000
   maximum_duration_ms: 10000
   maximum_drift_ms: 500
-  # Retained for future model-backed alignment; v7 does not use these thresholds.
+  # Retained for future model-backed alignment; v8 does not use these thresholds.
   minimum_alignment_score: -10.0
   minimum_vad_speech_ratio: 0.0
 
@@ -115,7 +115,7 @@ output:
   shard_format: parquet
 
 runtime:
-  scratch_root: /scratch/syvai/p1-segmentation
+  scratch_root: /scratch/syvai/p1-segmentation-v8
   max_source_bytes: 6197291423
   max_scratch_bytes: 68719476736
   workers: 1

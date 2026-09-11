@@ -711,6 +711,30 @@ def test_transcript_pointer_round_trip_preserves_encoded_metadata(
     assert index.get(original.file_id) == original
 
 
+def test_v8_ambiguous_ownership_is_lossless_and_non_fatal() -> None:
+    """Cross-speaker, unknown, zero-duration and terminal text remains owned once."""
+    parsed = parse_transcript_row(
+        row={
+            "file_id": "x",
+            "words": [
+                {"text": "one", "start_ms": 0, "end_ms": 100, "speaker": "a"},
+                {"text": "cross", "speaker": "a"},
+                {"text": "<zero>", "start_ms": 100, "end_ms": 100, "speaker": "b"},
+                {"text": "unknown"},
+                {"text": "two", "start_ms": 100, "end_ms": 200, "speaker": "b"},
+                {"text": " [tail]", "speaker": "a"},
+            ],
+        }
+    )
+
+    assert parsed.text == "onecross<zero>unknowntwo [tail]"
+    assert "onecross<zero>" + "unknowntwo [tail]" == parsed.text
+    assert parsed.ambiguous_source_text_records == 3
+    assert parsed.words[0].separator_text == ""
+    assert parsed.words[1].separator_text == "cross<zero>unknown"
+    assert parsed.words[-1].trailing_text == " [tail]"
+
+
 @pytest.mark.parametrize("point_ms", [100, 150, 200])
 def test_zero_duration_lexical_gap_has_deterministic_ownership(point_ms: int) -> None:
     """Same-speaker points at either closed gap edge belong to the next word."""

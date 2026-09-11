@@ -1,4 +1,4 @@
-"""Acceptance tests for the timestamp-native P1 v7 path."""
+"""Acceptance tests for the timestamp-native P1 v8 path."""
 
 from __future__ import annotations
 
@@ -15,13 +15,23 @@ from hviske.p1_contracts import (
     SegmentationContract,
     SourceWord,
 )
-from hviske.p1_pipeline import PipelineSettings, preflight_pipeline, run_pipeline
-from hviske.p1_segments import TimestampAlignmentBackend, segment_programme
+from hviske.p1_pipeline import (
+    PipelineSettings,
+    configure_scratch,
+    preflight_pipeline,
+    run_pipeline,
+)
+from hviske.p1_segments import (
+    CTCBackend,
+    TimestampAlignmentBackend,
+    VADBackend,
+    segment_programme,
+)
 from tests.test_p1_publish import MemoryHub
 
 
 @pytest.mark.parametrize(("end_ms", "accepted"), [(9_999, True), (10_000, False)])
-def test_v7_duration_upper_bound_is_exclusive(end_ms: int, accepted: bool) -> None:
+def test_v8_duration_upper_bound_is_exclusive(end_ms: int, accepted: bool) -> None:
     """The timestamp span accepts 9,999 ms but rejects exactly 10 seconds."""
     words = (SourceWord(text="ord", start_ms=0, end_ms=end_ms),)
     result = segment_programme(
@@ -32,7 +42,7 @@ def test_v7_duration_upper_bound_is_exclusive(end_ms: int, accepted: bool) -> No
         segmentation=_segmentation(),
         normalisation=NormalisationContract(version="unused"),
         ctc=TimestampAlignmentBackend(),
-        pipeline_version="p1-segmentation-7",
+        pipeline_version="p1-segmentation-8",
         pipeline_config_sha256="a" * 64,
     )
 
@@ -52,7 +62,7 @@ def _segmentation() -> SegmentationContract:
     )
 
 
-def test_v7_initialise_never_probes_cuda_or_model_provenance(
+def test_v8_initialise_never_probes_cuda_or_model_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Initialisation records explicit non-applicability without probing models."""
@@ -73,10 +83,10 @@ def test_v7_initialise_never_probes_cuda_or_model_provenance(
 
 
 def _config(tmp_path: Path) -> DictConfig:
-    """Load the active v7 configuration with an isolated scratch directory.
+    """Load the active v8 configuration with an isolated scratch directory.
 
     Returns:
-        The v7 configuration with temporary scratch storage.
+        The v8 configuration with temporary scratch storage.
     """
     config = OmegaConf.load("config/p1_segments.yaml")
     config.mode = "plan"
@@ -84,7 +94,13 @@ def _config(tmp_path: Path) -> DictConfig:
     return t.cast(DictConfig, config)
 
 
-def test_v7_preflight_never_checks_models_or_cuda(
+def test_v8_pipeline_rejects_injected_model_backends(tmp_path: Path) -> None:
+    """The orchestration entry point refuses injected model implementations."""
+    with pytest.raises(ValueError, match="injected model-backed"):
+        run_pipeline(config=_config(tmp_path), ctc=t.cast(CTCBackend, object()))
+
+
+def test_v8_preflight_never_checks_models_or_cuda(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The active plan path has no model, VAD, or CUDA preflight dependency."""
@@ -112,7 +128,37 @@ def test_v7_preflight_never_checks_models_or_cuda(
     assert report.model_revisions == {}
 
 
-def test_v7_uses_exact_word_boundaries_and_no_acoustic_evidence() -> None:
+def test_v8_rejects_injected_model_backends() -> None:
+    """The active path refuses both injected CTC and VAD implementations."""
+    words = (SourceWord(text="ord", start_ms=0, end_ms=1_000),)
+    with pytest.raises(ValueError, match="model-backed"):
+        segment_programme(
+            words=words,
+            audio=np.zeros(16_000, dtype=np.float32),
+            source_file_id="programme",
+            source_duration_ms=1_000,
+            segmentation=_segmentation(),
+            normalisation=NormalisationContract(version="unused"),
+            ctc=t.cast(CTCBackend, object()),
+            pipeline_version="p1-segmentation-8",
+            pipeline_config_sha256="a" * 64,
+        )
+    with pytest.raises(ValueError, match="VAD"):
+        segment_programme(
+            words=words,
+            audio=np.zeros(16_000, dtype=np.float32),
+            source_file_id="programme",
+            source_duration_ms=1_000,
+            segmentation=_segmentation(),
+            normalisation=NormalisationContract(version="unused"),
+            ctc=TimestampAlignmentBackend(),
+            pipeline_version="p1-segmentation-8",
+            pipeline_config_sha256="a" * 64,
+            vad=t.cast(VADBackend, object()),
+        )
+
+
+def test_v8_uses_exact_word_boundaries_and_no_acoustic_evidence() -> None:
     """Timestamp-native rows preserve words, speakers, and source endpoints."""
     words = (
         SourceWord(text="Hej", start_ms=123, end_ms=1_100, speaker_id="a"),
@@ -126,7 +172,7 @@ def test_v7_uses_exact_word_boundaries_and_no_acoustic_evidence() -> None:
         segmentation=_segmentation(),
         normalisation=NormalisationContract(version="unused"),
         ctc=TimestampAlignmentBackend(),
-        pipeline_version="p1-segmentation-7",
+        pipeline_version="p1-segmentation-8",
         pipeline_config_sha256="a" * 64,
     )
 
@@ -142,3 +188,12 @@ def test_v7_uses_exact_word_boundaries_and_no_acoustic_evidence() -> None:
     assert row.vad_speech_ratio is None
     assert OUTPUT_SCHEMA.schema_version == "p1-segments-v2"
     assert "alignment_method" in {field.name for field in OUTPUT_SCHEMA.fields}
+
+
+def test_v8_uses_model_free_scratch_layout(tmp_path: Path) -> None:
+    """The active scratch layout does not create model-cache directories."""
+    root = configure_scratch(tmp_path / "p1-v8", model_free=True)
+
+    assert root.name == "p1-v8"
+    assert not (root / "transformers").exists()
+    assert not (root / "torch").exists()

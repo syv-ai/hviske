@@ -1,4 +1,4 @@
-"""Tests for the privacy-safe post-pilot v7 sanity gate."""
+"""Tests for the privacy-safe post-pilot v8 sanity gate."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import soundfile as sf
 
 from hviske.p1_contracts import OutputRow
 from hviske.p1_segments import _rows_table
-from hviske.p1_v7_sanity_gate import run_v7_sanity_gate
+from hviske.p1_v8_sanity_gate import run_v8_sanity_gate
 from hviske.p1_validation import (
     AuditReservoir,
     PinnedHubClipRetriever,
@@ -109,10 +109,9 @@ def test_audit_manifest_retrieves_published_parquet_rows(tmp_path: Path) -> None
     retriever = PinnedHubClipRetriever(
         _PublishedHub(), repository=repository, revision=revision
     )
-    report = run_v7_sanity_gate(
+    report = run_v8_sanity_gate(
         manifest,
         retriever=retriever,
-        asr=_ASR(),
         pilot_head=revision,
         report_path=tmp_path / "sanity.json",
     )
@@ -123,17 +122,9 @@ def test_audit_manifest_retrieves_published_parquet_rows(tmp_path: Path) -> None
         "selected": 12,
         "retrieved": 12,
         "structural_failures": 0,
-        "asr_empty": 0,
-        "asr_non_speech": 0,
-        "wer_high": 0,
+        "pipeline_digests": 1,
     }
     assert all("_p1_metadata_sha256" not in candidate for candidate in manifest)
-
-
-class _ASR:
-    def transcribe(self, audio: bytes) -> str:
-        del audio
-        return "hej verden"
 
 
 def _row(index: int) -> dict[str, object]:
@@ -160,7 +151,7 @@ def _row(index: int) -> dict[str, object]:
         "vad_speech_ratio": None,
         "alignment_backend": "timestamp-native",
         "alignment_method": "timestamp-native:p1-transcripts.words",
-        "pipeline_version": "p1-segmentation-7",
+        "pipeline_version": "p1-segmentation-8",
         "pipeline_config_sha256": "c" * 64,
     }
 
@@ -168,11 +159,8 @@ def _row(index: int) -> dict[str, object]:
 def test_gate_fails_without_a_full_dozen(tmp_path: Path) -> None:
     """A short accepted pool produces a failed aggregate report."""
     report_path = tmp_path / "gate.json"
-    report = run_v7_sanity_gate(
-        _candidates(11),
-        retriever=_Retriever(_candidates(11)),
-        asr=_ASR(),
-        report_path=report_path,
+    report = run_v8_sanity_gate(
+        _candidates(11), retriever=_Retriever(_candidates(11)), report_path=report_path
     )
 
     assert report["pass"] is False
@@ -191,6 +179,9 @@ class _Retriever:
     def retrieve_row(self, candidate: dict[str, object]) -> dict[str, object]:
         self.seen.append(str(candidate["audit_id"]))
         return self.rows[candidate["segment_id"]]
+
+    def verify_repository(self) -> None:
+        """The fake retriever models private immutable verification."""
 
 
 def _candidates(count: int) -> list[dict[str, object]]:
@@ -222,19 +213,15 @@ def test_gate_is_deterministic_and_report_contains_aggregate_only(
     """The selected set is stable and the report contains no row-level evidence."""
     candidates = _candidates(18)
     first_retriever = _Retriever(candidates)
-    first = run_v7_sanity_gate(
+    first = run_v8_sanity_gate(
         candidates,
         retriever=first_retriever,
-        asr=_ASR(),
         seed="test-seed",
         report_path=tmp_path / "first.json",
     )
     second_retriever = _Retriever(list(reversed(candidates)))
-    second = run_v7_sanity_gate(
-        list(reversed(candidates)),
-        retriever=second_retriever,
-        asr=_ASR(),
-        seed="test-seed",
+    second = run_v8_sanity_gate(
+        list(reversed(candidates)), retriever=second_retriever, seed="test-seed"
     )
 
     assert first["pass"] is True
