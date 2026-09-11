@@ -89,7 +89,7 @@ class P1RuntimeContract:
 
 
 P1_RUNTIME_CONTRACT = P1RuntimeContract(
-    pipeline_version="p1-segmentation-7",
+    pipeline_version="p1-segmentation-8",
     alignment_method="timestamp-native:p1-transcripts.words",
     ctc_name="ctc-segmentation",
     ctc_version="1.7.4",
@@ -132,9 +132,9 @@ P1_RUNTIME_CONTRACT = P1RuntimeContract(
     roest_word_delimiter_token_id=36,
     roest_required_tokens=frozenset("0123456789abcdefghijklmnopqrstuvwxyzåæéøü"),
     roest_tokenizer_case="lowercase-only",
-    normalisation_version="p1-text-normalisation-5",
+    normalisation_version="p1-text-normalisation-6",
     normalisation_source_text_ownership=(
-        "speaker-consistent-following-word-with-terminal-suffix-v5"
+        "best-effort-following-word-with-terminal-suffix-v6"
     ),
     normalisation_unicode_form="NFC",
     normalisation_case_folding=True,
@@ -262,12 +262,14 @@ class OutputRow(ContractModel):
         if self.alignment_score is not None and not math.isfinite(self.alignment_score):
             raise ValueError("alignment_score must be finite when supplied")
         if self.pipeline_version == "p1-segmentation-7":
+            raise ValueError("v7 rows cannot be mixed with the active v8 contract")
+        if self.pipeline_version == "p1-segmentation-8":
             if self.alignment_method != "timestamp-native:p1-transcripts.words":
-                raise ValueError("v7 rows must use timestamp-native alignment")
+                raise ValueError("v8 rows must use timestamp-native alignment")
             if self.alignment_backend != "timestamp-native":
-                raise ValueError("v7 rows must use the timestamp-native backend")
+                raise ValueError("v8 rows must use the timestamp-native backend")
             if self.alignment_score_type != "not_applicable:source_timestamps":
-                raise ValueError("v7 rows must have a not-applicable score type")
+                raise ValueError("v8 rows must have a not-applicable score type")
             if (
                 self.source_start_ms != self.proposal_start_ms
                 or self.source_end_ms != self.proposal_end_ms
@@ -711,7 +713,7 @@ class NormalisationContract(ContractModel):
 
     version: StrictStr
     source_text_ownership: StrictStr = (
-        "speaker-consistent-following-word-with-terminal-suffix-v5"
+        "best-effort-following-word-with-terminal-suffix-v6"
     )
     unicode_form: StrictStr = "NFC"
     case_folding: bool = False
@@ -902,9 +904,9 @@ def _canonical_value(value: object) -> JSONValue:
 def pipeline_config_sha256(manifest: CanonicalIdentityManifest) -> str:
     """Return the digest for the active pipeline identity.
 
-    The v7 pipeline consumes source timestamps and therefore has no model-backed
+    The v8 pipeline consumes source timestamps and therefore has no model-backed
     alignment identity.  Keep the legacy model fields on the manifest so the
-    generic future aligner remains representable, but do not let them affect v7
+    generic future aligner remains representable, but do not let them affect v8
     segment identities.
     """
     if manifest.pipeline_version == P1_RUNTIME_CONTRACT.pipeline_version:
@@ -987,7 +989,7 @@ def validate_p1_runtime_contract(
             Version of the P1 pipeline implementation.
         ctc:
             CTC contract for a future model-backed alignment. It is not required by
-            timestamp-native v7.
+            timestamp-native v8.
         alignment_method (optional):
             Active alignment method identity.
         normalisation:

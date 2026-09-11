@@ -208,7 +208,11 @@ def build_dataset_card(
         "P1 uses timestamp-native segmentation: source words and timestamps are "
         "authoritative. Each segment spans the first and last selected word "
         "boundaries. No acoustic model refines P1, and acoustic alignment evidence "
-        "is not part of active v7 output.\n\n"
+        "is not part of active v8 output. Untimed lexical text is retained exactly "
+        "once using deterministic following-word ownership, with terminal suffixes "
+        "owned by the preceding timed word. Where speaker attribution cannot be "
+        "proven, ownership is best-effort and recorded only as aggregate uncertainty; "
+        "it does not reject the programme.\n\n"
         "<details>\n"
         "<summary>Reproducibility details</summary>\n\n"
         "The configured alignment identity and details are:\n\n"
@@ -710,7 +714,7 @@ def initialise_private_dataset(
     Raises:
         PublicationError:
             If metadata is unsafe, the licence is not pinned, or the target tree is
-            not pristine metadata-only v7 state.
+            not pristine metadata-only v8 state.
     """
     _assert_safe_metadata(card, token=token)
     _assert_safe_metadata(gitattributes, token=token)
@@ -827,13 +831,15 @@ def _assert_initialise_target_is_safe(
             "cannot inspect the existing target card before initialisation"
         ) from error
     required = (
-        "pipeline_version: p1-segmentation-7",
+        "pipeline_version: p1-segmentation-8",
         "timestamp-native:p1-transcripts.words",
         "p1-segments-v2",
     )
+    if "pipeline_version: p1-segmentation-7" in existing_card:
+        raise PublicationError("refusing to mix a v7 target card with v8")
     if not all(marker in existing_card for marker in required):
         raise PublicationError(
-            "refusing to overwrite a target card without the compatible v7 identity"
+            "refusing to overwrite a target card without the compatible v8 identity"
         )
     expected_digest = re.search(r"pipeline_config_sha256:\s*([0-9a-f]{64})", card)
     actual_digest = re.search(
@@ -842,7 +848,7 @@ def _assert_initialise_target_is_safe(
     if expected_digest is not None and (
         actual_digest is None or actual_digest.group(1) != expected_digest.group(1)
     ):
-        raise PublicationError("existing target card has a different v7 identity")
+        raise PublicationError("existing target card has a different v8 identity")
     if re.search(r"\b(?:vad|ctc|roest|whisper|silero)\b", existing_card, re.I):
         raise PublicationError(
             "existing target card contains inactive model provenance"
@@ -1456,15 +1462,19 @@ def _validate_row(row: object, shard_path: str) -> None:
     if decoded.shape[0] != duration * 16:
         raise VerificationError(f"decoded duration is inconsistent: {shard_path}")
     if row.get("pipeline_version") == "p1-segmentation-7":
+        raise VerificationError(
+            f"v7 row cannot be used by the active v8 pipeline: {shard_path}"
+        )
+    if row.get("pipeline_version") == "p1-segmentation-8":
         if row.get("alignment_method") != "timestamp-native:p1-transcripts.words":
             raise VerificationError(
-                f"v7 row does not declare timestamp-native alignment: {shard_path}"
+                f"v8 row does not declare timestamp-native alignment: {shard_path}"
             )
         if row.get("alignment_backend") != "timestamp-native":
-            raise VerificationError(f"v7 row has a non-native backend: {shard_path}")
+            raise VerificationError(f"v8 row has a non-native backend: {shard_path}")
         if row.get("alignment_score_type") != "not_applicable:source_timestamps":
             raise VerificationError(
-                f"v7 row has an applicable score type: {shard_path}"
+                f"v8 row has an applicable score type: {shard_path}"
             )
         if (
             row.get("source_start_ms") != row.get("proposal_start_ms")
@@ -1475,7 +1485,7 @@ def _validate_row(row: object, shard_path: str) -> None:
             or row.get("vad_speech_ratio") is not None
         ):
             raise VerificationError(
-                f"v7 row contains non-native alignment evidence: {shard_path}"
+                f"v8 row contains non-native alignment evidence: {shard_path}"
             )
 
 

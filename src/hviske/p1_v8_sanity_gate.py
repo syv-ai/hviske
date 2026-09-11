@@ -1,8 +1,8 @@
-"""Privacy-safe, post-pilot sanity gate for the P1 v7 dataset.
+"""Privacy-safe, structural sanity gate for the P1 v8 dataset.
 
-This module is deliberately separate from segmentation.  It selects twelve accepted
-remote rows, retrieves one row at a time from the immutable pilot revision, and emits
-only aggregate evidence.
+The active gate retrieves a small, deterministic sample from one private immutable
+revision. It validates publication structure and audio encoding only; transcription
+agreement and model-backed quality checks are intentionally out of scope.
 """
 
 from __future__ import annotations
@@ -12,157 +12,57 @@ import hashlib
 import io
 import json
 import logging
-import math
 import re
-import typing as t
 from pathlib import Path, PurePosixPath
-from statistics import mean, median
 
 import numpy as np
 import soundfile as sf
 
 from .p1_contracts import OUTPUT_SCHEMA
-from .p1_source import harden_p1_logging
-from .p1_validation import (
-    IndependentASR,
-    _embedded_audio,
-    _metadata_digest,
-    normalised_wer,
-)
+from .p1_validation import _embedded_audio, _metadata_digest
 
 logger = logging.getLogger(__name__)
 
 PILOT_REPOSITORY = "syvai/p1-segments"
-PIPELINE_VERSION = "p1-segmentation-7"
+PIPELINE_VERSION = "p1-segmentation-8"
 SCHEMA_VERSION = "p1-segments-v2"
-WHISPER_MODEL = "openai/whisper-small"
-WHISPER_REVISION = "973afd24965f72e36ca33b3055d56a652f456b4d"
 SAMPLE_SIZE = 12
-MEDIAN_WER_LIMIT = 0.5
-HIGH_WER_LIMIT = 0.8
-HIGH_WER_COUNT_LIMIT = 3
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MetadataRow = c.Mapping[str, object]
 
 
-class WhisperSmallASR:
-    """Independent, pinned OpenAI Whisper-small transcription backend.
-
-    The processor and model are constructed once per gate invocation.  Calls receive
-    decoded arrays only; neither audio nor generated text is written or logged.
-    """
-
-    def __init__(self, device: int | str | None = None) -> None:
-        """Load the pinned model once.
-
-        Args:
-            device (optional):
-                Transformers device index, or ``-1`` for CPU. Defaults to the first
-                CUDA device when available and CPU otherwise.
-        """
-        _harden_gate_logging()
-        import torch
-        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-
-        processor = AutoProcessor.from_pretrained(
-            WHISPER_MODEL, revision=WHISPER_REVISION
-        )
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            WHISPER_MODEL, revision=WHISPER_REVISION
-        )
-        model.eval()
-        selected_device: int | str
-        if device is not None:
-            selected_device = device
-        else:
-            selected_device = 0 if torch.cuda.is_available() else -1
-        self._pipeline = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            device=selected_device,
-        )
-
-    def transcribe(self, audio: bytes) -> str:
-        """Transcribe one in-memory 16 kHz FLAC clip in Danish.
-
-        Returns:
-            The Danish transcription returned by the pinned model.
-
-        Raises:
-            ValueError:
-                If the backend returns no transcription or receives invalid audio.
-        """
-        with sf.SoundFile(io.BytesIO(audio)) as audio_file:
-            if (
-                audio_file.format != "FLAC"
-                or audio_file.subtype != "PCM_16"
-                or audio_file.samplerate != 16_000
-                or audio_file.channels != 1
-            ):
-                raise ValueError("ASR received audio outside the v7 audio contract")
-            decoded = audio_file.read(dtype="float32", always_2d=True)
-        result = self._pipeline(
-            decoded[:, 0], generate_kwargs={"language": "danish", "task": "transcribe"}
-        )
-        if not isinstance(result, c.Mapping) or not isinstance(result.get("text"), str):
-            raise ValueError("independent ASR returned no text")
-        return t.cast(str, result["text"])
-
-
-def _harden_gate_logging() -> None:
-    """Suppress dependency diagnostics that may expose local cache locations."""
-    harden_p1_logging()
-    for name in (
-        "datasets",
-        "fsspec",
-        "huggingface_hub",
-        "httpcore",
-        "httpx",
-        "safetensors",
-        "torch",
-        "transformers",
-    ):
-        logging.getLogger(name).setLevel(logging.CRITICAL)
-
-
-def run_v7_sanity_gate(
+def run_v8_sanity_gate(
     candidates: c.Iterable[MetadataRow],
     *,
     retriever: object,
-    asr: IndependentASR,
     pilot_head: str | None = None,
-    seed: str | int = "p1-v7-dozen",
+    seed: str | int = "p1-v8-dozen",
     report_path: Path | str | None = None,
 ) -> dict[str, object]:
-    """Run the post-pilot v7 dozen-clip gate.
+    """Run the model-free post-pilot v8 structural gate.
 
     Args:
         candidates:
-            Metadata-only records from ``scratch/audit-candidates.jsonl``.
+            Metadata-only records from the bounded audit manifest.
         retriever:
-            A retriever which verifies immutable row, metadata, audio and Parquet
-            hashes before returning one row or one embedded audio payload.
-        asr:
-            Independent Danish ASR, normally :class:`WhisperSmallASR`.
+            A retriever which verifies private immutable rows, shard hashes, row
+            hashes, and audio hashes before returning one row.
         pilot_head (optional):
             Expected complete immutable commit SHA. If omitted, the sole revision in
             the accepted candidates is used.
         seed (optional):
-            Stable sample-selection seed. Defaults to ``p1-v7-dozen``.
+            Stable sample-selection seed. Defaults to ``p1-v8-dozen``.
         report_path (optional):
             Aggregate JSON destination. No candidate identifiers are written there.
 
     Returns:
-        An aggregate report safe to retain outside the private dataset environment.
+        An aggregate structural report safe to retain outside the private dataset.
 
     Raises:
         ValueError:
-            If the explicitly supplied pilot head is not an immutable commit SHA.
+            If the explicitly supplied pilot head is not immutable.
     """
-    _harden_gate_logging()
     rows = [dict(row) for row in candidates]
     accepted = [row for row in rows if _is_accepted_candidate(row)]
     expected_head = _resolve_pilot_head(accepted, pilot_head)
@@ -174,14 +74,34 @@ def run_v7_sanity_gate(
         return report
 
     verify_repository = getattr(retriever, "verify_repository", None)
-    if callable(verify_repository):
+    if not callable(verify_repository):
+        report["counts"] = {
+            "accepted": len(accepted),
+            "selected": len(selected),
+            "retrieved": 0,
+            "structural_failures": len(selected),
+            "pipeline_digests": 0,
+        }
+        report["pass"] = False
+        _write_report(report_path, report)
+        return report
+    try:
         verify_repository()
+    except Exception:
+        report["counts"] = {
+            "accepted": len(accepted),
+            "selected": len(selected),
+            "retrieved": 0,
+            "structural_failures": len(selected),
+            "pipeline_digests": 0,
+        }
+        report["pass"] = False
+        _write_report(report_path, report)
+        return report
 
     structural_failures = 0
     retrievals = 0
-    asr_empty = 0
-    asr_non_speech = 0
-    scores: list[float] = []
+    digests: set[str] = set()
     for ordinal, candidate in enumerate(selected, 1):
         try:
             if expected_head is None:
@@ -196,59 +116,31 @@ def run_v7_sanity_gate(
             duration = row.get("duration_ms")
             if not isinstance(duration, int) or isinstance(duration, bool):
                 raise ValueError("retrieved row has invalid duration metadata")
-            decoded = _decode_audio(audio, duration_ms=duration)
+            _decode_audio(audio, duration_ms=duration)
+            digest = row.get("pipeline_config_sha256")
+            if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+                raise ValueError("retrieved row has an invalid pipeline digest")
+            digests.add(digest)
         except Exception:
             structural_failures += 1
             logger.warning(
-                "v7 sanity sample %d/%d failed structural checks", ordinal, SAMPLE_SIZE
+                "v8 sanity sample %d/%d failed structural checks", ordinal, SAMPLE_SIZE
             )
             continue
+        logger.info("v8 sanity sample %d/%d validated", ordinal, SAMPLE_SIZE)
 
-        try:
-            hypothesis = asr.transcribe(audio)
-            if not _has_trainable_text(hypothesis):
-                asr_empty += 1
-                logger.warning(
-                    "v7 sanity sample %d/%d returned empty ASR", ordinal, SAMPLE_SIZE
-                )
-                continue
-            if not bool(np.any(decoded != 0.0)):
-                asr_non_speech += 1
-                continue
-            reference = row.get("text")
-            if not isinstance(reference, str) or not _has_trainable_text(reference):
-                structural_failures += 1
-                continue
-            score = normalised_wer(reference, hypothesis)
-            if not math.isfinite(score):
-                asr_empty += 1
-                continue
-            scores.append(score)
-        except Exception:
-            asr_empty += 1
-        logger.info("v7 sanity sample %d/%d validated", ordinal, SAMPLE_SIZE)
-
-    distribution = _distribution(scores)
-    high_errors = sum(score > HIGH_WER_LIMIT for score in scores)
     report["counts"] = {
         "accepted": len(accepted),
         "selected": len(selected),
         "retrieved": retrievals,
         "structural_failures": structural_failures,
-        "asr_empty": asr_empty,
-        "asr_non_speech": asr_non_speech,
-        "wer_high": high_errors,
+        "pipeline_digests": len(digests),
     }
-    report["wer_distribution"] = distribution
     report["pass"] = bool(
         len(selected) == SAMPLE_SIZE
-        and len(scores) == SAMPLE_SIZE
+        and retrievals == SAMPLE_SIZE
         and structural_failures == 0
-        and asr_empty == 0
-        and asr_non_speech == 0
-        and distribution["median"] is not None
-        and distribution["median"] <= MEDIAN_WER_LIMIT
-        and high_errors <= HIGH_WER_COUNT_LIMIT
+        and len(digests) == 1
     )
     _write_report(report_path, report)
     return report
@@ -273,27 +165,6 @@ def _decode_audio(audio: bytes, *, duration_ms: int) -> np.ndarray:
     return decoded[:, 0]
 
 
-def _distribution(scores: list[float]) -> dict[str, float | int | None]:
-    if not scores:
-        return {
-            "count": 0,
-            "minimum": None,
-            "maximum": None,
-            "mean": None,
-            "median": None,
-            "p90": None,
-        }
-    ordered = sorted(scores)
-    return {
-        "count": len(scores),
-        "minimum": ordered[0],
-        "maximum": ordered[-1],
-        "mean": mean(scores),
-        "median": median(scores),
-        "p90": ordered[min(len(ordered) - 1, math.ceil(len(ordered) * 0.9) - 1)],
-    }
-
-
 def _empty_report(
     *, expected_head: str | None, seed: str | int, selected: list[MetadataRow]
 ) -> dict[str, object]:
@@ -305,20 +176,25 @@ def _empty_report(
         ).encode()
     ).hexdigest()
     return {
-        "report_type": "p1-v7-dozen-sanity-gate",
+        "report_type": "p1-v8-dozen-sanity-gate",
         "pilot_head": expected_head,
         "pipeline_version": PIPELINE_VERSION,
         "schema_version": SCHEMA_VERSION,
         "sample_set_digest": selected_digest,
         "sample_size": SAMPLE_SIZE,
         "seed": str(seed),
-        "thresholds": {
-            "median_wer_max": MEDIAN_WER_LIMIT,
-            "high_wer": HIGH_WER_LIMIT,
-            "high_wer_count_max": HIGH_WER_COUNT_LIMIT,
+        "checks": {
+            "private_immutable_revision": True,
+            "hashes": True,
+            "flac_pcm16_16khz_mono": True,
+            "exact_schema": True,
+            "one_pipeline_digest": True,
+            "timestamp_native_v8": True,
+            "exact_duration_and_bounds": True,
+            "trainable_text": True,
+            "timed_anchor_single_speaker": True,
         },
         "counts": {"accepted": 0, "selected": 0},
-        "wer_distribution": _distribution([]),
         "pass": False,
     }
 
@@ -335,10 +211,6 @@ def _stable_candidate_identity(row: MetadataRow) -> str:
     ).hexdigest()
 
 
-def _has_trainable_text(value: object) -> bool:
-    return isinstance(value, str) and any(char.isalnum() for char in value)
-
-
 def _is_accepted_candidate(row: MetadataRow) -> bool:
     status = row.get("status", row.get("quality_status"))
     if status is not None:
@@ -347,15 +219,6 @@ def _is_accepted_candidate(row: MetadataRow) -> bool:
 
 
 def _rebind_candidate(candidate: MetadataRow, *, pilot_head: str) -> dict[str, object]:
-    """Rebind a candidate to the final immutable publication head in memory.
-
-    Returns:
-        A copy whose retrieval revision is the final pilot HEAD.
-
-    Raises:
-        ValueError:
-            If the candidate does not contain a complete immutable revision.
-    """
     revision = candidate.get("revision")
     if not isinstance(revision, str) or not _COMMIT_SHA.fullmatch(revision):
         raise ValueError("candidate revision is not immutable")
@@ -406,20 +269,17 @@ def _select_candidates(
 ) -> list[MetadataRow]:
     groups: dict[tuple[str, tuple[str, ...]], list[MetadataRow]] = {}
     for candidate in candidates:
-        programme = _programme_key(candidate)
-        stratum = _stratum(candidate)
-        groups.setdefault((programme, stratum), []).append(candidate)
-    ranked_groups: list[tuple[str, tuple[str, tuple[str, ...]], list[MetadataRow]]] = []
+        key = (_programme_key(candidate), _stratum(candidate))
+        groups.setdefault(key, []).append(candidate)
+    ranked_groups: list[tuple[str, list[MetadataRow]]] = []
     for key, group in groups.items():
         ordered = sorted(group, key=lambda row: _rank(seed, row))
-        ranked_groups.append(
-            (hashlib.sha256(repr(key).encode()).hexdigest(), key, ordered)
-        )
+        ranked_groups.append((hashlib.sha256(repr(key).encode()).hexdigest(), ordered))
     ranked_groups.sort(key=lambda item: item[0])
     selected: list[MetadataRow] = []
     while len(selected) < SAMPLE_SIZE and ranked_groups:
         progressed = False
-        for _, _, group in ranked_groups:
+        for _, group in ranked_groups:
             if group:
                 selected.append(group.pop(0))
                 progressed = True
@@ -456,8 +316,7 @@ def _stratum(row: MetadataRow) -> tuple[str, ...]:
 def _validate_candidate_locator(
     candidate: MetadataRow, *, pilot_head: str | None, repository: str
 ) -> None:
-    candidate_repository = candidate.get("repository")
-    if candidate_repository != repository:
+    if candidate.get("repository") != repository:
         raise ValueError("candidate is not from the private P1 repository")
     revision = candidate.get("revision")
     if not isinstance(revision, str) or not _COMMIT_SHA.fullmatch(revision):
@@ -481,21 +340,23 @@ def _validate_candidate_locator(
 def _validate_row(*, row: dict[str, object], candidate: MetadataRow) -> bytes:
     expected_fields = {field.name for field in OUTPUT_SCHEMA.fields}
     transport_fields = {
+        "_p1_audio_sha256",
+        "_p1_metadata_sha256",
         "audit_id",
+        "metadata_sha256",
+        "parquet_path",
+        "parquet_sha256",
+        "remote_parquet_path",
         "repository",
         "revision",
-        "parquet_path",
-        "remote_parquet_path",
         "row_locator",
-        "metadata_sha256",
-        "parquet_sha256",
         "status",
         "stratum",
     }
     if not expected_fields.issubset(row) or (
         set(row) - expected_fields - transport_fields
     ):
-        raise ValueError("retrieved row does not have the exact v7 schema")
+        raise ValueError("retrieved row does not have the exact v8 schema")
     if row.get("pipeline_version") != PIPELINE_VERSION:
         raise ValueError("retrieved row has the wrong pipeline version")
     if row.get("language") != "da":
@@ -511,25 +372,17 @@ def _validate_row(*, row: dict[str, object], candidate: MetadataRow) -> bytes:
         raise ValueError("retrieved row has the wrong alignment method")
     speakers = row.get("speaker_ids")
     if isinstance(speakers, (str, bytes)) or not isinstance(speakers, c.Iterable):
-        raise ValueError("retrieved row has no single speaker evidence")
+        raise ValueError("retrieved row has no single timed-anchor speaker")
     speaker_values = tuple(speakers)
     if (
         len(speaker_values) != 1
         or not isinstance(speaker_values[0], str)
         or not speaker_values[0]
     ):
-        raise ValueError("retrieved row has no single speaker evidence")
-    speaker_count = row.get("speaker_count")
-    if speaker_count is not None and speaker_count != 1:
-        raise ValueError("retrieved row has no single speaker evidence")
+        raise ValueError("retrieved row has no single timed-anchor speaker")
     text = row.get("text")
     alignment_text = row.get("alignment_text")
-    if (
-        not isinstance(text, str)
-        or not _has_trainable_text(text)
-        or not isinstance(alignment_text, str)
-        or not _has_trainable_text(alignment_text)
-    ):
+    if not _has_trainable_text(text) or not _has_trainable_text(alignment_text):
         raise ValueError("retrieved row has no trainable text")
     duration = row.get("duration_ms")
     start = row.get("source_start_ms")
@@ -543,7 +396,9 @@ def _validate_row(*, row: dict[str, object], candidate: MetadataRow) -> bytes:
     if (
         not 1_000 <= duration < 10_000
         or start < 0
+        or end <= start
         or end - start != duration
+        or source_duration <= 0
         or end > source_duration
     ):
         raise ValueError("retrieved row has inconsistent duration metadata")
@@ -555,7 +410,7 @@ def _validate_row(*, row: dict[str, object], candidate: MetadataRow) -> bytes:
         or row.get("end_drift_ms") is not None
         or row.get("vad_speech_ratio") is not None
     ):
-        raise ValueError("retrieved row has non-native v7 alignment evidence")
+        raise ValueError("retrieved row has non-native v8 alignment evidence")
     audio = _embedded_audio(row)
     expected_audio = candidate.get("audio_sha256")
     expected_metadata = candidate.get("metadata_sha256")
@@ -580,6 +435,10 @@ def _validate_row(*, row: dict[str, object], candidate: MetadataRow) -> bytes:
     return audio
 
 
+def _has_trainable_text(value: object) -> bool:
+    return isinstance(value, str) and any(char.isalnum() for char in value)
+
+
 def _write_report(path: Path | str | None, report: dict[str, object]) -> None:
     if path is None:
         return
@@ -592,14 +451,9 @@ def _write_report(path: Path | str | None, report: dict[str, object]) -> None:
 
 
 __all__ = [
-    "HIGH_WER_COUNT_LIMIT",
-    "HIGH_WER_LIMIT",
-    "MEDIAN_WER_LIMIT",
     "PILOT_REPOSITORY",
     "PIPELINE_VERSION",
+    "SAMPLE_SIZE",
     "SCHEMA_VERSION",
-    "WHISPER_MODEL",
-    "WHISPER_REVISION",
-    "WhisperSmallASR",
-    "run_v7_sanity_gate",
+    "run_v8_sanity_gate",
 ]

@@ -390,8 +390,8 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
     assert hub.private is True
     assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
     card = hub.files["README.md"].decode("utf-8")
-    assert "p1-text-normalisation-5" in card
-    assert "speaker-consistent-following-word-with-terminal-suffix-v5" in card
+    assert "p1-text-normalisation-6" in card
+    assert "best-effort-following-word-with-terminal-suffix-v6" in card
     assert "exact published and canonical CTC text" not in card
     assert "vad_speech_ratio" in card
     assert 'data_files="data/train/*.parquet"' in card
@@ -400,7 +400,7 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
         "pipeline_config_sha256"
         not in card.split("## Key facts", 1)[1].split("## Data format", 1)[0]
     )
-    assert report.preflight.target["contract_v7"] is True
+    assert report.preflight.target["contract_v8"] is True
     assert source.iterated is False
 
 
@@ -655,13 +655,13 @@ def test_overlong_transcript_is_a_terminal_transcript_over_audio_rejection(
 
 
 def test_p1_settings_exclude_future_model_evidence(tmp_path: Path) -> None:
-    """Active v7 settings retain no model provenance."""
+    """Active v8 settings retain no model provenance."""
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
 
-    assert settings.pipeline_version == "p1-segmentation-7"
+    assert settings.pipeline_version == "p1-segmentation-8"
     assert settings.alignment_method == "timestamp-native:p1-transcripts.words"
     assert settings.segmentation.maximum_duration_ms == 10_000
-    assert settings.normalisation.version == "p1-text-normalisation-5"
+    assert settings.normalisation.version == "p1-text-normalisation-6"
     assert settings.model_revisions == {}
 
 
@@ -1166,7 +1166,7 @@ def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
     assert "runtime_error" in caplog.text
 
 
-def test_v7_normalisation_contract_fails_before_source_work(tmp_path: Path) -> None:
+def test_v8_normalisation_contract_fails_before_source_work(tmp_path: Path) -> None:
     """An incompatible active config fails before planning can retrieve source data."""
     config = pipeline_config(tmp_path, mode="build")
     config.normalisation.case_folding = False
@@ -1190,7 +1190,7 @@ def test_v7_normalisation_contract_fails_before_source_work(tmp_path: Path) -> N
         "## Model revisions\n\n- **Repository:** legacy/model",
     ],
 )
-def test_v7_target_validation_rejects_legacy_model_provenance(
+def test_v8_target_validation_rejects_legacy_model_provenance(
     legacy_statement: str, tmp_path: Path
 ) -> None:
     """An active identity cannot mask legacy or model-backed provenance."""
@@ -1207,7 +1207,7 @@ def test_v7_target_validation_rejects_legacy_model_provenance(
 
     target = target_privacy(hub, settings.target_private_repo, settings.pipeline_digest)
 
-    assert target["contract_v7"] is False
+    assert target["contract_v8"] is False
 
 
 def test_zero_accepted_programme_is_skipped_on_the_second_run(
@@ -1349,6 +1349,7 @@ def test_zero_duration_normalisation_is_reported_as_metadata_only(
                             "end_ms": 200,
                             "speaker": "speaker-a",
                         },
+                        {"text": "[uncertain]", "speaker": "speaker-b"},
                     ],
                 }
             )
@@ -1387,10 +1388,15 @@ def test_zero_duration_normalisation_is_reported_as_metadata_only(
             report=report,
             log=MetadataLog(events),
         )
-    assert report.normalization_counts == {"zero_duration_tokens_omitted": 1}
-    assert report.as_dict()["normalization_counts"] == {
-        "zero_duration_tokens_omitted": 1
+    assert report.normalization_counts == {
+        "zero_duration_tokens_omitted": 1,
+        "untimed_tokens_owned": 1,
+        "ambiguous_source_text_records": 1,
     }
+    assert report.ownership_counts == {"best_effort_uncertain": 1}
+    assert report.as_dict()["ownership_counts"] == {"best_effort_uncertain": 1}
     event_text = events.read_text(encoding="utf-8")
     assert "transcript_normalized" in event_text
+    assert "transcript_ownership" in event_text
     assert "<hidden>" not in event_text
+    assert "[uncertain]" not in event_text

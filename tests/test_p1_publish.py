@@ -261,7 +261,7 @@ def make_card() -> str:
         permitted_use="Internal ASR research",
         private_access_terms="Access is limited to the project organisation",
         alignment_method=(
-            "pipeline_version: p1-segmentation-7; "
+            "pipeline_version: p1-segmentation-8; "
             "alignment_method: timestamp-native:p1-transcripts.words; "
             f"pipeline_config_sha256: {'c' * 64}; "
             "Source word timestamps are authoritative."
@@ -327,6 +327,8 @@ def test_card_is_readable_and_contract_driven() -> None:
     assert all(field.name in card for field in OUTPUT_SCHEMA.fields)
     assert "Exact, verbatim source-owned text" in card
     assert "Exact source-text ownership chunks for alignment units" in card
+    assert "best-effort" in card
+    assert "does not reject the programme" in card
     key_facts = card.split("## Key facts", 1)[1].split("## Data format", 1)[0]
     assert "| Alignment | Timestamp-native source word boundaries |" in key_facts
     assert "VAD followed by CTC alignment" not in key_facts
@@ -572,7 +574,7 @@ def test_initialisation_commits_card_and_attributes_privately() -> None:
 
 
 def test_initialisation_refuses_existing_generation_payload() -> None:
-    """Initialisation cannot relabel an existing payload as v7 metadata."""
+    """Initialisation cannot relabel an existing payload as v8 metadata."""
     hub = MemoryHub(existing_paths=("data/v6.parquet",))
 
     with pytest.raises(PublicationError, match="data or unknown payload"):

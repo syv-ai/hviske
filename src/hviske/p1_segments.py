@@ -825,7 +825,7 @@ def segment_programme(
 ) -> SegmentationResult:
     """Run bounded proposal, optional legacy alignment, filtering, and encoding.
 
-    ``TimestampAlignmentBackend`` is the active P1 v7 backend. It returns the
+    ``TimestampAlignmentBackend`` is the active P1 v8 backend. It returns the
     proposal's source word endpoints and deliberately supplies no acoustic evidence.
     The injectable VAD/CTC path remains available for future datasets.
 
@@ -836,12 +836,13 @@ def segment_programme(
         SourceValidationError:
             If source audio does not match its declared duration or timestamps fail.
         ValueError:
-            If a model-backed aligner is supplied to the active v7 pipeline.
+            If a model-backed aligner is supplied to the active v8 pipeline.
     """
-    if pipeline_version == "p1-segmentation-7" and not isinstance(
-        ctc, TimestampAlignmentBackend
-    ):
-        raise ValueError("v7 cannot accept CTC alignment rows")
+    if pipeline_version == "p1-segmentation-8":
+        if not isinstance(ctc, TimestampAlignmentBackend):
+            raise ValueError("v8 cannot accept model-backed alignment rows")
+        if vad is not None:
+            raise ValueError("v8 cannot accept a VAD backend")
     try:
         values = prepare_source_audio(
             audio=audio, sampling_rate=sampling_rate, channels=channels
@@ -875,7 +876,11 @@ def segment_programme(
             rejections=(("", RejectionCategory.NO_TIMED_WORDS.value),),
             correction_count=0,
         )
-    vad_signal = None if vad is None else vad.analyse(values, 16000)
+    vad_signal = (
+        None
+        if pipeline_version == "p1-segmentation-8" or vad is None
+        else vad.analyse(values, 16000)
+    )
     proposals = form_candidate_segments(
         words=validated,
         source_file_id=source_file_id,
@@ -916,7 +921,7 @@ def segment_programme(
         ):
             reject(proposal, RejectionCategory.DURATION_OUT_OF_RANGE.value)
             continue
-        timestamp_native = pipeline_version == "p1-segmentation-7"
+        timestamp_native = pipeline_version == "p1-segmentation-8"
         if timestamp_native:
             alignment_text = proposal.text
             selected_words = validated[
@@ -1350,18 +1355,20 @@ def validate_output_shard(path: Path) -> None:
             if row["source_end_ms"] - row["source_start_ms"] != row["duration_ms"]:
                 raise ValueError("source interval does not match duration_ms")
             if row.get("pipeline_version") == "p1-segmentation-7":
+                raise ValueError("v7 rows cannot be mixed with the active v8 contract")
+            if row.get("pipeline_version") == "p1-segmentation-8":
                 if row.get("alignment_method") != (
                     "timestamp-native:p1-transcripts.words"
                 ):
                     raise ValueError(
-                        "v7 row does not declare timestamp-native alignment"
+                        "v8 row does not declare timestamp-native alignment"
                     )
                 if row.get("alignment_backend") != "timestamp-native":
-                    raise ValueError("v7 row has a non-native backend")
+                    raise ValueError("v8 row has a non-native backend")
                 if row.get("alignment_score_type") != (
                     "not_applicable:source_timestamps"
                 ):
-                    raise ValueError("v7 row has an applicable score type")
+                    raise ValueError("v8 row has an applicable score type")
                 if (
                     row.get("source_start_ms") != row.get("proposal_start_ms")
                     or row.get("source_end_ms") != row.get("proposal_end_ms")
@@ -1370,7 +1377,7 @@ def validate_output_shard(path: Path) -> None:
                     or row.get("end_drift_ms") is not None
                     or row.get("vad_speech_ratio") is not None
                 ):
-                    raise ValueError("v7 row contains non-native alignment evidence")
+                    raise ValueError("v8 row contains non-native alignment evidence")
 
 
 def _rows_table(rows: c.Sequence[OutputRow]) -> pa.Table:
