@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 
-from hviske.p1_source import (
+from p1_dataset.source import (
     HfP1Source,
     InvalidSourceRecord,
     InvalidSourceTimestamp,

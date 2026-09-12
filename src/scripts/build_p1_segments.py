@@ -8,7 +8,7 @@ import logging
 import hydra
 from omegaconf import DictConfig
 
-from hviske.p1_pipeline import P1PreflightError, _safe_exception_category, run_pipeline
+from p1_dataset.pipeline import P1PreflightError, _safe_exception_category, run_pipeline
 
 logger = logging.getLogger("build_p1_segments")
 

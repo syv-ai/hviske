@@ -25,7 +25,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import soundfile as sf
 
-from .p1_contracts import (
+from .contracts import (
     NormalisationContract,
     OutputRow,
     RejectionCategory,

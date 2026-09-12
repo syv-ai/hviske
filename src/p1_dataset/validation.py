@@ -28,8 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from statistics import mean, median
 
-from .p1_contracts import OUTPUT_SCHEMA
-from .p1_source import _AUDIO_POINTER_METADATA_KEY, _AUDIO_POINTER_METADATA_MAX_BYTES
+from .contracts import OUTPUT_SCHEMA
+from .source import _AUDIO_POINTER_METADATA_KEY, _AUDIO_POINTER_METADATA_MAX_BYTES
 
 MetadataRow = c.Mapping[str, object]
 RowStream = c.Iterable[MetadataRow]

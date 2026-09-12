@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
-import hviske.p1_supervisor as supervisor
-from hviske.p1_pipeline import PipelineSettings
+import p1_dataset.supervisor as supervisor
+from p1_dataset.pipeline import PipelineSettings
 
 
 def test_aggregate_scratch_capacity_is_checked_before_spawn(

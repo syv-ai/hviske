@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hviske.p1_validation import create_blinded_audit_manifest
+from p1_dataset.validation import create_blinded_audit_manifest
 from scripts import validate_p1_segments as cli
 
 

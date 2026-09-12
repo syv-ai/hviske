@@ -26,7 +26,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import soundfile as sf
 
-from .p1_contracts import SourceWord, annotate_source_words
+from .contracts import SourceWord, annotate_source_words
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

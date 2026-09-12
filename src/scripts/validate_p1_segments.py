@@ -13,9 +13,9 @@ import numpy as np
 import pyarrow.parquet as pq
 import soundfile as sf
 
-from hviske.p1_publish import HfApiAdapter
-from hviske.p1_source import AudioPointer, HfP1Source, SourceShard
-from hviske.p1_validation import (
+from p1_dataset.publish import HfApiAdapter
+from p1_dataset.source import AudioPointer, HfP1Source, SourceShard
+from p1_dataset.validation import (
     ClipRetriever,
     MetadataLedger,
     PinnedHubClipRetriever,
@@ -29,7 +29,7 @@ from hviske.p1_validation import (
     review_one_clip,
 )
 
-logger = logging.getLogger("hviske_p1_validation")
+logger = logging.getLogger("p1_dataset.validation")
 
 
 def main() -> None:

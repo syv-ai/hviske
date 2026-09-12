@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hviske.p1_validation import (
+from p1_dataset.validation import (
     AuditReservoir,
     MetadataLedger,
     PinnedHubClipRetriever,
@@ -432,7 +432,7 @@ def test_play_audio_uses_argv_without_shell(
     def run(command: list[str], *, check: bool) -> None:
         calls.append({"command": command, "check": check})
 
-    monkeypatch.setattr("hviske.p1_validation.subprocess.run", run)
+    monkeypatch.setattr("p1_dataset.validation.subprocess.run", run)
     path = tmp_path / "clip;touch unsafe"
     path.write_bytes(b"audio")
     play_audio(path, player='player --flag "value with spaces"')

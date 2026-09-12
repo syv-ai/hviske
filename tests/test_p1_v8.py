@@ -9,19 +9,19 @@ import numpy as np
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
-from hviske.p1_contracts import (
+from p1_dataset.contracts import (
     OUTPUT_SCHEMA,
     NormalisationContract,
     SegmentationContract,
     SourceWord,
 )
-from hviske.p1_pipeline import (
+from p1_dataset.pipeline import (
     PipelineSettings,
     configure_scratch,
     preflight_pipeline,
     run_pipeline,
 )
-from hviske.p1_segments import (
+from p1_dataset.segments import (
     CTCBackend,
     TimestampAlignmentBackend,
     VADBackend,
@@ -67,7 +67,7 @@ def test_v8_initialise_never_probes_cuda_or_model_provenance(
 ) -> None:
     """Initialisation records explicit non-applicability without probing models."""
     monkeypatch.setattr(
-        "hviske.p1_pipeline.cuda_status",
+        "p1_dataset.pipeline.cuda_status",
         lambda *_args, **_kwargs: pytest.fail("CUDA initialisation probe was called"),
     )
     config = _config(tmp_path)
@@ -106,11 +106,11 @@ def test_v8_preflight_never_checks_models_or_cuda(
     """The active plan path has no model, VAD, or CUDA preflight dependency."""
     settings = PipelineSettings.from_config(_config(tmp_path))
     monkeypatch.setattr(
-        "hviske.p1_pipeline.check_model_revisions",
+        "p1_dataset.pipeline.check_model_revisions",
         lambda *_args, **_kwargs: pytest.fail("model revision check was called"),
     )
     monkeypatch.setattr(
-        "hviske.p1_pipeline.cuda_status",
+        "p1_dataset.pipeline.cuda_status",
         lambda *_args, **_kwargs: pytest.fail("CUDA preflight was called"),
     )
 

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from .p1_contracts import (
+from .contracts import (
     BatchEvidence,
     ContractModel,
     LedgerState,

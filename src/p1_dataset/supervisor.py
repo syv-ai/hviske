@@ -24,7 +24,7 @@ from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
 
-from .p1_pipeline import (
+from .pipeline import (
     PipelineSettings,
     _safe_exception_category,
     calculate_scratch_requirement,

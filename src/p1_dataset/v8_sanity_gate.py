@@ -19,8 +19,8 @@ from pathlib import Path, PurePosixPath
 import numpy as np
 import soundfile as sf
 
-from .p1_contracts import OUTPUT_SCHEMA, OutputRow
-from .p1_validation import _metadata_digest
+from .contracts import OUTPUT_SCHEMA, OutputRow
+from .validation import _metadata_digest
 
 logger = logging.getLogger(__name__)
 
