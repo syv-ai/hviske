@@ -660,6 +660,7 @@ def test_hf_adapter_uses_path_operations_and_preserves_exact_bytes(
 
     class Api:
         def create_commit(self, **kwargs: object) -> object:
+            assert kwargs["num_threads"] == 1
             operations = t.cast(list[object], kwargs["operations"])
             paths = [
                 t.cast(str, getattr(operation, "path_or_fileobj"))
@@ -724,6 +725,57 @@ def test_hf_lfs_forbidden_failure_is_safe_and_non_retryable() -> None:
     assert "huggingface.co" not in repr(diagnostic)
     assert "private/path" not in repr(diagnostic)
     assert "hf_secret" not in repr(diagnostic)
+
+
+def test_hf_missing_uploaded_object_is_retryable_without_transport_details() -> None:
+    """The known grouped-upload failure has only a bounded diagnosis."""
+    body = (
+        "Bad request for commit endpoint:\n"
+        "Your push was rejected because an LFS pointer pointed to a file that does "
+        "not exist. "
+        "offending/private.parquet token=hf_secret https://signed.test/object"
+    )
+    error = BadRequestError(
+        "private source-id " + body,
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://huggingface.co/api/datasets/org/repo/commit"
+            ),
+            content=body.encode(),
+        ),
+    )
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.status_code == 400
+    assert diagnostic.phase == "commit"
+    assert diagnostic.reason == "missing_uploaded_object"
+    assert diagnostic.retryable
+    assert "offending" not in repr(diagnostic)
+    assert "hf_secret" not in repr(diagnostic)
+    assert "signed.test" not in repr(diagnostic)
+    assert "source-id" not in repr(diagnostic)
+
+
+def test_hf_near_match_400_is_unknown_and_non_retryable() -> None:
+    """Only the exact missing-object phrase is allowlisted."""
+    error = BadRequestError(
+        "private source-id",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://huggingface.co/api/datasets/org/repo/commit"
+            ),
+            content=b"An LFS pointer points to a file that does not exist.",
+        ),
+    )
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.phase == "commit"
+    assert diagnostic.reason == "unknown"
+    assert not diagnostic.retryable
 
 
 def test_hf_xet_failure_is_classified_without_transport_details() -> None:

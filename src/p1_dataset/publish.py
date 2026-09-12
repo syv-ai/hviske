@@ -500,6 +500,7 @@ class HfApiAdapter:
                 repo_type=repo_type,
                 commit_message=commit_message,
                 parent_commit=parent_commit,
+                num_threads=1,
                 token=self._token,
             )
         except HfHubHTTPError as error:

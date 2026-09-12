@@ -26,6 +26,7 @@ _ERROR_CODE_REASONS = {
     "RepoNotFound": "repository_not_found",
     "GatedRepo": "authorisation",
 }
+_MISSING_UPLOADED_OBJECT_PHRASE = "lfs pointer pointed to a file that does not exist"
 
 
 def annotate_hub_error(
@@ -34,7 +35,7 @@ def annotate_hub_error(
     """Attach only validated classifier hints to an exception."""
     if _SAFE_PHASE.fullmatch(phase):
         setattr(error, "_p1_hub_phase", phase)
-    if reason in {"stale_parent", "xet_unavailable"}:
+    if reason in {"missing_uploaded_object", "stale_parent", "xet_unavailable"}:
         setattr(error, "_p1_hub_reason", reason)
 
 
@@ -72,6 +73,8 @@ def classify_hub_error(error: BaseException) -> HubErrorDiagnostic:
 
 
 def _is_retryable(*, status_code: int | None, reason: str) -> bool:
+    if reason == "missing_uploaded_object":
+        return status_code == 400
     if reason in {"stale_parent", "xet_unavailable"}:
         return True
     return status_code in {408, 409, 425, 429} or (
@@ -98,6 +101,8 @@ def _reason_from_response(response: object, status_code: int | None) -> str:
         return _ERROR_CODE_REASONS[error_code]
 
     fragments = _response_fragments(response)
+    if any(_MISSING_UPLOADED_OBJECT_PHRASE in item for item in fragments):
+        return "missing_uploaded_object"
     if any("a commit has happened since" in item for item in fragments) or any(
         "parent commit" in item
         and any(word in item for word in ("mismatch", "does not match", "stale"))
@@ -126,6 +131,12 @@ def _response_fragments(response: object) -> tuple[str, ...]:
         message = headers.get("X-Error-Message")
         if isinstance(message, str):
             values.append(message.casefold())
+    try:
+        text = getattr(response, "text", None)
+    except Exception:
+        text = None
+    if isinstance(text, str):
+        values.append(text[:512].casefold())
     json_method = getattr(response, "json", None)
     if callable(json_method):
         try:
@@ -151,4 +162,8 @@ def _collect_strings(value: object, *, values: list[str], depth: int) -> None:
 
 def _tagged_reason(error: HfHubHTTPError) -> str | None:
     reason = getattr(error, "_p1_hub_reason", None)
-    return reason if reason in {"stale_parent", "xet_unavailable"} else None
+    return (
+        reason
+        if reason in {"missing_uploaded_object", "stale_parent", "xet_unavailable"}
+        else None
+    )
