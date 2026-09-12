@@ -1075,6 +1075,55 @@ def test_progress_logs_do_not_include_source_identifiers_or_paths(
     assert "private/audio.parquet" not in progress
 
 
+def test_publication_does_not_repeat_unknown_bad_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unclassified deterministic 400 is left to the supervisor immediately."""
+    attempts = 0
+
+    def publish(**_kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        raise HfHubHTTPError(
+            "source-id https://hub.test/private?token=secret",
+            response=httpx.Response(
+                400,
+                request=httpx.Request(
+                    "POST",
+                    "https://hub.test/api/datasets/org/repo/preupload/main"
+                    "?token=secret",
+                ),
+                json={"error": "private/path source-id token=secret"},
+            ),
+        )
+
+    monkeypatch.setattr("p1_dataset.pipeline._publish_pending_unlocked", publish)
+    monkeypatch.setattr(
+        "p1_dataset.pipeline.time.sleep",
+        lambda _delay: pytest.fail("deterministic 400 must not sleep"),
+    )
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+    with caplog.at_level(logging.WARNING, logger="p1_dataset.pipeline"):
+        with pytest.raises(HfHubHTTPError):
+            publish_pending(
+                hub=object(),
+                settings=settings,
+                ledger=cast(Ledger, object()),
+                batch_id="batch",
+                pending=(),
+                pending_ids=(),
+            )
+
+    assert attempts == 1
+    assert "status_code=400" in caplog.text
+    assert "hub_phase=preupload" in caplog.text
+    assert "hub_reason=unknown" in caplog.text
+    assert "hub.test" not in caplog.text
+    assert "source-id" not in caplog.text
+    assert "private/path" not in caplog.text
+    assert "token=secret" not in caplog.text
+
+
 def test_publication_does_not_retry_non_hub_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1118,6 +1167,47 @@ def test_publication_lock_releases_after_exception(tmp_path: Path) -> None:
     with _publication_lock(lock_path):
         pass
     assert lock_path.stat().st_size == 0
+
+
+def test_publication_retries_allowlisted_stale_parent_bad_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A known transient 400 refreshes HEAD on the next lock acquisition."""
+    attempts = 0
+    delays: list[float] = []
+
+    def publish(**_kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise HfHubHTTPError(
+                "opaque bad request",
+                response=httpx.Response(
+                    400,
+                    request=httpx.Request(
+                        "POST", "https://hub.test/api/datasets/org/repo/commit/main"
+                    ),
+                    json={"error": "A commit has happened since; refresh and retry"},
+                ),
+            )
+        return "verified"
+
+    monkeypatch.setattr("p1_dataset.pipeline._publish_pending_unlocked", publish)
+    monkeypatch.setattr("p1_dataset.pipeline.time.sleep", delays.append)
+    settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
+
+    result = publish_pending(
+        hub=object(),
+        settings=settings,
+        ledger=cast(Ledger, object()),
+        batch_id="batch",
+        pending=(),
+        pending_ids=(),
+    )
+
+    assert result == "verified"
+    assert attempts == 2
+    assert delays == [5.0]
 
 
 def test_publication_retries_committed_batch_through_verification_recovery(

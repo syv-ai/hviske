@@ -10,7 +10,9 @@ import time
 import typing as t
 from pathlib import Path
 
+import httpx
 import pytest
+from huggingface_hub.errors import BadRequestError
 from omegaconf import DictConfig, OmegaConf
 
 import p1_dataset.supervisor as supervisor
@@ -73,6 +75,9 @@ def test_child_ipc_is_bounded_status_only(monkeypatch: pytest.MonkeyPatch) -> No
             "outcome",
             "category",
             "exception_class",
+            "http_status_code",
+            "hub_phase",
+            "hub_reason",
             "status",
             "started_at",
             "finished_at",
@@ -83,6 +88,59 @@ def test_child_ipc_is_bounded_status_only(monkeypatch: pytest.MonkeyPatch) -> No
         forbidden in repr(message).casefold()
         for message in messages
         for forbidden in ("audio", "transcript", "payload", "source_id", "ledger")
+    )
+
+
+def test_failed_child_diagnostic_cannot_leak_transport_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Supervisor diagnostics expose only allowlisted classifications."""
+    messages: list[dict[str, object]] = []
+
+    class StatusQueue:
+        def put(self, payload: dict[str, object], *, timeout: float) -> None:
+            del timeout
+            messages.append(payload)
+
+    def fail(*, config: object) -> None:
+        del config
+        request = httpx.Request(
+            "POST",
+            "https://hub.test/api/datasets/private/source-id/preupload/main"
+            "?token=hf_secret&signature=signed",
+        )
+        response = httpx.Response(
+            400,
+            request=request,
+            headers={"X-Error-Message": "private/path source-id hf_secret"},
+            json={"error": "private/path source-id hf_secret"},
+        )
+        raise BadRequestError("signed URL private record", response=response)
+
+    monkeypatch.setattr(supervisor, "run_pipeline", fail)
+    monkeypatch.setattr(supervisor.logging, "disable", lambda level: None)
+    supervisor._child_entry(
+        config=OmegaConf.create({"runtime": {"workers": 1}}),
+        partition_index=2,
+        attempt=1,
+        status_queue=StatusQueue(),
+    )
+
+    failure = messages[-1]
+    assert failure["http_status_code"] == 400
+    assert failure["hub_phase"] == "preupload"
+    assert failure["hub_reason"] == "unknown"
+    encoded = repr(failure).casefold()
+    assert not any(
+        forbidden in encoded
+        for forbidden in (
+            "hub.test",
+            "private/path",
+            "source-id",
+            "hf_secret",
+            "signature",
+            "signed url",
+        )
     )
 
 
@@ -258,6 +316,9 @@ def test_reap_waits_for_asynchronous_terminal_status(tmp_path: Path) -> None:
         "outcome": "DONE",
         "category": "none",
         "exception_class": "none",
+        "http_status_code": None,
+        "hub_phase": "unknown",
+        "hub_reason": "unknown",
         "status": "done",
         "started_at": "now",
         "finished_at": "now",

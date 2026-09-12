@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections.abc as c
+import contextlib
 import hashlib
 import io
 import json
@@ -18,6 +19,7 @@ from pathlib import Path, PurePosixPath
 import soundfile as sf
 from datasets import Audio, Features, Sequence, Value, load_dataset
 from huggingface_hub import CommitOperationAdd, HfApi, HfFileSystem, hf_hub_url
+from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 from pyarrow import parquet as pq
 
@@ -29,6 +31,7 @@ from .contracts import (
     RejectionCategory,
     ShardEvidence,
 )
+from .hub_diagnostics import annotate_hub_error
 
 if t.TYPE_CHECKING:
     from .ledger import Ledger
@@ -480,21 +483,35 @@ class HfApiAdapter:
 
         Returns:
             The Hub commit response.
+
+        Raises:
+            HfHubHTTPError:
+                If the Hub rejects preupload, object transfer, or commit creation.
         """
-        hub_operations = [
-            CommitOperationAdd(
-                path_in_repo=operation.path_in_repo, path_or_fileobj=operation.path
-            )
-            for operation in operations
-        ]
-        return self._api.create_commit(
-            repo_id=repo_id,
-            operations=hub_operations,
-            repo_type=repo_type,
-            commit_message=commit_message,
-            parent_commit=parent_commit,
-            token=self._token,
-        )
+        # Buffered streams deliberately select the mature LFS transport rather than
+        # Xet. The Hub commit API otherwise offers Xet whenever hf-xet is installed,
+        # adding a repository-token request that can fail before an ordinary LFS
+        # commit. Each stream remains open for the whole synchronous commit.
+        with contextlib.ExitStack() as stack:
+            hub_operations = [
+                CommitOperationAdd(
+                    path_in_repo=operation.path_in_repo,
+                    path_or_fileobj=stack.enter_context(operation.path.open("rb")),
+                )
+                for operation in operations
+            ]
+            try:
+                return self._api.create_commit(
+                    repo_id=repo_id,
+                    operations=hub_operations,
+                    repo_type=repo_type,
+                    commit_message=commit_message,
+                    parent_commit=parent_commit,
+                    token=self._token,
+                )
+            except HfHubHTTPError as error:
+                annotate_hub_error(error, phase="create_commit")
+                raise
 
     def create_repo(
         self, repo_id: str, *, repo_type: str, private: bool, exist_ok: bool
@@ -925,13 +942,27 @@ def _mutate_commit(
     commit_recorded: c.Callable[[str], None] | None = None,
 ) -> object:
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
-    result = api.create_commit(
-        repo_id,
-        operations,
-        repo_type="dataset",
-        commit_message=message,
-        parent_commit=parent_commit,
-    )
+    try:
+        result = api.create_commit(
+            repo_id,
+            operations,
+            repo_type="dataset",
+            commit_message=message,
+            parent_commit=parent_commit,
+        )
+    except HfHubHTTPError as error:
+        # Some Hub stale-parent responses are opaque 400s. Confirming that HEAD
+        # advanced turns only that deterministic race into a bounded safe retry.
+        if parent_commit is not None and _http_status_code(error) == 400:
+            try:
+                current_head = _target_head(
+                    api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id
+                )
+            except Exception:
+                current_head = parent_commit
+            if current_head != parent_commit:
+                annotate_hub_error(error, phase="commit", reason="stale_parent")
+        raise
     commit_id = _commit_sha(result)
     if commit_recorded is not None:
         commit_recorded(commit_id)
@@ -1375,6 +1406,12 @@ def _has_parquet_footer(path: Path) -> bool:
     return header == b"PAR1" and footer == b"PAR1"
 
 
+def _http_status_code(error: HfHubHTTPError) -> int | None:
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
 def _local_evidence(
     shard: LocalShard,
     *,
@@ -1646,21 +1683,29 @@ def _refuse_remote_collisions(
         AllowListError:
             If a requested path already exists in the repository.
     """
-    try:
-        existing = set(
-            api.list_repo_files(repo_id, repo_type="dataset", revision=revision)
-        )
-    except RevisionNotFoundError as error:
-        if revision is not None:
+    if revision is None:
+        existing: set[str] = set()
+    else:
+        requested = [item.path for item in expected]
+        try:
+            info = api.get_paths_info(
+                repo_id, requested, repo_type="dataset", revision=revision
+            )
+            existing = {
+                path for item in info if (path := _remote_info_path(item)) is not None
+            }
+        except RevisionNotFoundError as error:
             raise AllowListError("could not establish remote path safety") from error
-        existing = set()
-    except Exception as error:
-        raise AllowListError("could not establish remote path safety") from error
+        except Exception as error:
+            raise AllowListError("could not establish remote path safety") from error
     collisions = existing.intersection(item.path for item in expected)
     if collisions:
-        raise AllowListError(
-            "remote publication path collision: " + ", ".join(sorted(collisions))
-        )
+        raise AllowListError("remote publication path collision")
+
+
+def _remote_info_path(info: object) -> str | None:
+    value = info.get("path") if isinstance(info, dict) else getattr(info, "path", None)
+    return value if isinstance(value, str) else None
 
 
 def _sha256_bytes(value: bytes) -> str:
