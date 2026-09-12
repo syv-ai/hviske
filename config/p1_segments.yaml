@@ -117,7 +117,7 @@ output:
 runtime:
   scratch_root: /scratch/syvai/p1-segmentation-v8
   max_source_bytes: 6197291423
-  max_scratch_bytes: 68719476736
+  max_scratch_bytes: 137438953472
   # Each externally launched partition keeps one in-process programme worker.
   workers: 1
   partition_count: 1
@@ -135,7 +135,9 @@ runtime:
   max_decoded_audio_bytes: 2147483648
   # The active timestamp-native pipeline has no device dependency.
   device: cpu
-  shards_per_commit: 8
+  # One manifest plus up to 96 shards stays below Hub's 100-operation limit.
+  shards_per_commit: 96
+  programmes_per_commit: 16
   target_shard_bytes: 500000000
   target_private_repo: syvai/p1-segments
 

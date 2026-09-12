@@ -268,6 +268,57 @@ def test_local_reconciliation_requires_exact_digest_and_regular_file(
         assert not ledger.reconcile_local_shard("shard-1", local)
 
 
+def test_open_group_appends_programmes_and_seals_durably(tmp_path: Path) -> None:
+    """A group retains both programme relationships until it is sealed."""
+    first = tmp_path / "first.parquet"
+    second = tmp_path / "second.parquet"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    with Ledger(tmp_path / "ledger.sqlite") as ledger:
+        add_programme(ledger, "programme-1")
+        add_programme(ledger, "programme-2")
+        digest = hashlib.sha256(first.read_bytes()).hexdigest()
+        batch, _ = ledger.allocate_batch_with_shards(
+            "programme-1",
+            [
+                ShardAllocation(
+                    local_path=first,
+                    remote_path="data/first.parquet",
+                    sha256=digest,
+                    byte_size=first.stat().st_size,
+                    row_count=1,
+                )
+            ],
+        )
+        digest = hashlib.sha256(second.read_bytes()).hexdigest()
+        appended, shards = ledger.append_programme_to_batch(
+            batch.batch_id,
+            "programme-2",
+            [
+                ShardAllocation(
+                    local_path=second,
+                    remote_path="data/second.parquet",
+                    sha256=digest,
+                    byte_size=second.stat().st_size,
+                    row_count=2,
+                )
+            ],
+            rejection_counts={RejectionCategory.EMPTY_TEXT: 1},
+        )
+        assert appended.programme_count == 2
+        assert appended.row_count == 3
+        assert appended.rejection_counts == {RejectionCategory.EMPTY_TEXT.value: 1}
+        assert {item.programme_id for item in ledger.shards(batch.batch_id)} == {
+            "programme-1",
+            "programme-2",
+        }
+        assert ledger.open_batches() == (appended,)
+        sealed = ledger.seal_batch(batch.batch_id)
+        assert sealed.sealed
+        assert ledger.open_batches() == ()
+        assert shards[0].programme_id == "programme-2"
+
+
 def test_programme_complete_state_machine_and_evidence(tmp_path: Path) -> None:
     """A programme records attempts, counts, source purge, and timestamps."""
     with Ledger(tmp_path / "ledger.sqlite") as ledger:

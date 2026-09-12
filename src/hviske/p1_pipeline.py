@@ -91,6 +91,7 @@ class PipelineSettings:
     max_source_bytes: int
     max_scratch_bytes: int
     shards_per_commit: int
+    programmes_per_commit: int
     target_shard_bytes: int
     workers: int
     queue_slots: int
@@ -291,6 +292,12 @@ class PipelineSettings:
             }
         )
         common_scratch_root = Path(str(runtime["scratch_root"])).expanduser().resolve()
+        programmes_per_commit = _as_int(runtime.get("programmes_per_commit", 16))
+        shards_per_commit = _as_int(shard_limit)
+        if programmes_per_commit < 1:
+            raise ValueError("programmes_per_commit must be positive")
+        if not 1 <= shards_per_commit <= 98:
+            raise ValueError("shards_per_commit must leave room for the manifest")
         partition_count = _as_int(runtime.get("partition_count", 1))
         partition_index = _as_int(runtime.get("partition_index", 0))
         if partition_count < 1:
@@ -318,7 +325,8 @@ class PipelineSettings:
             partition_index=partition_index,
             max_source_bytes=_as_int(max_source),
             max_scratch_bytes=_as_int(max_scratch),
-            shards_per_commit=_as_int(shard_limit),
+            shards_per_commit=shards_per_commit,
+            programmes_per_commit=programmes_per_commit,
             target_shard_bytes=_as_int(runtime["target_shard_bytes"]),
             workers=_as_int(runtime.get("workers", 1)),
             queue_slots=_as_int(runtime.get("queue_slots", 1)),
@@ -546,7 +554,9 @@ def calculate_scratch_requirement(
     """
     worker_slots = 1 + settings.queue_slots
     source_and_decode = maximum_source_bytes * worker_slots * 2
-    open_and_pending_shards = settings.target_shard_bytes * max(1, shard_count)
+    open_and_pending_shards = settings.target_shard_bytes * max(
+        1, shard_count, settings.programmes_per_commit
+    )
     encoder_and_upload = settings.target_shard_bytes + maximum_source_bytes
     checksum_and_verification = (
         64
@@ -1482,6 +1492,31 @@ def _process_native_programmes(
     from hviske.p1_ledger import ShardAllocation
     from hviske.p1_source import InvalidSourceRecord, InvalidSourceTimestamp
 
+    open_groups = ledger.open_batches()
+    if len(open_groups) > 1:
+        raise ValueError("more than one unsealed publication group exists")
+    open_batch_id = open_groups[0].batch_id if open_groups else None
+    shard_cap = settings.shards_per_commit
+
+    def flush_group(batch_id: str) -> None:
+        ledger.seal_batch(batch_id)
+        records = ledger.shards(batch_id)
+        _publish_native_pending(
+            hub=hub,
+            settings=settings,
+            ledger=ledger,
+            pending=tuple(_local_shard_from_record(record) for record in records),
+            pending_ids=tuple(record.shard_id for record in records),
+            batch_id=batch_id,
+            audit_reservoir=audit_reservoir,
+        )
+
+    if open_batch_id is not None:
+        existing = ledger.batch(open_batch_id)
+        if existing.programme_count >= settings.programmes_per_commit:
+            flush_group(open_batch_id)
+            open_batch_id = None
+
     for programme_number, candidate in enumerate(candidates, start=1):
         # Count at consumption time so skipped and retryable candidates are included
         # without pre-counting bounded lists or retaining source identifiers.
@@ -1881,36 +1916,52 @@ def _process_native_programmes(
                 row_counts=tuple(item.row_count for item in allocations),
                 local_paths=tuple(Path(item.local_path) for item in allocations),
             )
-            batch, shard_records = ledger.allocate_batch_with_shards(
-                programme_id,
-                allocations,
-                accepted_count=len(result.rows),
-                rejected_count=len(result.rejections),
-                processed_duration_ms=int((time.monotonic() - started) * 1000),
-                rejection_counts={
-                    reason: sum(1 for _, value in result.rejections if value == reason)
-                    for _, reason in result.rejections
-                },
-                audit_candidates=audit_candidates,
-                batch_prefix=f"p{settings.partition_index}-batch",
-            )
+            rejection_counts = {
+                reason: sum(1 for _, value in result.rejections if value == reason)
+                for _, reason in result.rejections
+            }
+            processed_duration_ms = int((time.monotonic() - started) * 1000)
+            if open_batch_id is not None:
+                current_records = ledger.shards(open_batch_id)
+                if len(current_records) + len(allocations) > shard_cap:
+                    flush_group(open_batch_id)
+                    open_batch_id = None
+            if open_batch_id is None:
+                batch, shard_records = ledger.allocate_batch_with_shards(
+                    programme_id,
+                    allocations,
+                    accepted_count=len(result.rows),
+                    rejected_count=len(result.rejections),
+                    processed_duration_ms=processed_duration_ms,
+                    rejection_counts=rejection_counts,
+                    audit_candidates=audit_candidates,
+                    batch_prefix=f"p{settings.partition_index}-batch",
+                )
+            else:
+                batch, shard_records = ledger.append_programme_to_batch(
+                    open_batch_id,
+                    programme_id,
+                    allocations,
+                    accepted_count=len(result.rows),
+                    rejected_count=len(result.rejections),
+                    processed_duration_ms=processed_duration_ms,
+                    rejection_counts=rejection_counts,
+                    audit_candidates=audit_candidates,
+                )
+            open_batch_id = batch.batch_id
             if audit_reservoir is not None and audit_candidates:
                 getattr(audit_reservoir, "add")(audit_candidates)
             report.shard_count += len(shard_records)
+            # The source adapter owns this temporary. It is released before the next
+            # programme is fetched; only the fsynced publication shards remain.
             purge_source_temporary(getattr(source, "last_temporary", None))
             ledger.mark_source_temps_purged(programme_id, evidence={"deleted": True})
-            _publish_native_pending(
-                hub=hub,
-                settings=settings,
-                ledger=ledger,
-                pending=tuple(
-                    _local_shard_from_record(record) for record in shard_records
-                ),
-                pending_ids=tuple(record.shard_id for record in shard_records),
-                batch_id=batch.batch_id,
-                audit_rows=result.rows,
-                audit_reservoir=audit_reservoir,
-            )
+            if (
+                batch.programme_count >= settings.programmes_per_commit
+                or len(ledger.shards(batch.batch_id)) >= shard_cap
+            ):
+                flush_group(batch.batch_id)
+                open_batch_id = None
             report.processed += 1
             logger.info("Programme %d terminal outcome: accepted", programme_number)
         except InvalidSourceTimestamp:
@@ -1943,6 +1994,8 @@ def _process_native_programmes(
         finally:
             gc.collect()
         enforce_scratch_cap(settings)
+    if open_batch_id is not None:
+        flush_group(open_batch_id)
     enforce_scratch_cap(settings)
 
 
@@ -2613,6 +2666,7 @@ def _recover_native_batches(
         if (
             batch.commit_id is None
             and batch.state is _state("sharded")
+            and batch.sealed
             and records
             and len(paths) == len(records)
         ):
