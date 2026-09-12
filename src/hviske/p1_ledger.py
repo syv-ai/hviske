@@ -73,6 +73,7 @@ class BatchRecord:
     publication_artifact_purged_at: str | None
     publication_artifact_purge_evidence: dict[str, object]
     remote_checked_at: str | None
+    sealed: bool
     remote_present: bool | None
     last_error: str | None
 
@@ -336,8 +337,8 @@ class Ledger:
             connection.execute(
                 """INSERT INTO batches (
                     batch_id, state, pipeline_digest, programme_count, row_count,
-                    rejection_counts, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rejection_counts, sealed, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     resolved_batch_id,
                     LedgerState.SHARDED.value,
@@ -345,6 +346,7 @@ class Ledger:
                     1,
                     sum(item["row_count"] for item in prepared),
                     safe_rejections,
+                    0,
                     now,
                     now,
                 ),
@@ -417,6 +419,166 @@ class Ledger:
                 self._require_row(connection, "batches", "batch_id", resolved_batch_id)
             )
         return batch, tuple(records)
+
+    def append_programme_to_batch(
+        self,
+        batch_id: str,
+        programme_id: str,
+        shards: Sequence[ShardAllocation | Mapping[str, object] | object],
+        *,
+        accepted_count: int = 0,
+        rejected_count: int = 0,
+        processed_duration_ms: int | None = None,
+        rejection_counts: Mapping[RejectionCategory | str, int] | None = None,
+        audit_candidates: Sequence[Mapping[str, object]] = (),
+    ) -> tuple[BatchRecord, tuple[ShardRecord, ...]]:
+        """Atomically append one programme to an unsealed publication group.
+
+        Local shard evidence, audit locators, programme counters, and the relationship
+        to the group become durable in one transaction. The group remains unsealed so
+        a restart can continue filling it without re-encoding attached programmes.
+
+        Returns:
+            The updated group and its newly attached shards.
+
+        Raises:
+            EvidenceError:
+                If evidence or the publication path is invalid.
+            InvalidTransition:
+                If the group or programme cannot accept shards.
+        """
+        if not shards:
+            raise EvidenceError("a programme must provide at least one shard")
+        self._validate_identifier(batch_id, "batch_id")
+        self._validate_identifier(programme_id, "programme_id")
+        self._validate_nonnegative(accepted_count, "accepted_count")
+        self._validate_nonnegative(rejected_count, "rejected_count")
+        self._validate_nonnegative(processed_duration_ms, "processed_duration_ms")
+        safe_rejections = self._rejection_counts(rejection_counts or {})
+        prepared = tuple(self._prepare_allocation(item) for item in shards)
+        prepared_audit = tuple(
+            self._prepare_audit_candidate(candidate) for candidate in audit_candidates
+        )
+        remote_paths = [cast(str, item["remote_path"]) for item in prepared]
+        if len(remote_paths) != len(set(remote_paths)):
+            raise EvidenceError("publication paths must be unique")
+        with self.transaction() as connection:
+            batch = self._require_row(connection, "batches", "batch_id", batch_id)
+            programme = self._require_row(
+                connection, "programmes", "programme_id", programme_id
+            )
+            if batch["pipeline_digest"] != programme["pipeline_digest"]:
+                raise EvidenceError("programme pipeline digest differs from the batch")
+            if batch["sealed"] or batch["commit_id"] is not None:
+                raise InvalidTransition("cannot append to a sealed publication group")
+            if batch["state"] not in {
+                LedgerState.DISCOVERED.value,
+                LedgerState.PROCESSING.value,
+                LedgerState.SHARDED.value,
+            }:
+                raise InvalidTransition(
+                    "cannot append to a completed publication group"
+                )
+            if LedgerState(programme["state"]) not in {
+                LedgerState.DISCOVERED,
+                LedgerState.PROCESSING,
+            }:
+                raise InvalidTransition("programme cannot allocate new shards")
+            existing = connection.execute(
+                "SELECT 1 FROM shards WHERE batch_id = ? AND programme_id = ?",
+                (batch_id, programme_id),
+            ).fetchone()
+            if existing is not None:
+                raise EvidenceError("programme is already attached to this batch")
+            existing_paths = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT path FROM shards WHERE batch_id = ?", (batch_id,)
+                ).fetchall()
+            }
+            if existing_paths.intersection(remote_paths):
+                raise EvidenceError("publication paths must be unique")
+            now = self._now()
+            records: list[ShardRecord] = []
+            for item in prepared:
+                shard_id = cast(
+                    str,
+                    item["shard_id"]
+                    or self._next_identifier(connection, kind="shard", prefix="shard"),
+                )
+                self._validate_identifier(shard_id, "shard_id")
+                connection.execute(
+                    """INSERT INTO shards (
+                        shard_id, programme_id, batch_id, state, path, byte_size,
+                        row_count, sha256, local_path, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        shard_id,
+                        programme_id,
+                        batch_id,
+                        LedgerState.SHARDED.value,
+                        item["remote_path"],
+                        item["byte_size"],
+                        item["row_count"],
+                        item["sha256"],
+                        item["local_path"],
+                        now,
+                        now,
+                    ),
+                )
+                records.append(
+                    self._shard_record(
+                        self._require_row(connection, "shards", "shard_id", shard_id)
+                    )
+                )
+            for candidate in prepared_audit:
+                connection.execute(
+                    """INSERT INTO audit_candidates (
+                        batch_id, programme_id, candidate_json, local_path,
+                        local_row_locator, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        batch_id,
+                        programme_id,
+                        candidate[0],
+                        candidate[1],
+                        candidate[2],
+                        now,
+                    ),
+                )
+            old_counts = json.loads(str(batch["rejection_counts"]))
+            new_counts = json.loads(safe_rejections)
+            for key, value in new_counts.items():
+                old_counts[key] = int(old_counts.get(key, 0)) + value
+            connection.execute(
+                """UPDATE programmes SET state = ?, accepted_count = ?,
+                rejected_count = ?, processed_duration_ms = ?, rejection_counts = ?,
+                updated_at = ? WHERE programme_id = ?""",
+                (
+                    LedgerState.SHARDED.value,
+                    accepted_count,
+                    rejected_count,
+                    processed_duration_ms,
+                    safe_rejections,
+                    now,
+                    programme_id,
+                ),
+            )
+            self._refresh_batch_counts(connection, batch_id)
+            connection.execute(
+                """UPDATE batches SET state = ?, rejection_counts = ?, updated_at = ?
+                WHERE batch_id = ?""",
+                (
+                    LedgerState.SHARDED.value,
+                    json.dumps(old_counts, sort_keys=True, separators=(",", ":")),
+                    now,
+                    batch_id,
+                ),
+            )
+            result = self._batch_record(
+                self._require_row(connection, "batches", "batch_id", batch_id)
+            )
+        return result, tuple(records)
 
     def discover_programme(
         self,
@@ -497,6 +659,15 @@ class Ledger:
             ):
                 raise EvidenceError("programme identity differs from the ledger")
         return self.programme(programme_id)
+
+    def open_batches(self) -> tuple[BatchRecord, ...]:
+        """Return unsealed groups that can accept another programme."""
+        rows = self._connection.execute(
+            """SELECT * FROM batches WHERE state = ? AND sealed = 0
+            AND commit_id IS NULL ORDER BY batch_id""",
+            (LedgerState.SHARDED.value,),
+        ).fetchall()
+        return tuple(self._batch_record(row) for row in rows)
 
     def purge_programme(
         self, programme_id: str, *, evidence: Mapping[str, object] | None = None
@@ -655,6 +826,37 @@ class Ledger:
                 raise EvidenceError("shard evidence differs from the ledger")
         return self.shard(shard_id)
 
+    def seal_batch(self, batch_id: str) -> BatchRecord:
+        """Durably seal an open group so it is eligible for one Hub commit.
+
+        Returns:
+            The sealed group record.
+
+        Raises:
+            EvidenceError:
+                If the group is empty.
+            InvalidTransition:
+                If the group is not open.
+        """
+        with self.transaction() as connection:
+            batch = self._require_row(connection, "batches", "batch_id", batch_id)
+            if batch["commit_id"] is not None:
+                return self._batch_record(batch)
+            if batch["state"] != LedgerState.SHARDED.value:
+                raise InvalidTransition("only sharded groups can be sealed")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM shards WHERE batch_id = ?", (batch_id,)
+                ).fetchone()
+                is None
+            ):
+                raise EvidenceError("cannot seal an empty publication group")
+            connection.execute(
+                "UPDATE batches SET sealed = 1, updated_at = ? WHERE batch_id = ?",
+                (self._now(), batch_id),
+            )
+        return self.batch(batch_id)
+
     prepare_batch = allocate_batch_with_shards
     allocate_publication_batch = allocate_batch_with_shards
     register_batch_with_shards = allocate_batch_with_shards
@@ -801,14 +1003,15 @@ class Ledger:
             if existing is None:
                 connection.execute(
                     """INSERT INTO batches (
-                        batch_id, state, pipeline_digest, duration_ms, created_at,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        batch_id, state, pipeline_digest, duration_ms, sealed,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         batch_id,
                         LedgerState.DISCOVERED.value,
                         pipeline_digest,
                         duration_ms,
+                        0,
                         now,
                         now,
                     ),
@@ -1752,6 +1955,13 @@ class Ledger:
                 )"""
             )
             connection.execute("PRAGMA user_version = 3")
+        # Schema version 3 ledgers may predate publication groups. Keep the public
+        # schema version stable while adding this nullable-free runtime marker.
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(batches)")}
+        if "sealed" not in columns:
+            connection.execute(
+                "ALTER TABLE batches ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _publication_path(value: str) -> str:
@@ -2086,6 +2296,7 @@ class Ledger:
             remote_present=None
             if row["remote_present"] is None
             else bool(row["remote_present"]),
+            sealed=bool(row["sealed"]),
             last_error=row["last_error"],
         )
 

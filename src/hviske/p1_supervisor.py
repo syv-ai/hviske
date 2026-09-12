@@ -751,6 +751,10 @@ def validate_invariants(
             raise ValueError("partition assignment is not deterministic")
         if item.workers != 1:
             raise ValueError("each partition must have exactly one runtime worker")
+        if item.programmes_per_commit < 1:
+            raise ValueError("programmes_per_commit must be positive")
+        if not 1 <= item.shards_per_commit <= 98:
+            raise ValueError("shards_per_commit must leave room for the manifest")
         if item.alignment_method != "timestamp-native:p1-transcripts.words":
             raise ValueError("production requires timestamp-native alignment")
 
