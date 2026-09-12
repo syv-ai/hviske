@@ -51,6 +51,7 @@ from .contracts import (
     pipeline_config_sha256,
     validate_p1_runtime_contract,
 )
+from .hub_diagnostics import classify_hub_error
 from .ledger import Ledger
 from .segments import (
     CTCBackend,
@@ -2167,7 +2168,7 @@ def publish_pending(
 
     Raises:
         HfHubHTTPError:
-            If all bounded Hub publication attempts fail.
+            If a deterministic Hub request fails or bounded transient attempts fail.
         AssertionError:
             If the bounded retry loop exits without returning or raising.
     """
@@ -2185,36 +2186,33 @@ def publish_pending(
                     audit_reservoir=audit_reservoir,
                 )
         except HfHubHTTPError as error:
+            diagnostic = classify_hub_error(error)
+            will_retry = (
+                diagnostic.retryable and attempt < _PUBLICATION_RETRY_MAX_ATTEMPTS
+            )
             delay = (
                 _publication_retry_delay(settings=settings, attempt=attempt)
-                if attempt < _PUBLICATION_RETRY_MAX_ATTEMPTS
+                if will_retry
                 else 0.0
             )
             logger.warning(
                 "P1 Hub publication attempt=%d/%d partition=%d "
-                "exception_class=%s status_code=%s delay_seconds=%.1f",
+                "exception_class=%s status_code=%s hub_phase=%s "
+                "hub_reason=%s retryable=%s delay_seconds=%.1f",
                 attempt,
                 _PUBLICATION_RETRY_MAX_ATTEMPTS,
                 settings.partition_index,
                 type(error).__name__,
-                _hub_status_code(error),
+                diagnostic.status_code,
+                diagnostic.phase,
+                diagnostic.reason,
+                diagnostic.retryable,
                 delay,
             )
-            if attempt == _PUBLICATION_RETRY_MAX_ATTEMPTS:
+            if not will_retry:
                 raise
             time.sleep(delay)
     raise AssertionError("publication retry loop must return or raise")
-
-
-def _hub_status_code(error: HfHubHTTPError) -> int | None:
-    """Extract only the numeric HTTP status from a Hub transport error.
-
-    Returns:
-        Numeric HTTP status when the Hub response exposes one.
-    """
-    response = getattr(error, "response", None)
-    status_code = getattr(response, "status_code", None)
-    return status_code if isinstance(status_code, int) else None
 
 
 @contextlib.contextmanager

@@ -19,10 +19,12 @@ import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 import yaml
-from huggingface_hub import CommitInfo, HfFileSystem
+from huggingface_hub import CommitInfo, HfApi, HfFileSystem
+from huggingface_hub.errors import BadRequestError
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
 from p1_dataset.contracts import LedgerState, OutputRow, ShardEvidence
+from p1_dataset.hub_diagnostics import classify_hub_error
 from p1_dataset.ledger import Ledger
 from p1_dataset.publish import (
     AllowListError,
@@ -149,7 +151,9 @@ class MemoryHub:
         """Return size and optionally content-digest metadata."""
         result = []
         for path in paths:
-            content = self.files[path]
+            if path not in self.files and path not in self.existing_paths:
+                continue
+            content = self.files.get(path, b"")
             attrs: dict[str, object] = {"path": path, "size": len(content)}
             if self.expose_digest:
                 attrs["sha256"] = hashlib.sha256(content).hexdigest()
@@ -346,6 +350,31 @@ def test_card_is_readable_and_contract_driven() -> None:
     assert "Alexandra" not in card
     assert "CoRal" not in card
     assert "Roest" not in card
+
+
+def test_collision_check_queries_only_proposed_paths(tmp_path: Path) -> None:
+    """Collision safety does not enumerate an increasingly large repository tree."""
+    path = tmp_path / "one.parquet"
+    write_valid_shard(path)
+
+    class NoListingHub(MemoryHub):
+        def list_repo_files(
+            self, repo_id: str, *, repo_type: str, revision: str | None = None
+        ) -> c.Iterable[str]:
+            del repo_id, repo_type, revision
+            raise AssertionError("full repository listing must not be used")
+
+    hub = NoListingHub(sha="b" * 40)
+    publish_batch(
+        hub,
+        "org/p1",
+        "batch",
+        [LocalShard(path, "one.parquet", 1)],
+        expected_pipeline_version="test",
+        expected_pipeline_config_sha256="b" * 64,
+    )
+
+    assert hub.commits == [("one.parquet", "manifests/batch.json")]
 
 
 def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
@@ -581,6 +610,72 @@ def test_failed_verification_resumes_without_reupload_or_early_purge(
         assert len(hub.commits) == 1
         assert not path.exists()
         assert not manifest_path.exists()
+
+
+def test_hf_adapter_forces_lfs_and_preserves_exact_bytes(tmp_path: Path) -> None:
+    """Buffered inputs avoid Xet while retaining the exact operation bytes."""
+    path = tmp_path / "private-source-id.parquet"
+    expected = b"exact parquet bytes"
+    path.write_bytes(expected)
+    adapter = object.__new__(HfApiAdapter)
+    adapter._token = True
+
+    class Api:
+        def create_commit(self, **kwargs: object) -> object:
+            operations = t.cast(list[object], kwargs["operations"])
+            handles = [
+                getattr(operation, "path_or_fileobj") for operation in operations
+            ]
+            assert all(isinstance(handle, io.BufferedIOBase) for handle in handles)
+            assert [handle.read() for handle in handles] == [expected]
+            return SimpleNamespace(commit_id="a" * 40)
+
+    adapter._api = t.cast(HfApi, Api())
+    result = adapter.create_commit(
+        "org/private",
+        [UploadOperation(path_in_repo="data/one.parquet", path=path)],
+        repo_type="dataset",
+        commit_message="test",
+        parent_commit="b" * 40,
+    )
+
+    assert getattr(result, "commit_id") == "a" * 40
+
+
+def test_hf_adapter_tags_opaque_create_failure_without_leaking(tmp_path: Path) -> None:
+    """Adapter phase hints are bounded even when transport details are private."""
+    path = tmp_path / "private-source-id.parquet"
+    path.write_bytes(b"bytes")
+    adapter = object.__new__(HfApiAdapter)
+    adapter._token = True
+    error = BadRequestError(
+        "private-source-id token=hf_secret",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://signed.test/object?token=secret"),
+        ),
+    )
+
+    class Api:
+        def create_commit(self, **kwargs: object) -> object:
+            del kwargs
+            raise error
+
+    adapter._api = t.cast(HfApi, Api())
+    with pytest.raises(BadRequestError) as captured:
+        adapter.create_commit(
+            "org/private",
+            [UploadOperation(path_in_repo="data/one.parquet", path=path)],
+            repo_type="dataset",
+            commit_message="test",
+        )
+
+    diagnostic = classify_hub_error(captured.value)
+    assert diagnostic.phase == "create_commit"
+    assert diagnostic.reason == "unknown"
+    assert "private" not in repr(diagnostic)
+    assert "signed.test" not in repr(diagnostic)
+    assert "secret" not in repr(diagnostic)
 
 
 def test_hf_digest_stream_uses_explicit_dataset_namespace() -> None:
@@ -886,12 +981,14 @@ class RacingHub(MemoryHub):
         self.head = self.commit_id
         return result
 
-    def list_repo_files(
-        self, repo_id: str, *, repo_type: str, revision: str | None = None
-    ) -> c.Iterable[str]:
+    def get_paths_info(
+        self, repo_id: str, paths: list[str], *, repo_type: str, revision: str
+    ) -> list[object]:
         """Return the old immutable snapshot before racing a competitor."""
         self.revisions.append(revision)
-        snapshot = tuple(self.files) + self.existing_paths
+        snapshot = super().get_paths_info(
+            repo_id, paths, repo_type=repo_type, revision=revision
+        )
         if self.race:
             self.race = False
             self.files[self.race_path] = self.race_bytes
@@ -931,7 +1028,7 @@ def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
     """Publishing never overwrites a path owned by an existing publication."""
     path = tmp_path / "one.parquet"
     write_valid_shard(path)
-    hub = MemoryHub(existing_paths=("one.parquet",))
+    hub = MemoryHub(sha="b" * 40, existing_paths=("one.parquet",))
     with pytest.raises(AllowListError, match="collision"):
         publish_batch(
             hub,
