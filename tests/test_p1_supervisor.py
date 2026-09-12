@@ -78,6 +78,7 @@ def test_child_ipc_is_bounded_status_only(monkeypatch: pytest.MonkeyPatch) -> No
             "http_status_code",
             "hub_phase",
             "hub_reason",
+            "hub_retryable",
             "status",
             "started_at",
             "finished_at",
@@ -130,6 +131,7 @@ def test_failed_child_diagnostic_cannot_leak_transport_details(
     assert failure["http_status_code"] == 400
     assert failure["hub_phase"] == "preupload"
     assert failure["hub_reason"] == "unknown"
+    assert failure["hub_retryable"] is False
     encoded = repr(failure).casefold()
     assert not any(
         forbidden in encoded
@@ -319,6 +321,7 @@ def test_reap_waits_for_asynchronous_terminal_status(tmp_path: Path) -> None:
         "http_status_code": None,
         "hub_phase": "unknown",
         "hub_reason": "unknown",
+        "hub_retryable": None,
         "status": "done",
         "started_at": "now",
         "finished_at": "now",
@@ -516,6 +519,99 @@ def test_supervisor_retries_a_failed_child_and_writes_done_marker(
     assert attempts == [0, 0]
     assert (tmp_path / "run/supervisor/DONE").exists()
     assert not (tmp_path / "run/supervisor/FAILED").exists()
+
+
+def test_supervisor_retries_known_missing_object_hub_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounded missing-object retry remains eligible for supervisor retry."""
+    config = _config(tmp_path)
+    attempts: list[int] = []
+
+    def run(config: DictConfig) -> None:
+        attempts.append(int(config.runtime.partition_index))
+        if len(attempts) == 1:
+            raise BadRequestError(
+                "private source-id",
+                response=httpx.Response(
+                    400,
+                    request=httpx.Request(
+                        "POST", "https://huggingface.co/api/datasets/org/repo/commit"
+                    ),
+                    content=b"LFS pointer pointed to a file that does not exist",
+                ),
+            )
+
+    monkeypatch.setattr(supervisor, "run_pipeline", run)
+    monkeypatch.setattr(supervisor.logging, "disable", lambda level: None)
+    monkeypatch.setattr(
+        supervisor.multiprocessing, "get_context", lambda name: _FakeContext()
+    )
+    result = supervisor.run_supervisor(
+        config=config,
+        settings=supervisor.SupervisorSettings(
+            process_count=1,
+            retry_delay_seconds=0,
+            max_attempts=2,
+            shutdown_grace_seconds=0,
+            run_root=tmp_path / "run",
+        ),
+    )
+
+    assert attempts == [0, 0]
+    assert result.completed == (0,)
+    assert result.exit_code == 0
+    log = (tmp_path / "run/supervisor/partition-0.jsonl").read_text()
+    assert '"hub_retryable": true' in log
+
+
+def test_supervisor_stops_non_retryable_hub_failure_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deterministic Hub failure does not consume supervisor attempts."""
+    config = _config(tmp_path)
+    attempts = 0
+
+    def fail(*, config: DictConfig) -> None:
+        nonlocal attempts
+        del config
+        attempts += 1
+        raise BadRequestError(
+            "private source-id",
+            response=httpx.Response(
+                400,
+                request=httpx.Request(
+                    "POST", "https://huggingface.co/api/datasets/org/repo/commit"
+                ),
+                json={"error": "unrelated validation failure"},
+            ),
+        )
+
+    monkeypatch.setattr(supervisor, "run_pipeline", fail)
+    monkeypatch.setattr(supervisor.logging, "disable", lambda level: None)
+    monkeypatch.setattr(
+        supervisor.multiprocessing, "get_context", lambda name: _FakeContext()
+    )
+    result = supervisor.run_supervisor(
+        config=config,
+        settings=supervisor.SupervisorSettings(
+            process_count=1,
+            retry_delay_seconds=0,
+            max_attempts=3,
+            shutdown_grace_seconds=0,
+            run_root=tmp_path / "run",
+        ),
+    )
+
+    assert attempts == 1
+    assert result.failed == (0,)
+    assert (tmp_path / "run/supervisor/partition-0.jsonl").read_text().count(
+        '"attempt": 1'
+    ) == 2
+    assert (
+        '"hub_retryable": false'
+        in (tmp_path / "run/supervisor/partition-0.jsonl").read_text()
+    )
 
 
 def test_validation_rejects_nested_workers_before_spawn(tmp_path: Path) -> None:

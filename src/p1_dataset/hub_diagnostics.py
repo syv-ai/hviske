@@ -35,7 +35,7 @@ def annotate_hub_error(
     """Attach only validated classifier hints to an exception."""
     if _SAFE_PHASE.fullmatch(phase):
         setattr(error, "_p1_hub_phase", phase)
-    if reason in {"missing_uploaded_object", "stale_parent", "xet_unavailable"}:
+    if reason in {"stale_parent", "xet_unavailable"}:
         setattr(error, "_p1_hub_reason", reason)
 
 
@@ -67,7 +67,9 @@ def classify_hub_error(error: BaseException) -> HubErrorDiagnostic:
         tagged_phase = getattr(error, "_p1_hub_phase", None)
         if isinstance(tagged_phase, str) and _SAFE_PHASE.fullmatch(tagged_phase):
             phase = tagged_phase
-    reason = _tagged_reason(error) or _reason_from_response(response, status_code)
+    reason = _tagged_reason(error) or _reason_from_response(
+        response, status_code, error=error
+    )
     retryable = _is_retryable(status_code=status_code, reason=reason)
     return HubErrorDiagnostic(status_code, phase, reason, retryable)
 
@@ -94,13 +96,15 @@ def _phase_from_response(response: object) -> str:
     return "unknown"
 
 
-def _reason_from_response(response: object, status_code: int | None) -> str:
+def _reason_from_response(
+    response: object, status_code: int | None, *, error: HfHubHTTPError
+) -> str:
     headers = getattr(response, "headers", None)
     error_code = headers.get("X-Error-Code") if hasattr(headers, "get") else None
     if isinstance(error_code, str) and error_code in _ERROR_CODE_REASONS:
         return _ERROR_CODE_REASONS[error_code]
 
-    fragments = _response_fragments(response)
+    fragments = _response_fragments(response) + _error_fragments(error)
     if any(_MISSING_UPLOADED_OBJECT_PHRASE in item for item in fragments):
         return "missing_uploaded_object"
     if any("a commit has happened since" in item for item in fragments) or any(
@@ -122,6 +126,17 @@ def _reason_from_response(response: object, status_code: int | None) -> str:
     if status_code in {401, 403}:
         return "authorisation"
     return "unknown"
+
+
+def _error_fragments(error: HfHubHTTPError) -> tuple[str, ...]:
+    values: list[str] = []
+    for argument in error.args:
+        if isinstance(argument, str):
+            values.append(argument[:512].casefold())
+    server_message = getattr(error, "server_message", None)
+    if isinstance(server_message, str):
+        values.append(server_message[:512].casefold())
+    return tuple(values)
 
 
 def _response_fragments(response: object) -> tuple[str, ...]:
@@ -162,8 +177,4 @@ def _collect_strings(value: object, *, values: list[str], depth: int) -> None:
 
 def _tagged_reason(error: HfHubHTTPError) -> str | None:
     reason = getattr(error, "_p1_hub_reason", None)
-    return (
-        reason
-        if reason in {"missing_uploaded_object", "stale_parent", "xet_unavailable"}
-        else None
-    )
+    return reason if reason in {"stale_parent", "xet_unavailable"} else None

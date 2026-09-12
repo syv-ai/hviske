@@ -24,7 +24,7 @@ from huggingface_hub.errors import BadRequestError, HfHubHTTPError
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
 from p1_dataset.contracts import LedgerState, OutputRow, ShardEvidence
-from p1_dataset.hub_diagnostics import classify_hub_error
+from p1_dataset.hub_diagnostics import annotate_hub_error, classify_hub_error
 from p1_dataset.ledger import Ledger
 from p1_dataset.publish import (
     AllowListError,
@@ -774,6 +774,26 @@ def test_hf_near_match_400_is_unknown_and_non_retryable() -> None:
     diagnostic = classify_hub_error(error)
 
     assert diagnostic.phase == "commit"
+    assert diagnostic.reason == "unknown"
+    assert not diagnostic.retryable
+
+
+def test_hf_tagged_missing_uploaded_object_is_unknown_without_phrase() -> None:
+    """Code-supplied missing-object tags cannot override server evidence."""
+    error = BadRequestError(
+        "unrelated manually tagged failure",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://huggingface.co/api/datasets/org/repo/commit"
+            ),
+            json={"error": "unrelated validation failure"},
+        ),
+    )
+    annotate_hub_error(error, phase="commit", reason="missing_uploaded_object")
+
+    diagnostic = classify_hub_error(error)
+
     assert diagnostic.reason == "unknown"
     assert not diagnostic.retryable
 
