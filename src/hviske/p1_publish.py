@@ -365,7 +365,7 @@ def build_dataset_card(
         "language: [da]\n"
         "task_categories: [automatic-speech-recognition]\n"
         "license: other\n"
-        "license_name: syv.ai layered dataset licence\n"
+        "license_name: syvai-layered-data-license\n"
         "license_link: LICENSE\n"
         "---\n\n"
         "# DR P1 speech segments\n\n"

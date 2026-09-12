@@ -266,7 +266,7 @@ def test_card_contains_required_terms_and_no_credentials() -> None:
     card = make_card()
     assert "No public redistribution grant" not in card
     assert "license: other" in card
-    assert "license_name: syv.ai layered dataset licence" in card
+    assert "license_name: syvai-layered-data-license" in card
     assert "license_link: LICENSE" in card
     assert "CC BY 4.0" in card
     assert "embedded DR audio" in card
@@ -325,7 +325,7 @@ def test_card_is_readable_and_contract_driven() -> None:
         "language": ["da"],
         "task_categories": ["automatic-speech-recognition"],
         "license": "other",
-        "license_name": "syv.ai layered dataset licence",
+        "license_name": "syvai-layered-data-license",
         "license_link": "LICENSE",
     }
     assert [
