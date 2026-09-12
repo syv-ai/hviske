@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import collections.abc as c
-import contextlib
 import hashlib
 import io
 import json
@@ -488,30 +487,24 @@ class HfApiAdapter:
             HfHubHTTPError:
                 If the Hub rejects preupload, object transfer, or commit creation.
         """
-        # Buffered streams deliberately select the mature LFS transport rather than
-        # Xet. The Hub commit API otherwise offers Xet whenever hf-xet is installed,
-        # adding a repository-token request that can fail before an ordinary LFS
-        # commit. Each stream remains open for the whole synchronous commit.
-        with contextlib.ExitStack() as stack:
-            hub_operations = [
-                CommitOperationAdd(
-                    path_in_repo=operation.path_in_repo,
-                    path_or_fileobj=stack.enter_context(operation.path.open("rb")),
-                )
-                for operation in operations
-            ]
-            try:
-                return self._api.create_commit(
-                    repo_id=repo_id,
-                    operations=hub_operations,
-                    repo_type=repo_type,
-                    commit_message=commit_message,
-                    parent_commit=parent_commit,
-                    token=self._token,
-                )
-            except HfHubHTTPError as error:
-                annotate_hub_error(error, phase="create_commit")
-                raise
+        hub_operations = [
+            CommitOperationAdd(
+                path_in_repo=operation.path_in_repo, path_or_fileobj=operation.path
+            )
+            for operation in operations
+        ]
+        try:
+            return self._api.create_commit(
+                repo_id=repo_id,
+                operations=hub_operations,
+                repo_type=repo_type,
+                commit_message=commit_message,
+                parent_commit=parent_commit,
+                token=self._token,
+            )
+        except HfHubHTTPError as error:
+            annotate_hub_error(error, phase="create_commit")
+            raise
 
     def create_repo(
         self, repo_id: str, *, repo_type: str, private: bool, exist_ok: bool

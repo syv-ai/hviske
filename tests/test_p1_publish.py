@@ -20,7 +20,7 @@ import pytest
 import soundfile as sf
 import yaml
 from huggingface_hub import CommitInfo, HfApi, HfFileSystem
-from huggingface_hub.errors import BadRequestError
+from huggingface_hub.errors import BadRequestError, HfHubHTTPError
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
 from p1_dataset.contracts import LedgerState, OutputRow, ShardEvidence
@@ -612,36 +612,6 @@ def test_failed_verification_resumes_without_reupload_or_early_purge(
         assert not manifest_path.exists()
 
 
-def test_hf_adapter_forces_lfs_and_preserves_exact_bytes(tmp_path: Path) -> None:
-    """Buffered inputs avoid Xet while retaining the exact operation bytes."""
-    path = tmp_path / "private-source-id.parquet"
-    expected = b"exact parquet bytes"
-    path.write_bytes(expected)
-    adapter = object.__new__(HfApiAdapter)
-    adapter._token = True
-
-    class Api:
-        def create_commit(self, **kwargs: object) -> object:
-            operations = t.cast(list[object], kwargs["operations"])
-            handles = [
-                getattr(operation, "path_or_fileobj") for operation in operations
-            ]
-            assert all(isinstance(handle, io.BufferedIOBase) for handle in handles)
-            assert [handle.read() for handle in handles] == [expected]
-            return SimpleNamespace(commit_id="a" * 40)
-
-    adapter._api = t.cast(HfApi, Api())
-    result = adapter.create_commit(
-        "org/private",
-        [UploadOperation(path_in_repo="data/one.parquet", path=path)],
-        repo_type="dataset",
-        commit_message="test",
-        parent_commit="b" * 40,
-    )
-
-    assert getattr(result, "commit_id") == "a" * 40
-
-
 def test_hf_adapter_tags_opaque_create_failure_without_leaking(tmp_path: Path) -> None:
     """Adapter phase hints are bounded even when transport details are private."""
     path = tmp_path / "private-source-id.parquet"
@@ -678,6 +648,39 @@ def test_hf_adapter_tags_opaque_create_failure_without_leaking(tmp_path: Path) -
     assert "secret" not in repr(diagnostic)
 
 
+def test_hf_adapter_uses_path_operations_and_preserves_exact_bytes(
+    tmp_path: Path,
+) -> None:
+    """Native Hub operations retain the source path and its exact bytes."""
+    path = tmp_path / "private-source-id.parquet"
+    expected = b"exact parquet bytes"
+    path.write_bytes(expected)
+    adapter = object.__new__(HfApiAdapter)
+    adapter._token = True
+
+    class Api:
+        def create_commit(self, **kwargs: object) -> object:
+            operations = t.cast(list[object], kwargs["operations"])
+            paths = [
+                t.cast(str, getattr(operation, "path_or_fileobj"))
+                for operation in operations
+            ]
+            assert paths == [str(path)]
+            assert [Path(item).read_bytes() for item in paths] == [expected]
+            return SimpleNamespace(commit_id="a" * 40)
+
+    adapter._api = t.cast(HfApi, Api())
+    result = adapter.create_commit(
+        "org/private",
+        [UploadOperation(path_in_repo="data/one.parquet", path=path)],
+        repo_type="dataset",
+        commit_message="test",
+        parent_commit="b" * 40,
+    )
+
+    assert getattr(result, "commit_id") == "a" * 40
+
+
 def test_hf_digest_stream_uses_explicit_dataset_namespace() -> None:
     """The filesystem adapter never ambiguously addresses a model repository."""
     adapter = object.__new__(HfApiAdapter)
@@ -695,6 +698,57 @@ def test_hf_digest_stream_uses_explicit_dataset_namespace() -> None:
         )
     ) == [b"payload"]
     assert paths == ["datasets/org/p1/shards/one.parquet"]
+
+
+def test_hf_lfs_forbidden_failure_is_safe_and_non_retryable() -> None:
+    """LFS authorisation failures expose only a bounded classification."""
+    error = HfHubHTTPError(
+        "private/path token=hf_secret",
+        response=httpx.Response(
+            403,
+            request=httpx.Request(
+                "POST",
+                "https://huggingface.co/api/datasets/org/repo/info/lfs/objects/batch"
+                "?token=hf_secret",
+            ),
+            json={"error": "private/path token=hf_secret"},
+        ),
+    )
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.status_code == 403
+    assert diagnostic.phase == "lfs_batch"
+    assert diagnostic.reason == "authorisation"
+    assert not diagnostic.retryable
+    assert "huggingface.co" not in repr(diagnostic)
+    assert "private/path" not in repr(diagnostic)
+    assert "hf_secret" not in repr(diagnostic)
+
+
+def test_hf_xet_failure_is_classified_without_transport_details() -> None:
+    """Xet endpoint failures expose a safe phase and no request data."""
+    error = HfHubHTTPError(
+        "signed URL https://cas-server.xethub.hf.co/reconstruction/object",
+        response=httpx.Response(
+            403,
+            request=httpx.Request(
+                "GET",
+                "https://cas-server.xethub.hf.co/reconstruction/object"
+                "?X-Amz-Signature=signed",
+            ),
+            json={"error": "private/object signed"},
+        ),
+    )
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.status_code == 403
+    assert diagnostic.phase == "xet"
+    assert diagnostic.reason == "authorisation"
+    assert not diagnostic.retryable
+    assert "xethub" not in repr(diagnostic)
+    assert "signed" not in repr(diagnostic)
 
 
 def test_initialisation_commits_card_and_attributes_privately() -> None:
