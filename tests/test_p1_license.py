@@ -1,4 +1,4 @@
-"""Tests for the immutable P1 dataset licence adaptation."""
+"""Tests for the custom layered P1 dataset licence."""
 
 from __future__ import annotations
 
@@ -7,50 +7,51 @@ from pathlib import Path
 
 from hviske.p1_contracts import P1_RUNTIME_CONTRACT
 
-_PINNED_TEMPLATE_URL = (
-    "https://huggingface.co/datasets/CoRal-project/coral-v3/resolve/"
-    "01f7c93c21fc9dec87fe9f7149c79569cc433f08/LICENSE"
+_SOURCE_README_URL = (
+    "https://huggingface.co/datasets/syvai/p1/resolve/"
+    "449b9c2294026df6d0d37538f279fdec03f565ff/README.md"
 )
-_SOURCE_SEQUENCE_TEXT = (
-    "The Licensed Material (as defined below) is made available to You by Alexandra\n"
-    "Instituttet A/S, Åbogade 34, 8200 Aarhus N, Denmark"
-)
-_TARGET_SEQUENCE_TEXT = (
-    "The Licensed Material (as defined below) is made available to You by syv.ai ApS,\n"
-    "Rosenvængets Allé 11, 1. tv, 2100 København Ø, Denmark"
-)
-_SOURCE_SEQUENCE_BYTES = _SOURCE_SEQUENCE_TEXT.encode("utf-8")
-_TARGET_SEQUENCE_BYTES = _TARGET_SEQUENCE_TEXT.encode("utf-8")
 
 
-def test_target_license_is_exactly_the_pinned_source_adaptation() -> None:
-    """Only the exact licensor identity bytes differ from the pinned source."""
+def test_license_provenance_uses_pinned_source_rights_coordinates() -> None:
+    """The pinned Hub source is provenance, not presented as a licence text."""
+    contract = P1_RUNTIME_CONTRACT
+    assert contract.dataset_license_template_repository == "syvai/p1"
+    assert contract.dataset_license_template_revision == (
+        "449b9c2294026df6d0d37538f279fdec03f565ff"
+    )
+    assert contract.dataset_license_template_url == _SOURCE_README_URL
+    assert contract.dataset_license_template_sha256 == (
+        "133a669aa02adbb3d2ca2ebebae14a811be1703eae7157a75f94b465dcdd1ece"
+    )
+    assert contract.dataset_license_template_bytes == 2002
+    assert "not a textual licence template" in contract.dataset_license_adaptation
+
+
+def test_target_license_is_the_pinned_custom_layered_license() -> None:
+    """The tracked licence bytes and contract digest cannot drift."""
     root = Path(__file__).parents[1]
-    source_bytes = (root / "tests/fixtures/p1/LICENSE.source").read_bytes()
     target_bytes = (root / "LICENSE-DATASET").read_bytes()
+    published_bytes = (root / "LICENSE").read_bytes()
 
-    assert len(source_bytes) == P1_RUNTIME_CONTRACT.dataset_license_template_bytes
-    assert (
-        hashlib.sha256(source_bytes).hexdigest()
-        == "ee93c98df9a894464d1c042b66c6039543776c463d06d1a6e93f176e08ca67bd"
-        == P1_RUNTIME_CONTRACT.dataset_license_template_sha256
-    )
-    assert source_bytes.count(_SOURCE_SEQUENCE_BYTES) == 1
-    expected_target_bytes = source_bytes.replace(
-        _SOURCE_SEQUENCE_BYTES, _TARGET_SEQUENCE_BYTES
-    )
-    assert target_bytes == expected_target_bytes
+    assert target_bytes == published_bytes
     assert (
         hashlib.sha256(target_bytes).hexdigest()
-        == "e06010caf8ea36292a241339c08eedc7ea399778954cf9a546e989d421a48cd6"
+        == "02f6d0056a6f19f59b57c6a20c49bf7edd90530fa2664bb7e4a286522c981c6e"
         == P1_RUNTIME_CONTRACT.dataset_license_target_sha256
     )
-
-    source_text = source_bytes.decode("utf-8")
     target_text = target_bytes.decode("utf-8")
-    assert source_text.count(_SOURCE_SEQUENCE_TEXT) == 1
-    assert target_text.count(_TARGET_SEQUENCE_TEXT) == 1
-    assert _SOURCE_SEQUENCE_TEXT in P1_RUNTIME_CONTRACT.dataset_license_adaptation
-    assert _TARGET_SEQUENCE_TEXT in P1_RUNTIME_CONTRACT.dataset_license_adaptation
-    assert "The place of arbitration shall be Aarhus, Denmark." in target_text
-    assert P1_RUNTIME_CONTRACT.dataset_license_template_url == _PINNED_TEMPLATE_URL
+    assert "syv.ai ApS" in target_text
+    assert "CC BY 4.0" in target_text
+    assert "https://creativecommons.org/licenses/by/4.0/legalcode" in target_text
+    assert "embedded DR audio" in target_text
+    assert "verbatim/source-derived" in target_text
+    assert "transcript text" in target_text
+    assert "public\nredistribution or sublicensing" in target_text
+    assert "ElevenLabs Scribe v2" in target_text
+    assert "https://www.dr.dk/om-dr/vilkaar-paa-drdk" in target_text
+    assert "https://elevenlabs.io/terms-of-use-eu" in target_text
+    assert "https://elevenlabs.io/speech-to-text-terms" in target_text
+    assert "CoRal" not in target_text
+    assert "Alexandra" not in target_text
+    assert "Roest" not in target_text

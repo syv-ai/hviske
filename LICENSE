@@ -1,21 +1,59 @@
-MIT License
+DR P1 SPEECH SEGMENTS — LAYERED DATASET LICENCE
 
-Copyright (c) 2026- syv.ai ApS
-Copyright (c) 2023-2024 Alexandra Instituttet A/S
+Copyright © 2026 syv.ai ApS. This licence is authored by syv.ai ApS.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this
-software and associated documentation files (the "Software"), to deal in the Software
-without restriction, including without limitation the rights to use, copy, modify,
-merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to the following
-conditions:
+1. CC BY 4.0 GRANT
 
-The above copyright notice and this permission notice shall be included in all copies
-or substantial portions of the Software.
+syv.ai ApS makes the dataset structure, arrangement, segment boundaries, and
+metadata independently created by syv.ai ApS (the “syv.ai Material”) available
+under the Creative Commons Attribution 4.0 International licence (CC BY 4.0):
+https://creativecommons.org/licenses/by/4.0/legalcode
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
-INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
-HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
-CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
-THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+For the syv.ai Material, you may share and adapt the material, including for
+commercial purposes, provided that you give appropriate credit to syv.ai ApS,
+link to CC BY 4.0, and indicate if changes were made. A practical attribution
+is: “syv.ai ApS, DR P1 speech segments — CC BY 4.0”, with a link to this file
+and the CC BY 4.0 legal code.
+
+2. EXCLUDED MATERIAL
+
+The CC BY grant does not include the embedded DR audio or verbatim/source-derived
+transcript text. Rights in that excluded content remain with DR and any other
+relevant rightsholders. Private access to the dataset does not grant a public
+redistribution or sublicensing right for excluded content. You may use excluded
+content only under a separate permission or agreement from the relevant
+rightsholder, or as otherwise permitted by applicable law.
+
+3. TRANSCRIPT OUTPUT AND THIRD-PARTY SERVICES
+
+ElevenLabs Scribe v2 generated the transcript output. As between a customer and
+ElevenLabs, the applicable paid-service terms generally leave rights in output
+with the customer. Those terms do not clear DR or any other third-party rights
+in the recordings or source-derived text. See the EEA terms and speech-to-text
+terms, as applicable:
+https://elevenlabs.io/terms-of-use-eu
+https://elevenlabs.io/speech-to-text-terms
+
+No ElevenLabs model or service code is distributed with this dataset.
+
+4. SOURCE TERMS
+
+DR’s terms are available at:
+https://www.dr.dk/om-dr/vilkaar-paa-drdk
+
+These linked pages are official references and may change; this file does not
+claim that a mutable web page is an immutable licence source. The applicable
+rights and permissions for excluded content must be assessed separately.
+
+5. DISCLAIMER
+
+The syv.ai Material is provided “AS IS” and without warranties of any kind, to
+the fullest extent permitted by law. syv.ai ApS is not responsible for claims,
+loss, or damage arising from use of the dataset or from use of excluded content.
+
+6. CONTACT AND ACCESS
+
+For authorised access questions, permissions, or attribution questions, contact
+syv.ai ApS through the project owner or the access channel that provided this
+private repository. Access to the private repository remains subject to the
+separate access agreement and does not change the exclusions above.

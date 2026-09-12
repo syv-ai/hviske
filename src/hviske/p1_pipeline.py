@@ -76,6 +76,10 @@ _PUBLICATION_RETRY_MAX_ATTEMPTS = 8
 _PUBLICATION_RETRY_BASE_SECONDS = 5.0
 _PUBLICATION_RETRY_MAX_DELAY_SECONDS = 60.0
 _PUBLICATION_RETRY_PARTITION_STAGGER_SECONDS = 0.5
+_P1_AUDIO_REPOSITORY = "syvai/p1"
+_P1_AUDIO_REVISION = "449b9c2294026df6d0d37538f279fdec03f565ff"
+_P1_TRANSCRIPT_REPOSITORY = "syvai/p1-transcripts"
+_P1_TRANSCRIPT_REVISION = "41132579816d86e889635f84f30511279f026359"
 
 
 @dataclass(frozen=True)
@@ -645,21 +649,37 @@ def _target_card_is_v8(
         card = payload.decode("utf-8")
     except Exception:
         return False
-    required = (
-        "pipeline_version: p1-segmentation-8",
-        "timestamp-native:p1-transcripts.words",
-        "p1-segments-v2",
-    )
-    if "pipeline_version: p1-segmentation-7" in card:
-        return False
-    if not all(marker in card for marker in required):
+    if "license_link: LICENSE" not in card:
         return False
     if _card_declares_inactive_model_provenance(card):
         return False
+    machine_comment = re.search(r"<!--(?P<body>.*?)-->", card, re.DOTALL)
+    if machine_comment is None:
+        return False
+    body = machine_comment.group("body")
+    coordinates = {
+        key: value
+        for key, value in re.findall(
+            r"^\s*(pipeline_config_sha256|source_audio_repository|"
+            r"source_audio_revision|source_transcript_repository|"
+            r"source_transcript_revision):\s*(\S+)\s*$",
+            body,
+            re.MULTILINE,
+        )
+    }
+    expected_coordinates = {
+        "source_audio_repository": _P1_AUDIO_REPOSITORY,
+        "source_audio_revision": _P1_AUDIO_REVISION,
+        "source_transcript_repository": _P1_TRANSCRIPT_REPOSITORY,
+        "source_transcript_revision": _P1_TRANSCRIPT_REVISION,
+    }
+    if any(
+        coordinates.get(key) != value for key, value in expected_coordinates.items()
+    ):
+        return False
     return (
-        expected_digest is None
-        or re.search(rf"pipeline_config_sha256:\s*{re.escape(expected_digest)}", card)
-        is not None
+        expected_digest is not None
+        and coordinates.get("pipeline_config_sha256") == expected_digest
     )
 
 
@@ -678,11 +698,7 @@ def _card_declares_inactive_model_provenance(card: str) -> bool:
         Whether the card declares inactive model or device provenance.
     """
     technology = re.compile(r"\b(?:vad|ctc|whisper|cuda|silero|roest)\b", re.I)
-    model_provenance = re.compile(
-        r"\bmodel[- ]backed\b|\bmodel[_ -]+"
-        r"(?:revisions?|provenance|repository|id)\b",
-        re.I,
-    )
+    model_provenance = re.compile(r"\bmodel\b|\bmodel[- _]+backed\b", re.I)
     processing_cue = re.compile(
         r"\b(?:alignment(?:[_ -]+(?:method|backend))?|aligner|aligned|backend|"
         r"device|segmentation|active|enabled|legacy|uses?|using|requires?|runs?|"
@@ -2848,6 +2864,7 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
         settings.target_private_repo,
         card=card,
         license_text=license_path.read_text(encoding="utf-8"),
+        expected_pipeline_config_sha256=settings.pipeline_digest,
     )
 
 
