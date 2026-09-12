@@ -444,7 +444,7 @@ def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> 
 def test_commit_sha_prefers_commit_info_oid_and_accepts_plain_sha() -> None:
     """CommitInfo URLs do not hide their immutable object identifiers."""
     commit = CommitInfo(
-        commit_url="https://huggingface.co/commit/main",
+        commit_url="https://huggingface.co/datasets/org/repo/commit/main",
         commit_message="",
         commit_description="",
         oid="a" * 40,
@@ -460,7 +460,7 @@ def test_commit_sha_prefers_commit_info_oid_and_accepts_plain_sha() -> None:
         "a" * 39,
         "a" * 41,
         CommitInfo(
-            commit_url="https://huggingface.co/commit/main",
+            commit_url="https://huggingface.co/datasets/org/repo/commit/main",
             commit_message="",
             commit_description="",
             oid="main",
