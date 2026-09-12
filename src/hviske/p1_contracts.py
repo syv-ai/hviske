@@ -143,26 +143,27 @@ P1_RUNTIME_CONTRACT = P1RuntimeContract(
     normalisation_punctuation_removed=True,
     normalisation_number_expansion=False,
     normalisation_preserves_source_word_map=True,
-    dataset_license_template_repository="CoRal-project/coral-v3",
-    dataset_license_template_revision=("01f7c93c21fc9dec87fe9f7149c79569cc433f08"),
+    # This pinned Hub README records source-rights provenance; it is not a textual
+    # licence template. The target is the tracked custom layered licence.
+    dataset_license_template_repository="syvai/p1",
+    dataset_license_template_revision=("449b9c2294026df6d0d37538f279fdec03f565ff"),
     dataset_license_template_url=(
-        "https://huggingface.co/datasets/CoRal-project/coral-v3/resolve/"
-        "01f7c93c21fc9dec87fe9f7149c79569cc433f08/LICENSE"
+        "https://huggingface.co/datasets/syvai/p1/resolve/"
+        "449b9c2294026df6d0d37538f279fdec03f565ff/README.md"
     ),
     dataset_license_template_sha256=(
-        "ee93c98df9a894464d1c042b66c6039543776c463d06d1a6e93f176e08ca67bd"
+        "133a669aa02adbb3d2ca2ebebae14a811be1703eae7157a75f94b465dcdd1ece"
     ),
-    dataset_license_template_bytes=14112,
+    dataset_license_template_bytes=2002,
     dataset_license_adaptation=(
-        "Replace only the exact UTF-8 byte/text sequence 'The Licensed Material "
-        "(as defined below) is made available to You by Alexandra\nInstituttet A/S, "
-        "Åbogade 34, 8200 Aarhus N, Denmark' with 'The Licensed Material (as "
-        "defined below) is made available to You by syv.ai ApS,\nRosenvængets Allé "
-        "11, 1. tv, 2100 København Ø, Denmark'; preserve all other bytes."
+        "Pinned syvai/p1 README coordinates record source-rights provenance only; "
+        "they are not a textual licence template. The tracked custom layered "
+        "licence is authored by syv.ai ApS and defines terms for this combined "
+        "dataset."
     ),
     dataset_license_target_path="LICENSE",
     dataset_license_target_sha256=(
-        "e06010caf8ea36292a241339c08eedc7ea399778954cf9a546e989d421a48cd6"
+        "02f6d0056a6f19f59b57c6a20c49bf7edd90530fa2664bb7e4a286522c981c6e"
     ),
 )
 

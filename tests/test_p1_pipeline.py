@@ -396,16 +396,14 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
     assert hub.private is True
     assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
     card = hub.files["README.md"].decode("utf-8")
-    assert "p1-text-normalisation-6" in card
-    assert "best-effort-following-word-with-terminal-suffix-v6" in card
-    assert "exact published and canonical CTC text" not in card
-    assert "vad_speech_ratio" in card
+    assert "roughly 2006–2022" in card
+    assert "ElevenLabs Scribe v2" in card
+    assert "mono 16 kHz OGG/Opus" in card
+    assert "p1-text-normalisation-6" not in card
+    assert "vad_speech_ratio" not in card
     assert 'data_files="data/train/*.parquet"' in card
-    assert "| Alignment | Timestamp-native source word boundaries |" in card
-    assert (
-        "pipeline_config_sha256"
-        not in card.split("## Key facts", 1)[1].split("## Data format", 1)[0]
-    )
+    assert "<!--" in card and "pipeline_config_sha256" in card
+    assert "p1-segments-v2" not in card
     assert report.preflight.target["contract_v8"] is True
     assert source.iterated is False
 

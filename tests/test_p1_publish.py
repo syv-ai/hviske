@@ -22,7 +22,7 @@ import yaml
 from huggingface_hub import CommitInfo, HfFileSystem
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
-from hviske.p1_contracts import OUTPUT_SCHEMA, LedgerState, OutputRow, ShardEvidence
+from hviske.p1_contracts import LedgerState, OutputRow, ShardEvidence
 from hviske.p1_ledger import Ledger
 from hviske.p1_publish import (
     AllowListError,
@@ -266,15 +266,14 @@ def test_card_contains_required_terms_and_no_credentials() -> None:
     card = make_card()
     assert "No public redistribution grant" not in card
     assert "license: other" in card
-    assert "license_name: p1-dataset-license" in card
+    assert "license_name: syv.ai layered dataset licence" in card
     assert "license_link: LICENSE" in card
-    assert "subject to [LICENSE](LICENSE)" in card
-    assert (
-        "https://huggingface.co/datasets/CoRal-project/coral-v3/resolve/"
-        "01f7c93c21fc9dec87fe9f7149c79569cc433f08/LICENSE" in card
-    )
+    assert "CC BY 4.0" in card
+    assert "embedded DR audio" in card
+    assert "transcript text" in card
     assert "/main/" not in card
-    assert all(section in card for section in ("Source provenance", "Field schema"))
+    assert all(section in card for section in ("## Source", "## Licence"))
+    assert all(term not in card for term in ("CoRal", "Alexandra", "Roest"))
     with pytest.raises(PublicationError):
         initialise_private_dataset(
             MemoryHub(), "org/p1", card="token=hf_" + "x" * 20, token="hf_" + "x" * 20
@@ -302,15 +301,17 @@ def make_card() -> str:
         rejection_policy="Reject undecodable or poorly aligned material",
         source_revisions=json.dumps(
             {
-                "audio": {"repository": "syvai/p1", "revision": "a" * 40},
+                "audio": {
+                    "repository": "syvai/p1",
+                    "revision": "449b9c2294026df6d0d37538f279fdec03f565ff",
+                },
                 "transcripts": {
                     "repository": "syvai/p1-transcripts",
-                    "revision": "b" * 40,
+                    "revision": "41132579816d86e889635f84f30511279f026359",
                 },
             },
             sort_keys=True,
         ),
-        model_revisions="ctc@" + "b" * 40,
     )
 
 
@@ -320,52 +321,31 @@ def test_card_is_readable_and_contract_driven() -> None:
     metadata = yaml.safe_load(card.split("---", 2)[1])
 
     assert metadata == {
-        "pretty_name": "P1 segmented Danish speech",
+        "pretty_name": "DR P1 speech segments",
         "language": ["da"],
         "task_categories": ["automatic-speech-recognition"],
         "license": "other",
-        "license_name": "p1-dataset-license",
+        "license_name": "syv.ai layered dataset licence",
         "license_link": "LICENSE",
     }
-    assert "## Key facts" in card
-    assert "## Data format and schema" in card
-    assert "## Timestamp-native segmentation" in card
-    assert "source words and timestamps are authoritative" in card
-    assert "No acoustic model refines P1" in card
-    assert "This private repository is being published incrementally" in card
-    assert "Consumers must pin an immutable revision" in card
-    assert "intentionally includes no payload examples" in card
-    assert "source identifiers" not in card
-    assert "The supplied field-schema note is" not in card
-    assert "Nullable fields are null" not in card
-    assert "## Source and licence provenance" in card
-    assert "| Audio | `syvai/p1` |" in card
-    assert "| Transcripts | `syvai/p1-transcripts` |" in card
-    assert "Template repository" in card
-    assert "<summary>Reproducibility details</summary>" in card
-    assert "<summary>Licence provenance</summary>" in card
-    reproducibility = card.split("<summary>Reproducibility details</summary>", 1)[1]
-    reproducibility = reproducibility.split("</details>", 1)[0]
-    assert "pipeline_config_sha256" in reproducibility
-    licence = card.split("<summary>Licence provenance</summary>", 1)[1]
-    licence = licence.split("</details>", 1)[0]
-    assert "Template repository" in licence
-    assert '{"audio"' not in card
-    assert 'data_files="data/train/*.parquet"' in card
+    assert [
+        section
+        for section in ("## Dataset", "## Source", "## Access", "## Licence")
+        if section in card
+    ] == ["## Dataset", "## Source", "## Access", "## Licence"]
+    assert "roughly 2006–2022" in card
+    assert "ElevenLabs Scribe v2" in card
+    assert "mono 16 kHz OGG/Opus" in card
+    assert "verbatim text, timing, and speaker metadata" in card
+    assert "authorised users" in card
     assert 'revision="<immutable-commit-sha>"' in card
     assert "streaming=True" in card
-    assert 'revision="main"' not in card
-    assert all(field.name in card for field in OUTPUT_SCHEMA.fields)
-    assert "Exact, verbatim source-owned text" in card
-    assert "Exact source-text ownership chunks for alignment units" in card
-    assert "best-effort" in card
-    assert "does not reject the programme" in card
-    key_facts = card.split("## Key facts", 1)[1].split("## Data format", 1)[0]
-    assert "| Alignment | Timestamp-native source word boundaries |" in key_facts
-    assert "VAD followed by CTC alignment" not in key_facts
-    assert "The configured alignment identity and details are:" in card
-    assert "Future alignment material" in card
-    assert "ctc@" in card
+    assert "Reproducibility details" not in card
+    assert "p1-segments-v2" not in card
+    assert "p1-segmentation-8" not in card
+    assert "Alexandra" not in card
+    assert "CoRal" not in card
+    assert "Roest" not in card
 
 
 def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:

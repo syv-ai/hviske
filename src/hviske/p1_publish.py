@@ -39,6 +39,10 @@ _CREDENTIAL_KEYS = re.compile(
     r"(?:token|secret|password|credential|authorization|api[_-]?key)", re.I
 )
 _CREDENTIAL_VALUES = re.compile(r"(?:hf_[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{10,})")
+_P1_AUDIO_REPOSITORY = "syvai/p1"
+_P1_AUDIO_REVISION = "449b9c2294026df6d0d37538f279fdec03f565ff"
+_P1_TRANSCRIPT_REPOSITORY = "syvai/p1-transcripts"
+_P1_TRANSCRIPT_REVISION = "41132579816d86e889635f84f30511279f026359"
 _SCHEMA_DESCRIPTIONS = {
     "audio": "16 kHz mono OGG/Opus audio",
     "audio_sha256": "SHA-256 digest of audio",
@@ -98,162 +102,6 @@ class LocalShard:
     row_count: int
 
 
-def build_dataset_card(
-    *,
-    source_provenance: str,
-    permitted_use: str,
-    private_access_terms: str,
-    alignment_method: str,
-    field_schema: str,
-    known_limitations: str,
-    rejection_policy: str,
-    source_revisions: str,
-    model_revisions: str | None = None,
-    dataset_license: str | None = None,
-) -> str:
-    """Build a concise, metadata-only private P1 dataset card.
-
-    Args:
-        source_provenance:
-            Description of the source data and its provenance.
-        permitted_use:
-            Permitted uses of the derived dataset.
-        private_access_terms:
-            Terms governing access to the private repository.
-        alignment_method:
-            Alignment and segmentation method.
-        field_schema:
-            Published training-row schema.
-        known_limitations:
-            Known quality or coverage limitations.
-        rejection_policy:
-            Policy and categories for rejected material.
-        source_revisions:
-            Immutable source dataset revisions.
-        model_revisions (optional):
-            Immutable model revisions for a model-backed future alignment.
-        dataset_license (optional):
-            Immutable target dataset licence provenance.
-
-    Returns:
-        Dataset card Markdown with no credential-bearing metadata.
-    """
-    license_metadata: object = (
-        _default_dataset_license()
-        if dataset_license is None
-        else _parse_card_metadata(dataset_license)
-    )
-
-    metadata = {
-        "Source provenance": _parse_card_metadata(source_provenance),
-        "Permitted use": permitted_use,
-        "Private-access terms": private_access_terms,
-        "Alignment method": alignment_method,
-        "Field schema": field_schema,
-        "Known limitations": known_limitations,
-        "Rejection policy": rejection_policy,
-        "Source revisions": _parse_card_metadata(source_revisions),
-        "Dataset licence provenance": license_metadata,
-    }
-    if model_revisions is not None:
-        metadata["Model revisions"] = _parse_card_metadata(model_revisions)
-    _assert_safe_metadata(metadata)
-
-    model_section = ""
-    if model_revisions is not None:
-        model_section = (
-            "\n\n### Future alignment material\n\n"
-            "The following pinned model information is retained for a possible future "
-            "alignment only.\n"
-            "No acoustic model refines P1.\n\n"
-            f"{_render_card_metadata(metadata['Model revisions'])}"
-        )
-
-    return (
-        "---\n"
-        "pretty_name: P1 segmented Danish speech\n"
-        "language: [da]\n"
-        "task_categories: [automatic-speech-recognition]\n"
-        "license: other\n"
-        "license_name: p1-dataset-license\n"
-        "license_link: LICENSE\n"
-        "---\n\n"
-        "# P1 segmented Danish speech\n\n"
-        "P1 is a private, derived dataset of timestamp-segmented Danish\n"
-        "speech for authorised ASR work.\n"
-        "This card contains metadata only and intentionally includes no payload "
-        "examples.\n\n"
-        "> **Publication notice:** This private repository is being published "
-        "incrementally.\n"
-        "> Consumers must pin an immutable revision when loading it.\n"
-        ">\n"
-        "> **Private access:** The repository is private.\n"
-        f"> {_render_card_text(private_access_terms, width=86)}\n\n"
-        "## Key facts\n\n"
-        "| Fact | Value |\n"
-        "| --- | --- |\n"
-        "| Language | Danish (`da`) |\n"
-        f"| Schema | `{OUTPUT_SCHEMA.schema_version}` |\n"
-        f"| Audio | Mono OGG/Opus at 16 kHz |\n"
-        f"| Pipeline | `{P1_RUNTIME_CONTRACT.pipeline_version}` |\n"
-        f"| Alignment | {_alignment_summary(alignment_method)} |\n"
-        f"| Permitted use | {_markdown_cell(permitted_use)} |\n"
-        f"| Access terms | {_markdown_cell(private_access_terms)} |\n"
-        "| Field schema | See the exact contract below |\n\n"
-        "## Data format and schema\n\n"
-        f"The published rows use `{OUTPUT_SCHEMA.schema_version}` and the exact "
-        "contract below.\n\n"
-        f"{_render_card_text(field_schema)}\n\n"
-        f"{_render_schema_table()}\n\n"
-        "## Timestamp-native segmentation\n\n"
-        "P1 uses timestamp-native segmentation: source words and timestamps are "
-        "authoritative. Each segment spans the first and last selected word "
-        "boundaries. No acoustic model refines P1, and acoustic alignment evidence "
-        "is not part of active v8 output. Untimed lexical text is retained exactly "
-        "once using deterministic following-word ownership, with terminal suffixes "
-        "owned by the preceding timed word. Where speaker attribution cannot be "
-        "proven, ownership is best-effort and recorded only as aggregate uncertainty; "
-        "it does not reject the programme.\n\n"
-        "<details>\n"
-        "<summary>Reproducibility details</summary>\n\n"
-        "The configured alignment identity and details are:\n\n"
-        f"{_render_card_text(alignment_method)}\n\n"
-        "</details>\n"
-        f"{model_section}\n\n"
-        "## Source and licence provenance\n\n"
-        "### Source provenance\n\n"
-        f"{_render_card_metadata(metadata['Source provenance'])}\n\n"
-        "### Source revisions\n\n"
-        f"{_render_source_revisions(metadata['Source revisions'])}\n\n"
-        "### Dataset licence\n\n"
-        "This repository uses an immutable adaptation of the P1 dataset licence. "
-        "See [LICENSE](LICENSE) for the applicable terms.\n\n"
-        "<details>\n"
-        "<summary>Licence provenance</summary>\n\n"
-        f"{_render_card_metadata(metadata['Dataset licence provenance'])}\n\n"
-        "</details>\n\n"
-        "## Limitations and rejection policy\n\n"
-        "### Limitations\n\n"
-        f"{_render_card_text(known_limitations)}\n\n"
-        "### Rejection policy\n\n"
-        f"{_render_card_text(rejection_policy)}\n\n"
-        "## Loading\n\n"
-        "Use the full commit SHA recorded for the verified batch.\n"
-        "Do not use a moving branch such as `main`:\n\n"
-        "```python\n"
-        "from datasets import load_dataset\n\n"
-        "dataset = load_dataset(\n"
-        '    "syvai/p1-segments",\n'
-        '    data_files="data/train/*.parquet",\n'
-        '    revision="<immutable-commit-sha>",\n'
-        "    streaming=True,\n"
-        ")\n"
-        "```\n\n"
-        "## Licence\n\n"
-        "Private access, use, and distribution are subject to [LICENSE](LICENSE).\n"
-    )
-
-
 def _alignment_summary(alignment_method: str) -> str:
     """Return a compact table value for the configured alignment method.
 
@@ -267,27 +115,6 @@ def _alignment_summary(alignment_method: str) -> str:
     if "timestamp-native:p1-transcripts.words" in alignment_method:
         return "Timestamp-native source word boundaries"
     return "See alignment details below"
-
-
-def _assert_safe_metadata(value: object, token: str | None = None) -> None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if _CREDENTIAL_KEYS.search(str(key)):
-                raise PublicationError(
-                    "credentials are forbidden in publication metadata"
-                )
-            _assert_safe_metadata(child, token)
-    elif isinstance(value, (list, tuple, set)):
-        for child in value:
-            _assert_safe_metadata(child, token)
-    elif token and token in str(value):
-        raise PublicationError("credentials are forbidden in publication metadata")
-    elif isinstance(value, str) and _CREDENTIAL_VALUES.search(value):
-        raise PublicationError("credentials are forbidden in publication metadata")
-
-
-class PublicationError(RuntimeError):
-    """Base error for an unsafe or unverified publication."""
 
 
 def _default_dataset_license() -> dict[str, object]:
@@ -321,22 +148,64 @@ def _markdown_cell(value: str) -> str:
     return value.replace("|", r"\|").replace("\n", " ")
 
 
-def _parse_card_metadata(value: object) -> object:
-    """Parse JSON metadata while retaining support for existing prose values.
+def _render_schema_table() -> str:
+    """Render the contract-defined training fields as a readable Markdown table.
+
+    Returns:
+        A Markdown table generated from the active output schema contract.
+    """
+    rows = ["| Field | Type | Nullable | Description |", "| --- | --- | --- | --- |"]
+    for field in OUTPUT_SCHEMA.fields:
+        nullable = "yes" if field.nullable else "no"
+        description = _SCHEMA_DESCRIPTIONS.get(field.name, "Contract-defined field")
+        rows.append(f"| `{field.name}` | `{field.type}` | {nullable} | {description} |")
+    return "\n".join(rows)
+
+
+def _render_source_revisions(value: object) -> str:
+    """Render source repositories and revisions without exposing source records.
 
     Args:
         value:
-            Existing JSON or prose metadata supplied to the card builder.
+            Parsed source provenance metadata.
 
     Returns:
-        Structured metadata when JSON is supplied, otherwise the original value.
+        A source table when repository coordinates are available, or readable bullets.
     """
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
+    if isinstance(value, dict) and value:
+        rows = ["| Source | Repository | Immutable revision |", "| --- | --- | --- |"]
+        table = True
+        for name, details in value.items():
+            if not isinstance(details, dict):
+                table = False
+                break
+            repository = details.get("repository")
+            revision = details.get("revision")
+            if set(details) != {"repository", "revision"}:
+                table = False
+                break
+            if not isinstance(repository, str) or not isinstance(revision, str):
+                table = False
+                break
+            rows.append(
+                f"| {_humanise_key(str(name))} | `{repository}` | `{revision}` |"
+            )
+        if table and len(rows) > 2:
+            return "\n".join(rows)
+    return _render_card_metadata(value)
+
+
+def _humanise_key(value: str) -> str:
+    """Turn a contract key into a short human-readable label.
+
+    Args:
+        value:
+            Contract key to label.
+
+    Returns:
+        A sentence-case label.
+    """
+    return value.replace("_", " ").capitalize()
 
 
 def _render_card_metadata(value: object, *, indent: str = "") -> str:
@@ -417,64 +286,159 @@ def _render_card_text(value: str, *, width: int = 88) -> str:
     return "\n".join(lines)
 
 
-def _humanise_key(value: str) -> str:
-    """Turn a contract key into a short human-readable label.
+def build_dataset_card(
+    *,
+    source_provenance: str,
+    permitted_use: str,
+    private_access_terms: str,
+    alignment_method: str,
+    field_schema: str,
+    known_limitations: str,
+    rejection_policy: str,
+    source_revisions: str,
+    model_revisions: str | None = None,
+    dataset_license: str | None = None,
+) -> str:
+    """Build the concise, metadata-only DR P1 dataset card.
+
+    The legacy arguments remain part of the internal call contract so callers can
+    migrate without changing pipeline settings. Only source coordinates and the
+    pipeline digest are emitted in a hidden machine-verification comment; internal
+    schema, pipeline, model, and licence-provenance labels are never rendered.
+
+    Returns:
+        The four-section Markdown card with machine-only identity coordinates.
+    """
+    del source_provenance, permitted_use, field_schema, known_limitations
+    del rejection_policy, model_revisions, dataset_license
+    revisions = _parse_card_metadata(source_revisions)
+    if not isinstance(revisions, dict):
+        revisions = {}
+    audio = revisions.get("audio", {})
+    transcripts = revisions.get("transcripts", {})
+    audio_repository = (
+        str(audio.get("repository", "syvai/p1"))
+        if isinstance(audio, dict)
+        else "syvai/p1"
+    )
+    audio_revision = (
+        str(audio.get("revision", "449b9c2294026df6d0d37538f279fdec03f565ff"))
+        if isinstance(audio, dict)
+        else "449b9c2294026df6d0d37538f279fdec03f565ff"
+    )
+    transcript_repository = (
+        str(transcripts.get("repository", "syvai/p1-transcripts"))
+        if isinstance(transcripts, dict)
+        else "syvai/p1-transcripts"
+    )
+    transcript_revision = (
+        str(transcripts.get("revision", "41132579816d86e889635f84f30511279f026359"))
+        if isinstance(transcripts, dict)
+        else "41132579816d86e889635f84f30511279f026359"
+    )
+    digest_match = re.search(
+        r"pipeline_config_sha256:\s*([0-9a-f]{64})", alignment_method
+    )
+    digest = digest_match.group(1) if digest_match else ""
+    machine_comment = (
+        "<!--\n"
+        f"pipeline_config_sha256: {digest}\n"
+        f"source_audio_repository: {audio_repository}\n"
+        f"source_audio_revision: {audio_revision}\n"
+        f"source_transcript_repository: {transcript_repository}\n"
+        f"source_transcript_revision: {transcript_revision}\n"
+        "-->"
+    )
+    _assert_safe_metadata(
+        [
+            private_access_terms,
+            audio_repository,
+            audio_revision,
+            transcript_repository,
+            transcript_revision,
+            digest,
+        ]
+    )
+    return (
+        "---\n"
+        "pretty_name: DR P1 speech segments\n"
+        "language: [da]\n"
+        "task_categories: [automatic-speech-recognition]\n"
+        "license: other\n"
+        "license_name: syv.ai layered dataset licence\n"
+        "license_link: LICENSE\n"
+        "---\n\n"
+        "# DR P1 speech segments\n\n"
+        f"{machine_comment}\n\n"
+        "## Dataset\n\n"
+        "Danish speech clips from DR P1, in mono 16 kHz OGG/Opus, with verbatim "
+        "text, timing, and speaker metadata. Transcript text and speaker attribution "
+        "may contain automated errors.\n\n"
+        "## Source\n\n"
+        "The recordings cover roughly 2006–2022 and come from DR P1 recordings in "
+        "kb.dk’s DR archive. Audio is sourced through the pinned "
+        f"`{audio_repository}` revision `{audio_revision}`. Transcripts were generated "
+        "with ElevenLabs Scribe v2 through the pinned "
+        f"`{transcript_repository}` revision `{transcript_revision}`.\n\n"
+        "## Access\n\n"
+        "This is a private dataset for authorised users. Load it with an immutable "
+        "dataset commit revision (not `main`):\n\n"
+        "```python\n"
+        "from datasets import load_dataset\n\n"
+        "dataset = load_dataset(\n"
+        '    "syvai/p1-segments",\n'
+        '    data_files="data/train/*.parquet",\n'
+        '    revision="<immutable-commit-sha>",\n'
+        "    streaming=True,\n"
+        ")\n"
+        "```\n\n"
+        f"{_render_card_text(private_access_terms)}\n\n"
+        "## Licence\n\n"
+        "The dataset uses a layered licence. The dataset structure, arrangement, "
+        "segment boundaries, and independently created metadata are CC BY 4.0; "
+        "embedded DR audio and verbatim/source-derived transcript text are excluded. "
+        "Private access does not grant public redistribution or sublicensing of the "
+        "excluded content. See [LICENSE](LICENSE).\n"
+    )
+
+
+def _assert_safe_metadata(value: object, token: str | None = None) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if _CREDENTIAL_KEYS.search(str(key)):
+                raise PublicationError(
+                    "credentials are forbidden in publication metadata"
+                )
+            _assert_safe_metadata(child, token)
+    elif isinstance(value, (list, tuple, set)):
+        for child in value:
+            _assert_safe_metadata(child, token)
+    elif token and token in str(value):
+        raise PublicationError("credentials are forbidden in publication metadata")
+    elif isinstance(value, str) and _CREDENTIAL_VALUES.search(value):
+        raise PublicationError("credentials are forbidden in publication metadata")
+
+
+class PublicationError(RuntimeError):
+    """Base error for an unsafe or unverified publication."""
+
+
+def _parse_card_metadata(value: object) -> object:
+    """Parse JSON metadata while retaining support for existing prose values.
 
     Args:
         value:
-            Contract key to label.
+            Existing JSON or prose metadata supplied to the card builder.
 
     Returns:
-        A sentence-case label.
+        Structured metadata when JSON is supplied, otherwise the original value.
     """
-    return value.replace("_", " ").capitalize()
-
-
-def _render_schema_table() -> str:
-    """Render the contract-defined training fields as a readable Markdown table.
-
-    Returns:
-        A Markdown table generated from the active output schema contract.
-    """
-    rows = ["| Field | Type | Nullable | Description |", "| --- | --- | --- | --- |"]
-    for field in OUTPUT_SCHEMA.fields:
-        nullable = "yes" if field.nullable else "no"
-        description = _SCHEMA_DESCRIPTIONS.get(field.name, "Contract-defined field")
-        rows.append(f"| `{field.name}` | `{field.type}` | {nullable} | {description} |")
-    return "\n".join(rows)
-
-
-def _render_source_revisions(value: object) -> str:
-    """Render source repositories and revisions without exposing source records.
-
-    Args:
-        value:
-            Parsed source provenance metadata.
-
-    Returns:
-        A source table when repository coordinates are available, or readable bullets.
-    """
-    if isinstance(value, dict) and value:
-        rows = ["| Source | Repository | Immutable revision |", "| --- | --- | --- |"]
-        table = True
-        for name, details in value.items():
-            if not isinstance(details, dict):
-                table = False
-                break
-            repository = details.get("repository")
-            revision = details.get("revision")
-            if set(details) != {"repository", "revision"}:
-                table = False
-                break
-            if not isinstance(repository, str) or not isinstance(revision, str):
-                table = False
-                break
-            rows.append(
-                f"| {_humanise_key(str(name))} | `{repository}` | `{revision}` |"
-            )
-        if table and len(rows) > 2:
-            return "\n".join(rows)
-    return _render_card_metadata(value)
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
 @dataclass(frozen=True)
@@ -692,6 +656,7 @@ def initialise_private_dataset(
     license_text: str | None = None,
     gitattributes: str = "*.parquet filter=lfs diff=lfs merge=lfs -text\n",
     token: str | None = None,
+    expected_pipeline_config_sha256: str | None = None,
 ) -> str | None:
     """Create and initialise a private dataset repository.
 
@@ -708,6 +673,8 @@ def initialise_private_dataset(
             Initial Git attributes content.
         token (optional):
             Authentication token, used only to reject accidental card leakage.
+        expected_pipeline_config_sha256 (optional):
+            Expected hidden pipeline digest for the initial card.
 
     Returns:
         The immutable initialisation commit SHA, if a commit was made.
@@ -723,6 +690,13 @@ def initialise_private_dataset(
         license_path = Path(__file__).resolve().parents[2] / "LICENSE-DATASET"
         license_text = license_path.read_text(encoding="utf-8")
     _assert_safe_metadata(license_text, token=token)
+    if not _card_has_verified_identity(card) or (
+        expected_pipeline_config_sha256 is not None
+        and _card_digest(card) != expected_pipeline_config_sha256
+    ):
+        raise PublicationError(
+            "target card does not contain the active machine identity"
+        )
     if (
         hashlib.sha256(license_text.encode("utf-8")).hexdigest()
         != P1_RUNTIME_CONTRACT.dataset_license_target_sha256
@@ -831,29 +805,14 @@ def _assert_initialise_target_is_safe(
         raise PublicationError(
             "cannot inspect the existing target card before initialisation"
         ) from error
-    required = (
-        "pipeline_version: p1-segmentation-8",
-        "timestamp-native:p1-transcripts.words",
-        "p1-segments-v2",
-    )
-    if "pipeline_version: p1-segmentation-7" in existing_card:
-        raise PublicationError("refusing to mix a v7 target card with v8")
-    if not all(marker in existing_card for marker in required):
+    expected_digest = _card_digest(card)
+    if not _card_has_verified_identity(existing_card):
         raise PublicationError(
-            "refusing to overwrite a target card without the compatible v8 identity"
+            "refusing to overwrite a target card without the compatible identity"
         )
-    expected_digest = re.search(r"pipeline_config_sha256:\s*([0-9a-f]{64})", card)
-    actual_digest = re.search(
-        r"pipeline_config_sha256:\s*([0-9a-f]{64})", existing_card
-    )
-    if expected_digest is not None and (
-        actual_digest is None or actual_digest.group(1) != expected_digest.group(1)
-    ):
-        raise PublicationError("existing target card has a different v8 identity")
-    if re.search(r"\b(?:vad|ctc|roest|whisper|silero)\b", existing_card, re.I):
-        raise PublicationError(
-            "existing target card contains inactive model provenance"
-        )
+    actual_digest = _card_digest(existing_card)
+    if actual_digest != expected_digest:
+        raise PublicationError("existing target card has a different pipeline identity")
     if "LICENSE" in paths:
         try:
             existing_license = b"".join(
@@ -874,6 +833,52 @@ def _assert_initialise_target_is_safe(
             raise PublicationError(
                 "existing target licence is not the pinned dataset licence"
             )
+
+
+def _card_digest(card: str) -> str | None:
+    """Extract the hidden pipeline digest from a dataset card.
+
+    Returns:
+        The digest, or ``None`` when the machine comment is absent or malformed.
+    """
+    match = re.search(r"<!--(?P<body>.*?)-->", card, re.DOTALL)
+    if match is None:
+        return None
+    digest = re.search(
+        r"^\s*pipeline_config_sha256:\s*([0-9a-f]{64})\s*$",
+        match.group("body"),
+        re.MULTILINE,
+    )
+    return digest.group(1) if digest is not None else None
+
+
+def _card_has_verified_identity(card: str) -> bool:
+    """Check the reduced publication card identity and source coordinates.
+
+    Returns:
+        Whether the card contains the expected immutable identity coordinates.
+    """
+    if "license_link: LICENSE" not in card:
+        return False
+    if re.search(r"\b(?:vad|ctc|whisper|silero|roest|coral|model)\b", card, re.I):
+        return False
+    match = re.search(r"<!--(?P<body>.*?)-->", card, re.DOTALL)
+    if match is None or _card_digest(card) is None:
+        return False
+    coordinates = dict(
+        re.findall(
+            r"^\s*(source_audio_repository|source_audio_revision|"
+            r"source_transcript_repository|source_transcript_revision):\s*(\S+)\s*$",
+            match.group("body"),
+            re.MULTILINE,
+        )
+    )
+    return coordinates == {
+        "source_audio_repository": _P1_AUDIO_REPOSITORY,
+        "source_audio_revision": _P1_AUDIO_REVISION,
+        "source_transcript_repository": _P1_TRANSCRIPT_REPOSITORY,
+        "source_transcript_revision": _P1_TRANSCRIPT_REVISION,
+    }
 
 
 def _assert_private(info: object, repo_id: str) -> None:
