@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from hviske.p1_models import (
+from p1_dataset.models import (
     ROEST_REPOSITORY,
     ROEST_VOCAB_SIZE,
     SILERO_MODEL_BLOB,

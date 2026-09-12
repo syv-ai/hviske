@@ -18,9 +18,9 @@ import soundfile as sf
 from huggingface_hub.errors import HfHubHTTPError
 from omegaconf import DictConfig, OmegaConf
 
-from hviske.p1_contracts import LedgerState, SourceWord
-from hviske.p1_ledger import Ledger
-from hviske.p1_pipeline import (
+from p1_dataset.contracts import LedgerState, SourceWord
+from p1_dataset.ledger import Ledger
+from p1_dataset.pipeline import (
     BuildReport,
     MetadataLog,
     NativeCandidate,
@@ -40,13 +40,13 @@ from hviske.p1_pipeline import (
     run_pipeline,
     target_privacy,
 )
-from hviske.p1_segments import (
+from p1_dataset.segments import (
     CTCBackend,
     SegmentationResult,
     ShardBatchResult,
     VADBackend,
 )
-from hviske.p1_source import (
+from p1_dataset.source import (
     AudioPointer,
     InvalidSourceTimestamp,
     ParsedAudio,
@@ -57,7 +57,7 @@ from hviske.p1_source import (
     harden_p1_logging,
     parse_transcript_row,
 )
-from hviske.p1_validation import stratified_sample
+from p1_dataset.validation import stratified_sample
 from tests.test_p1_publish import LocalShard, MemoryHub, write_valid_shard
 
 
@@ -71,7 +71,7 @@ def test_audio_scan_progress_reports_threshold_crossings(
     tmp_path: Path,
 ) -> None:
     """Large shards report every crossed progress threshold in either scan path."""
-    monkeypatch.setattr("hviske.p1_pipeline._PROGRESS_INTERVAL", 2)
+    monkeypatch.setattr("p1_dataset.pipeline._PROGRESS_INTERVAL", 2)
     rows = tuple({"file_id": f"file-{index}"} for index in range(5))
 
     class Source:
@@ -104,7 +104,7 @@ def test_audio_scan_progress_reports_threshold_crossings(
     else:
         setattr(source, "iter_programme_metadata", None)
 
-    with caplog.at_level(logging.INFO, logger="hviske.p1_pipeline"):
+    with caplog.at_level(logging.INFO, logger="p1_dataset.pipeline"):
         candidates = _native_candidates(
             source=source,
             shards=(SourceShard("audio.parquet", 10),),
@@ -210,7 +210,7 @@ def test_decoded_duration_overrun_is_invalid_timestamp_before_alignment(
         calls += 1
         return SegmentationResult(rows=(), rejections=(), correction_count=0)
 
-    monkeypatch.setattr("hviske.p1_pipeline.segment_programme", segment)
+    monkeypatch.setattr("p1_dataset.pipeline.segment_programme", segment)
     report = _pipeline_test_report()
     with Ledger(tmp_path / "ledger.sqlite") as ledger:
         _process_native_programmes(
@@ -269,9 +269,9 @@ def test_decoded_duration_replaces_declared_metadata_duration(
         captured.update(kwargs)
         return SegmentationResult(rows=(), rejections=(), correction_count=0)
 
-    monkeypatch.setattr("hviske.p1_pipeline.segment_programme", segment)
+    monkeypatch.setattr("p1_dataset.pipeline.segment_programme", segment)
     monkeypatch.setattr(
-        "hviske.p1_pipeline.write_shards",
+        "p1_dataset.pipeline.write_shards",
         lambda *_, **__: ShardBatchResult(shards=(), source_recoverable=False),
     )
     report = _pipeline_test_report()
@@ -470,8 +470,8 @@ def test_invalid_transcript_never_constructs_models_or_retrieves_audio(
         calls["ctc"] += 1
         return object()
 
-    monkeypatch.setattr("hviske.p1_pipeline.make_silero_vad", make_vad)
-    monkeypatch.setattr("hviske.p1_pipeline.make_ctc_backend", make_ctc)
+    monkeypatch.setattr("p1_dataset.pipeline.make_silero_vad", make_vad)
+    monkeypatch.setattr("p1_dataset.pipeline.make_ctc_backend", make_ctc)
     report = _pipeline_test_report()
     with Ledger(tmp_path / "ledger.sqlite") as ledger:
         _process_native_programmes(
@@ -963,7 +963,7 @@ def test_pipeline_hardens_hydra_root_and_file_logging(
     )
     levels_hardened = False
     try:
-        with caplog.at_level(logging.INFO, logger="hviske.p1_pipeline"):
+        with caplog.at_level(logging.INFO, logger="p1_dataset.pipeline"):
             run_pipeline(config=pipeline_config(tmp_path), source=MetadataSource())
             levels_hardened = all(
                 item.level == logging.WARNING for item in transport_loggers
@@ -971,7 +971,7 @@ def test_pipeline_hardens_hydra_root_and_file_logging(
             transport_logger.warning(
                 'HTTP Request: GET %s "HTTP/1.1 200 OK"', signed_url
             )
-            logging.getLogger("hviske.p1_pipeline").info(
+            logging.getLogger("p1_dataset.pipeline").info(
                 "P1 metadata event retained: source revision checked"
             )
             root_logger.addHandler(late_handler)
@@ -1022,7 +1022,7 @@ def test_plan_excludes_future_model_provenance(
 ) -> None:
     """Planning does not inspect inactive model metadata."""
     monkeypatch.setattr(
-        "hviske.p1_pipeline.check_model_revisions",
+        "p1_dataset.pipeline.check_model_revisions",
         lambda *_args, **_kwargs: pytest.fail("inactive model check was called"),
     )
     source = MetadataSource()
@@ -1057,7 +1057,7 @@ def test_progress_logs_do_not_include_source_identifiers_or_paths(
         def get(self, file_id: str) -> object | None:
             return object() if file_id == target else None
 
-    with caplog.at_level(logging.INFO, logger="hviske.p1_pipeline"):
+    with caplog.at_level(logging.INFO, logger="p1_dataset.pipeline"):
         candidates = _native_candidates(
             source=Source(),
             shards=(SourceShard("private/audio.parquet", 10),),
@@ -1089,8 +1089,8 @@ def test_publication_does_not_retry_non_hub_errors(
     def sleep(_delay: float) -> None:
         raise AssertionError("non-Hub errors must not sleep")
 
-    monkeypatch.setattr("hviske.p1_pipeline._publish_pending_unlocked", publish)
-    monkeypatch.setattr("hviske.p1_pipeline.time.sleep", sleep)
+    monkeypatch.setattr("p1_dataset.pipeline._publish_pending_unlocked", publish)
+    monkeypatch.setattr("p1_dataset.pipeline.time.sleep", sleep)
     settings = PipelineSettings.from_config(pipeline_config(tmp_path, mode="build"))
     with pytest.raises(ValueError, match="schema failure"):
         publish_pending(
@@ -1157,7 +1157,7 @@ def test_publication_retries_committed_batch_through_verification_recovery(
     def sleep(_delay: float) -> None:
         return None
 
-    monkeypatch.setattr("hviske.p1_pipeline.time.sleep", sleep)
+    monkeypatch.setattr("p1_dataset.pipeline.time.sleep", sleep)
     with Ledger(tmp_path / "ledger.sqlite", pipeline_digest=digest) as ledger:
         ledger.register_batch("batch", pipeline_digest=digest)
         ledger.register_shard(
@@ -1212,9 +1212,9 @@ def test_publication_retries_hub_error_and_releases_lock(
         with _publication_lock(settings.publish_lock_path):
             acquired_during_sleep.append(True)
 
-    monkeypatch.setattr("hviske.p1_pipeline._publish_pending_unlocked", publish)
-    monkeypatch.setattr("hviske.p1_pipeline.time.sleep", sleep)
-    with caplog.at_level(logging.WARNING, logger="hviske.p1_pipeline"):
+    monkeypatch.setattr("p1_dataset.pipeline._publish_pending_unlocked", publish)
+    monkeypatch.setattr("p1_dataset.pipeline.time.sleep", sleep)
+    with caplog.at_level(logging.WARNING, logger="p1_dataset.pipeline"):
         result = publish_pending(
             hub=object(),
             settings=settings,
@@ -1407,7 +1407,7 @@ def test_unexpected_native_failure_is_retryable_and_aborts_without_payload(
     database = tmp_path / "ledger.sqlite"
     events = tmp_path / "events.jsonl"
     report = _pipeline_test_report()
-    with caplog.at_level(logging.INFO, logger="hviske.p1_pipeline"):
+    with caplog.at_level(logging.INFO, logger="p1_dataset.pipeline"):
         with pytest.raises(RuntimeError):
             with Ledger(database) as ledger:
                 _process_native_programmes(
@@ -1510,15 +1510,15 @@ def test_zero_accepted_programme_is_skipped_on_the_second_run(
             )
 
     monkeypatch.setattr(
-        "hviske.p1_pipeline._decoded_native_audio",
+        "p1_dataset.pipeline._decoded_native_audio",
         lambda _audio, file_id, max_decoded_audio_bytes: np.zeros(16_000),
     )
     monkeypatch.setattr(
-        "hviske.p1_pipeline.segment_programme",
+        "p1_dataset.pipeline.segment_programme",
         lambda **_: SegmentationResult(rows=(), rejections=(), correction_count=0),
     )
     monkeypatch.setattr(
-        "hviske.p1_pipeline.write_shards",
+        "p1_dataset.pipeline.write_shards",
         lambda *_, **__: ShardBatchResult(shards=(), source_recoverable=False),
     )
     preflight = PreflightReport(
@@ -1635,11 +1635,11 @@ def test_zero_duration_normalisation_is_reported_as_metadata_only(
             )
 
     monkeypatch.setattr(
-        "hviske.p1_pipeline.segment_programme",
+        "p1_dataset.pipeline.segment_programme",
         lambda **_: SegmentationResult(rows=(), rejections=(), correction_count=0),
     )
     monkeypatch.setattr(
-        "hviske.p1_pipeline.write_shards",
+        "p1_dataset.pipeline.write_shards",
         lambda *_, **__: ShardBatchResult(shards=(), source_recoverable=False),
     )
     events = tmp_path / "events.jsonl"

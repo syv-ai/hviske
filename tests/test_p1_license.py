@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from hviske.p1_contracts import P1_RUNTIME_CONTRACT
+from p1_dataset.contracts import P1_RUNTIME_CONTRACT
 
 _SOURCE_README_URL = (
     "https://huggingface.co/datasets/syvai/p1/resolve/"

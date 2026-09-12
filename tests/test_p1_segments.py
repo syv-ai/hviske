@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 
-from hviske.p1_contracts import (
+from p1_dataset.contracts import (
     NormalisationContract,
     RejectionCategory,
     SegmentationContract,
@@ -20,7 +20,7 @@ from hviske.p1_contracts import (
     SourceWord,
     annotate_source_words,
 )
-from hviske.p1_segments import (
+from p1_dataset.segments import (
     AlignmentResult,
     CTCAlignmentInfeasible,
     CTCBackend,
@@ -41,14 +41,14 @@ from hviske.p1_segments import (
     validate_raw_timestamps,
     write_shards,
 )
-from hviske.p1_source import parse_transcript_row
+from p1_dataset.source import parse_transcript_row
 
 CONFIG_DIGEST = hashlib.sha256(b"p1-test-config").hexdigest()
 
 
 def test_all_zero_transcript_is_terminally_classifiable() -> None:
     """A transcript with no timing anchors is an explicit rejection, not empty work."""
-    from hviske.p1_segments import segment_programme
+    from p1_dataset.segments import segment_programme
 
     parsed = parse_transcript_row(
         row={
@@ -315,7 +315,7 @@ def test_drift_correction_runs_at_most_once() -> None:
 
 def test_exact_ten_seconds_is_not_accepted_by_duration_gate() -> None:
     """The upper duration bound is strict, including at exactly 10,000 ms."""
-    from hviske.p1_segments import make_output_row
+    from p1_dataset.segments import make_output_row
 
     proposal = form_candidate_segments(
         words=words(("hej", 0, 10_000, None)),
@@ -495,7 +495,7 @@ def test_owned_lexical_text_reaches_ctc_and_published_text_exactly() -> None:
 
 def test_pilot_mean_log_probability_threshold_is_config_shaped() -> None:
     """The permissive pilot threshold accepts plausible and rejects poor scores."""
-    from hviske.p1_segments import make_output_row
+    from p1_dataset.segments import make_output_row
 
     contract = segmentation_contract()
     contract = contract.model_copy(update={"minimum_alignment_score": -10.0})
@@ -571,7 +571,7 @@ def test_real_duration_boundary_is_checked_before_ctc(
 
 def test_segment_ids_are_config_sensitive() -> None:
     """The same content under different pipeline identities is not conflated."""
-    from hviske.p1_segments import make_output_row
+    from p1_dataset.segments import make_output_row
 
     proposal = form_candidate_segments(
         words=words(("hej", 0, 2_000, None)),
@@ -602,7 +602,7 @@ def test_segment_ids_are_config_sensitive() -> None:
 
 def test_shards_rotate_and_callback_follows_fsync(tmp_path: Path) -> None:
     """Rotation leaves readable shards and calls deletion only after recovery."""
-    from hviske.p1_segments import make_output_row
+    from p1_dataset.segments import make_output_row
 
     rows = []
     for index in range(3):

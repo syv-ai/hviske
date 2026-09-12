@@ -435,11 +435,11 @@ GPU availability, model caches, and model alignment are not prerequisites.
 
 Add these components:
 
-- `src/hviske/p1_segments.py` for timestamp proposal parsing, segmentation, filtering,
+- `src/p1_dataset/segments.py` for timestamp proposal parsing, segmentation, filtering,
   deterministic IDs, and shard writing; model-backed scoring remains inactive generic
   infrastructure;
-- `src/hviske/p1_ledger.py` for atomic state transitions and restart logic;
-- `src/hviske/p1_publish.py` for private repository checks, commits, and verification;
+- `src/p1_dataset/ledger.py` for atomic state transitions and restart logic;
+- `src/p1_dataset/publish.py` for private repository checks, commits, and verification;
 - `src/scripts/build_p1_segments.py` as the non-interactive Hydra entry point;
 - `config/p1_segments.yaml` for pinned revisions and tunable pilot thresholds;
 - focused tests using synthetic waveforms and in-memory Hub fakes.

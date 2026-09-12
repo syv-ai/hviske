@@ -31,7 +31,7 @@ import numpy as np
 from huggingface_hub.errors import HfHubHTTPError
 from omegaconf import DictConfig, OmegaConf
 
-from hviske.p1_contracts import (
+from .contracts import (
     OUTPUT_SCHEMA,
     P1_RUNTIME_CONTRACT,
     CanonicalIdentityManifest,
@@ -51,15 +51,15 @@ from hviske.p1_contracts import (
     pipeline_config_sha256,
     validate_p1_runtime_contract,
 )
-from hviske.p1_ledger import Ledger
-from hviske.p1_segments import (
+from .ledger import Ledger
+from .segments import (
     CTCBackend,
     TimestampAlignmentBackend,
     VADBackend,
     segment_programme,
     write_shards,
 )
-from hviske.p1_source import (
+from .source import (
     _AUDIO_POINTER_METADATA_KEY,
     _AUDIO_POINTER_METADATA_MAX_BYTES,
     AudioPointer,
@@ -474,7 +474,7 @@ def run_pipeline(
         ValueError:
             If v8 receives an injected model-backed backend.
     """
-    from hviske.p1_source import harden_p1_logging
+    from .source import harden_p1_logging
 
     harden_p1_logging()
     settings = PipelineSettings.from_config(config)
@@ -493,7 +493,7 @@ def run_pipeline(
         initialise_target(hub=hub, settings=settings)
         return _initialise_report(settings=settings, hub=hub)
     if source is None:
-        from hviske.p1_source import HfP1Source
+        from .source import HfP1Source
 
         source = HfP1Source(
             audio_repository=settings.source_audio_repository,
@@ -504,7 +504,7 @@ def run_pipeline(
             max_decoded_audio_bytes=settings.max_decoded_audio_bytes,
         )
     if not hasattr(source, "plan"):
-        raise TypeError("source must expose the p1_source planning API")
+        raise TypeError("source must expose the P1 source planning API")
     return _run_native_pipeline(config=config, source=source, hub=hub, vad=vad, ctc=ctc)
 
 
@@ -767,8 +767,8 @@ def _run_native_pipeline(
         model_free=settings.alignment_method == "timestamp-native:p1-transcripts.words",
     )
     log = MetadataLog(scratch / "p1-events.jsonl")
-    from hviske.p1_source import SourcePlan
-    from hviske.p1_validation import AuditReservoir
+    from .source import SourcePlan
+    from .validation import AuditReservoir
 
     audit_reservoir = AuditReservoir(scratch / "audit-reservoir.json")
     plan = t.cast(
@@ -981,7 +981,7 @@ def _native_candidates(
         ValueError:
             If the partition settings are invalid.
     """
-    from hviske.p1_source import SourceSelectionError, SourceShard
+    from .source import SourceSelectionError, SourceShard
 
     if partition_count < 1:
         raise ValueError("partition_count must be positive")
@@ -1245,7 +1245,7 @@ def _native_candidates(
         selected = list(itertools.islice(stream(), programme_limit))
         dedup.close()
         return selected
-    from hviske.p1_validation import stratified_sample
+    from .validation import stratified_sample
 
     selected_rows = stratified_sample(
         (candidate.metadata for candidate in stream(include_pointer_metadata=True)),
@@ -1505,8 +1505,8 @@ def _process_native_programmes(
         ValueError:
             If a selected programme produces no shard or has invalid state.
     """
-    from hviske.p1_ledger import ShardAllocation
-    from hviske.p1_source import InvalidSourceRecord, InvalidSourceTimestamp
+    from .ledger import ShardAllocation
+    from .source import InvalidSourceRecord, InvalidSourceTimestamp
 
     open_groups = ledger.open_batches()
     if len(open_groups) > 1:
@@ -2061,7 +2061,7 @@ def _decoded_native_audio(
         DecodedAudioTooLarge:
             If the decoded PCM exceeds the configured cap.
     """
-    from hviske.p1_source import DecodedAudioTooLarge, ParsedAudio, parse_audio_row
+    from .source import DecodedAudioTooLarge, ParsedAudio, parse_audio_row
 
     if max_decoded_audio_bytes <= 0:
         raise ValueError("max_decoded_audio_bytes must be positive")
@@ -2108,7 +2108,7 @@ def _local_shard_from_record(record: object) -> object:
         ValueError:
             If the ledger record has no local path.
     """
-    from hviske.p1_publish import LocalShard
+    from .publish import LocalShard
 
     local_path = getattr(record, "local_path", None)
     if local_path is None:
@@ -2261,7 +2261,7 @@ def _publish_pending_unlocked(
         P1PreflightError:
             If the target card does not prove the active v8 contract.
     """
-    from hviske.p1_publish import HubClient, LocalShard, publish_batch
+    from .publish import HubClient, LocalShard, publish_batch
 
     if settings.alignment_method == "timestamp-native:p1-transcripts.words":
         if not _target_card_is_v8(
@@ -2286,7 +2286,7 @@ def _publish_pending_unlocked(
         ledger.transition_batch(batch_id, _state("sharded"))
         record = ledger.batch(batch_id)
     if record.state in {_state("verified"), _state("purged")}:
-        from hviske.p1_publish import HubClient, verify_batch
+        from .publish import HubClient, verify_batch
 
         evidence = verify_batch(
             t.cast(HubClient, hub),
@@ -2441,10 +2441,7 @@ def _record_audit_candidates(
                 raw_candidate = dict(row)
             else:
                 raise TypeError("audit rows must be mappings or contract models")
-            from hviske.p1_validation import (
-                _metadata_copy,
-                _metadata_digest_for_candidate,
-            )
+            from .validation import _metadata_copy, _metadata_digest_for_candidate
 
             metadata_digest = _metadata_digest_for_candidate(raw_candidate)
             candidate = _metadata_copy(raw_candidate)
@@ -2474,7 +2471,7 @@ def _record_audit_candidates(
     if not candidates:
         return []
     if path is not None:
-        from hviske.p1_validation import create_blinded_audit_manifest
+        from .validation import create_blinded_audit_manifest
 
         selected = create_blinded_audit_manifest(
             candidates, accepted_quota=min(200, len(candidates)), rejected_quota=0
@@ -2572,7 +2569,7 @@ def _validate_native_timestamps(
         TranscriptOverAudio:
             If a word endpoint exceeds the decoded programme duration.
     """
-    from hviske.p1_source import InvalidSourceTimestamp
+    from .source import InvalidSourceTimestamp
 
     previous_end = 0
     for word in words:
@@ -2610,7 +2607,7 @@ def make_ctc_backend(settings: PipelineSettings) -> CTCBackend:
     Returns:
         The real pinned CTC backend.
     """
-    from hviske.p1_models import HuggingFaceCTCBackend
+    from .models import HuggingFaceCTCBackend
 
     return HuggingFaceCTCBackend(
         settings.ctc_model_repository,
@@ -2626,7 +2623,7 @@ def make_silero_vad(settings: PipelineSettings) -> VADBackend:
     Returns:
         The real pinned Silero VAD backend.
     """
-    from hviske.p1_models import make_silero_vad as make_pinned_silero_vad
+    from .models import make_silero_vad as make_pinned_silero_vad
 
     return make_pinned_silero_vad(
         settings.scratch_root / "models", device=settings.device
@@ -2656,7 +2653,7 @@ def _recover_native_batches(
     remains mandatory even when all local files are present.
     """
     del source
-    from hviske.p1_publish import HubClient, _manifest_bytes, verify_batch
+    from .publish import HubClient, _manifest_bytes, verify_batch
 
     unattached, _ = ledger.recovery_work()
     for record in unattached:
@@ -2803,11 +2800,7 @@ def configure_scratch(root: Path, *, model_free: bool = False) -> Path:
 
 def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
     """Create and initialise the private target before uploading any shard bytes."""
-    from hviske.p1_publish import (
-        HubClient,
-        build_dataset_card,
-        initialise_private_dataset,
-    )
+    from .publish import HubClient, build_dataset_card, initialise_private_dataset
 
     card = build_dataset_card(
         source_provenance=(
@@ -2874,7 +2867,7 @@ def make_hub() -> object:
     Returns:
         An authenticated Hub adapter.
     """
-    from hviske.p1_publish import HfApiAdapter
+    from .publish import HfApiAdapter
 
     return HfApiAdapter()
 
@@ -3027,7 +3020,7 @@ def check_model_revisions(source: object, revisions: dict[str, object]) -> bool:
     if client_getter is None:
         checker = getattr(source, "check_model_revisions", None)
         return True if checker is None else bool(checker(revisions=revisions))
-    from hviske.p1_models import verify_hub_model_revision, verify_silero_vad_revision
+    from .models import verify_hub_model_revision, verify_silero_vad_revision
 
     api = client_getter()
     vad = t.cast(dict[str, object], revisions["vad"])

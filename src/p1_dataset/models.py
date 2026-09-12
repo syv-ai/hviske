@@ -16,8 +16,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .p1_contracts import P1_RUNTIME_CONTRACT
-from .p1_segments import (
+from .contracts import P1_RUNTIME_CONTRACT
+from .segments import (
     CTCEmissionsAlignmentAdapter,
     UnsupportedAlignmentText,
     VADBackend,

@@ -9,13 +9,13 @@ import sys
 import typing as t
 from pathlib import Path
 
-from hviske.p1_publish import HfApiAdapter
-from hviske.p1_v8_sanity_gate import (
+from p1_dataset.publish import HfApiAdapter
+from p1_dataset.v8_sanity_gate import (
     PILOT_REPOSITORY,
     PIPELINE_VERSION,
     run_v8_sanity_gate,
 )
-from hviske.p1_validation import PinnedHubClipRetriever
+from p1_dataset.validation import PinnedHubClipRetriever
 
 logger = logging.getLogger(__name__)
 

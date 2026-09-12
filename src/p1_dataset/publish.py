@@ -21,7 +21,7 @@ from huggingface_hub import CommitOperationAdd, HfApi, HfFileSystem, hf_hub_url
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 from pyarrow import parquet as pq
 
-from .p1_contracts import (
+from .contracts import (
     OUTPUT_SCHEMA,
     P1_RUNTIME_CONTRACT,
     BatchEvidence,
@@ -31,7 +31,7 @@ from .p1_contracts import (
 )
 
 if t.TYPE_CHECKING:
-    from .p1_ledger import Ledger
+    from .ledger import Ledger
 
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")

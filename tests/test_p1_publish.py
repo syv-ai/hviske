@@ -22,9 +22,9 @@ import yaml
 from huggingface_hub import CommitInfo, HfFileSystem
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
-from hviske.p1_contracts import LedgerState, OutputRow, ShardEvidence
-from hviske.p1_ledger import Ledger
-from hviske.p1_publish import (
+from p1_dataset.contracts import LedgerState, OutputRow, ShardEvidence
+from p1_dataset.ledger import Ledger
+from p1_dataset.publish import (
     AllowListError,
     HfApiAdapter,
     LocalShard,
@@ -41,7 +41,7 @@ from hviske.p1_publish import (
     validate_staging_directory,
     verify_batch,
 )
-from hviske.p1_segments import _rows_table
+from p1_dataset.segments import _rows_table
 
 
 def test_batch_verifies_every_path_and_streams_every_shard(tmp_path: Path) -> None:

@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from hviske.p1_contracts import LedgerState, RejectionCategory
-from hviske.p1_ledger import EvidenceError, InvalidTransition, Ledger, ShardAllocation
+from p1_dataset.contracts import LedgerState, RejectionCategory
+from p1_dataset.ledger import EvidenceError, InvalidTransition, Ledger, ShardAllocation
 
 DIGEST = "a" * 64
 COMMIT = "b" * 40

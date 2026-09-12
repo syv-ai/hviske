@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from hviske.p1_contracts import (
+from p1_dataset.contracts import (
     CanonicalIdentityManifest,
     CTCContract,
     DatasetLicenseContract,

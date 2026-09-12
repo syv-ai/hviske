@@ -17,9 +17,9 @@ import pytest
 import soundfile as sf
 from omegaconf import DictConfig, OmegaConf
 
-from hviske.p1_ledger import Ledger
-from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
-from hviske.p1_source import (
+from p1_dataset.ledger import Ledger
+from p1_dataset.pipeline import PipelineSettings, initialise_target, run_pipeline
+from p1_dataset.source import (
     AudioPointer,
     ParsedAudio,
     ParsedTranscript,
@@ -119,7 +119,7 @@ class FakeSource:
             The parsed transcript.
         """
         del pointer
-        from hviske.p1_contracts import SourceWord
+        from p1_dataset.contracts import SourceWord
 
         return ParsedTranscript(
             file_id="programme-1",
@@ -248,8 +248,8 @@ def test_sharding_crash_recovers_equivalent_audit_manifest(tmp_path: Path) -> No
 import os
 import sys
 from pathlib import Path
-from hviske.p1_ledger import Ledger
-from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
+from p1_dataset.ledger import Ledger
+from p1_dataset.pipeline import PipelineSettings, initialise_target, run_pipeline
 from tests.test_build_p1_segments import FakeSource, config
 from tests.test_p1_publish import MemoryHub
 
@@ -282,7 +282,7 @@ run_pipeline(
     recovery_code = """
 import sys
 from pathlib import Path
-from hviske.p1_pipeline import PipelineSettings, initialise_target, run_pipeline
+from p1_dataset.pipeline import PipelineSettings, initialise_target, run_pipeline
 from tests.test_build_p1_segments import FakeSource, config
 from tests.test_p1_publish import MemoryHub
 

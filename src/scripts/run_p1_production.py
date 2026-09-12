@@ -9,8 +9,8 @@ import hydra
 from huggingface_hub import get_token
 from omegaconf import DictConfig
 
-from hviske.p1_source import harden_p1_logging
-from hviske.p1_supervisor import run_supervisor
+from p1_dataset.source import harden_p1_logging
+from p1_dataset.supervisor import run_supervisor
 
 logger = logging.getLogger("run_p1_production")
 

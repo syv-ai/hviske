@@ -15,10 +15,10 @@ import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 
-from hviske.p1_contracts import OutputRow
-from hviske.p1_segments import _rows_table
-from hviske.p1_v8_sanity_gate import run_v8_sanity_gate
-from hviske.p1_validation import (
+from p1_dataset.contracts import OutputRow
+from p1_dataset.segments import _rows_table
+from p1_dataset.v8_sanity_gate import run_v8_sanity_gate
+from p1_dataset.validation import (
     AuditReservoir,
     PinnedHubClipRetriever,
     _metadata_digest,
@@ -41,7 +41,7 @@ def _ogg_opus() -> bytes:
 
 def test_active_p1_imports_and_sanity_help_are_model_free() -> None:
     """P1 imports and CLI help do not load model runtimes."""
-    modules = "import hviske.p1_pipeline, hviske.p1_v8_sanity_gate"
+    modules = "import p1_dataset.pipeline, p1_dataset.v8_sanity_gate"
     check = (
         f"{modules}; import sys; "
         "print('torch' in sys.modules, 'transformers' in sys.modules)"
