@@ -11,7 +11,10 @@ _SAFE_PHASE = re.compile(r"^[a-z_]{1,32}$")
 _ENDPOINT_PATTERNS = (
     ("preupload", re.compile(r"/preupload(?:/|$)")),
     ("lfs_batch", re.compile(r"/info/lfs/objects/batch(?:[?#]|$)")),
-    ("xet", re.compile(r"(?:/xet-|/api/.*/xet(?:/|$)|xet.*(?:token|write))")),
+    (
+        "xet",
+        re.compile(r"(?:xethub\.hf\.co|/xet-|/api/.*/xet(?:/|$)|xet.*(?:token|write))"),
+    ),
     ("commit", re.compile(r"/commit(?:/|$)")),
     ("paths_info", re.compile(r"/paths-info(?:/|$)")),
     ("repo_tree", re.compile(r"/tree(?:/|$)")),
