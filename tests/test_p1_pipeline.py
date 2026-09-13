@@ -33,6 +33,7 @@ from p1_dataset.pipeline import (
     _publication_lock,
     _SelectionDedup,
     _unlink_recovered,
+    build_active_dataset_card,
     enforce_scratch_cap,
     partition_for_file_id,
     preflight_pipeline,
@@ -385,15 +386,15 @@ def test_existing_scratch_is_included_in_hard_budget(tmp_path: Path) -> None:
         )
 
 
-def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
-    """Initialisation creates the private target without source retrieval."""
+def test_initialise_commits_only_public_metadata(tmp_path: Path) -> None:
+    """Initialisation creates the public target without source retrieval."""
     source = MetadataSource()
     hub = MemoryHub()
     report = run_pipeline(
         config=pipeline_config(tmp_path, mode="initialise"), source=source, hub=hub
     )
 
-    assert hub.private is True
+    assert hub.private is False
     assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
     card = hub.files["README.md"].decode("utf-8")
     assert "roughly 2006–2022" in card
@@ -405,6 +406,8 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
     assert "<!--" in card and "pipeline_config_sha256" in card
     assert "p1-segments-v2" not in card
     assert report.preflight.target["contract_v8"] is True
+    assert report.preflight.target["visibility_matches"] is True
+    assert report.preflight.target["governance_matches"] is True
     assert source.iterated is False
 
 
@@ -1075,6 +1078,25 @@ def test_progress_logs_do_not_include_source_identifiers_or_paths(
     assert "private/audio.parquet" not in progress
 
 
+def test_public_governance_preserves_deployed_v8_digest(tmp_path: Path) -> None:
+    """Active visibility and wording stay outside canonical row identity."""
+    config = pipeline_config(tmp_path)
+    baseline = PipelineSettings.from_config(config)
+    expected_digest = "1953e058f9bf904a93b475b4bd7e79b404a53f9dc4eeb5cdceb169c1cbe6bd2b"
+    golden_json = Path("tests/fixtures/p1-v8-canonical-identity.json").read_text(
+        encoding="utf-8"
+    )
+    assert hashlib.sha256(golden_json.rstrip("\n").encode()).hexdigest() == (
+        expected_digest
+    )
+    assert baseline.pipeline_digest == expected_digest
+    config.active_governance.version = "p1-governance-wording-update"
+    config.active_governance.expected_visibility = "private"
+    config.runtime.expected_target_visibility = "private"
+    changed = PipelineSettings.from_config(config)
+    assert changed.pipeline_digest == baseline.pipeline_digest
+
+
 def test_publication_does_not_repeat_unknown_bad_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1242,7 +1264,9 @@ def test_publication_retries_committed_batch_through_verification_recovery(
                 repo_id, shard_path=shard_path, revision=revision, streaming=streaming
             )
 
-    hub = FlakyHub()
+    hub = FlakyHub(sha="d" * 40)
+    hub.files["README.md"] = build_active_dataset_card(settings).encode("utf-8")
+    hub.files["LICENSE"] = settings.active_license_path.read_bytes()
 
     def sleep(_delay: float) -> None:
         return None

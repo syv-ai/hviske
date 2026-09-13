@@ -22,10 +22,12 @@ import yaml
 from huggingface_hub import CommitInfo, HfApi, HfFileSystem
 from huggingface_hub.errors import BadRequestError, HfHubHTTPError
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
+from omegaconf import DictConfig, OmegaConf
 
 from p1_dataset.contracts import LedgerState, OutputRow, ShardEvidence
 from p1_dataset.hub_diagnostics import annotate_hub_error, classify_hub_error
 from p1_dataset.ledger import Ledger
+from p1_dataset.pipeline import PipelineSettings, build_active_dataset_card
 from p1_dataset.publish import (
     AllowListError,
     HfApiAdapter,
@@ -89,7 +91,7 @@ def test_batch_verifies_every_path_and_streams_every_shard(tmp_path: Path) -> No
 class MemoryHub:
     """Small in-memory Hub fake that records every operation."""
 
-    private: object = True
+    private: object = False
     sha: str | None = None
     commit_id: str = "a" * 40
     expose_digest: bool = False
@@ -130,7 +132,8 @@ class MemoryHub:
         for operation in operations:
             self.files[operation.path_in_repo] = operation.path.read_bytes()
         if self.flip_public:
-            self.private = False
+            self.private = True
+        self.sha = self.commit_id
         return SimpleNamespace(commit_id=self.commit_id)
 
     def create_repo(
@@ -278,6 +281,17 @@ def test_card_contains_required_terms_and_no_credentials() -> None:
     assert "/main/" not in card
     assert all(section in card for section in ("## Source", "## Licence"))
     assert all(term not in card for term in ("CoRal", "Alexandra", "Roest"))
+    assert all(
+        term not in card.lower()
+        for term in (
+            "private dataset",
+            "authorised",
+            "authorized",
+            "authorization",
+            "authorisation",
+            "access agreement",
+        )
+    )
     with pytest.raises(PublicationError):
         initialise_private_dataset(
             MemoryHub(), "org/p1", card="token=hf_" + "x" * 20, token="hf_" + "x" * 20
@@ -341,7 +355,10 @@ def test_card_is_readable_and_contract_driven() -> None:
     assert "ElevenLabs Scribe v2" in card
     assert "mono 16 kHz OGG/Opus" in card
     assert "verbatim text, timing, and speaker metadata" in card
-    assert "authorised users" in card
+    assert "publicly accessible" in card
+    assert "authorised users" not in card
+    assert "private dataset" not in card
+    assert "Public availability" in card
     assert 'revision="<immutable-commit-sha>"' in card
     assert "streaming=True" in card
     assert "Reproducibility details" not in card
@@ -823,8 +840,8 @@ def test_hf_xet_failure_is_classified_without_transport_details() -> None:
     assert "signed" not in repr(diagnostic)
 
 
-def test_initialisation_commits_card_and_attributes_privately() -> None:
-    """Initialisation uploads only the card and Git attributes privately."""
+def test_initialisation_commits_public_governance_metadata() -> None:
+    """Initialisation uploads only the public card, attributes, and licence."""
     hub = MemoryHub()
     commit = initialise_private_dataset(hub, "org/p1", card=make_card())
     assert commit == "a" * 40
@@ -937,8 +954,8 @@ def test_local_validation_enforces_exact_schema_audio_and_duration(
             )
 
 
-def test_missing_repository_is_created_private_before_initialisation() -> None:
-    """A missing repository is created private and checked before its card commit."""
+def test_missing_repository_is_created_public_before_initialisation() -> None:
+    """A missing repository is created public and checked before its card commit."""
     hub = MemoryHub(missing=True)
     commit = initialise_private_dataset(hub, "org/p1", card=make_card())
     assert commit == "a" * 40
@@ -963,9 +980,9 @@ def test_post_commit_privacy_failure_stops_before_verification(tmp_path: Path) -
     assert not hub.loaded
 
 
-def test_public_or_unknown_visibility_aborts_before_commit() -> None:
-    """Public, unknown, and malformed visibility never receive a commit."""
-    for visibility in (False, None, "private"):
+def test_private_or_unknown_visibility_aborts_before_commit() -> None:
+    """Private, unknown, and malformed visibility never receive a public commit."""
+    for visibility in (True, None, "private"):
         hub = MemoryHub(private=visibility)
         with pytest.raises(PrivacyError):
             initialise_private_dataset(hub, "org/p1", card=make_card())
@@ -1214,3 +1231,36 @@ def test_symlinks_and_unexpected_staging_entries_are_rejected(tmp_path: Path) ->
     unexpected.write_text("no")
     with pytest.raises(AllowListError):
         validate_staging_directory(tmp_path, [Path("real.parquet")])
+
+
+@pytest.mark.parametrize("metadata_path", ["README.md", "LICENSE"])
+def test_wrong_active_governance_blocks_payload_and_retains_local_data(
+    tmp_path: Path, metadata_path: str
+) -> None:
+    """Payload mutation requires exact active metadata at current public HEAD."""
+    config = OmegaConf.load("config/p1_segments.yaml")
+    config.runtime.scratch_root = str(tmp_path / "scratch")
+    settings = PipelineSettings.from_config(t.cast(DictConfig, config))
+    card = build_active_dataset_card(settings)
+    hub = MemoryHub(sha="d" * 40)
+    hub.files["README.md"] = card.encode("utf-8")
+    hub.files["LICENSE"] = settings.active_license_path.read_bytes()
+    hub.files[metadata_path] += b"drift"
+    path = tmp_path / "one.parquet"
+    write_valid_shard(path)
+
+    with pytest.raises(PublicationError, match="README|LICENSE"):
+        publish_batch(
+            hub,
+            "org/p1",
+            "batch",
+            [LocalShard(path, "one.parquet", 1)],
+            expected_pipeline_version="test",
+            expected_pipeline_config_sha256="b" * 64,
+            expected_visibility="public",
+            expected_card=card,
+            expected_license_sha256=settings.active_governance.license_sha256,
+            expected_license_bytes=settings.active_governance.license_bytes,
+        )
+    assert path.exists()
+    assert not hub.commits

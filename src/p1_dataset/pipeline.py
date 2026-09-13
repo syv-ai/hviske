@@ -34,6 +34,7 @@ from omegaconf import DictConfig, OmegaConf
 from .contracts import (
     OUTPUT_SCHEMA,
     P1_RUNTIME_CONTRACT,
+    ActiveGovernanceContract,
     CanonicalIdentityManifest,
     CTCContract,
     DatasetLicenseContract,
@@ -110,6 +111,9 @@ class PipelineSettings:
     resume: bool
     device: str
     target_private_repo: str
+    expected_target_visibility: str
+    active_governance: ActiveGovernanceContract
+    active_license_path: Path
     source_audio_repository: str
     source_audio_revision: str
     source_transcript_repository: str
@@ -199,6 +203,21 @@ class PipelineSettings:
         anomaly_raw = t.cast(dict[str, object], future_alignment["anomaly_model"])
         output_raw = t.cast(dict[str, object], root["output"])
         dataset_license_raw = t.cast(dict[str, object], root["dataset_license"])
+        governance = ActiveGovernanceContract.model_validate(root["active_governance"])
+        expected_visibility = runtime.get("expected_target_visibility")
+        if expected_visibility != governance.expected_visibility:
+            raise ValueError(
+                "runtime expected visibility must match active governance exactly"
+            )
+        active_license_path = Path(governance.license_path).resolve()
+        if not active_license_path.is_file() or active_license_path.is_symlink():
+            raise ValueError("active governance licence must be a regular local file")
+        active_license = active_license_path.read_bytes()
+        if (
+            len(active_license) != governance.license_bytes
+            or hashlib.sha256(active_license).hexdigest() != governance.license_sha256
+        ):
+            raise ValueError("active governance licence bytes do not match config")
         manifest = CanonicalIdentityManifest(
             schema_version=str(root["schema_version"]),
             pipeline_version=str(root["pipeline_version"]),
@@ -349,6 +368,9 @@ class PipelineSettings:
             resume=bool(root.get("resume", True)),
             device=str(runtime.get("device", "cuda:0")),
             target_private_repo=str(runtime["target_private_repo"]),
+            expected_target_visibility=governance.expected_visibility,
+            active_governance=governance,
+            active_license_path=active_license_path,
             source_audio_repository=str(audio["repository"]),
             source_audio_revision=str(audio["revision"]),
             source_transcript_repository=str(transcripts["repository"]),
@@ -519,7 +541,15 @@ def _initialise_report(*, settings: PipelineSettings, hub: object) -> BuildRepor
     scratch = settings.scratch_root
     free_bytes = shutil.disk_usage(scratch).free
     scratch_bytes = directory_size(scratch)
-    target = target_privacy(hub, settings.target_private_repo, settings.pipeline_digest)
+    target = target_privacy(
+        hub,
+        settings.target_private_repo,
+        settings.pipeline_digest,
+        expected_visibility=settings.expected_target_visibility,
+        expected_card=build_active_dataset_card(settings),
+        expected_license_sha256=settings.active_governance.license_sha256,
+        expected_license_bytes=settings.active_governance.license_bytes,
+    )
     preflight = PreflightReport(
         mode=settings.mode,
         selected_programmes=0,
@@ -541,12 +571,69 @@ def _initialise_report(*, settings: PipelineSettings, hub: object) -> BuildRepor
         cuda={"checked": False, "reason": "not_applicable:timestamp-native"},
         target=target,
         checks={
-            "target_checked": target["private"] is True,
+            "target_checked": bool(target["visibility_matches"]),
             "model_provenance_not_applicable": True,
             "cuda_device_checked": False,
         },
     )
     return BuildReport(preflight=preflight, selected_programmes=0)
+
+
+def build_active_dataset_card(settings: PipelineSettings) -> str:
+    """Build the exact README required by active publication governance.
+
+    Returns:
+        The active public dataset card.
+    """
+    from .publish import build_dataset_card
+
+    return build_dataset_card(
+        source_provenance=(
+            "Pinned P1 sources: "
+            f"{settings.source_audio_revision}, {settings.source_transcript_revision}."
+        ),
+        permitted_use="Use is governed by the layered dataset licence.",
+        private_access_terms="The dataset is publicly accessible.",
+        alignment_method=(
+            "pipeline_version: p1-segmentation-8; "
+            "alignment_method: timestamp-native:p1-transcripts.words; "
+            f"pipeline_config_sha256: {settings.pipeline_digest}; "
+            "Source word timestamps are authoritative; boundaries are the first "
+            "timed word start and last timed word end. Text follows "
+            f"{P1_RUNTIME_CONTRACT.normalisation_version} and "
+            f"{P1_RUNTIME_CONTRACT.normalisation_source_text_ownership}."
+        ),
+        field_schema=(
+            "p1-segments-v2 OutputRow schema; alignment_backend is timestamp-native, "
+            "alignment_score_type is not_applicable:source_timestamps, and all "
+            "acoustic evidence fields are null."
+        ),
+        known_limitations="Timestamp quality is limited by the source word timestamps.",
+        rejection_policy=(
+            "Invalid, empty, short or overlong timestamp proposals, source timeline "
+            "defects, and undecodable programmes are recorded in the ledger. Untimed "
+            "lexical records whose speaker cannot be proven are retained using "
+            "best-effort ownership and counted as uncertain metadata; unexpected "
+            "source and programming failures remain fatal."
+        ),
+        source_revisions=json.dumps(
+            {
+                "audio": {
+                    "repository": settings.source_audio_repository,
+                    "revision": settings.source_audio_revision,
+                },
+                "transcripts": {
+                    "repository": settings.source_transcript_repository,
+                    "revision": settings.source_transcript_revision,
+                },
+            },
+            sort_keys=True,
+        ),
+        model_revisions=None,
+        dataset_license=json.dumps(
+            settings.dataset_license.model_dump(mode="json"), sort_keys=True
+        ),
+    )
 
 
 def calculate_scratch_requirement(
@@ -595,15 +682,34 @@ def directory_size(root: Path) -> int:
 
 
 def target_privacy(
-    hub: object | None, repo_id: str, expected_digest: str | None = None
+    hub: object | None,
+    repo_id: str,
+    expected_digest: str | None = None,
+    *,
+    expected_visibility: str = "private",
+    expected_card: str | None = None,
+    expected_license_sha256: str | None = None,
+    expected_license_bytes: int | None = None,
 ) -> dict[str, object]:
-    """Report target access while allowing a missing target during planning.
+    """Report exact target visibility while allowing a missing planning target.
 
     Returns:
-        Metadata-only target presence and privacy evidence.
+        Metadata-only target presence and visibility evidence.
+
+    Raises:
+        ValueError:
+            If the expected visibility is not a supported exact value.
     """
+    if expected_visibility not in {"private", "public"}:
+        raise ValueError("expected visibility must be exactly private or public")
     if hub is None:
-        return {"checked": False, "present": False, "private": None, "repo_id": repo_id}
+        return {
+            "checked": False,
+            "present": False,
+            "private": None,
+            "visibility_matches": False,
+            "repo_id": repo_id,
+        }
     try:
         info = hub.repo_info(repo_id=repo_id, repo_type="dataset")
     except Exception as exc:
@@ -612,6 +718,7 @@ def target_privacy(
                 "checked": True,
                 "present": False,
                 "private": None,
+                "visibility_matches": False,
                 "repo_id": repo_id,
             }
         raise
@@ -620,14 +727,34 @@ def target_privacy(
         if isinstance(info, dict)
         else getattr(info, "private", None)
     )
+    expected_private = expected_visibility == "private"
+    visibility_matches = type(private) is bool and private is expected_private
     contract_v8 = _target_card_is_v8(
         hub=hub, repo_id=repo_id, expected_digest=expected_digest
     )
+    governance_matches = False
+    if visibility_matches and expected_card is not None:
+        from .publish import HubClient, PublicationError, assert_active_governance
+
+        try:
+            assert_active_governance(
+                t.cast(HubClient, hub),
+                repo_id,
+                expected_visibility=expected_visibility,
+                expected_card=expected_card,
+                expected_license_sha256=t.cast(str, expected_license_sha256),
+                expected_license_bytes=t.cast(int, expected_license_bytes),
+            )
+            governance_matches = True
+        except PublicationError:
+            governance_matches = False
     return {
         "checked": True,
         "present": True,
-        "private": private is True,
+        "private": private if type(private) is bool else None,
+        "visibility_matches": visibility_matches,
         "contract_v8": contract_v8,
+        "governance_matches": governance_matches,
         "repo_id": repo_id,
     }
 
@@ -2272,6 +2399,7 @@ def _publish_pending_unlocked(
             )
 
     shards = t.cast(c.Sequence[LocalShard], pending)
+    governance_card = build_active_dataset_card(settings)
     try:
         record = ledger.batch(batch_id)
     except KeyError:
@@ -2293,6 +2421,10 @@ def _publish_pending_unlocked(
             expected_pipeline_version=settings.pipeline_version,
             expected_pipeline_config_sha256=settings.pipeline_digest,
             ledger=ledger,
+            expected_visibility=settings.expected_target_visibility,
+            expected_card=governance_card,
+            expected_license_sha256=settings.active_governance.license_sha256,
+            expected_license_bytes=settings.active_governance.license_bytes,
         )
         if ledger.batch(batch_id).state is _state("verified"):
             expected = {
@@ -2373,6 +2505,10 @@ def _publish_pending_unlocked(
         ledger=ledger,
         purge_callback=purge,
         commit_recorded=commit_recorded,
+        expected_visibility=settings.expected_target_visibility,
+        expected_card=governance_card,
+        expected_license_sha256=settings.active_governance.license_sha256,
+        expected_license_bytes=settings.active_governance.license_bytes,
     )
     ledger.finalise_batch_children(batch_id)
     for programme_id in programme_ids:
@@ -2720,6 +2856,10 @@ def _recover_native_batches(
             ledger=ledger,
             manifest_path=manifest_path,
             local_paths=paths,
+            expected_visibility=settings.expected_target_visibility,
+            expected_card=build_active_dataset_card(settings),
+            expected_license_sha256=settings.active_governance.license_sha256,
+            expected_license_bytes=settings.active_governance.license_bytes,
         )
         expected_local: dict[Path, tuple[int, str]] = {
             Path(record.local_path): (record.byte_size, record.sha256)
@@ -2797,65 +2937,19 @@ def configure_scratch(root: Path, *, model_free: bool = False) -> Path:
 
 
 def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
-    """Create and initialise the private target before uploading any shard bytes."""
-    from .publish import HubClient, build_dataset_card, initialise_private_dataset
+    """Create and initialise the visibility-bound target before payload upload."""
+    from .publish import HubClient, initialise_private_dataset
 
-    card = build_dataset_card(
-        source_provenance=(
-            "Pinned P1 sources: "
-            f"{settings.source_audio_revision}, {settings.source_transcript_revision}."
-        ),
-        permitted_use=(
-            "Private commercial data preparation and authorised internal use only."
-        ),
-        private_access_terms="Access is restricted to authorised syv.ai members.",
-        alignment_method=(
-            "pipeline_version: p1-segmentation-8; "
-            "alignment_method: timestamp-native:p1-transcripts.words; "
-            f"pipeline_config_sha256: {settings.pipeline_digest}; "
-            "Source word timestamps are authoritative; boundaries are the first "
-            "timed word start and last timed word end. Text follows "
-            f"{P1_RUNTIME_CONTRACT.normalisation_version} and "
-            f"{P1_RUNTIME_CONTRACT.normalisation_source_text_ownership}."
-        ),
-        field_schema=(
-            "p1-segments-v2 OutputRow schema; alignment_backend is timestamp-native, "
-            "alignment_score_type is not_applicable:source_timestamps, and all "
-            "acoustic evidence fields are null."
-        ),
-        known_limitations="Timestamp quality is limited by the source word timestamps.",
-        rejection_policy=(
-            "Invalid, empty, short or overlong timestamp proposals, source timeline "
-            "defects, and undecodable programmes are recorded in the ledger. Untimed "
-            "lexical records whose speaker cannot be proven are retained using "
-            "best-effort ownership and counted as uncertain metadata; unexpected "
-            "source and programming failures remain fatal."
-        ),
-        source_revisions=json.dumps(
-            {
-                "audio": {
-                    "repository": settings.source_audio_repository,
-                    "revision": settings.source_audio_revision,
-                },
-                "transcripts": {
-                    "repository": settings.source_transcript_repository,
-                    "revision": settings.source_transcript_revision,
-                },
-            },
-            sort_keys=True,
-        ),
-        model_revisions=None,
-        dataset_license=json.dumps(
-            settings.dataset_license.model_dump(mode="json"), sort_keys=True
-        ),
-    )
-    license_path = Path(__file__).resolve().parents[2] / "LICENSE-DATASET"
+    card = build_active_dataset_card(settings)
     initialise_private_dataset(
         t.cast(HubClient, hub),
         settings.target_private_repo,
         card=card,
-        license_text=license_path.read_text(encoding="utf-8"),
+        license_text=settings.active_license_path.read_text(encoding="utf-8"),
         expected_pipeline_config_sha256=settings.pipeline_digest,
+        expected_visibility=settings.expected_target_visibility,
+        expected_license_sha256=settings.active_governance.license_sha256,
+        expected_license_bytes=settings.active_governance.license_bytes,
     )
 
 
@@ -2942,7 +3036,15 @@ def preflight_pipeline(
         raise P1PreflightError(
             f"insufficient free space: need {required}, have {free_bytes}"
         )
-    target = target_privacy(hub, settings.target_private_repo, settings.pipeline_digest)
+    target = target_privacy(
+        hub,
+        settings.target_private_repo,
+        settings.pipeline_digest,
+        expected_visibility=settings.expected_target_visibility,
+        expected_card=build_active_dataset_card(settings),
+        expected_license_sha256=settings.active_governance.license_sha256,
+        expected_license_bytes=settings.active_governance.license_bytes,
+    )
     cuda = (
         {"checked": False, "reason": "not_applicable:timestamp-native"}
         if timestamp_native
@@ -2961,18 +3063,25 @@ def preflight_pipeline(
         ),
         "target_checked": bool(target.get("checked", False)),
         "target_contract_v8": bool(target.get("contract_v8", False)),
+        "target_governance": bool(target.get("governance_matches", False)),
     }
     if not source_revision_ok:
         raise P1PreflightError("source revision is not available at the pinned SHA")
     if not model_revision_ok:
         raise P1PreflightError("model revision is not available at the pinned SHA")
-    if settings.mode != "plan" and not target.get("private", False):
-        raise P1PreflightError("target repository is not demonstrably private")
+    if settings.mode != "plan" and not target.get("visibility_matches", False):
+        raise P1PreflightError("target repository does not match expected visibility")
     if settings.mode not in {"plan", "initialise"} and not target.get(
         "contract_v8", False
     ):
         raise P1PreflightError(
             "target card does not prove the P1 v8 timestamp-native contract"
+        )
+    if settings.mode not in {"plan", "initialise"} and not target.get(
+        "governance_matches", False
+    ):
+        raise P1PreflightError(
+            "target README or LICENSE does not match active governance"
         )
     return PreflightReport(
         mode=settings.mode,

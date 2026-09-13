@@ -44,7 +44,7 @@ class VerifyFailHub(MemoryHub):
             RuntimeError:
                 When a shard is streamed for remote verification.
         """
-        if path == "README.md":
+        if path in {"README.md", "LICENSE"}:
             return super().stream_file(
                 repo_id, path, repo_type=repo_type, revision=revision
             )
