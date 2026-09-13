@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import collections.abc as c
 import hashlib
+import os
+import re
 import tempfile
 import typing as t
 from dataclasses import dataclass
 from pathlib import Path
 
+from .hub_diagnostics import classify_hub_error
 from .pipeline import PipelineSettings, _publication_lock, build_active_dataset_card
 from .publish import (
     HubClient,
@@ -37,6 +40,10 @@ class _GovernanceHubClient(t.Protocol):
         commit_message: str,
         parent_commit: str | None = None,
     ) -> object: ...
+
+    def list_repo_commits(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> c.Iterable[object]: ...
 
     def list_repo_files(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
@@ -77,8 +84,9 @@ def migrate_public_governance(
 
     The shared publication lock covers the complete compare-and-swap operation.
     Corpus objects are inventoried by repository path only and are never downloaded.
-    A failure before commit submission restores private visibility. Once submission
-    starts, any exception is treated as ambiguous and visibility is not rolled back.
+    Failures before submission, and Hub failures proven to occur before commit
+    creation, restore private visibility. An ambiguous submission is left public for
+    investigation rather than risking a rollback of a successful commit.
 
     Args:
         api:
@@ -149,51 +157,74 @@ def _migrate_public_governance_unlocked(
     if not apply:
         return report
 
+    commit_result_available = False
     try:
-        api.update_repo_visibility(
-            settings.target_private_repo, repo_type="dataset", private=False
-        )
-        public_info = api.repo_info(
-            repo_id=settings.target_private_repo, repo_type="dataset"
-        )
-        public_head = _target_head(
-            public_info, settings.target_private_repo, expected_visibility="public"
-        )
-        if public_head != old_head:
-            raise PublicationError("target HEAD changed while switching visibility")
-        if (
-            _inventory_paths(api=api, settings=settings, revision=public_head)
-            != old_paths
-        ):
-            raise PublicationError(
-                "target inventory changed while switching visibility"
+        with tempfile.TemporaryDirectory(prefix="hviske-p1-governance-") as directory:
+            root = Path(directory)
+            readme_path = root / "README.md"
+            license_path = root / "LICENSE"
+            _stage_metadata(
+                readme_path=readme_path,
+                license_path=license_path,
+                active_card=active_card,
+                active_license=active_license,
+                expected_license_sha256=settings.active_governance.license_sha256,
+                expected_license_bytes=settings.active_governance.license_bytes,
             )
+            operations = (
+                UploadOperation(path_in_repo="README.md", path=readme_path),
+                UploadOperation(path_in_repo="LICENSE", path=license_path),
+            )
+            api.update_repo_visibility(
+                settings.target_private_repo, repo_type="dataset", private=False
+            )
+            public_info = api.repo_info(
+                repo_id=settings.target_private_repo, repo_type="dataset"
+            )
+            public_head = _target_head(
+                public_info, settings.target_private_repo, expected_visibility="public"
+            )
+            if public_head != old_head:
+                raise PublicationError("target HEAD changed while switching visibility")
+            if (
+                _inventory_paths(api=api, settings=settings, revision=public_head)
+                != old_paths
+            ):
+                raise PublicationError(
+                    "target inventory changed while switching visibility"
+                )
+            # A returned result proves that a commit may exist. Until then, a
+            # deterministic pre-upload failure can safely be followed by rollback.
+            try:
+                result = api.create_commit(
+                    settings.target_private_repo,
+                    operations,
+                    repo_type="dataset",
+                    commit_message="Migrate P1 dataset to public governance",
+                    parent_commit=expected_old_head,
+                )
+            except Exception as error:
+                if _commit_result_may_exist(error):
+                    commit_result_available = True
+                raise
+            commit_result_available = True
     except Exception:
-        api.update_repo_visibility(
-            settings.target_private_repo, repo_type="dataset", private=True
-        )
+        if not commit_result_available:
+            _restore_private(
+                api=api,
+                settings=settings,
+                expected_old_head=expected_old_head,
+                expected_paths=old_paths,
+            )
         raise
 
-    with tempfile.TemporaryDirectory(prefix="hviske-p1-governance-") as directory:
-        root = Path(directory)
-        readme_path = root / "README.md"
-        license_path = root / "LICENSE"
-        readme_path.write_text(active_card, encoding="utf-8")
-        license_path.write_bytes(active_license)
-        operations = (
-            UploadOperation(path_in_repo="README.md", path=readme_path),
-            UploadOperation(path_in_repo="LICENSE", path=license_path),
-        )
-        # From this point a transport error may hide a successful commit. Never
-        # automatically restore private visibility after an ambiguous submission.
-        result = api.create_commit(
-            settings.target_private_repo,
-            operations,
-            repo_type="dataset",
-            commit_message="Migrate P1 dataset to public governance",
-            parent_commit=expected_old_head,
-        )
     commit_id = _commit_sha(result)
+    _verify_commit_descends(
+        api=api,
+        settings=settings,
+        expected_old_head=expected_old_head,
+        new_head=commit_id,
+    )
     assert_active_governance(
         t.cast(HubClient, api),
         settings.target_private_repo,
@@ -213,6 +244,170 @@ def _migrate_public_governance_unlocked(
         license_sha256=report.license_sha256,
         commit_sha256=commit_id,
     )
+
+
+def _commit_result_may_exist(error: BaseException) -> bool:
+    """Return whether a failed Hub request has an ambiguous commit outcome."""
+    diagnostic = classify_hub_error(error)
+    if diagnostic.reason in {"missing_uploaded_object", "xet_unavailable"}:
+        return False
+    return diagnostic.phase not in {"preupload", "lfs_batch", "xet"}
+
+
+def _restore_private(
+    *,
+    api: _GovernanceHubClient,
+    settings: PipelineSettings,
+    expected_old_head: str,
+    expected_paths: tuple[str, ...],
+) -> None:
+    """Restore private visibility and prove that the old tree is still intact.
+
+    Raises:
+        PublicationError:
+            If visibility, HEAD, or the repository inventory cannot be restored.
+    """
+    api.update_repo_visibility(
+        settings.target_private_repo, repo_type="dataset", private=True
+    )
+    info = api.repo_info(repo_id=settings.target_private_repo, repo_type="dataset")
+    restored_head = _target_head(
+        info, settings.target_private_repo, expected_visibility="private"
+    )
+    if restored_head != expected_old_head:
+        raise PublicationError("private visibility rollback did not restore HEAD")
+    if (
+        _inventory_paths(api=api, settings=settings, revision=expected_old_head)
+        != expected_paths
+    ):
+        raise PublicationError(
+            "private visibility rollback changed repository inventory"
+        )
+    if _read_metadata(
+        api=api, settings=settings, path="README.md", revision=expected_old_head
+    ) != _historical_private_card(settings).encode("utf-8"):
+        raise PublicationError("private visibility rollback changed README")
+    restored_license = _read_metadata(
+        api=api, settings=settings, path="LICENSE", revision=expected_old_head
+    )
+    if (
+        len(restored_license) != _HISTORICAL_LICENSE_BYTES
+        or hashlib.sha256(restored_license).hexdigest() != _HISTORICAL_LICENSE_SHA256
+    ):
+        raise PublicationError("private visibility rollback changed LICENSE")
+
+
+def _stage_metadata(
+    *,
+    readme_path: Path,
+    license_path: Path,
+    active_card: str,
+    active_license: bytes,
+    expected_license_sha256: str,
+    expected_license_bytes: int,
+) -> None:
+    """Durably stage and re-read both metadata files before a visibility change.
+
+    Raises:
+        PublicationError:
+            If either staged file fails validation.
+    """
+    with readme_path.open("w", encoding="utf-8") as handle:
+        handle.write(active_card)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with license_path.open("wb") as handle:
+        handle.write(active_license)
+        handle.flush()
+        os.fsync(handle.fileno())
+    directory_fd = os.open(readme_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    staged_license = license_path.read_bytes()
+    if (
+        not readme_path.is_file()
+        or readme_path.is_symlink()
+        or not license_path.is_file()
+        or license_path.is_symlink()
+        or readme_path.read_text(encoding="utf-8") != active_card
+        or staged_license != active_license
+        or len(staged_license) != expected_license_bytes
+        or hashlib.sha256(staged_license).hexdigest() != expected_license_sha256
+    ):
+        raise PublicationError("local governance staging validation failed")
+
+
+def _verify_commit_descends(
+    *,
+    api: _GovernanceHubClient,
+    settings: PipelineSettings,
+    expected_old_head: str,
+    new_head: str,
+) -> None:
+    """Prove the metadata commit is the direct child of the expected old HEAD.
+
+    Raises:
+        PublicationError:
+            If current HEAD or Hub ancestry does not prove the expected parent.
+    """
+    current_info = api.repo_info(
+        repo_id=settings.target_private_repo, repo_type="dataset"
+    )
+    current_head = _target_head(
+        current_info, settings.target_private_repo, expected_visibility="public"
+    )
+    if current_head != new_head:
+        raise PublicationError("Hub current HEAD differs from returned commit")
+    commits = tuple(
+        api.list_repo_commits(
+            settings.target_private_repo, repo_type="dataset", revision=new_head
+        )
+    )
+    commit_ids = tuple(_commit_sha(item) for item in commits)
+    if len(commit_ids) < 2 or commit_ids[0] != new_head:
+        raise PublicationError("Hub returned unknown commit ancestry")
+    parent_value = _value(commits[0], "parents", "parent_commit", "parent")
+    if parent_value is not None:
+        parents = _parent_shas(parent_value)
+        if parents != (expected_old_head,):
+            raise PublicationError("metadata commit has the wrong parent")
+    elif commit_ids[1] != expected_old_head:
+        raise PublicationError("metadata commit ancestry is not directly verifiable")
+    elif len(set(commit_ids[:2])) != 2:
+        raise PublicationError("Hub returned ambiguous commit ancestry")
+
+
+def _parent_shas(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        values: tuple[object, ...] = (value,)
+    elif isinstance(value, c.Iterable) and not isinstance(value, (bytes, str)):
+        values = tuple(value)
+    else:
+        values = (value,)
+    result: list[str] = []
+    for item in values:
+        candidate = _value(item, "commit_id", "oid", "sha")
+        if candidate is None and type(item) is str:
+            candidate = item
+        if not isinstance(candidate, str) or not _COMMIT_SHA.fullmatch(candidate):
+            return ()
+        result.append(candidate)
+    return tuple(result)
+
+
+def _value(value: object, *names: str) -> object:
+    for name in names:
+        if isinstance(value, dict) and name in value:
+            return value[name]
+        candidate = getattr(value, name, None)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _historical_private_card(settings: PipelineSettings) -> str:

@@ -51,6 +51,8 @@ class MigrationHub:
         self.operations: tuple[str, ...] = ()
         self.fail_inventory_after_switch = False
         self.ambiguous_commit = False
+        self.wrong_parent = False
+        self.unknown_ancestry = False
 
     def create_commit(
         self,
@@ -81,6 +83,19 @@ class MigrationHub:
             self.files[operation.path_in_repo] = operation.path.read_bytes()
         self.sha = _NEW_HEAD
         return SimpleNamespace(commit_id=_NEW_HEAD)
+
+    def list_repo_commits(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> c.Iterable[object]:
+        """Return commit metadata for direct-parent verification."""
+        del repo_id, repo_type, revision
+        if self.unknown_ancestry:
+            return ()
+        parent = "c" * 40 if self.wrong_parent else _OLD_HEAD
+        return (
+            SimpleNamespace(commit_id=self.sha, parent_commit=parent),
+            SimpleNamespace(commit_id=_OLD_HEAD),
+        )
 
     def list_repo_files(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
@@ -156,7 +171,7 @@ def test_migration_cas_and_precommit_failure_restore_private(tmp_path: Path) -> 
         migrate_public_governance(
             api=hub, settings=active, expected_old_head=_OLD_HEAD, apply=True
         )
-    assert hub.events[-1] == "private"
+    assert "private" in hub.events
     assert hub.private is True
     assert "commit" not in hub.events
 
@@ -192,3 +207,18 @@ def test_migration_orders_switch_then_two_metadata_operations(tmp_path: Path) ->
     assert hub.files["README.md"] == build_active_dataset_card(active).encode("utf-8")
     assert hub.files["LICENSE"] == active.active_license_path.read_bytes()
     assert hub.files["data/train/part.parquet"] == b"never read"
+
+
+@pytest.mark.parametrize("failure", ["wrong_parent", "unknown_ancestry"])
+def test_migration_rejects_unproven_commit_ancestry(
+    tmp_path: Path, failure: str
+) -> None:
+    """A commit is not accepted without an exact Hub ancestry proof."""
+    active = settings(tmp_path)
+    hub = MigrationHub(active)
+    setattr(hub, failure, True)
+    with pytest.raises(PublicationError, match="parent|ancestry"):
+        migrate_public_governance(
+            api=hub, settings=active, expected_old_head=_OLD_HEAD, apply=True
+        )
+    assert hub.private is False
