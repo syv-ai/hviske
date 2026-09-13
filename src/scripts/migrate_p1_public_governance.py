@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import collections.abc as c
 import contextlib
+import ctypes
 import logging
 import os
 import re
@@ -142,15 +143,54 @@ def _hub_diagnostic(error: BaseException) -> object | None:
 
 @contextlib.contextmanager
 def _quiet_runtime() -> c.Iterator[None]:
-    """Suppress warnings and dependency streams during untrusted operations."""
-    with (
-        warnings.catch_warnings(),
-        open(os.devnull, "w", encoding="utf-8") as sink,
-        contextlib.redirect_stdout(sink),
-        contextlib.redirect_stderr(sink),
-    ):
-        warnings.simplefilter("ignore")
-        yield
+    """Suppress dependency output, including direct file-descriptor writes."""
+    saved_fds: dict[int, int] = {}
+    redirected_fds: set[int] = set()
+    null_fd: int | None = None
+    try:
+        _flush_streams()
+        saved_fds[1] = os.dup(1)
+        saved_fds[2] = os.dup(2)
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        for fd in (1, 2):
+            os.dup2(null_fd, fd)
+            redirected_fds.add(fd)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            yield
+    finally:
+        _flush_streams()
+        for fd in (1, 2):
+            saved_fd = saved_fds.get(fd)
+            if fd not in redirected_fds or saved_fd is None:
+                continue
+            try:
+                os.dup2(saved_fd, fd)
+            except OSError:
+                pass
+        for saved_fd in saved_fds.values():
+            try:
+                os.close(saved_fd)
+            except OSError:
+                pass
+        if null_fd is not None:
+            try:
+                os.close(null_fd)
+            except OSError:
+                pass
+
+
+def _flush_streams() -> None:
+    """Flush Python and, where available, C standard streams best-effort."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    try:
+        ctypes.CDLL(None).fflush(None)
+    except Exception:
+        pass
 
 
 def _safe_class_name(value: str) -> str:

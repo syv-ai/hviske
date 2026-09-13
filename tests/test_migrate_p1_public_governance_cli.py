@@ -20,6 +20,9 @@ def test_migration_cli_captures_import_warning_logs_and_hub_content(
         """
 import builtins
 import logging
+import os
+import subprocess
+import sys
 import warnings
 
 _original_import = builtins.__import__
@@ -30,6 +33,17 @@ def _import(name, globals=None, locals=None, fromlist=(), level=0):
     if name == "p1_dataset.governance":
         warnings.warn("SENTINEL_PATH?token=SENTINEL_CONTENT", UserWarning)
         logging.getLogger("httpx").warning("SENTINEL_URL response SENTINEL_CONTENT")
+        os.write(1, b"SENTINEL direct stdout\\n")
+        os.write(2, b"SENTINEL direct stderr\\n")
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os; os.write(1, b'SENTINEL child stdout\\n'); "
+                "os.write(2, b'SENTINEL child stderr\\n')",
+            ],
+            check=False,
+        )
         from huggingface_hub.errors import HfHubHTTPError
 
         def fail(**kwargs):
