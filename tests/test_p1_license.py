@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import cast
+
+from omegaconf import DictConfig, OmegaConf
 
 from p1_dataset.contracts import P1_RUNTIME_CONTRACT
+from p1_dataset.pipeline import PipelineSettings
 
 _SOURCE_README_URL = (
     "https://huggingface.co/datasets/syvai/p1/resolve/"
@@ -35,10 +39,18 @@ def test_target_license_is_the_pinned_custom_layered_license() -> None:
     published_bytes = (root / "LICENSE").read_bytes()
 
     assert target_bytes == published_bytes
-    assert (
-        hashlib.sha256(target_bytes).hexdigest()
-        == "02f6d0056a6f19f59b57c6a20c49bf7edd90530fa2664bb7e4a286522c981c6e"
-        == P1_RUNTIME_CONTRACT.dataset_license_target_sha256
+    settings = PipelineSettings.from_config(
+        cast(DictConfig, OmegaConf.load(root / "config" / "p1_segments.yaml"))
+    )
+    assert hashlib.sha256(target_bytes).hexdigest() == (
+        "33ea2032bdd0cabac95c158d66f03646f3d8ba77d9a8cb118d3ba02f2fb84d8f"
+    )
+    assert settings.active_governance.license_sha256 == (
+        "33ea2032bdd0cabac95c158d66f03646f3d8ba77d9a8cb118d3ba02f2fb84d8f"
+    )
+    assert len(target_bytes) == settings.active_governance.license_bytes
+    assert P1_RUNTIME_CONTRACT.dataset_license_target_sha256 == (
+        "02f6d0056a6f19f59b57c6a20c49bf7edd90530fa2664bb7e4a286522c981c6e"
     )
     target_text = target_bytes.decode("utf-8")
     assert "syv.ai ApS" in target_text
@@ -47,7 +59,12 @@ def test_target_license_is_the_pinned_custom_layered_license() -> None:
     assert "embedded DR audio" in target_text
     assert "verbatim/source-derived" in target_text
     assert "transcript text" in target_text
-    assert "public\nredistribution or sublicensing" in target_text
+    assert "Public availability" in target_text
+    assert "independently grant downstream rights" in target_text
+    assert "private repository" not in target_text.lower()
+    assert "authorised access" not in target_text.lower()
+    assert "authorization" not in target_text.lower()
+    assert "authorisation" not in target_text.lower()
     assert "ElevenLabs Scribe v2" in target_text
     assert "https://www.dr.dk/om-dr/vilkaar-paa-drdk" in target_text
     assert "https://elevenlabs.io/terms-of-use-eu" in target_text

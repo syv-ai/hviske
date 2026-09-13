@@ -19,10 +19,10 @@ and the CC BY 4.0 legal code.
 
 The CC BY grant does not include the embedded DR audio or verbatim/source-derived
 transcript text. Rights in that excluded content remain with DR and any other
-relevant rightsholders. Public availability of the dataset does not place the
-excluded content under an open licence or independently grant downstream rights.
-You may use excluded content only with relevant permissions or another basis
-under applicable law.
+relevant rightsholders. Private access to the dataset does not grant a public
+redistribution or sublicensing right for excluded content. You may use excluded
+content only under a separate permission or agreement from the relevant
+rightsholder, or as otherwise permitted by applicable law.
 
 3. TRANSCRIPT OUTPUT AND THIRD-PARTY SERVICES
 
@@ -51,7 +51,9 @@ The syv.ai Material is provided “AS IS” and without warranties of any kind, 
 the fullest extent permitted by law. syv.ai ApS is not responsible for claims,
 loss, or damage arising from use of the dataset or from use of excluded content.
 
-6. CONTACT
+6. CONTACT AND ACCESS
 
-For licence or attribution questions, contact syv.ai ApS through the project
-owner.
+For authorised access questions, permissions, or attribution questions, contact
+syv.ai ApS through the project owner or the access channel that provided this
+private repository. Access to the private repository remains subject to the
+separate access agreement and does not change the exclusions above.

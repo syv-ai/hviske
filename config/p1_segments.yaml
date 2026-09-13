@@ -1,5 +1,5 @@
 # Phase 1C contract configuration. Active v8 identity is source-timestamp based.
-# Use mode=plan for a Hub-metadata-only preflight; initialise creates the private
+# Use mode=plan for a Hub-metadata-only preflight; initialise creates the public
 # target card, while pilot and production are bounded builds.
 pipeline_version: p1-segmentation-8
 alignment_method: timestamp-native:p1-transcripts.words
@@ -94,6 +94,9 @@ segmentation:
   minimum_alignment_score: -10.0
   minimum_vad_speech_ratio: 0.0
 
+# Historical identity compatibility only. These exact values remain in the v8
+# canonical manifest so all existing and future rows retain the deployed digest.
+# They do not identify the active published licence.
 dataset_license:
   # Pinned source-rights provenance; this is not a textual licence template.
   template_repository: syvai/p1
@@ -107,6 +110,15 @@ dataset_license:
     syv.ai ApS and defines terms for this combined dataset.
   target_path: LICENSE
   target_sha256: 02f6d0056a6f19f59b57c6a20c49bf7edd90530fa2664bb7e4a286522c981c6e
+
+# Active publication governance is deliberately outside CanonicalIdentityManifest.
+# Wording and visibility changes must never alter pipeline_config_sha256.
+active_governance:
+  version: p1-public-governance-1
+  expected_visibility: public
+  license_path: LICENSE-DATASET
+  license_sha256: 33ea2032bdd0cabac95c158d66f03646f3d8ba77d9a8cb118d3ba02f2fb84d8f
+  license_bytes: 2437
 
 output:
   audio_format: ogg-opus
@@ -139,7 +151,9 @@ runtime:
   shards_per_commit: 96
   programmes_per_commit: 16
   target_shard_bytes: 500000000
+  # Historical name retained for configuration compatibility.
   target_private_repo: syvai/p1-segments
+  expected_target_visibility: public
 
 # Runtime-only parent controls.  They are excluded from the canonical pipeline
 # digest.  The production entry point derives one child configuration per partition.

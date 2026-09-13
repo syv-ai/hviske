@@ -143,8 +143,9 @@ P1_RUNTIME_CONTRACT = P1RuntimeContract(
     normalisation_punctuation_removed=True,
     normalisation_number_expansion=False,
     normalisation_preserves_source_word_map=True,
-    # This pinned Hub README records source-rights provenance; it is not a textual
-    # licence template. The target is the tracked custom layered licence.
+    # Historical identity compatibility data. These exact bytes remain in the v8
+    # canonical manifest solely to preserve all deployed row and ledger identities;
+    # they do not identify the active published licence.
     dataset_license_template_repository="syvai/p1",
     dataset_license_template_revision=("449b9c2294026df6d0d37538f279fdec03f565ff"),
     dataset_license_template_url=(
@@ -174,8 +175,32 @@ class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
+class ActiveGovernanceContract(ContractModel):
+    """Publication governance kept outside the row identity manifest."""
+
+    version: StrictStr
+    expected_visibility: StrictStr
+    license_path: StrictStr
+    license_sha256: StrictStr
+    license_bytes: StrictInt = Field(gt=0)
+
+    @field_validator("license_sha256")
+    @classmethod
+    def _license_digest_is_valid(cls, value: str) -> str:
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("active licence digest must be lowercase SHA-256 hex")
+        return value
+
+    @field_validator("expected_visibility")
+    @classmethod
+    def _visibility_is_known(cls, value: str) -> str:
+        if value not in {"private", "public"}:
+            raise ValueError("expected visibility must be exactly private or public")
+        return value
+
+
 class DatasetLicenseContract(ContractModel):
-    """Immutable source and adaptation identity for the target data licence."""
+    """Historical licence identity retained for deployed-row compatibility."""
 
     template_repository: StrictStr
     template_revision: StrictStr
@@ -845,7 +870,7 @@ class VADContract(ContractModel):
 
 
 def _default_dataset_license() -> DatasetLicenseContract:
-    """Return the repository's immutable target dataset licence identity."""
+    """Return the historical licence identity used by deployed v8 rows."""
     contract = P1_RUNTIME_CONTRACT
     return DatasetLicenseContract(
         template_repository=contract.dataset_license_template_repository,

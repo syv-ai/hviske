@@ -1,4 +1,4 @@
-"""Private, verified publication of P1 dataset shards."""
+"""Visibility-bound, governance-verified publication of P1 dataset shards."""
 
 from __future__ import annotations
 
@@ -311,8 +311,8 @@ def build_dataset_card(
     Returns:
         The four-section Markdown card with machine-only identity coordinates.
     """
-    del source_provenance, permitted_use, field_schema, known_limitations
-    del rejection_policy, model_revisions, dataset_license
+    del source_provenance, permitted_use, private_access_terms, field_schema
+    del known_limitations, rejection_policy, model_revisions, dataset_license
     revisions = _parse_card_metadata(source_revisions)
     if not isinstance(revisions, dict):
         revisions = {}
@@ -353,7 +353,6 @@ def build_dataset_card(
     )
     _assert_safe_metadata(
         [
-            private_access_terms,
             audio_repository,
             audio_revision,
             transcript_repository,
@@ -383,8 +382,8 @@ def build_dataset_card(
         "with ElevenLabs Scribe v2 through the pinned "
         f"`{transcript_repository}` revision `{transcript_revision}`.\n\n"
         "## Access\n\n"
-        "This is a private dataset for authorised users. Load it with an immutable "
-        "dataset commit revision (not `main`):\n\n"
+        "This dataset is publicly accessible. Load it with an immutable dataset "
+        "commit revision (never `main`):\n\n"
         "```python\n"
         "from datasets import load_dataset\n\n"
         "dataset = load_dataset(\n"
@@ -394,13 +393,13 @@ def build_dataset_card(
         "    streaming=True,\n"
         ")\n"
         "```\n\n"
-        f"{_render_card_text(private_access_terms)}\n\n"
         "## Licence\n\n"
         "The dataset uses a layered licence. The dataset structure, arrangement, "
         "segment boundaries, and independently created metadata are CC BY 4.0; "
         "embedded DR audio and verbatim/source-derived transcript text are excluded. "
-        "Private access does not grant public redistribution or sublicensing of the "
-        "excluded content. See [LICENSE](LICENSE).\n"
+        "Public availability does not place excluded content under an open licence "
+        "or independently grant downstream rights. Users need relevant permissions "
+        "or another basis under applicable law. See [LICENSE](LICENSE).\n"
     )
 
 
@@ -510,7 +509,7 @@ class HfApiAdapter:
     def create_repo(
         self, repo_id: str, *, repo_type: str, private: bool, exist_ok: bool
     ) -> object:
-        """Create a private dataset repository.
+        """Create a dataset repository with the requested visibility.
 
         Returns:
             The Hub repository response.
@@ -606,6 +605,18 @@ class HfApiAdapter:
 
         return chunks()
 
+    def update_repo_visibility(
+        self, repo_id: str, *, repo_type: str, private: bool
+    ) -> object:
+        """Set repository visibility explicitly.
+
+        Returns:
+            The Hub settings response.
+        """
+        return self._api.update_repo_settings(
+            repo_id=repo_id, repo_type=repo_type, private=private, token=self._token
+        )
+
 
 class HubClient(t.Protocol):
     """The small Hub surface needed by the publisher."""
@@ -668,8 +679,11 @@ def initialise_private_dataset(
     gitattributes: str = "*.parquet filter=lfs diff=lfs merge=lfs -text\n",
     token: str | None = None,
     expected_pipeline_config_sha256: str | None = None,
+    expected_visibility: str = "public",
+    expected_license_sha256: str | None = None,
+    expected_license_bytes: int | None = None,
 ) -> str | None:
-    """Create and initialise a private dataset repository.
+    """Create and initialise a visibility-bound dataset repository.
 
     Args:
         api:
@@ -686,6 +700,12 @@ def initialise_private_dataset(
             Authentication token, used only to reject accidental card leakage.
         expected_pipeline_config_sha256 (optional):
             Expected hidden pipeline digest for the initial card.
+        expected_visibility (optional):
+            Exact target visibility. Defaults to public.
+        expected_license_sha256 (optional):
+            Active licence digest. Defaults to the tracked licence digest.
+        expected_license_bytes (optional):
+            Active licence size. Defaults to the supplied licence size.
 
     Returns:
         The immutable initialisation commit SHA, if a commit was made.
@@ -708,20 +728,40 @@ def initialise_private_dataset(
         raise PublicationError(
             "target card does not contain the active machine identity"
         )
+    license_payload = license_text.encode("utf-8")
+    if expected_license_sha256 is None:
+        expected_license_sha256 = hashlib.sha256(
+            (Path(__file__).resolve().parents[2] / "LICENSE-DATASET").read_bytes()
+        ).hexdigest()
+    if expected_license_bytes is None:
+        expected_license_bytes = len(license_payload)
     if (
-        hashlib.sha256(license_text.encode("utf-8")).hexdigest()
-        != P1_RUNTIME_CONTRACT.dataset_license_target_sha256
+        hashlib.sha256(license_payload).hexdigest() != expected_license_sha256
+        or len(license_payload) != expected_license_bytes
     ):
-        raise PublicationError("target dataset licence does not match the pinned file")
+        raise PublicationError(
+            "target dataset licence does not match active governance"
+        )
+    _expected_private(expected_visibility)
     try:
         info = api.repo_info(repo_id=repo_id, repo_type="dataset")
     except RepositoryNotFoundError:
         api.create_repo(
-            repo_id=repo_id, repo_type="dataset", private=True, exist_ok=True
+            repo_id=repo_id,
+            repo_type="dataset",
+            private=_expected_private(expected_visibility),
+            exist_ok=True,
         )
         info = api.repo_info(repo_id=repo_id, repo_type="dataset")
-    target_head = _target_head(info, repo_id)
-    _assert_initialise_target_is_safe(api, repo_id, card, revision=target_head)
+    target_head = _target_head(info, repo_id, expected_visibility=expected_visibility)
+    _assert_initialise_target_is_safe(
+        api,
+        repo_id,
+        card,
+        revision=target_head,
+        expected_license_sha256=expected_license_sha256,
+        expected_license_bytes=expected_license_bytes,
+    )
 
     with tempfile.TemporaryDirectory(prefix="hviske-p1-card-") as directory:
         root = Path(directory)
@@ -739,15 +779,36 @@ def initialise_private_dataset(
                 UploadOperation(path_in_repo=".gitattributes", path=attrs_path),
                 UploadOperation(path_in_repo="LICENSE", path=license_path),
             ),
-            message="Initialise private P1 dataset",
+            message="Initialise P1 dataset governance",
             parent_commit=target_head,
+            expected_visibility=expected_visibility,
         )
-        _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
-    return _commit_sha(commit)
+        _assert_visibility(
+            api.repo_info(repo_id=repo_id, repo_type="dataset"),
+            repo_id,
+            expected_visibility,
+        )
+    commit_id = _commit_sha(commit)
+    assert_active_governance(
+        api,
+        repo_id,
+        expected_visibility=expected_visibility,
+        expected_card=card,
+        expected_license_sha256=expected_license_sha256,
+        expected_license_bytes=expected_license_bytes,
+        revision=commit_id,
+    )
+    return commit_id
 
 
 def _assert_initialise_target_is_safe(
-    api: HubClient, repo_id: str, card: str, *, revision: str | None
+    api: HubClient,
+    repo_id: str,
+    card: str,
+    *,
+    revision: str | None,
+    expected_license_sha256: str,
+    expected_license_bytes: int,
 ) -> None:
     """Reject target trees that could contain an earlier generation payload.
 
@@ -796,11 +857,12 @@ def _assert_initialise_target_is_safe(
                 raise PublicationError(
                     "cannot inspect the existing target licence before initialisation"
                 ) from error
-            if hashlib.sha256(existing_license).hexdigest() != (
-                P1_RUNTIME_CONTRACT.dataset_license_target_sha256
+            if (
+                hashlib.sha256(existing_license).hexdigest() != expected_license_sha256
+                or len(existing_license) != expected_license_bytes
             ):
                 raise PublicationError(
-                    "existing target licence is not the pinned dataset licence"
+                    "existing target licence is not the active dataset licence"
                 )
         return
     try:
@@ -838,11 +900,12 @@ def _assert_initialise_target_is_safe(
             raise PublicationError(
                 "cannot inspect the existing target licence before initialisation"
             ) from error
-        if hashlib.sha256(existing_license).hexdigest() != (
-            P1_RUNTIME_CONTRACT.dataset_license_target_sha256
+        if (
+            hashlib.sha256(existing_license).hexdigest() != expected_license_sha256
+            or len(existing_license) != expected_license_bytes
         ):
             raise PublicationError(
-                "existing target licence is not the pinned dataset licence"
+                "existing target licence is not the active dataset licence"
             )
 
 
@@ -892,15 +955,26 @@ def _card_has_verified_identity(card: str) -> bool:
     }
 
 
-def _assert_private(info: object, repo_id: str) -> None:
-    if _value(info, "private") is not True:
+def _assert_visibility(info: object, repo_id: str, expected_visibility: str) -> None:
+    expected_private = _expected_private(expected_visibility)
+    actual = _value(info, "private")
+    if type(actual) is not bool or actual is not expected_private:
         raise PrivacyError(
-            f"private-only publication refuses unknown/public repository {repo_id!r}"
+            f"publication refuses repository {repo_id!r} without exact "
+            f"{expected_visibility} visibility"
         )
 
 
 class PrivacyError(PublicationError):
-    """Raised when the destination is not demonstrably private."""
+    """Raised when target visibility does not match the exact expected value."""
+
+
+def _expected_private(expected_visibility: str) -> bool:
+    if expected_visibility == "private":
+        return True
+    if expected_visibility == "public":
+        return False
+    raise PrivacyError("expected visibility must be exactly private or public")
 
 
 def _value(value: object, *names: str) -> object:
@@ -933,9 +1007,14 @@ def _mutate_commit(
     operations: c.Sequence[UploadOperation],
     message: str,
     parent_commit: str | None,
+    expected_visibility: str,
     commit_recorded: c.Callable[[str], None] | None = None,
 ) -> object:
-    _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
+    _assert_visibility(
+        api.repo_info(repo_id=repo_id, repo_type="dataset"),
+        repo_id,
+        expected_visibility,
+    )
     try:
         result = api.create_commit(
             repo_id,
@@ -950,7 +1029,9 @@ def _mutate_commit(
         if parent_commit is not None and _http_status_code(error) == 400:
             try:
                 current_head = _target_head(
-                    api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id
+                    api.repo_info(repo_id=repo_id, repo_type="dataset"),
+                    repo_id,
+                    expected_visibility=expected_visibility,
                 )
             except Exception:
                 current_head = parent_commit
@@ -960,11 +1041,15 @@ def _mutate_commit(
     commit_id = _commit_sha(result)
     if commit_recorded is not None:
         commit_recorded(commit_id)
-    _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
+    _assert_visibility(
+        api.repo_info(repo_id=repo_id, repo_type="dataset"),
+        repo_id,
+        expected_visibility,
+    )
     return result
 
 
-def _target_head(info: object, repo_id: str) -> str | None:
+def _target_head(info: object, repo_id: str, *, expected_visibility: str) -> str | None:
     """Return the exact current target head, including an empty-repo marker.
 
     Returns:
@@ -975,7 +1060,7 @@ def _target_head(info: object, repo_id: str) -> str | None:
         PublicationError:
             If the target is not private or exposes a non-immutable head.
     """
-    _assert_private(info, repo_id)
+    _assert_visibility(info, repo_id, expected_visibility)
     present = False
     value: object = None
     for name in ("sha", "oid", "commit_id"):
@@ -988,12 +1073,57 @@ def _target_head(info: object, repo_id: str) -> str | None:
             value = getattr(info, name)
             break
     if not present:
-        raise PublicationError("Hub did not expose the private target HEAD")
+        raise PublicationError("Hub did not expose the target HEAD")
     if value is None:
         return None
     if not isinstance(value, str) or not _COMMIT_SHA.fullmatch(value):
-        raise PublicationError("Hub did not return a complete private target HEAD")
+        raise PublicationError("Hub did not return a complete target HEAD")
     return value
+
+
+def assert_active_governance(
+    api: HubClient,
+    repo_id: str,
+    *,
+    expected_visibility: str,
+    expected_card: str,
+    expected_license_sha256: str,
+    expected_license_bytes: int,
+    revision: str | None = None,
+) -> str:
+    """Verify exact active metadata and visibility without reading corpus payloads.
+
+    Returns:
+        The immutable HEAD whose README and licence match active governance.
+
+    Raises:
+        PublicationError:
+            If visibility, HEAD, README, or licence does not match.
+    """
+    info = api.repo_info(repo_id=repo_id, repo_type="dataset")
+    head = _target_head(info, repo_id, expected_visibility=expected_visibility)
+    if head is None:
+        raise PublicationError("active governance requires an initialised target")
+    if revision is not None and revision != head:
+        raise PublicationError("target HEAD differs from expected governance revision")
+    try:
+        card = b"".join(
+            api.stream_file(repo_id, "README.md", repo_type="dataset", revision=head)
+        )
+        licence = b"".join(
+            api.stream_file(repo_id, "LICENSE", repo_type="dataset", revision=head)
+        )
+    except Exception as error:
+        raise PublicationError("cannot verify active target governance") from error
+    expected_card_bytes = expected_card.encode("utf-8")
+    if card != expected_card_bytes:
+        raise PublicationError("target README does not match active governance")
+    if (
+        len(licence) != expected_license_bytes
+        or hashlib.sha256(licence).hexdigest() != expected_license_sha256
+    ):
+        raise PublicationError("target LICENSE does not match active governance")
+    return head
 
 
 def publish_batch(
@@ -1014,6 +1144,10 @@ def publish_batch(
     staging_dir: Path | None = None,
     ledger: Ledger | None = None,
     commit_recorded: c.Callable[[str], None] | None = None,
+    expected_visibility: str = "public",
+    expected_card: str | None = None,
+    expected_license_sha256: str | None = None,
+    expected_license_bytes: int | None = None,
 ) -> BatchEvidence:
     """Commit, verify, stream-decode, and optionally purge one bounded batch.
 
@@ -1021,7 +1155,7 @@ def publish_batch(
         api:
             Injectable Hub client.
         repo_id:
-            Private dataset repository identifier.
+            Dataset repository identifier.
         batch_id:
             Stable local batch identifier.
         shards:
@@ -1053,6 +1187,14 @@ def publish_batch(
             Callback that checks the exact remote dataset schema.
         expected_schema (optional):
             Feature or Arrow schema compared exactly with each remote shard.
+        expected_visibility (optional):
+            Exact target visibility. Defaults to public.
+        expected_card (optional):
+            Exact active README required before and after publication.
+        expected_license_sha256 (optional):
+            Exact active licence digest paired with ``expected_card``.
+        expected_license_bytes (optional):
+            Exact active licence size paired with ``expected_card``.
 
     Returns:
         Verified or purged batch evidence.
@@ -1066,10 +1208,28 @@ def publish_batch(
     _validate_expected_identity(
         expected_pipeline_version, expected_pipeline_config_sha256
     )
+    _validate_governance_arguments(
+        expected_card=expected_card,
+        expected_license_sha256=expected_license_sha256,
+        expected_license_bytes=expected_license_bytes,
+    )
+    _expected_private(expected_visibility)
     if shards and len(shards) + 1 >= 100:
         raise AllowListError("a Hub commit must contain fewer than 100 operations")
     target_info = api.repo_info(repo_id=repo_id, repo_type="dataset")
-    target_head = _target_head(target_info, repo_id)
+    target_head = _target_head(
+        target_info, repo_id, expected_visibility=expected_visibility
+    )
+    if expected_card is not None:
+        target_head = assert_active_governance(
+            api,
+            repo_id,
+            expected_visibility=expected_visibility,
+            expected_card=expected_card,
+            expected_license_sha256=t.cast(str, expected_license_sha256),
+            expected_license_bytes=t.cast(int, expected_license_bytes),
+            revision=target_head,
+        )
     ledger_record = None if ledger is None else ledger.batch(batch_id)
     if ledger_record is not None and ledger_record.state in {
         LedgerState.COMMITTED,
@@ -1105,6 +1265,10 @@ def publish_batch(
             purge_callback=purge_callback,
             manifest_path=manifest_path,
             local_paths=local_paths,
+            expected_visibility=expected_visibility,
+            expected_card=expected_card,
+            expected_license_sha256=expected_license_sha256,
+            expected_license_bytes=expected_license_bytes,
         )
     if not shards:
         raise AllowListError("a publication batch must contain at least one shard")
@@ -1187,6 +1351,7 @@ def publish_batch(
         operations=operations,
         message=f"Publish P1 batch {batch_id}",
         parent_commit=target_head,
+        expected_visibility=expected_visibility,
         commit_recorded=remember_commit,
     )
     assert commit_id is not None
@@ -1210,6 +1375,10 @@ def publish_batch(
             None if purge_callback is None else lambda paths: purge_callback(paths)
         ),
         local_paths=tuple(shard.path for shard in shards),
+        expected_visibility=expected_visibility,
+        expected_card=expected_card,
+        expected_license_sha256=expected_license_sha256,
+        expected_license_bytes=expected_license_bytes,
     )
 
 
@@ -1232,6 +1401,10 @@ def verify_batch(
     durable_verification: c.Callable[[BatchEvidence], None] | None = None,
     purge_callback: c.Callable[[tuple[Path, ...]], None] | None = None,
     local_paths: c.Sequence[Path] | None = None,
+    expected_visibility: str = "public",
+    expected_card: str | None = None,
+    expected_license_sha256: str | None = None,
+    expected_license_bytes: int | None = None,
 ) -> BatchEvidence:
     """Idempotently verify a committed batch and optionally purge its files.
 
@@ -1254,6 +1427,12 @@ def verify_batch(
     _validate_expected_identity(
         expected_pipeline_version, expected_pipeline_config_sha256
     )
+    _validate_governance_arguments(
+        expected_card=expected_card,
+        expected_license_sha256=expected_license_sha256,
+        expected_license_bytes=expected_license_bytes,
+    )
+    _expected_private(expected_visibility)
     if ledger is not None:
         record = ledger.batch(batch_id)
         if record.commit_id is None:
@@ -1299,9 +1478,20 @@ def verify_batch(
             sha256=_sha256_bytes(manifest),
         ),
     )
-    _assert_private(
-        api.repo_info(repo_id=repo_id, repo_type="dataset", revision=commit_id), repo_id
+    _assert_visibility(
+        api.repo_info(repo_id=repo_id, repo_type="dataset", revision=commit_id),
+        repo_id,
+        expected_visibility,
     )
+    if expected_card is not None:
+        assert_active_governance(
+            api,
+            repo_id,
+            expected_visibility=expected_visibility,
+            expected_card=expected_card,
+            expected_license_sha256=t.cast(str, expected_license_sha256),
+            expected_license_bytes=t.cast(int, expected_license_bytes),
+        )
     streamed_files = _verify_remote(api, repo_id, expected=expected, revision=commit_id)
     remote_manifest = streamed_files.get(_manifest_repo_path(batch_id), manifest)
     if remote_manifest != manifest:
@@ -1356,6 +1546,21 @@ def verify_batch(
     if durable_verification is not None:
         durable_verification(result)
     if purge_callback is not None:
+        if expected_card is not None:
+            assert_active_governance(
+                api,
+                repo_id,
+                expected_visibility=expected_visibility,
+                expected_card=expected_card,
+                expected_license_sha256=t.cast(str, expected_license_sha256),
+                expected_license_bytes=t.cast(int, expected_license_bytes),
+            )
+        else:
+            _assert_visibility(
+                api.repo_info(repo_id=repo_id, repo_type="dataset"),
+                repo_id,
+                expected_visibility,
+            )
         if not durable:
             raise PublicationError("purge requires a durable verification callback")
         if ledger is not None and ledger.batch(batch_id).state is LedgerState.PURGED:
@@ -1786,6 +1991,27 @@ def _as_features(value: object) -> Features | None:
     if isinstance(value, dict):
         return Features(value)
     return None
+
+
+def _validate_governance_arguments(
+    *,
+    expected_card: str | None,
+    expected_license_sha256: str | None,
+    expected_license_bytes: int | None,
+) -> None:
+    supplied = (
+        expected_card is not None,
+        expected_license_sha256 is not None,
+        expected_license_bytes is not None,
+    )
+    if any(supplied) and not all(supplied):
+        raise ValueError("active governance arguments must be supplied together")
+    if expected_license_sha256 is not None and not _SHA256.fullmatch(
+        expected_license_sha256
+    ):
+        raise ValueError("active licence digest must be SHA-256")
+    if expected_license_bytes is not None and expected_license_bytes < 1:
+        raise ValueError("active licence byte count must be positive")
 
 
 def _verify_remote(
