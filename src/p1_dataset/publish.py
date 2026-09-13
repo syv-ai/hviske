@@ -534,6 +534,29 @@ class HfApiAdapter:
             token=self._token,
         )
 
+    def list_repo_commits(
+        self, repo_id: str, *, repo_type: str, revision: str | None = None
+    ) -> c.Iterable[object]:
+        """List immutable commit metadata for ancestry checks.
+
+        Returns:
+            Commit metadata returned by the Hub.
+
+        Raises:
+            HfHubHTTPError:
+                If the Hub rejects the metadata request.
+        """
+        try:
+            return self._api.list_repo_commits(
+                repo_id=repo_id,
+                repo_type=repo_type,
+                revision=revision,
+                token=self._token,
+            )
+        except HfHubHTTPError as error:
+            annotate_hub_error(error, phase="commit")
+            raise
+
     def list_repo_files(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
     ) -> c.Iterable[str]:

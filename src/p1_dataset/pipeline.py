@@ -2412,7 +2412,7 @@ def _publish_pending_unlocked(
         ledger.transition_batch(batch_id, _state("sharded"))
         record = ledger.batch(batch_id)
     if record.state in {_state("verified"), _state("purged")}:
-        from .publish import HubClient, verify_batch
+        from .publish import HubClient, assert_active_governance, verify_batch
 
         evidence = verify_batch(
             t.cast(HubClient, hub),
@@ -2426,12 +2426,28 @@ def _publish_pending_unlocked(
             expected_license_sha256=settings.active_governance.license_sha256,
             expected_license_bytes=settings.active_governance.license_bytes,
         )
+        assert_active_governance(
+            t.cast(HubClient, hub),
+            settings.target_private_repo,
+            expected_visibility=settings.expected_target_visibility,
+            expected_card=governance_card,
+            expected_license_sha256=settings.active_governance.license_sha256,
+            expected_license_bytes=settings.active_governance.license_bytes,
+        )
         if ledger.batch(batch_id).state is _state("verified"):
             expected = {
                 Path(item.local_path): (item.byte_size, item.sha256)
                 for item in ledger.shards(batch_id)
                 if item.local_path is not None
             }
+            assert_active_governance(
+                t.cast(HubClient, hub),
+                settings.target_private_repo,
+                expected_visibility=settings.expected_target_visibility,
+                expected_card=governance_card,
+                expected_license_sha256=settings.active_governance.license_sha256,
+                expected_license_bytes=settings.active_governance.license_bytes,
+            )
             _unlink_recovered(tuple(expected), expected=expected)
             ledger.purge_batch(
                 batch_id, evidence={"deleted": True, "kind": "publication-artifact"}
@@ -2787,7 +2803,12 @@ def _recover_native_batches(
     remains mandatory even when all local files are present.
     """
     del source
-    from .publish import HubClient, _manifest_bytes, verify_batch
+    from .publish import (
+        HubClient,
+        _manifest_bytes,
+        assert_active_governance,
+        verify_batch,
+    )
 
     unattached, _ = ledger.recovery_work()
     for record in unattached:
@@ -2847,56 +2868,77 @@ def _recover_native_batches(
                     row_counts=tuple(record.row_count for record in records),
                     parquet_sha256=tuple(record.sha256 for record in records),
                 )
-        verify_batch(
-            t.cast(HubClient, hub),
-            settings.target_private_repo,
-            batch.batch_id,
-            expected_pipeline_version=settings.pipeline_version,
-            expected_pipeline_config_sha256=settings.pipeline_digest,
-            ledger=ledger,
-            manifest_path=manifest_path,
-            local_paths=paths,
-            expected_visibility=settings.expected_target_visibility,
-            expected_card=build_active_dataset_card(settings),
-            expected_license_sha256=settings.active_governance.license_sha256,
-            expected_license_bytes=settings.active_governance.license_bytes,
-        )
-        expected_local: dict[Path, tuple[int, str]] = {
-            Path(record.local_path): (record.byte_size, record.sha256)
-            for record in records
-            if record.local_path is not None
-        }
-        if manifest_path is not None:
-            manifest = _manifest_bytes(
-                batch_id=batch.batch_id,
-                shards=tuple(
-                    ShardEvidence(
-                        path=record.path,
-                        byte_size=record.byte_size,
-                        row_count=record.row_count,
-                        sha256=record.sha256,
-                    )
-                    for record in records
-                ),
-                programme_count=batch.programme_count,
-                rejection_counts={
-                    RejectionCategory(key): value
-                    for key, value in batch.rejection_counts.items()
-                },
-            )
-            expected_local[manifest_path] = (
-                len(manifest),
-                hashlib.sha256(manifest).hexdigest(),
-            )
-        _unlink_recovered(tuple(expected_local), expected=expected_local)
-        recovered_batch = ledger.batch(batch.batch_id)
-        if recovered_batch.state is _state("verified"):
-            ledger.purge_batch(
+        governance_card = build_active_dataset_card(settings)
+        # Verification and local purge are one critical section.  Without this lock,
+        # another publisher could change governance after verification but before the
+        # recovery process deletes its local evidence.
+        with _publication_lock(settings.publish_lock_path):
+            verify_batch(
+                t.cast(HubClient, hub),
+                settings.target_private_repo,
                 batch.batch_id,
-                evidence={"deleted": True, "kind": "publication-artifact"},
+                expected_pipeline_version=settings.pipeline_version,
+                expected_pipeline_config_sha256=settings.pipeline_digest,
+                ledger=ledger,
+                manifest_path=manifest_path,
+                local_paths=paths,
+                expected_visibility=settings.expected_target_visibility,
+                expected_card=governance_card,
+                expected_license_sha256=settings.active_governance.license_sha256,
+                expected_license_bytes=settings.active_governance.license_bytes,
             )
-        if ledger.batch(batch.batch_id).state is _state("purged"):
-            ledger.finalise_batch_children(batch.batch_id)
+            assert_active_governance(
+                t.cast(HubClient, hub),
+                settings.target_private_repo,
+                expected_visibility=settings.expected_target_visibility,
+                expected_card=governance_card,
+                expected_license_sha256=settings.active_governance.license_sha256,
+                expected_license_bytes=settings.active_governance.license_bytes,
+            )
+            expected_local: dict[Path, tuple[int, str]] = {
+                Path(record.local_path): (record.byte_size, record.sha256)
+                for record in records
+                if record.local_path is not None
+            }
+            if manifest_path is not None:
+                manifest = _manifest_bytes(
+                    batch_id=batch.batch_id,
+                    shards=tuple(
+                        ShardEvidence(
+                            path=record.path,
+                            byte_size=record.byte_size,
+                            row_count=record.row_count,
+                            sha256=record.sha256,
+                        )
+                        for record in records
+                    ),
+                    programme_count=batch.programme_count,
+                    rejection_counts={
+                        RejectionCategory(key): value
+                        for key, value in batch.rejection_counts.items()
+                    },
+                )
+                expected_local[manifest_path] = (
+                    len(manifest),
+                    hashlib.sha256(manifest).hexdigest(),
+                )
+            assert_active_governance(
+                t.cast(HubClient, hub),
+                settings.target_private_repo,
+                expected_visibility=settings.expected_target_visibility,
+                expected_card=governance_card,
+                expected_license_sha256=settings.active_governance.license_sha256,
+                expected_license_bytes=settings.active_governance.license_bytes,
+            )
+            _unlink_recovered(tuple(expected_local), expected=expected_local)
+            recovered_batch = ledger.batch(batch.batch_id)
+            if recovered_batch.state is _state("verified"):
+                ledger.purge_batch(
+                    batch.batch_id,
+                    evidence={"deleted": True, "kind": "publication-artifact"},
+                )
+            if ledger.batch(batch.batch_id).state is _state("purged"):
+                ledger.finalise_batch_children(batch.batch_id)
     for batch in ledger.purged_batches_with_pending_children():
         ledger.finalise_batch_children(batch.batch_id)
 
