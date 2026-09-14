@@ -5,11 +5,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
 from transformers import EvalPrediction, TrainingArguments
 from transformers.modeling_outputs import CausalLMOutput
+from transformers.models.parakeet import (
+    ParakeetEncoderConfig,
+    ParakeetForRNNT,
+    ParakeetRNNTConfig,
+)
 from transformers.models.parakeet.feature_extraction_parakeet import (
     ParakeetFeatureExtractor,
 )
@@ -19,6 +25,7 @@ from transformers.pipelines.automatic_speech_recognition import (
 
 from hviske.cohere import get_asr_call_kwargs
 from hviske.compute_metrics import compute_error_rate_metrics
+from hviske.data import process_example
 from hviske.data_collators import DataCollatorParakeetWithPadding
 from hviske.data_models import Processor
 from hviske.model_setup import load_model_setup
@@ -61,6 +68,41 @@ def test_parakeet_collator_pads_frames_masks_and_labels() -> None:
     assert batch["labels"].tolist() == [[4, 5], [6, 0]]
 
 
+def test_parakeet_collator_pads_rnnt_decoder_inputs() -> None:
+    """RNNT decoder inputs are padded independently from transcript labels."""
+    processor = SimpleNamespace(
+        feature_extractor=ParakeetFeatureExtractor(feature_size=3),
+        tokenizer=MagicMock(),
+    )
+    processor.tokenizer.pad.side_effect = [
+        {"input_ids": torch.tensor([[1, 2], [3, 0]])},
+        {"input_ids": torch.tensor([[0, 1, 2], [0, 3, 0]])},
+    ]
+    collator = DataCollatorParakeetWithPadding(
+        processor=t.cast(Processor, processor), sample_rate=16_000, padding="longest"
+    )
+
+    batch = collator(
+        [
+            {
+                "input_features": torch.zeros(4, 3),
+                "attention_mask": torch.ones(4),
+                "labels": [1, 2],
+                "decoder_input_ids": [0, 1, 2],
+            },
+            {
+                "input_features": torch.zeros(6, 3),
+                "attention_mask": torch.ones(6),
+                "labels": [3],
+                "decoder_input_ids": [0, 3],
+            },
+        ]
+    )
+
+    assert batch["labels"].tolist() == [[1, 2], [3, 0]]
+    assert batch["decoder_input_ids"].tolist() == [[0, 1, 2], [0, 3, 0]]
+
+
 def test_parakeet_dispatch() -> None:
     """The model factory selects the Parakeet setup."""
     config = OmegaConf.create({"model": {"type": "parakeet"}})
@@ -73,9 +115,14 @@ def test_parakeet_family_rejects_collection_checkpoint() -> None:
         parakeet_family(SimpleNamespace(model_type="nemo"))
 
 
+def test_parakeet_family_rejects_tdt_architecture() -> None:
+    """TDT directs users to NeMo instead of attempting native fine-tuning."""
+    with pytest.raises(ValueError, match="Use NVIDIA NeMo"):
+        parakeet_family(SimpleNamespace(model_type="parakeet_tdt"))
+
+
 def test_parakeet_family_uses_checkpoint_architecture() -> None:
-    """TDT and RNNT are distinguished using native Transformers config data."""
-    assert parakeet_family(SimpleNamespace(model_type="parakeet_tdt")) == "tdt"
+    """RNNT is identified from native Transformers config data."""
     assert (
         parakeet_family(
             SimpleNamespace(model_type="unknown", architectures=["ParakeetForRNNT"])
@@ -132,7 +179,7 @@ def test_parakeet_generation_trainer_unwraps_transducer_output(tmp_path: Path) -
 def test_parakeet_inference_omits_whisper_generation_kwargs() -> None:
     """Shared pipelines must not send language/task kwargs to Parakeet."""
     transcriber = SimpleNamespace(
-        model=SimpleNamespace(config=SimpleNamespace(model_type="parakeet_tdt"))
+        model=SimpleNamespace(config=SimpleNamespace(model_type="parakeet_rnnt"))
     )
     assert (
         get_asr_call_kwargs(t.cast(AutomaticSpeechRecognitionPipeline, transcriber))
@@ -171,7 +218,7 @@ def test_parakeet_load_model_selects_native_auto_class(
 
 
 def test_parakeet_metric_decodes_generated_sequences() -> None:
-    """RNNT/TDT generated IDs use the same tokenizer path as CTC labels."""
+    """RNNT generated IDs use the same tokenizer path as CTC labels."""
     tokenizer = MagicMock(pad_token_id=0)
     tokenizer.batch_decode.side_effect = [["hej"], ["hej"]]
     processor = SimpleNamespace(
@@ -188,3 +235,126 @@ def test_parakeet_metric_decodes_generated_sequences() -> None:
 
     assert metrics == {"cer": 0.0, "wer": 0.0}
     assert tokenizer.batch_decode.call_count == 2
+
+
+def test_parakeet_metrics_replace_trainer_padding() -> None:
+    """Variable-length generated IDs never pass Trainer's -100 to decoding."""
+    tokenizer = MagicMock(pad_token_id=0)
+    tokenizer.batch_decode.side_effect = [["hej", "du"], ["hej", "du"]]
+    processor = SimpleNamespace(
+        tokenizer=tokenizer, batch_decode=tokenizer.batch_decode
+    )
+    setup = ParakeetModelSetup(
+        config=OmegaConf.create(
+            {"model": {"type": "parakeet", "pretrained_model_id": "checkpoint"}}
+        )
+    )
+    setup.processor = t.cast(Processor, processor)
+
+    metrics = setup.load_compute_metrics()(
+        EvalPrediction(
+            predictions=np.array([[1, 2], [3, -100]]),
+            label_ids=np.array([[1, 2], [3, 0]]),
+        )
+    )
+
+    assert metrics == {"cer": 0.0, "wer": 0.0}
+    decoded_predictions = tokenizer.batch_decode.call_args_list[0].args[0]
+    assert -100 not in decoded_predictions
+    assert decoded_predictions.tolist() == [[1, 2], [3, 0]]
+
+
+def test_parakeet_processing_keeps_joint_decoder_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RNNT processing retains decoder IDs returned by the real processor contract."""
+    monkeypatch.setattr("hviske.data.download_background_noises", lambda: None)
+
+    class FakeParakeetProcessor:
+        blank_token = "<blank>"
+        decoder_type = "rnnt"
+
+        def __call__(self, audio: object, text: str, sampling_rate: int) -> dict:
+            assert len(t.cast(np.ndarray, audio)) == 32_000
+            assert text == "hej"
+            assert sampling_rate == 16_000
+            return {
+                "input_features": [[[0.0]]],
+                "attention_mask": [[1]],
+                "decoder_input_ids": [[4, 7]],
+                "labels": [[7]],
+            }
+
+    processed = process_example(
+        example={
+            "text": "hej",
+            "audio": {
+                "array": np.zeros(32_000, dtype=np.float32),
+                "sampling_rate": 16_000,
+            },
+        },
+        characters_to_keep=None,
+        conversion_dict={},
+        text_column="text",
+        audio_column="audio",
+        lower_case=False,
+        convert_numerals=False,
+        processor=t.cast(t.Callable, FakeParakeetProcessor()),
+        normalise_audio=False,
+        augment_audio=False,
+    )
+
+    assert processed["decoder_input_ids"] == [4, 7]
+    assert processed["num_seconds"] == 2.0
+
+
+def test_parakeet_rejects_max_length_padding() -> None:
+    """Frame max length cannot be inferred from the shared training config."""
+    processor = SimpleNamespace(
+        feature_extractor=ParakeetFeatureExtractor(feature_size=3),
+        tokenizer=MagicMock(),
+    )
+    with pytest.raises(ValueError, match="padding='max_length'"):
+        DataCollatorParakeetWithPadding(
+            processor=t.cast(Processor, processor),
+            sample_rate=16_000,
+            padding="max_length",
+        )
+
+
+def test_parakeet_rnnt_forward_computes_native_loss() -> None:
+    """A real tiny Transformers RNNT model computes its native loss."""
+    encoder_config = ParakeetEncoderConfig(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        conv_kernel_size=3,
+        subsampling_conv_channels=4,
+        num_mel_bins=16,
+        max_position_embeddings=100,
+        dropout=0.0,
+        layerdrop=0.0,
+        activation_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    model = ParakeetForRNNT(
+        ParakeetRNNTConfig(
+            encoder_config=encoder_config,
+            vocab_size=5,
+            decoder_hidden_size=4,
+            num_decoder_layers=1,
+            pad_token_id=4,
+            blank_token_id=4,
+        )
+    )
+
+    outputs = model(
+        input_features=torch.randn(2, 64, 16),
+        attention_mask=torch.ones(2, 64),
+        decoder_input_ids=torch.tensor([[4, 1, 2], [4, 1, 4]]),
+        labels=torch.tensor([[1, 2], [1, 4]]),
+    )
+
+    assert outputs.loss is not None
+    assert torch.isfinite(outputs.loss)

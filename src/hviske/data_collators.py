@@ -250,13 +250,13 @@ def _pad_length_backed_features(
 
 @dataclass
 class DataCollatorParakeetWithPadding(DataCollatorMixin):
-    """Pad Parakeet frame features, masks, and tokenizer labels.
+    """Pad Parakeet frame features, decoder inputs, and labels.
 
     Parakeet receives log-mel features shaped ``(frames, feature_size)``.  The
     feature extractor knows the feature size and frame padding value, so this
     collator intentionally delegates padding rather than assuming a mel width.
-    Labels remain padded with the tokenizer's pad ID: the native Parakeet CTC,
-    RNNT, and TDT losses use that ID to determine target lengths.
+    Native RNNT labels and decoder inputs remain padded with the tokenizer's
+    blank/pad ID.
     """
 
     processor: Processor
@@ -264,13 +264,28 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
     padding: bool | str
     return_tensors: str = "pt"
 
+    def __post_init__(self) -> None:
+        """Reject frame padding without an explicit Parakeet frame length.
+
+        Raises:
+            ValueError:
+                If ``padding`` is ``"max_length"``.
+        """
+        if self.padding == "max_length":
+            raise ValueError(
+                "Parakeet does not support padding='max_length': a frame max_length "
+                "is required, but this configuration does not provide one. Use "
+                "padding='longest' instead."
+            )
+
     def torch_call(self, features: list[dict]) -> BatchFeature:
         """Collate preprocessed Parakeet features and padded labels.
 
         Args:
             features:
                 Examples containing ``input_features`` and optionally an
-                ``attention_mask``, plus token ID ``labels``.
+                ``attention_mask``, plus token ID ``labels``. RNNT examples
+                also contain ``decoder_input_ids``.
 
         Returns:
             A batch suitable for a native Parakeet model.
@@ -315,6 +330,21 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
             label_features, padding=self.padding, return_tensors=self.return_tensors
         )
         batch["labels"] = labels_batch["input_ids"]
+
+        if "decoder_input_ids" in features[0]:
+            if any("decoder_input_ids" not in feature for feature in features):
+                raise ValueError(
+                    "Every Parakeet RNNT feature must contain decoder_input_ids."
+                )
+            decoder_features = [
+                {"input_ids": feature["decoder_input_ids"]} for feature in features
+            ]
+            decoder_batch = self.processor.tokenizer.pad(
+                decoder_features,
+                padding=self.padding,
+                return_tensors=self.return_tensors,
+            )
+            batch["decoder_input_ids"] = decoder_batch["input_ids"]
         return batch
 
 

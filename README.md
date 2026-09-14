@@ -44,14 +44,12 @@ Here are some of the more important available keys:
   - `cohere`
   - `parakeet-ctc`
   - `parakeet-rnnt`
-  - `parakeet-tdt`
-  - `parakeet-rnnt-da-dk` (reference only; see below)
 
-  The `parakeet-*` configs use the Transformers-native NVIDIA Parakeet CTC,
-  RNNT, and TDT implementations. The Danish `parakeet-rnnt-da-dk` checkpoint is
-  currently published only as a NeMo `.nemo` collection artefact and is therefore
-  rejected with a helpful error; convert it to a Transformers checkpoint first.
-  Parakeet RNNT and TDT evaluation uses native generation and does not pass Whisper
+  The `parakeet-*` configs use the Transformers-native NVIDIA Parakeet CTC and
+  RNNT implementations. Parakeet TDT fine-tuning is not supported on the
+  Transformers stack because its native loss is broken; use NVIDIA NeMo instead.
+  The Danish `parakeet-rnnt-da-dk` repository is NeMo-only and is not supported.
+  Parakeet RNNT evaluation uses native generation and does not pass Whisper
   language or task generation arguments.
 
   The `cohere` config fine-tunes `CohereLabs/cohere-transcribe-03-2026` with a
