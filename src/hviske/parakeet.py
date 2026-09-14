@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from omegaconf import DictConfig
+from torch import nn
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -17,6 +18,10 @@ from transformers import (
     PreTrainedConfig,
     PreTrainedModel,
     Trainer,
+)
+from transformers.models.parakeet.modeling_parakeet import (
+    ParakeetRNNTDecoder,
+    ParakeetRNNTJointNetwork,
 )
 from transformers.trainer_utils import EvalPrediction
 
@@ -107,6 +112,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
             model = AutoModelForCTC.from_pretrained(model_id, **kwargs)
         else:
             model = AutoModel.from_pretrained(model_id, **kwargs)
+        self._resize_model_vocabulary(model=model, family=family)
 
         if self.config.model.get("freeze_feature_encoder", False):
             encoder = getattr(model, "encoder", None)
@@ -140,6 +146,119 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
             ) from error
         return parakeet_family(config=config)
 
+    def _resize_model_vocabulary(
+        self, model: PreTrainedModel, family: ParakeetFamily
+    ) -> None:
+        """Resize Parakeet vocabulary-dependent modules after processor adaptation."""
+        processor = getattr(self, "processor", None)
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            return
+
+        vocabulary_size = len(tokenizer)
+        if family == "ctc":
+            self._resize_ctc_head(model=model, vocabulary_size=vocabulary_size)
+        else:
+            self._resize_rnnt_heads(model=model, vocabulary_size=vocabulary_size)
+
+    @staticmethod
+    def _resize_ctc_head(model: PreTrainedModel, vocabulary_size: int) -> None:
+        """Resize a CTC head while retaining its pretrained rows.
+
+        Raises:
+            ValueError:
+                If the model does not expose a CTC head or the target vocabulary
+                would discard existing output rows.
+        """
+        head = getattr(model, "ctc_head", None)
+        if not isinstance(head, nn.Conv1d):
+            raise ValueError("Native Parakeet CTC model does not provide ctc_head.")
+        if head.out_channels > vocabulary_size:
+            raise ValueError("The adapted tokenizer is smaller than the CTC head.")
+        if head.out_channels < vocabulary_size:
+            new_head = type(head)(
+                in_channels=head.in_channels,
+                out_channels=vocabulary_size,
+                kernel_size=head.kernel_size,
+                stride=head.stride,
+                padding=head.padding,
+                dilation=head.dilation,
+                groups=head.groups,
+                bias=head.bias is not None,
+                padding_mode=head.padding_mode,
+                device=head.weight.device,
+                dtype=head.weight.dtype,
+            )
+            model._init_weights(new_head)
+            with torch.no_grad():
+                new_head.weight[: head.out_channels].copy_(head.weight)
+                if head.bias is not None and new_head.bias is not None:
+                    new_head.bias[: head.out_channels].copy_(head.bias)
+            model.ctc_head = new_head
+        model.config.vocab_size = vocabulary_size
+
+    @staticmethod
+    def _resize_rnnt_heads(model: PreTrainedModel, vocabulary_size: int) -> None:
+        """Resize RNNT decoder and joint heads while retaining pretrained rows.
+
+        Raises:
+            ValueError:
+                If the model does not expose the expected heads or the target
+                vocabulary would discard existing rows.
+        """
+        decoder = t.cast(ParakeetRNNTDecoder | None, getattr(model, "decoder", None))
+        joint = t.cast(ParakeetRNNTJointNetwork | None, getattr(model, "joint", None))
+        if decoder is None or joint is None:
+            raise ValueError(
+                "Native Parakeet RNNT model does not provide decoder and joint heads."
+            )
+        embedding = decoder.embedding
+        head = joint.head
+        if not isinstance(embedding, nn.Embedding) or not isinstance(head, nn.Linear):
+            raise ValueError(
+                "Native Parakeet RNNT model does not provide decoder and joint heads."
+            )
+        if (
+            embedding.num_embeddings > vocabulary_size
+            or head.out_features > vocabulary_size
+        ):
+            raise ValueError("The adapted tokenizer is smaller than an RNNT head.")
+
+        if embedding.num_embeddings < vocabulary_size:
+            new_embedding = nn.Embedding(
+                num_embeddings=vocabulary_size,
+                embedding_dim=embedding.embedding_dim,
+                padding_idx=embedding.padding_idx,
+                device=embedding.weight.device,
+                dtype=embedding.weight.dtype,
+            )
+            model._init_weights(new_embedding)
+            with torch.no_grad():
+                new_embedding.weight[: embedding.num_embeddings].copy_(embedding.weight)
+            decoder.embedding = new_embedding
+
+        if head.out_features < vocabulary_size:
+            new_head = nn.Linear(
+                in_features=head.in_features,
+                out_features=vocabulary_size,
+                bias=head.bias is not None,
+                device=head.weight.device,
+                dtype=head.weight.dtype,
+            )
+            model._init_weights(new_head)
+            with torch.no_grad():
+                new_head.weight[: head.out_features].copy_(head.weight)
+                if head.bias is not None and new_head.bias is not None:
+                    new_head.bias[: head.out_features].copy_(head.bias)
+            joint.head = new_head
+
+        joint.vocab_size = vocabulary_size
+        model.config.vocab_size = vocabulary_size
+        generation_config = getattr(model, "generation_config", None)
+        blank_token_id = getattr(model.config, "blank_token_id", None)
+        if generation_config is not None and blank_token_id is not None:
+            generation_config.decoder_start_token_id = blank_token_id
+
     def load_processor(self) -> Processor:
         """Load the Transformers-native Parakeet processor.
 
@@ -166,9 +285,37 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
                 f"Parakeet checkpoint {model_id!r} does not provide a "
                 "Transformers feature extractor and tokenizer."
             )
-        if self._load_family(model_id=model_id) == "rnnt":
+        family = self._load_family(model_id=model_id)
+        if family == "rnnt":
             setattr(processor, "decoder_type", "rnnt")
-        self.processor = processor
+        self.processor = self._adapt_processor(processor=processor)
+        return self.processor
+
+    def _adapt_processor(self, processor: Processor) -> Processor:
+        """Add retained characters that the native tokenizer cannot encode.
+
+        Added tokens are deliberately ordinary tokens.  This leaves the native BPE
+        vocabulary and every existing special-token ID untouched.
+
+        Returns:
+            The processor with the adapted tokenizer.
+        """
+        characters_to_keep = self.config.model.get("characters_to_keep")
+        if characters_to_keep is None:
+            return processor
+
+        tokenizer = processor.tokenizer
+        unknown_token_id = tokenizer.unk_token_id
+        if unknown_token_id is None:
+            return processor
+
+        for character in dict.fromkeys(str(char) for char in characters_to_keep):
+            token_ids = tokenizer(character, add_special_tokens=False)["input_ids"]
+            if (
+                tokenizer.convert_tokens_to_ids(character) == unknown_token_id
+                or unknown_token_id in token_ids
+            ):
+                tokenizer.add_tokens(character)
         return processor
 
     def load_saved(self) -> PreTrainedModelData:
@@ -197,6 +344,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         family = self._load_family(model_id=model_path)
         if family == "rnnt":
             setattr(processor, "decoder_type", "rnnt")
+        processor = self._adapt_processor(processor=processor)
         try:
             if family == "ctc":
                 model = AutoModelForCTC.from_pretrained(
@@ -211,6 +359,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
             ) from error
 
         self.processor = processor
+        self._resize_model_vocabulary(model=model, family=family)
         return PreTrainedModelData(
             processor=processor,
             model=model,
