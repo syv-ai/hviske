@@ -598,6 +598,24 @@ class HfApiAdapter:
         )
         return dataset.cast_column("audio", Audio(sampling_rate=16000, decode=False))
 
+    def open_file(
+        self, repo_id: str, path: str, *, repo_type: str, revision: str
+    ) -> object:
+        """Open one immutable Hub file for bounded random-access reads.
+
+        Returns:
+            A seekable remote file handle.
+
+        Raises:
+            ValueError:
+                If a non-dataset repository is requested.
+        """
+        if repo_type != "dataset":
+            raise ValueError("P1 publication only supports dataset repositories")
+        return self._filesystem.open(
+            f"datasets/{repo_id}/{path}", mode="rb", revision=revision
+        )
+
     def repo_info(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
     ) -> object:
