@@ -14,12 +14,14 @@ import torch
 from omegaconf import DictConfig
 from torch.backends.mps import is_available as mps_is_available
 from transformers import (
+    PreTrainedModel,
     Wav2Vec2CTCTokenizer,
     Wav2Vec2FeatureExtractor,
     Wav2Vec2ForCTC,
     Wav2Vec2Processor,
     Wav2Vec2ProcessorWithLM,
 )
+from transformers.data.data_collator import DataCollatorMixin
 from transformers.trainer import Trainer
 from transformers.trainer_utils import EvalPrediction, SchedulerType
 from transformers.training_args import OptimizerNames, TrainingArguments
@@ -50,7 +52,7 @@ class Wav2Vec2ModelSetup(ModelSetup):
         """Return the compute metrics function for the model."""
         return partial(compute_error_rate_metrics, processor=self.processor)
 
-    def load_data_collator(self) -> DataCollatorCTCWithPadding:
+    def load_data_collator(self) -> DataCollatorMixin:
         """Return the data collator for the model.
 
         Returns:
@@ -63,7 +65,7 @@ class Wav2Vec2ModelSetup(ModelSetup):
             padding=self.config.padding,
         )
 
-    def load_model(self) -> Wav2Vec2ForCTC:
+    def load_model(self) -> PreTrainedModel:
         """Return the model for the model."""
         with transformers_output_ignored():
             model = Wav2Vec2ForCTC.from_pretrained(
@@ -94,7 +96,7 @@ class Wav2Vec2ModelSetup(ModelSetup):
 
         return model
 
-    def load_processor(self) -> Wav2Vec2Processor:
+    def load_processor(self) -> Processor:
         """Return the processor for the model.
 
         Returns:

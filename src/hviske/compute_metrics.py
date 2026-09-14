@@ -46,6 +46,7 @@ def compute_error_rate_metrics(
     # ensures that the WER metric does not consider these labels in its computation.
     labels = pred.label_ids
     assert isinstance(labels, np.ndarray)
+    labels = labels.copy()
     labels[labels == -100] = pad_token
 
     # Whisper decoding

@@ -1103,6 +1103,17 @@ def _processing_features(
         return None
     if processor is None:
         return None
+    model_input_names = getattr(processor, "model_input_names", [])
+    if "input_features" in model_input_names and not hasattr(
+        processor, "get_decoder_prompt_ids"
+    ):
+        return Features(
+            input_features=Sequence(Sequence(Value("float64"))),
+            attention_mask=Sequence(Value("int64")),
+            labels=Sequence(Value("int64")),
+            input_length=Value("int64"),
+            num_seconds=Value("float64"),
+        )
     if not hasattr(processor, "get_decoder_prompt_ids"):
         return Features(
             input_values=Sequence(Value("float64")),
@@ -1409,6 +1420,8 @@ def process_example(
     )
     audio_array = processed[audio_feature_name][0]
     example[audio_feature_name] = audio_array
+    if audio_feature_name == "input_features" and "attention_mask" in processed:
+        example["attention_mask"] = _to_python(processed["attention_mask"][0])
     example["num_seconds"] = len(example[audio_feature_name]) / sampling_rate
 
     # Some remote processors require audio for every call, so tokenise labels through
