@@ -249,6 +249,76 @@ def _pad_length_backed_features(
 
 
 @dataclass
+class DataCollatorParakeetWithPadding(DataCollatorMixin):
+    """Pad Parakeet frame features, masks, and tokenizer labels.
+
+    Parakeet receives log-mel features shaped ``(frames, feature_size)``.  The
+    feature extractor knows the feature size and frame padding value, so this
+    collator intentionally delegates padding rather than assuming a mel width.
+    Labels remain padded with the tokenizer's pad ID: the native Parakeet CTC,
+    RNNT, and TDT losses use that ID to determine target lengths.
+    """
+
+    processor: Processor
+    sample_rate: int
+    padding: bool | str
+    return_tensors: str = "pt"
+
+    def torch_call(self, features: list[dict]) -> BatchFeature:
+        """Collate preprocessed Parakeet features and padded labels.
+
+        Args:
+            features:
+                Examples containing ``input_features`` and optionally an
+                ``attention_mask``, plus token ID ``labels``.
+
+        Returns:
+            A batch suitable for a native Parakeet model.
+
+        Raises:
+            ValueError:
+                If examples do not contain preprocessed features or raw audio.
+        """
+        if "input_features" in features[0]:
+            audio_features = [
+                {
+                    key: feature[key]
+                    for key in ("input_features", "attention_mask")
+                    if key in feature
+                }
+                for feature in features
+            ]
+            batch = self.processor.feature_extractor.pad(
+                audio_features,
+                padding=self.padding,
+                return_attention_mask=True,
+                return_tensors=self.return_tensors,
+            )
+        elif "audio" in features[0]:
+            batch = self.processor.feature_extractor(
+                [feature["audio"]["array"] for feature in features],
+                sampling_rate=self.sample_rate,
+                padding=self.padding,
+                return_attention_mask=True,
+                return_tensors=self.return_tensors,
+            )
+        else:
+            raise ValueError(
+                "Parakeet features must contain either 'input_features' or 'audio'."
+            )
+
+        if "attention_mask" in batch:
+            batch["attention_mask"] = batch["attention_mask"].long()
+
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        labels_batch = self.processor.tokenizer.pad(
+            label_features, padding=self.padding, return_tensors=self.return_tensors
+        )
+        batch["labels"] = labels_batch["input_ids"]
+        return batch
+
+
+@dataclass
 class DataCollatorSpeechSeq2SeqWithPadding(DataCollatorMixin):
     """Data collator that will dynamically pad the inputs received.
 

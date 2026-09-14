@@ -869,6 +869,10 @@ def get_asr_call_kwargs(
     """Return generation arguments compatible with the selected ASR model."""
     if isinstance(transcriber, CohereASRTranscriber):
         return {}
+    model = getattr(transcriber, "model", None)
+    model_type = str(getattr(getattr(model, "config", None), "model_type", ""))
+    if model_type.startswith("parakeet"):
+        return {}
     return {"generate_kwargs": {"language": "danish", "task": "transcribe"}}
 
 
