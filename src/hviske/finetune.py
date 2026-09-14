@@ -39,103 +39,114 @@ def finetune(config: DictConfig) -> None:
             The Hydra configuration object.
     """
     validate_private_only_config(config=config)
-    download_background_noises()
 
     # Note if we're on the main process, if we are running in a distributed setting
     is_main_process = os.getenv("RANK", "0") == "0"
-
-    model_setup: ModelSetup = load_model_setup(config=config)
-    processor = model_setup.load_processor()
-    dataset = load_data_for_finetuning(config=config, processor=processor)
-    processor.save_pretrained(save_directory=config.model_dir)
-    model = model_setup.load_model()
-
     extracking_setup: ExTrackingSetup | None = None
     if config.enable_experiment_tracking and is_main_process:
         extracking_setup = load_extracking_setup(config=config)
-        extracking_setup.run_initialization()
 
-    vals = {
-        split_name: split
-        for split_name, split in dataset.items()
-        if split_name.startswith("val")
-    }
-    match len(vals):
-        case 0:
-            eval_dataset = None
-        case 1:
-            eval_dataset = list(vals.values())[0]
-        case _:
-            eval_dataset = vals
+    try:
+        if extracking_setup is not None:
+            extracking_setup.run_initialization()
 
-    if eval_dataset is None and is_main_process:
-        logger.info("No validation set found. Disabling early stopping.")
+        download_background_noises()
+        model_setup: ModelSetup = load_model_setup(config=config)
+        processor = model_setup.load_processor()
+        dataset = load_data_for_finetuning(config=config, processor=processor)
+        processor.save_pretrained(save_directory=config.model_dir)
+        model = model_setup.load_model()
 
-    callbacks: list[TrainerCallback] = []
-    evaluation_steps = config.get("evaluation_steps")
-    if evaluation_steps:
-        callbacks.append(
-            EvaluationScheduleCallback(
-                evaluation_steps=[int(step) for step in evaluation_steps],
-                metrics_path=config.get("evaluation_metrics_path"),
-            )
-        )
-    if eval_dataset is not None and config.early_stopping:
-        callbacks.append(
-            EarlyStoppingCallback(
-                early_stopping_patience=config.early_stopping_patience
-            )
-        )
+        vals = {
+            split_name: split
+            for split_name, split in dataset.items()
+            if split_name.startswith("val")
+        }
+        match len(vals):
+            case 0:
+                eval_dataset = None
+            case 1:
+                eval_dataset = list(vals.values())[0]
+            case _:
+                eval_dataset = vals
 
-    trainer = model_setup.load_trainer_class()(
-        model=model,
-        data_collator=model_setup.load_data_collator(),
-        args=model_setup.load_training_arguments(),
-        compute_metrics=model_setup.load_compute_metrics(),
-        train_dataset=dataset["train"],
-        eval_dataset=eval_dataset,
-        processing_class=getattr(processor, "tokenizer"),
-        callbacks=callbacks or None,
-    )
+        if eval_dataset is None and is_main_process:
+            logger.info("No validation set found. Disabling early stopping.")
 
-    block_terminal_output()
-    with disable_tqdm():
-        trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
-
-    if extracking_setup is not None and is_main_process:
-        extracking_setup.run_finalization()
-
-    model.save_pretrained(save_directory=config.model_dir)
-
-    if hasattr(config.model, "use_decoder") and config.model.use_decoder:
-        train_and_store_ngram_model(config=config)
-
-    if config.push_to_hub:
-        push_model_to_hub(
-            trainer=trainer,
-            model_name=config.model_id,
-            finetuned_from=config.model.pretrained_model_id,
-            create_pr=config.create_pr,
-            private=config.private,
-            private_only=config.get("private_only", False),
-            model_card_languages=config.get("model_card_languages"),
-            training_dataset_ids=list(
-                config.get("training_dataset_ids")
-                or [
-                    str(dataset_config.id)
-                    for dataset_config in config.datasets.values()
-                ]
-            ),
-            evaluation_status=(
-                config.get("evaluation_status")
-                or (
-                    "Evaluation ran during training."
-                    if eval_dataset is not None
-                    else "Not evaluated: no validation set was configured."
+        callbacks: list[TrainerCallback] = []
+        evaluation_steps = config.get("evaluation_steps")
+        if evaluation_steps:
+            callbacks.append(
+                EvaluationScheduleCallback(
+                    evaluation_steps=[int(step) for step in evaluation_steps],
+                    metrics_path=config.get("evaluation_metrics_path"),
                 )
-            ),
-            finetuned_from_revision=config.model.get("revision"),
+            )
+        stop_after_steps = config.get("stop_after_steps")
+        if stop_after_steps is not None:
+            callbacks.append(
+                StopAfterStepCallback(stop_after_steps=int(stop_after_steps))
+            )
+        if eval_dataset is not None and config.early_stopping:
+            callbacks.append(
+                EarlyStoppingCallback(
+                    early_stopping_patience=config.early_stopping_patience
+                )
+            )
+
+        trainer = model_setup.load_trainer_class()(
+            model=model,
+            data_collator=model_setup.load_data_collator(),
+            args=model_setup.load_training_arguments(),
+            compute_metrics=model_setup.load_compute_metrics(),
+            train_dataset=dataset["train"],
+            eval_dataset=eval_dataset,
+            processing_class=getattr(processor, "tokenizer"),
+            callbacks=callbacks or None,
         )
+
+        block_terminal_output()
+        with disable_tqdm():
+            trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
+
+        model.save_pretrained(save_directory=config.model_dir)
+
+        if hasattr(config.model, "use_decoder") and config.model.use_decoder:
+            train_and_store_ngram_model(config=config)
+
+        if config.push_to_hub:
+            push_model_to_hub(
+                trainer=trainer,
+                model_name=config.model_id,
+                finetuned_from=config.model.pretrained_model_id,
+                create_pr=config.create_pr,
+                private=config.private,
+                private_only=config.get("private_only", False),
+                model_card_languages=config.get("model_card_languages"),
+                training_dataset_ids=list(
+                    config.get("training_dataset_ids")
+                    or [
+                        str(dataset_config.id)
+                        for dataset_config in config.datasets.values()
+                    ]
+                ),
+                evaluation_status=(
+                    config.get("evaluation_status")
+                    or (
+                        "Evaluation ran during training."
+                        if eval_dataset is not None
+                        else "Not evaluated: no validation set was configured."
+                    )
+                ),
+                finetuned_from_revision=config.model.get("revision"),
+            )
+    except BaseException:
+        if extracking_setup is not None:
+            _finalize_tracking_after_failure(extracking_setup)
+        raise
+    else:
+        if extracking_setup is not None:
+            extracking_setup.run_finalization(exit_code=0)
 
 
 class EvaluationScheduleCallback(TrainerCallback):
@@ -194,3 +205,47 @@ class EvaluationScheduleCallback(TrainerCallback):
         del args, kwargs
         control.should_evaluate = state.global_step in self.evaluation_steps
         return control
+
+
+class StopAfterStepCallback(TrainerCallback):
+    """Stop training after a step without changing the scheduler horizon."""
+
+    def __init__(self, stop_after_steps: int) -> None:
+        """Initialise the callback with the final permitted global step.
+
+        Args:
+            stop_after_steps:
+                Global step at which training should stop.
+
+        Raises:
+            ValueError:
+                If ``stop_after_steps`` is not positive.
+        """
+        if stop_after_steps < 1:
+            raise ValueError("stop_after_steps must be positive")
+        self.stop_after_steps = stop_after_steps
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: object,
+    ) -> TrainerControl:
+        """Request termination once the configured global step is reached.
+
+        Returns:
+            The updated trainer control object.
+        """
+        del args, kwargs
+        if state.global_step >= self.stop_after_steps:
+            control.should_training_stop = True
+        return control
+
+
+def _finalize_tracking_after_failure(setup: ExTrackingSetup) -> None:
+    """Best-effort finalisation that cannot replace the training exception."""
+    try:
+        setup.run_finalization(exit_code=1)
+    except BaseException:
+        logger.exception("Experiment tracking finalisation failed after training error")

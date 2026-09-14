@@ -414,10 +414,13 @@ defaults unless a pilot shows a concrete failure:
 - **Pilot stop:** 2,000 steps, controlled separately from the scheduler horizon.
 - **Checkpoints:** best, latest resumable, and one rollback checkpoint.
 
-The current training code uses `max_steps` for both stopping and the cosine-scheduler
-horizon. Before the pilots, separate the production scheduler horizon from a bounded run
-stop. A 2,000-step pilot must follow the first 2,000 steps of the 100,000-step schedule;
-it must not decay to zero and then resume with a learning-rate jump.
+Training uses `max_steps` for the cosine-scheduler horizon and the tested
+`stop_after_steps` callback for bounded stopping. Set `max_steps=100000` and
+`stop_after_steps=2000` for each pilot. A 2,000-step pilot therefore follows the first
+2,000 steps of the 100,000-step schedule; it does not decay to zero and then resume with
+a learning-rate jump. The full run must pass the selected seed-4242 pilot checkpoint as
+`resume_from_checkpoint`, so Trainer restores its optimiser and scheduler state before
+continuing to 100,000 steps.
 
 Do not add a broad hyperparameter sweep. Compare only learning rates `5e-6` and `1e-5`.
 All other settings, source ordering, data revisions, development examples, and seed

@@ -104,7 +104,15 @@ Here are some of the more important available keys:
 - `enable_experiment_tracking`: Whether training monitoring during training should be
   enabled. Defaults to false. You can also set `experiment_tracking` to either `wandb`
   or `mlflow` to specify which experiment tracking tool to use (`wandb` is used by
-  default).
+  default). The production Sparkie preset uses the online W&B project `hviske`, group
+  `v6.0`, and the authenticated user's default workspace (no hardcoded entity). Generate
+  and persist a fresh ID for every smoke, pilot, and full phase, using `resume=never` for
+  new runs so an ID collision fails. Reuse only the persisted full-run ID with
+  `experiment_tracking.resume=must` when resuming a local checkpoint. Keep
+  `WANDB_LOG_MODEL=false` and `WANDB_WATCH=false` so checkpoints stay local while metrics
+  and configuration are logged online. Authenticate with
+  `uv run wandb login --verify`; the Python preflight never prompts or calls
+  `wandb.login`. Never put API keys in commands or configuration.
 - `per_device_batch_size` and `dataloader_num_workers`: The batch size and number of
   workers to use for training. Defaults to 8 and 4, respectively. Tweak these if you are
   running out of GPU memory.

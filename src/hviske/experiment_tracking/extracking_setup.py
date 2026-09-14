@@ -18,11 +18,12 @@ class ExTrackingSetup(ABC):
         self.config = config
 
     @abstractmethod
-    def run_finalization(self) -> None:
-        """Run the finalization of the experiment tracking setup.
+    def run_finalization(self, exit_code: int = 0) -> None:
+        """Finalise the tracking run with its process exit status.
 
-        Returns:
-            True if the finalization was successful, False otherwise.
+        Args:
+            exit_code (optional):
+                The process exit code to report. Defaults to ``0``.
         """
 
     @abstractmethod

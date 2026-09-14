@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added robust online W&B tracking for the production Sparkie v6.0 workflow, including
+  credential-safe preflight, resumable run IDs, and local-only model checkpoints.
 - Added reusable keyed and strict positional ASR dataset overlays with bounded SQLite
   indexing, shared preflight validation, and safe overlay provenance; configured the
   v6.0 Danish unified sources to use an environment-supplied immutable overlay revision.
@@ -20,5 +22,10 @@
 
 ### Fixed
 
+- Made W&B preflight non-interactive, scrubbed inherited Sparkie W&B identity, and
+  redacted checkpoint paths from online configuration payloads.
+- Separated bounded pilot stopping from the 100,000-step scheduler horizon, added
+  resumable tracking finalisation with success and failure statuses, and hardened W&B
+  preflight, IDs, environment policy, and configuration redaction.
 - Restored the codebase MIT license and removed the P1 dataset license files.
 - Preserved repeated reference tokens in Parakeet RNNT metrics.
