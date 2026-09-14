@@ -285,8 +285,10 @@ def _compute_parakeet_metrics(
     predictions = np.asarray(pred.predictions).copy()
     if predictions.ndim == 2:
         predictions[predictions == -100] = processor.tokenizer.pad_token_id
+    is_rnnt = str(getattr(processor, "decoder_type", "")).lower() == "rnnt"
     return compute_error_rate_metrics(
         pred=EvalPrediction(predictions=predictions, label_ids=pred.label_ids),
         processor=processor,
         log_examples=False,
+        label_group_tokens=False if is_rnnt else None,
     )

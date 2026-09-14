@@ -17,7 +17,10 @@ logger = logging.getLogger(__package__)
 
 
 def compute_error_rate_metrics(
-    pred: EvalPrediction, processor: Processor, log_examples: bool = True
+    pred: EvalPrediction,
+    processor: Processor,
+    log_examples: bool = True,
+    label_group_tokens: bool | None = None,
 ) -> dict[str, float]:
     """Compute the error rates of predictions.
 
@@ -28,6 +31,9 @@ def compute_error_rate_metrics(
             Audio and transcription processor.
         log_examples:
             Whether to log examples of the predictions and the ground truth labels.
+        label_group_tokens:
+            Whether to merge consecutive identical tokens when decoding labels. If
+            unset, the tokenizer's default is used.
 
     Returns:
         Dictionary with 'wer' as the key and the word error rate as the value.
@@ -58,7 +64,16 @@ def compute_error_rate_metrics(
             predictions_str = processor.batch_decode(
                 predictions, skip_special_tokens=True
             )
-        labels_str = tokenizer.batch_decode(sequences=labels, skip_special_tokens=True)
+        if label_group_tokens is None:
+            labels_str = tokenizer.batch_decode(
+                sequences=labels, skip_special_tokens=True
+            )
+        else:
+            labels_str = tokenizer.batch_decode(
+                sequences=labels,
+                skip_special_tokens=True,
+                group_tokens=label_group_tokens,
+            )
 
     # Wav2Vec2 decoding
     elif predictions.ndim == 3:
