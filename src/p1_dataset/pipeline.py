@@ -649,8 +649,6 @@ def _target_card_is_v8(
         card = payload.decode("utf-8")
     except Exception:
         return False
-    if "license_link: LICENSE" not in card:
-        return False
     if _card_declares_inactive_model_provenance(card):
         return False
     machine_comment = re.search(r"<!--(?P<body>.*?)-->", card, re.DOTALL)
@@ -2851,12 +2849,10 @@ def initialise_target(*, hub: object, settings: PipelineSettings) -> None:
             settings.dataset_license.model_dump(mode="json"), sort_keys=True
         ),
     )
-    license_path = Path(__file__).resolve().parents[2] / "LICENSE-DATASET"
     initialise_private_dataset(
         t.cast(HubClient, hub),
         settings.target_private_repo,
         card=card,
-        license_text=license_path.read_text(encoding="utf-8"),
         expected_pipeline_config_sha256=settings.pipeline_digest,
     )
 

@@ -15,4 +15,5 @@
 
 ### Fixed
 
+- Restored the codebase MIT license and removed the P1 dataset license files.
 - Preserved repeated reference tokens in Parakeet RNNT metrics.

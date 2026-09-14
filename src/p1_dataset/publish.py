@@ -364,9 +364,6 @@ def build_dataset_card(
         "pretty_name: DR P1 speech segments\n"
         "language: [da]\n"
         "task_categories: [automatic-speech-recognition]\n"
-        "license: other\n"
-        "license_name: syvai-layered-data-license\n"
-        "license_link: LICENSE\n"
         "---\n\n"
         "# DR P1 speech segments\n\n"
         f"{machine_comment}\n\n"
@@ -392,13 +389,7 @@ def build_dataset_card(
         "    streaming=True,\n"
         ")\n"
         "```\n\n"
-        f"{_render_card_text(private_access_terms)}\n\n"
-        "## Licence\n\n"
-        "The dataset uses a layered licence. The dataset structure, arrangement, "
-        "segment boundaries, and independently created metadata are CC BY 4.0; "
-        "embedded DR audio and verbatim/source-derived transcript text are excluded. "
-        "Private access does not grant public redistribution or sublicensing of the "
-        "excluded content. See [LICENSE](LICENSE).\n"
+        f"{_render_card_text(private_access_terms)}\n"
     )
 
 
@@ -653,7 +644,6 @@ def initialise_private_dataset(
     repo_id: str,
     *,
     card: str,
-    license_text: str | None = None,
     gitattributes: str = "*.parquet filter=lfs diff=lfs merge=lfs -text\n",
     token: str | None = None,
     expected_pipeline_config_sha256: str | None = None,
@@ -667,8 +657,6 @@ def initialise_private_dataset(
             Dataset repository identifier.
         card:
             Dataset card Markdown, without credentials.
-        license_text (optional):
-            Full target dataset licence. Defaults to the tracked repository licence.
         gitattributes (optional):
             Initial Git attributes content.
         token (optional):
@@ -681,15 +669,11 @@ def initialise_private_dataset(
 
     Raises:
         PublicationError:
-            If metadata is unsafe, the licence is not pinned, or the target tree is
-            not pristine metadata-only v8 state.
+            If metadata is unsafe or the target tree is not pristine metadata-only
+            v8 state.
     """
     _assert_safe_metadata(card, token=token)
     _assert_safe_metadata(gitattributes, token=token)
-    if license_text is None:
-        license_path = Path(__file__).resolve().parents[2] / "LICENSE-DATASET"
-        license_text = license_path.read_text(encoding="utf-8")
-    _assert_safe_metadata(license_text, token=token)
     if not _card_has_verified_identity(card) or (
         expected_pipeline_config_sha256 is not None
         and _card_digest(card) != expected_pipeline_config_sha256
@@ -697,11 +681,6 @@ def initialise_private_dataset(
         raise PublicationError(
             "target card does not contain the active machine identity"
         )
-    if (
-        hashlib.sha256(license_text.encode("utf-8")).hexdigest()
-        != P1_RUNTIME_CONTRACT.dataset_license_target_sha256
-    ):
-        raise PublicationError("target dataset licence does not match the pinned file")
     try:
         info = api.repo_info(repo_id=repo_id, repo_type="dataset")
     except RepositoryNotFoundError:
@@ -716,17 +695,14 @@ def initialise_private_dataset(
         root = Path(directory)
         card_path = root / "README.md"
         attrs_path = root / ".gitattributes"
-        license_path = root / "LICENSE"
         card_path.write_text(card, encoding="utf-8")
         attrs_path.write_text(gitattributes, encoding="utf-8")
-        license_path.write_text(license_text, encoding="utf-8")
         commit = _mutate_commit(
             api,
             repo_id,
             operations=(
                 UploadOperation(path_in_repo="README.md", path=card_path),
                 UploadOperation(path_in_repo=".gitattributes", path=attrs_path),
-                UploadOperation(path_in_repo="LICENSE", path=license_path),
             ),
             message="Initialise private P1 dataset",
             parent_commit=target_head,
@@ -858,8 +834,6 @@ def _card_has_verified_identity(card: str) -> bool:
     Returns:
         Whether the card contains the expected immutable identity coordinates.
     """
-    if "license_link: LICENSE" not in card:
-        return False
     if re.search(r"\b(?:vad|ctc|whisper|silero|roest|coral|model)\b", card, re.I):
         return False
     match = re.search(r"<!--(?P<body>.*?)-->", card, re.DOTALL)

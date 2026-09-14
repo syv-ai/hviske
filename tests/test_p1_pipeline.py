@@ -394,7 +394,8 @@ def test_initialise_commits_only_private_metadata(tmp_path: Path) -> None:
     )
 
     assert hub.private is True
-    assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
+    assert hub.commits == [("README.md", ".gitattributes")]
+    assert "LICENSE" not in hub.files
     card = hub.files["README.md"].decode("utf-8")
     assert "roughly 2006–2022" in card
     assert "ElevenLabs Scribe v2" in card

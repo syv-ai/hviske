@@ -265,14 +265,13 @@ def test_card_contains_required_terms_and_no_credentials() -> None:
     """Cards contain the required private-use statement and reject tokens."""
     card = make_card()
     assert "No public redistribution grant" not in card
-    assert "license: other" in card
-    assert "license_name: syvai-layered-data-license" in card
-    assert "license_link: LICENSE" in card
-    assert "CC BY 4.0" in card
-    assert "embedded DR audio" in card
-    assert "transcript text" in card
+    assert "license:" not in card
+    assert "license_name:" not in card
+    assert "license_link:" not in card
+    assert "CC BY 4.0" not in card
+    assert "## Licence" not in card
     assert "/main/" not in card
-    assert all(section in card for section in ("## Source", "## Licence"))
+    assert "## Source" in card
     assert all(term not in card for term in ("CoRal", "Alexandra", "Roest"))
     with pytest.raises(PublicationError):
         initialise_private_dataset(
@@ -324,15 +323,12 @@ def test_card_is_readable_and_contract_driven() -> None:
         "pretty_name": "DR P1 speech segments",
         "language": ["da"],
         "task_categories": ["automatic-speech-recognition"],
-        "license": "other",
-        "license_name": "syvai-layered-data-license",
-        "license_link": "LICENSE",
     }
     assert [
         section
         for section in ("## Dataset", "## Source", "## Access", "## Licence")
         if section in card
-    ] == ["## Dataset", "## Source", "## Access", "## Licence"]
+    ] == ["## Dataset", "## Source", "## Access"]
     assert "roughly 2006–2022" in card
     assert "ElevenLabs Scribe v2" in card
     assert "mono 16 kHz OGG/Opus" in card
@@ -607,9 +603,9 @@ def test_initialisation_commits_card_and_attributes_privately() -> None:
     hub = MemoryHub()
     commit = initialise_private_dataset(hub, "org/p1", card=make_card())
     assert commit == "a" * 40
-    assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
+    assert hub.commits == [("README.md", ".gitattributes")]
     assert "*.parquet" in hub.files[".gitattributes"].decode()
-    assert hub.files["LICENSE"]
+    assert "LICENSE" not in hub.files
     assert hub.privacy_checks >= 3
 
 
@@ -722,7 +718,7 @@ def test_missing_repository_is_created_private_before_initialisation() -> None:
     commit = initialise_private_dataset(hub, "org/p1", card=make_card())
     assert commit == "a" * 40
     assert hub.created
-    assert hub.commits == [("README.md", ".gitattributes", "LICENSE")]
+    assert hub.commits == [("README.md", ".gitattributes")]
 
 
 def test_post_commit_privacy_failure_stops_before_verification(tmp_path: Path) -> None:
