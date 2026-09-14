@@ -1,6 +1,6 @@
 """Offline migration of pending P1 publication paths.
 
-This module never imports a Hub client and never opens a remote repository.  It only
+This module never imports a Hub client and never opens a remote repository. It only
 changes metadata in local ledgers and manifests after complete evidence checks.
 """
 
@@ -9,20 +9,360 @@ from __future__ import annotations
 import collections.abc as c
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from .ledger import Ledger
-from .publication_layout import new_shard_path
+from .publication_layout import is_allowed_shard_path, new_shard_path
 
-_LEGACY_NESTED = re.compile(
-    r"^data/train/([A-Za-z0-9][A-Za-z0-9_.-]*)/part-([0-9]{5})\.parquet$"
+_LEGACY_FLAT = re.compile(
+    r"^data/train/([A-Za-z0-9][A-Za-z0-9_.-]*)-([0-9]{5})\.parquet$"
 )
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_PARTITIONS = tuple(range(8))
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _backup_files(
+    root: Path, snapshots: c.Mapping[Path, bytes | None]
+) -> dict[Path, Path]:
+    backups: dict[Path, Path] = {}
+    for index, (source, payload) in enumerate(snapshots.items()):
+        if payload is None:
+            continue
+        target = root / f"{index:04d}.backup"
+        _write_durable(target, payload)
+        backups[source] = target
+    _fsync_directory(root)
+    return backups
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_durable(path: Path, payload: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.layout.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(descriptor, view) :]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+
+
+def _complete_migration_marker(root: Path) -> None:
+    supervisor = root / "supervisor"
+    failed = supervisor / "FAILED"
+    done = supervisor / "DONE"
+    os.replace(failed, done)
+    _fsync_directory(supervisor)
+
+
+def _make_backup_root(root: Path) -> Path:
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    target = root / "publication-layout-backups" / stamp
+    target.mkdir(parents=True, exist_ok=False)
+    _fsync_directory(target.parent)
+    return target
+
+
+def _marker_paths(root: Path) -> tuple[Path, ...]:
+    marker_root = root / "supervisor" / "markers"
+    paths: list[Path] = [root / "supervisor" / "FAILED", root / "supervisor" / "DONE"]
+    for index in _PARTITIONS:
+        paths.extend(
+            (
+                marker_root / f"partition-{index}.FAILED",
+                marker_root / f"partition-{index}.DONE",
+            )
+        )
+    return tuple(paths)
+
+
+def _partition_ledgers(root: Path) -> tuple[Path, ...]:
+    ledgers = tuple(
+        root / f"partition-{index}" / "ledger.sqlite" for index in _PARTITIONS
+    )
+    if any(not path.is_file() or path.is_symlink() for path in ledgers):
+        raise ValueError("exactly partition-0 through partition-7 ledgers are required")
+    extras = tuple(root.glob("partition-*/ledger.sqlite"))
+    if len(extras) != len(_PARTITIONS) or set(extras) != set(ledgers):
+        raise ValueError("exactly partition-0 through partition-7 ledgers are required")
+    return ledgers
+
+
+@dataclass(frozen=True)
+class _BatchPlan:
+    """Selected ledger rows belonging to one uncommitted publication group."""
+
+    batch_id: str
+    sealed: bool
+    values: dict[str, object]
+    rows: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class _Occurrence:
+    """One selected legacy occurrence and its destination."""
+
+    source: str
+    target: str
+    batch_id: str
+    local_path: str
+
+
+@dataclass(frozen=True)
+class _LedgerPlan:
+    """All migration evidence collected from one partition ledger."""
+
+    path: Path
+    occurrences: tuple[_Occurrence, ...]
+    batches: tuple[_BatchPlan, ...]
+    all_paths: frozenset[str]
+
+
+def _plan_ledger(path: Path, expected_digest: str) -> _LedgerPlan:
+    with Ledger(
+        path, pipeline_digest=expected_digest, reset_processing=False
+    ) as ledger:
+        connection = ledger._connection  # noqa: SLF001 - read-only migration census
+        rows = tuple(
+            dict(row)
+            for row in connection.execute(
+                """SELECT s.*, b.state AS batch_state, b.commit_id AS batch_commit_id,
+                b.sealed AS batch_sealed, b.programme_count AS batch_programme_count,
+                b.row_count AS batch_row_count, b.rejection_counts AS batch_rejections
+                FROM shards AS s LEFT JOIN batches AS b ON b.batch_id = s.batch_id
+                ORDER BY s.shard_id"""
+            ).fetchall()
+        )
+    all_paths = frozenset(str(row["path"]) for row in rows)
+    selected = tuple(
+        row
+        for row in rows
+        if row["state"] == "sharded"
+        and row["batch_state"] == "sharded"
+        and row["batch_commit_id"] is None
+        and row["local_path"] is not None
+        and isinstance(row["batch_id"], str)
+    )
+    occurrences: list[_Occurrence] = []
+    batches: dict[str, _BatchPlan] = {}
+    for row in selected:
+        path_value = str(row["path"])
+        if path_value.startswith("data/train/"):
+            source, deterministic_id, ordinal = _legacy_parts(path_value)
+            target = new_shard_path(deterministic_id, ordinal)
+            local_path = str(row["local_path"])
+            _validate_local_evidence(row=row, local_path=Path(local_path))
+            occurrences.append(
+                _Occurrence(
+                    source=source,
+                    target=target,
+                    batch_id=str(row["batch_id"]),
+                    local_path=local_path,
+                )
+            )
+        elif not is_allowed_shard_path(path_value):
+            raise ValueError("selected shard path is not canonical")
+        batch_id = str(row["batch_id"])
+        batch_rows = tuple(
+            item
+            for item in rows
+            if item["batch_id"] == batch_id
+            and item["batch_state"] == "sharded"
+            and item["batch_commit_id"] is None
+        )
+        batches[batch_id] = _BatchPlan(
+            batch_id=batch_id,
+            sealed=bool(row["batch_sealed"]),
+            values=row,
+            rows=batch_rows,
+        )
+    return _LedgerPlan(
+        path=path,
+        occurrences=tuple(occurrences),
+        batches=tuple(batches.values()),
+        all_paths=all_paths,
+    )
+
+
+def _legacy_parts(path: str) -> tuple[str, str, int]:
+    match = _LEGACY_FLAT.fullmatch(path)
+    if match is None:
+        raise ValueError("legacy shard path is not canonical")
+    return path, match.group(1), int(match.group(2))
+
+
+def _validate_local_evidence(*, row: dict[str, object], local_path: Path) -> None:
+    if local_path.is_symlink() or not local_path.is_file():
+        raise ValueError("legacy shard local evidence is unavailable")
+    digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
+    if digest != row["sha256"] or local_path.stat().st_size != row["byte_size"]:
+        raise ValueError("legacy shard local evidence changed")
+
+
+@dataclass(frozen=True)
+class _ManifestPlan:
+    """A validated owned manifest and its optional rewritten bytes."""
+
+    path: Path
+    rewritten: bytes | None
+
+
+def _plan_manifests(
+    *, root: Path, plans: c.Sequence[_LedgerPlan], occurrences: c.Sequence[_Occurrence]
+) -> tuple[_ManifestPlan, ...]:
+    mapping = {item.source: item.target for item in occurrences}
+    output: list[_ManifestPlan] = []
+    for plan in plans:
+        for batch in plan.batches:
+            candidates = {root / "manifests" / f"{batch.batch_id}.json"}
+            candidates.update(
+                Path(str(row["local_path"])).parent
+                / "manifests"
+                / f"{batch.batch_id}.json"
+                for row in batch.rows
+                if row["local_path"] is not None
+            )
+            existing = tuple(
+                path
+                for path in sorted(candidates)
+                if path.exists() or path.is_symlink()
+            )
+            if batch.sealed and not existing:
+                raise ValueError("sealed pending group has no manifest")
+            for path in existing:
+                payload = _read_manifest(path)
+                _validate_manifest(payload=payload, batch=batch)
+                rewritten_payload = _replace_paths(payload, mapping)
+                rewritten = None
+                if rewritten_payload != payload:
+                    rewritten = _json_bytes(rewritten_payload)
+                output.append(_ManifestPlan(path=path, rewritten=rewritten))
+    return tuple(output)
+
+
+def _json_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _read_manifest(path: Path) -> object:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("pending manifest is not a regular file")
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("pending manifest is unreadable or malformed") from error
+
+
+def _replace_paths(value: object, mapping: c.Mapping[str, str]) -> object:
+    if isinstance(value, str):
+        return mapping.get(value, value)
+    if isinstance(value, list):
+        return [_replace_paths(item, mapping) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_paths(item, mapping) for key, item in value.items()}
+    return value
+
+
+def _validate_manifest(*, payload: object, batch: _BatchPlan) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("pending manifest must be a JSON object")
+    expected_keys = {
+        "batch_id",
+        "programme_count",
+        "row_count",
+        "rejection_counts",
+        "shards",
+    }
+    if set(payload) != expected_keys or payload["batch_id"] != batch.batch_id:
+        raise ValueError("pending manifest has the wrong schema or batch")
+    if not _nonnegative_int(payload["programme_count"]):
+        raise ValueError("pending manifest has invalid programme_count")
+    if not _nonnegative_int(payload["row_count"]):
+        raise ValueError("pending manifest has invalid row_count")
+    if payload["programme_count"] != batch.values["batch_programme_count"]:
+        raise ValueError("pending manifest programme count differs from ledger")
+    if payload["row_count"] != batch.values["batch_row_count"]:
+        raise ValueError("pending manifest row count differs from ledger")
+    rejections = payload["rejection_counts"]
+    if not isinstance(rejections, dict) or any(
+        not isinstance(key, str) or not _nonnegative_int(value)
+        for key, value in rejections.items()
+    ):
+        raise ValueError("pending manifest has invalid rejection counts")
+    try:
+        ledger_rejections = json.loads(str(batch.values["batch_rejections"]))
+    except json.JSONDecodeError as error:
+        raise ValueError("ledger has invalid rejection counts") from error
+    if rejections != ledger_rejections:
+        raise ValueError("pending manifest rejection counts differ from ledger")
+    shards = payload["shards"]
+    if not isinstance(shards, list) or len(shards) != len(batch.rows):
+        raise ValueError("pending manifest does not contain a complete shard mapping")
+    for item, row in zip(shards, batch.rows, strict=True):
+        if not isinstance(item, dict) or set(item) != {
+            "path",
+            "byte_size",
+            "row_count",
+            "sha256",
+        }:
+            raise ValueError("pending manifest has an invalid shard entry")
+        if not isinstance(item["path"], str) or not is_allowed_shard_path(item["path"]):
+            raise ValueError("pending manifest has a noncanonical shard path")
+        if any(
+            item[key] != row[key]
+            for key in ("path", "byte_size", "row_count", "sha256")
+        ):
+            raise ValueError("pending manifest shard evidence differs from ledger")
+
+
+def _nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _reject_duplicate_mappings(occurrences: c.Sequence[_Occurrence]) -> None:
+    sources = [item.source for item in occurrences]
+    targets = [item.target for item in occurrences]
+    if len(sources) != len(set(sources)):
+        raise ValueError("a legacy source occurs more than once")
+    if len(targets) != len(set(targets)):
+        raise ValueError("path mapping contains a collision")
+
+
+def _reject_existing_targets(
+    *, plans: c.Sequence[_LedgerPlan], occurrences: c.Sequence[_Occurrence]
+) -> None:
+    existing = set().union(*(set(plan.all_paths) for plan in plans))
+    if existing.intersection(item.target for item in occurrences):
+        raise ValueError("path mapping collides with existing ledger evidence")
 
 
 @dataclass(frozen=True)
@@ -45,188 +385,199 @@ def migrate_layout(
 ) -> LayoutMigrationReport:
     """Validate or apply all eight closed partition ledgers under ``run_root``.
 
-    The complete expected digest and a process lock are required in both modes.
-    Applying is restart-safe: an already migrated ledger has no legacy records and
-    contributes zero changes.
+    Only local shards in uncommitted, sharded publication groups are selected. A
+    stopped supervisor's aggregate FAILED marker is required before the first run;
+    a successful migration changes it to DONE. No Parquet file is written.
+
+    Args:
+        run_root:
+            Root containing ``partition-0`` through ``partition-7`` and supervisor
+            evidence.
+        expected_digest:
+            Complete pipeline SHA-256 expected by every ledger.
+        apply:
+            Whether to perform the metadata migration rather than only validate it.
+        publication_lock (optional):
+            Shared lock used to exclude publishers while inspecting and applying.
 
     Returns:
         Aggregate counts without source identifiers or paths.
 
     Raises:
         ValueError:
-            If the run root, digest, ledger set, or evidence is unsafe.
+            If the run root, digest, ledger set, run evidence, or manifests is unsafe.
     """
     if not _DIGEST.fullmatch(expected_digest):
         raise ValueError("expected digest must be a complete SHA-256")
     root = run_root.expanduser().resolve()
-    ledgers = tuple(sorted(root.glob("partition-*/ledger.sqlite")))
-    if len(ledgers) != 8:
-        raise ValueError("exactly eight partition ledgers are required")
+    ledgers = _partition_ledgers(root)
     lock_path = (publication_lock or root / "publish.lock").expanduser().resolve()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        manifests = _manifest_paths(root=root, ledgers=ledgers)
         plans = tuple(_plan_ledger(path, expected_digest) for path in ledgers)
-        mappings = {old: new for plan in plans for old, new in plan.items()}
-        targets = tuple(mappings.values())
-        if len(targets) != len(set(targets)):
-            raise ValueError("path mapping contains a collision")
+        occurrences = tuple(item for plan in plans for item in plan.occurrences)
+        _reject_duplicate_mappings(occurrences)
+        _reject_existing_targets(plans=plans, occurrences=occurrences)
+        manifests = _plan_manifests(root=root, plans=plans, occurrences=occurrences)
+        has_legacy = bool(occurrences)
+        marker_state = _validate_run_markers(root=root)
+
+        # A completed migration is the only permitted markerless-looking rerun. It
+        # still scans every ledger above, so a newly reintroduced legacy path cannot
+        # silently be treated as already migrated.
+        if marker_state == "done":
+            if has_legacy:
+                raise ValueError("completed migration still has eligible legacy paths")
+            return _report(apply=apply, manifest_count=0, shard_count=0, backup_count=0)
+
         if not apply:
-            return LayoutMigrationReport(
-                ledger_count=8,
-                shard_count=len(mappings),
-                manifest_count=len(_manifest_rewrites(manifests, mappings)),
+            return _report(
+                apply=False,
+                manifest_count=sum(item.rewritten is not None for item in manifests),
+                shard_count=len(occurrences),
                 backup_count=0,
-                applied=False,
             )
+
+        touched = (*ledgers, *(item.path for item in manifests), *_marker_paths(root))
+        snapshots = _snapshot_files(touched)
         backup_root = _make_backup_root(root)
-        backups = _backup_files(backup_root, (*ledgers, *manifests))
+        backups = _backup_files(backup_root, snapshots)
         try:
             changed = 0
-            for path, mapping in zip(ledgers, plans, strict=True):
-                with Ledger(
-                    path, pipeline_digest=expected_digest, reset_processing=False
-                ) as ledger:
-                    changed += ledger.remap_remote_paths(mapping)
-            manifest_rewrites = _manifest_rewrites(manifests, mappings)
-            for path, payload in manifest_rewrites.items():
-                _write_durable(path, payload)
+            for plan in plans:
+                mapping = {item.source: item.target for item in plan.occurrences}
+                if mapping:
+                    with Ledger(
+                        plan.path,
+                        pipeline_digest=expected_digest,
+                        reset_processing=False,
+                    ) as ledger:
+                        changed += ledger.remap_remote_paths(mapping)
+            for item in manifests:
+                if item.rewritten is not None:
+                    _write_durable(item.path, item.rewritten)
+            _complete_migration_marker(root)
         except BaseException:
-            _restore_backups(backups)
+            _restore_snapshots(snapshots)
             raise
-        return LayoutMigrationReport(
-            ledger_count=8,
+        return _report(
+            apply=True,
+            manifest_count=sum(item.rewritten is not None for item in manifests),
             shard_count=changed,
-            manifest_count=len(manifest_rewrites),
             backup_count=len(backups),
-            applied=True,
         )
 
 
-def _backup_files(root: Path, paths: c.Sequence[Path]) -> dict[Path, Path]:
-    backups: dict[Path, Path] = {}
-    for index, source in enumerate(paths):
-        if not source.is_file() or source.is_symlink():
-            continue
-        target = root / f"{index:04d}.backup"
-        shutil.copyfile(source, target)
-        descriptor = os.open(target, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        backups[source] = target
-    descriptor = os.open(root, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    return backups
-
-
-def _make_backup_root(root: Path) -> Path:
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    target = root / "publication-layout-backups" / stamp
-    target.mkdir(parents=True, exist_ok=False)
-    return target
-
-
-def _manifest_paths(*, root: Path, ledgers: c.Sequence[Path]) -> tuple[Path, ...]:
-    paths: set[Path] = set()
-    for ledger in ledgers:
-        paths.update(
-            item
-            for item in ledger.parent.rglob("manifests/*.json")
-            if item.is_file() and not item.is_symlink()
-        )
-    paths.update(
-        item
-        for item in root.glob("manifests/*.json")
-        if item.is_file() and not item.is_symlink()
+def _report(
+    *, apply: bool, manifest_count: int, shard_count: int, backup_count: int
+) -> LayoutMigrationReport:
+    return LayoutMigrationReport(
+        ledger_count=8,
+        shard_count=shard_count,
+        manifest_count=manifest_count,
+        backup_count=backup_count,
+        applied=apply,
     )
-    return tuple(sorted(paths))
 
 
-def _manifest_rewrites(
-    manifests: c.Sequence[Path], mapping: c.Mapping[str, str]
-) -> dict[Path, bytes]:
-    rewrites: dict[Path, bytes] = {}
-    for path in manifests:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+def _restore_snapshots(snapshots: c.Mapping[Path, bytes | None]) -> None:
+    for path, payload in snapshots.items():
+        if payload is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_durable(path, payload)
+    for path in snapshots:
+        _fsync_directory(path.parent)
+
+
+def _snapshot_files(paths: c.Sequence[Path]) -> dict[Path, bytes | None]:
+    snapshots: dict[Path, bytes | None] = {}
+    for path in paths:
+        if path in snapshots:
             continue
-        rewritten = _replace_paths(payload, mapping)
-        if rewritten != payload:
-            rewrites[path] = json.dumps(
-                rewritten, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-    return rewrites
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError("migration evidence is not a regular file")
+        snapshots[path] = path.read_bytes() if path.is_file() else None
+    return snapshots
 
 
-def _replace_paths(value: object, mapping: c.Mapping[str, str]) -> object:
-    if isinstance(value, str):
-        return mapping.get(value, value)
-    if isinstance(value, list):
-        return [_replace_paths(item, mapping) for item in value]
-    if isinstance(value, dict):
-        return {key: _replace_paths(item, mapping) for key, item in value.items()}
-    return value
+def _validate_run_markers(*, root: Path) -> str:
+    supervisor = root / "supervisor"
+    failed = supervisor / "FAILED"
+    done = supervisor / "DONE"
+    if done.exists() and failed.exists():
+        raise ValueError("supervisor has inconsistent aggregate markers")
+    if done.exists():
+        if done.is_symlink() or not done.is_file():
+            raise ValueError("supervisor DONE marker is unsafe")
+        return "done"
+    if failed.is_symlink() or not failed.is_file():
+        raise ValueError("stopped run requires an aggregate FAILED marker")
+    aggregate = _read_marker_text(failed)
+    aggregate_lines = aggregate.splitlines()
+    aggregate_matches = [
+        re.fullmatch(r"partition=([0-9]+) attempts=[0-9]+", line)
+        for line in aggregate_lines
+    ]
+    if not aggregate_lines or any(match is None for match in aggregate_matches):
+        raise ValueError("aggregate FAILED marker is malformed")
+    aggregate_indexes = [int(match.group(1)) for match in aggregate_matches if match]
+    if (
+        not aggregate_indexes
+        or len(aggregate_indexes) != len(set(aggregate_indexes))
+        or not set(aggregate_indexes).issubset(_PARTITIONS)
+    ):
+        raise ValueError("aggregate FAILED marker is inconsistent")
+
+    # The aggregate marker is the library's closed-run proof. Partition markers are
+    # optional because older supervisors only emitted the aggregate file; when they
+    # are present, however, every one must agree with it.
+    marker_root = supervisor / "markers"
+    individual_paths = (
+        tuple(marker_root.glob("partition-*.DONE"))
+        + tuple(marker_root.glob("partition-*.FAILED"))
+        if marker_root.is_dir() and not marker_root.is_symlink()
+        else ()
+    )
+    if individual_paths:
+        individual: dict[int, str] = {}
+        for path in individual_paths:
+            match = re.fullmatch(r"partition-([0-9]+)\.(DONE|FAILED)", path.name)
+            if match is None or path.is_symlink() or not path.is_file():
+                raise ValueError("partition completion markers are unsafe")
+            index = int(match.group(1))
+            if index not in _PARTITIONS or index in individual:
+                raise ValueError("partition completion markers are inconsistent")
+            individual[index] = match.group(2)
+            _validate_partition_marker(path=path, index=index)
+        if set(individual) != set(_PARTITIONS):
+            raise ValueError(
+                "exactly partition-0 through partition-7 markers are required"
+            )
+        actual_failed = {
+            index for index, state in individual.items() if state == "FAILED"
+        }
+        if set(aggregate_indexes) != actual_failed:
+            raise ValueError("aggregate FAILED marker is inconsistent")
+    return "failed"
 
 
-def _plan_ledger(path: Path, expected_digest: str) -> dict[str, str]:
-    with Ledger(
-        path, pipeline_digest=expected_digest, reset_processing=False
-    ) as ledger:
-        records = ledger.pending_shards()
-        mapping: dict[str, str] = {}
-        for record in records:
-            if record.path.startswith("data-shards/train/"):
-                continue
-            if not record.path.startswith("data/train/"):
-                raise ValueError("ledger contains a noncanonical shard root")
-            if record.local_path is None:
-                raise ValueError("legacy shard has no local evidence")
-            old, deterministic_id, ordinal = _legacy_parts(record.path)
-            target = new_shard_path(deterministic_id, ordinal)
-            if old in mapping and mapping[old] != target:
-                raise ValueError("legacy path has inconsistent deterministic mapping")
-            mapping[old] = target
-        return mapping
-
-
-def _legacy_parts(path: str) -> tuple[str, str, int]:
-    match = _LEGACY_NESTED.fullmatch(path)
-    if match is not None:
-        return path, match.group(1), int(match.group(2))
-    raise ValueError("legacy shard path is not canonical")
-
-
-def _restore_backups(backups: c.Mapping[Path, Path]) -> None:
-    for destination, source in backups.items():
-        shutil.copyfile(source, destination)
-        descriptor = os.open(destination, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-
-
-def _write_durable(path: Path, payload: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.layout.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def _read_marker_text(path: Path) -> str:
     try:
-        os.write(descriptor, payload)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
-    descriptor = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError("completion marker is unreadable") from error
+
+
+def _validate_partition_marker(*, path: Path, index: int) -> None:
+    lines = _read_marker_text(path).splitlines()
+    if (
+        len(lines) < 2
+        or lines[0] != f"partition={index}"
+        or not re.fullmatch(r"attempts=[0-9]+", lines[1])
+    ):
+        raise ValueError("partition completion marker is malformed")
 
 
 __all__ = ["LayoutMigrationReport", "migrate_layout"]
