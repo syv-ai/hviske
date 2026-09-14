@@ -1,9 +1,23 @@
 """Focused tests for reusable metadata-only ASR overlays."""
 
+import concurrent.futures
+import multiprocessing
+import pickle
+
 import pytest
 from datasets import Dataset
 
 from hviske.data import apply_dataset_overlay
+
+
+def _consume_pickled_overlay(payload: bytes) -> list[str]:
+    """Consume an overlay in a spawn child process.
+
+    Returns:
+        Text values emitted by the overlay.
+    """
+    dataset = pickle.loads(payload)
+    return [row["text"] for row in dataset]
 
 
 def test_keyed_overlay_rejects_duplicate_keys() -> None:
@@ -98,6 +112,76 @@ def test_keyed_overlay_rejects_missing_and_mismatched_keys() -> None:
         list(apply_dataset_overlay(base, mismatched_types, config))
 
 
+def test_overlay_consumers_are_pickleable_and_isolated() -> None:
+    """Independent consumers can run concurrently without shared seen-key state."""
+    base = Dataset.from_list(
+        [
+            {"id": 1, "source": "demo", "text": "one"},
+            {"id": 2, "source": "demo", "text": "two"},
+        ]
+    )
+    overlay = Dataset.from_list(
+        [
+            {
+                "id": 1,
+                "source": "demo",
+                "reference_text": "one",
+                "new_text": None,
+                "action": "keep",
+            },
+            {
+                "id": 2,
+                "source": "demo",
+                "reference_text": "two",
+                "new_text": "deux",
+                "action": "relabel",
+            },
+        ]
+    )
+    overlaid = apply_dataset_overlay(
+        base,
+        overlay,
+        _config(
+            strategy="keyed",
+            base_join_column="id",
+            overlay_join_column="id",
+            equality_checks={"text": "reference_text"},
+        ),
+    )
+
+    payload = pickle.dumps(overlaid)
+    pickle.loads(payload)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: list(overlaid), range(2)))
+
+    assert [row["text"] for row in results[0]] == ["one", "deux"]
+    assert [row["text"] for row in results[1]] == ["one", "deux"]
+
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(1) as pool:
+        assert pool.apply(_consume_pickled_overlay, (payload,)) == ["one", "deux"]
+
+
+def test_overlay_projects_unused_columns_before_indexing() -> None:
+    """Only join, action, equality, and text candidate columns are indexed."""
+    base = Dataset.from_list([{"source": "demo", "text": "one"}])
+    overlay = Dataset.from_list(
+        [
+            {
+                "source": "demo",
+                "reference_text": "one",
+                "new_text": None,
+                "action": "keep",
+                "unused_model_logits": [1.0, 2.0, 3.0],
+            }
+        ]
+    )
+    result = list(apply_dataset_overlay(base, overlay, _config()))
+
+    assert result[0]["text"] == "one"
+    assert "unused_model_logits" not in result[0]
+
+
 def test_overlay_rejects_absent_configured_columns() -> None:
     """Configured equality and text columns are required before streaming."""
     base = Dataset.from_list([{"source": "demo", "text": "one"}])
@@ -117,6 +201,50 @@ def test_overlay_rejects_missing_usable_text() -> None:
     )
 
     with pytest.raises(ValueError, match="no usable rows"):
+        apply_dataset_overlay(base, overlay, _config())
+
+
+def test_overlay_rejects_null_and_unknown_actions() -> None:
+    """Actions outside the configured recognised domain fail strictly."""
+    base = Dataset.from_list([{"source": "demo", "text": "one"}])
+    for action in [None, "mystery"]:
+        overlay = Dataset.from_list(
+            [
+                {
+                    "source": "demo",
+                    "reference_text": "one",
+                    "new_text": None,
+                    "action": action,
+                }
+            ]
+        )
+        with pytest.raises(ValueError, match="expected one of"):
+            apply_dataset_overlay(base, overlay, _config())
+
+
+def test_overlay_rejects_retained_rows_without_text_among_usable_rows() -> None:
+    """A bad retained row cannot be hidden by another usable overlay row."""
+    base = Dataset.from_list(
+        [{"source": "demo", "text": "one"}, {"source": "demo", "text": "two"}]
+    )
+    overlay = Dataset.from_list(
+        [
+            {
+                "source": "demo",
+                "reference_text": "one",
+                "new_text": None,
+                "action": "keep",
+            },
+            {
+                "source": "demo",
+                "reference_text": " ",
+                "new_text": None,
+                "action": "keep",
+            },
+        ]
+    )
+
+    with pytest.raises(ValueError, match="no usable text candidate"):
         apply_dataset_overlay(base, overlay, _config())
 
 

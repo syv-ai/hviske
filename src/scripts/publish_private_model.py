@@ -7,7 +7,11 @@ import click
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
-from hviske.utils import publish_model_folder, validate_transcript_revision
+from hviske.utils import (
+    publish_model_folder,
+    validate_overlay_revision,
+    validate_transcript_revision,
+)
 
 
 @click.command()
@@ -108,7 +112,9 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
                 "dataset_id": str(overlay_config.id),
                 "subset": str(overlay_config.get("subset") or "none"),
                 "split": str(overlay_config.get("split", "train")),
-                "revision": validate_transcript_revision(str(overlay_config.revision)),
+                "revision": validate_overlay_revision(
+                    str(overlay_config.revision or "")
+                ),
                 "filters": _safe_overlay_value(overlay_config.get("filters", {})),
                 "base_filters": _safe_overlay_value(
                     overlay_config.get("base_filters", {})
@@ -122,6 +128,9 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
                     overlay_config.get("equality_checks", {})
                 ),
                 "action_column": str(overlay_config.get("action_column", "action")),
+                "recognised_actions": _safe_overlay_value(
+                    overlay_config.get("recognised_actions", [])
+                ),
                 "allowed_actions": _safe_overlay_value(
                     overlay_config.get("allowed_actions", [])
                 ),

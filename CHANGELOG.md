@@ -6,7 +6,7 @@
 
 - Added reusable keyed and strict positional ASR dataset overlays with bounded SQLite
   indexing, shared preflight validation, and safe overlay provenance; configured the
-  pinned v6.0 Danish unified-source snapshot.
+  v6.0 Danish unified sources to use an environment-supplied immutable overlay revision.
 - Added Transformers-native NVIDIA Parakeet CTC and RNNT fine-tuning.
 - Added Danish vocabulary adaptation for native Parakeet tokenizers, preserving
   existing vocabulary and blank-token IDs while resizing CTC and RNNT heads.

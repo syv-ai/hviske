@@ -139,9 +139,11 @@ Use `config/datasets/drtv_local.yaml` or `youtube_local.yaml` as the dataset
 configuration. Training seeks and reads only each cue from the original WAV when it
 is consumed; the manifest stores paths, offsets, text, IDs, durations, and language.
 
-The reproducible Sparkie bilingual preset is `config/sparkie_bilingual.yaml`. Resolve
-it with the existing fixed Hydra entry point using `--config-name sparkie_bilingual`,
-then run the bounded data preflight before stopping other Sparkie services:
+The reproducible Sparkie bilingual preset is `config/sparkie_bilingual.yaml`. Export
+`HVISKE_OVERLAY_REVISION` with the completed immutable 40-character overlay commit,
+resolve the preset with the existing fixed Hydra entry point using
+`--config-name sparkie_bilingual`, then run the bounded data preflight before stopping
+other Sparkie services:
 
 ```bash
 uv run python src/scripts/preflight_finetuning_data.py \

@@ -1127,6 +1127,34 @@ class transformers_output_ignored:
         hf_logging.set_verbosity_info()
 
 
+def validate_overlay_revision(revision: str) -> str:
+    """Validate the immutable overlay revision supplied for the v6 data sources.
+
+    Args:
+        revision:
+            The overlay Hub revision, normally resolved from
+            ``HVISKE_OVERLAY_REVISION``.
+
+    Returns:
+        The unchanged, validated revision.
+
+    Raises:
+        ValueError:
+            If the environment-supplied revision is missing or not a full SHA.
+    """
+    if not revision:
+        raise ValueError(
+            "HVISKE_OVERLAY_REVISION is required: set it to the immutable 40-character "
+            "overlay commit SHA before running preflight or training."
+        )
+    if not _FULL_COMMIT_SHA.fullmatch(revision):
+        raise ValueError(
+            "HVISKE_OVERLAY_REVISION must be an immutable 40-character commit SHA; "
+            "mutable branches and abbreviated or non-hex revisions are forbidden."
+        )
+    return revision
+
+
 def validate_transcript_revision(revision: str) -> str:
     """Validate an immutable private transcript dataset revision.
 
