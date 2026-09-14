@@ -28,9 +28,11 @@ export P1_TRANSCRIPT_REVISION=<full-40-hex-p1-transcripts-commit-sha>
 export P1_AUDIO_JOIN_COLUMN=<p1-audio-key-column>
 export P1_TRANSCRIPT_JOIN_COLUMN=<p1-transcript-key-column>
 export P1_TRANSCRIPT_TEXT_COLUMN=<p1-transcript-text-column>
+# Use the completed immutable overlay commit; branches and short SHAs are rejected.
+export HVISKE_OVERLAY_REVISION=<full-40-hex-overlay-commit-sha>
 ```
 
-All four values are required. At revision
+All five values are required. At revision
 `41132579816d86e889635f84f30511279f026359`, the transcript repository contains
 16,640 rows: 16,638 usable texts, two empty texts, no null keys, and no duplicate
 keys. The P1 audio side remains streaming; the bounded preflight builds the compact
@@ -64,8 +66,8 @@ These are source-sampling probabilities chosen for style and acoustic balance, n
 weights proportional to row count. Large formal or read-aloud corpora are deliberately
 capped. The Danish total is exactly 60% and the English total 40%. FLEURS `en_us` is
 evaluation-only. The unified Danish repository is filtered into six separately weighted
-streams and uses the pinned v5-tiny metadata overlay; its rows are not loaded directly
-from the obsolete source repositories. Common Voice,
+streams and uses the `HVISKE_OVERLAY_REVISION` v5-tiny metadata overlay; its rows are not
+loaded directly from the obsolete source repositories. Common Voice,
 GigaSpeech, SPGISpeech, older CoRal data, and CoRal TTS are not part of this run.
 
 ## Local manifests and bounded preflight
@@ -87,10 +89,11 @@ uv run python src/scripts/build_vtt_manifest.py \
 Run the preflight while `qwen38-ar` is still serving. It resolves every required
 environment variable, checks Hub authentication and gated model access, validates all
 pinned dataset coordinates and schemas, validates each local manifest and its first
-referenced WAV, and consumes one joined P1 example. The transcript index is intentionally
-partial and built in memory; unmatched P1 audio rows and empty transcript rows are
-skipped lazily. The preflight does not load the ASR model, download background
-noise, or start training.
+referenced WAV, and consumes one joined P1 example. It fully consumes every overlay to
+prove positional length, duplicate, equality, and action/text integrity before lazy
+training starts. Overlay preflight casts audio with decoding disabled, so this gate
+never decodes the audio stream. The preflight does not load the ASR model, download
+background noise, or start training.
 
 ```bash
 uv run python src/scripts/finetune_asr_model.py \

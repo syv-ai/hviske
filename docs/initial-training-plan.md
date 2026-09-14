@@ -217,10 +217,12 @@ Sparkie corpus.
 ### Unified v5-tiny quality manifest
 
 Treat `syvai/danish-asr-unified-hviske-v5-tiny` as a quality and relabelling manifest,
-not as an audio dataset. It has no audio column. v6.0 pins the observed snapshot
-`58899784c825e954d83cf5c1bf7578aa215ecf71`, paired with unified-audio snapshot
-`5a3a49ee981baab6e1e37ddd2c45f9943c27d08f`; the overlay main branch was moving, so
-these revisions must not be replaced by a branch name.
+not as an audio dataset. It has no audio column. The overlay main branch is moving, so
+v6.0 does not carry a stale overlay SHA. Set `HVISKE_OVERLAY_REVISION` to the completed,
+immutable 40-character overlay commit before preflight or training; the six unified
+Danish sources all resolve that same environment value. Keep the matching unified-audio
+revision (`5a3a49ee981baab6e1e37ddd2c45f9943c27d08f`) in the source configurations until
+the overlay completion is pinned.
 
 After the job finishes:
 
@@ -441,6 +443,12 @@ Run in parallel with workstream A.
 - Define the Hub repository as private by default.
 
 ### Gate 1: data-only Sparkie preflight
+
+Set `HVISKE_OVERLAY_REVISION` before resolving the preset. Preflight rejects a missing,
+mutable, abbreviated, or non-hex value with an actionable error and fully consumes each
+overlay before training. This full integrity pass is required because positional training
+is lazy; it establishes the strict extra-row, missing-row, duplicate, and equality gates
+before any training iterator is created.
 
 Keep the existing GPU service running during this gate. In the same container and mounts
 that training will use:

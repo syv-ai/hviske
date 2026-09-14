@@ -14,7 +14,7 @@ coral_conversation:
     id: syvai/danish-asr-unified-hviske-v5-tiny
     subset: default
     split: train
-    revision: 58899784c825e954d83cf5c1bf7578aa215ecf71
+    revision: ${oc.env:HVISKE_OVERLAY_REVISION,""}
     strategy: positional
     base_filters:
       source: coral_conversation
@@ -25,6 +25,7 @@ coral_conversation:
       text: reference_text
     action_column: action
     allowed_actions: [keep, relabel, strip]
+    recognised_actions: [keep, relabel, strip, drop, flag, quarantine]
     text_policy:
       candidates:
         - column: new_text

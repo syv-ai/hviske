@@ -240,7 +240,7 @@ def test_sparkie_dataset_coordinates_and_revisions(
         "voxpopuli_da",
     ]
     assert all(
-        dataset.overlay.revision == "58899784c825e954d83cf5c1bf7578aa215ecf71"
+        dataset.overlay.revision == "9" * 40
         for dataset in datasets.values()
         if dataset.get("overlay") is not None
     )
@@ -256,6 +256,7 @@ def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
     monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
     monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
     monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
+    monkeypatch.setenv("HVISKE_OVERLAY_REVISION", "9" * 40)
     return compose(config_name="sparkie_bilingual")
 
 
@@ -373,8 +374,7 @@ def test_sparkie_publication_provenance_is_complete(
     overlay_sources = [source for source in sources if "overlay" in source]
     assert len(overlay_sources) == 6
     assert all(
-        t.cast(dict[str, object], source["overlay"])["revision"]
-        == "58899784c825e954d83cf5c1bf7578aa215ecf71"
+        t.cast(dict[str, object], source["overlay"])["revision"] == "9" * 40
         for source in overlay_sources
     )
     first_overlay = t.cast(dict[str, object], overlay_sources[0]["overlay"])
@@ -386,6 +386,14 @@ def test_sparkie_publication_provenance_is_complete(
         "text": "reference_text",
     }
     assert first_overlay["allowed_actions"] == ["keep", "relabel", "strip"]
+    assert first_overlay["recognised_actions"] == [
+        "keep",
+        "relabel",
+        "strip",
+        "drop",
+        "flag",
+        "quarantine",
+    ]
     assert "text_policy" in first_overlay
     assert all("path" not in str(source).lower() for source in overlay_sources)
     assert {"local_vtt:drtv_local", "local_vtt:youtube_local"}.issubset(source_ids)
