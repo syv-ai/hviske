@@ -16,7 +16,6 @@ characters_to_keep: 'abcdefghijklmnopqrstuvwxyzæøå0123456789éü'
 
 # Evaluation parameters
 model_id: null
-inference_backend: transformers  # Use nemo for NeMo-only checkpoints
 no_lm: false  # This is only relevant for Wav2Vec 2.0 models
 sampling_rate: 16_000
 batch_size: 16

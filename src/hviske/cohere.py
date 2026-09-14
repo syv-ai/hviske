@@ -40,7 +40,6 @@ from .data_collators import (
     DataCollatorSpeechSeq2SeqWithPadding,
 )
 from .data_models import ModelSetup, PreTrainedModelData, Processor
-from .nemo import NemoASRTranscriber
 from .utils import transformers_output_ignored
 
 logger = logging.getLogger(__package__)
@@ -865,12 +864,10 @@ class CohereASRTranscriber:
 
 
 def get_asr_call_kwargs(
-    transcriber: AutomaticSpeechRecognitionPipeline
-    | CohereASRTranscriber
-    | NemoASRTranscriber,
+    transcriber: AutomaticSpeechRecognitionPipeline | CohereASRTranscriber,
 ) -> dict[str, object]:
     """Return generation arguments compatible with the selected ASR model."""
-    if isinstance(transcriber, (CohereASRTranscriber, NemoASRTranscriber)):
+    if isinstance(transcriber, CohereASRTranscriber):
         return {}
     model = getattr(transcriber, "model", None)
     model_type = str(getattr(getattr(model, "config", None), "model_type", ""))

@@ -60,7 +60,7 @@ install-pre-commit:
 
 install-dependencies:
 	@uv python install 3.11
-	@uv sync --python 3.11 --extra kenlm --extra demo --extra plotting
+	@uv sync --python 3.11 --all-extras
 
 install-quality-tools:
 	@uv python install 3.12
