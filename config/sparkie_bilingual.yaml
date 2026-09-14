@@ -124,7 +124,27 @@ bf16_allowed: true
 resume_from_checkpoint: false
 ignore_data_skip: false
 save_total_limit: 3
-enable_experiment_tracking: false
+enable_experiment_tracking: true
+
+# Production W&B tracking. The entity is intentionally unset so W&B uses the
+# authenticated user's default/personal workspace.
+experiment_tracking:
+  name_experiment: hviske
+  name_group: v6.0
+  name_run: v6.0-full
+  entity: null
+  id: null
+  resume: allow
+  job_type: train
+  tags:
+    - v6.0
+    - production
+    - cohere
+  mode: online
+  save_code: true
+  log_model: false
+  watch: false
+  production: true
 
 adam_first_momentum: 0.9
 adam_second_momentum: 0.98

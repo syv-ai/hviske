@@ -21,6 +21,7 @@ from hviske.data import (
     apply_dataset_overlay,
     join_audio_and_transcripts,
 )
+from hviske.experiment_tracking.wandb_setup import preflight_wandb_access
 from hviske.utils import (
     validate_immutable_source_revision,
     validate_overlay_revision,
@@ -305,6 +306,10 @@ def preflight_finetuning_data(
         hub_api (optional):
             Hub API client. Defaults to an authenticated ``HfApi`` client.
     """
+    if config.get("enable_experiment_tracking", False):
+        if config.experiment_tracking.type == "wandb":
+            preflight_wandb_access(config=config)
+
     for source_config in config.datasets.values():
         immutable_revision_env = source_config.get("immutable_revision_env")
         if immutable_revision_env is not None:
