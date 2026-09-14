@@ -10,3 +10,24 @@ voxpopuli_da:
   language: da
   revision: 5a3a49ee981baab6e1e37ddd2c45f9943c27d08f
   trust_remote_code: false
+  overlay:
+    id: syvai/danish-asr-unified-hviske-v5-tiny
+    subset: default
+    split: train
+    revision: 58899784c825e954d83cf5c1bf7578aa215ecf71
+    strategy: positional
+    base_filters:
+      source: voxpopuli
+    filters:
+      source: voxpopuli
+    equality_checks:
+      source: source
+      text: reference_text
+    action_column: action
+    allowed_actions: [keep, relabel, strip]
+    text_policy:
+      candidates:
+        - column: new_text
+          actions: [relabel, strip]
+        - column: reference_text
+    trust_remote_code: false

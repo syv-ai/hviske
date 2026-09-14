@@ -1,10 +1,33 @@
 ftspeech:
-  id: alexandrainst/ftspeech
-  subset: null
+  id: syvai/danish-asr-unified
+  subset: default
   train_name: train
-  text_column: sentence
+  text_column: text
   audio_column: audio
   filter_dataset: true
+  filters:
+    source: ftspeech
   language: da
-  revision: e1b7096db63c7d996a8220b13780a547a88a9af0
+  revision: 5a3a49ee981baab6e1e37ddd2c45f9943c27d08f
   trust_remote_code: false
+  overlay:
+    id: syvai/danish-asr-unified-hviske-v5-tiny
+    subset: default
+    split: train
+    revision: 58899784c825e954d83cf5c1bf7578aa215ecf71
+    strategy: positional
+    base_filters:
+      source: ftspeech
+    filters:
+      source: ftspeech
+    equality_checks:
+      source: source
+      text: reference_text
+    action_column: action
+    allowed_actions: [keep, relabel, strip]
+    text_policy:
+      candidates:
+        - column: new_text
+          actions: [relabel, strip]
+        - column: reference_text
+    trust_remote_code: false

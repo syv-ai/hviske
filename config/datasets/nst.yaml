@@ -1,10 +1,33 @@
 nst:
-  id: alexandrainst/nst-da
-  subset: null
+  id: syvai/danish-asr-unified
+  subset: default
   train_name: train
   text_column: text
   audio_column: audio
   filter_dataset: true
+  filters:
+    source: nst
   language: da
-  revision: 0f14ad2005e0aab8f56cf3213b7689da1faf23c2
+  revision: 5a3a49ee981baab6e1e37ddd2c45f9943c27d08f
   trust_remote_code: false
+  overlay:
+    id: syvai/danish-asr-unified-hviske-v5-tiny
+    subset: default
+    split: train
+    revision: 58899784c825e954d83cf5c1bf7578aa215ecf71
+    strategy: positional
+    base_filters:
+      source: nst
+    filters:
+      source: nst
+    equality_checks:
+      source: source
+      text: reference_text
+    action_column: action
+    allowed_actions: [keep, relabel, strip]
+    text_policy:
+      candidates:
+        - column: new_text
+          actions: [relabel, strip]
+        - column: reference_text
+    trust_remote_code: false

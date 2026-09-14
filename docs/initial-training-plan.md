@@ -217,7 +217,10 @@ Sparkie corpus.
 ### Unified v5-tiny quality manifest
 
 Treat `syvai/danish-asr-unified-hviske-v5-tiny` as a quality and relabelling manifest,
-not as an audio dataset. It has no audio column.
+not as an audio dataset. It has no audio column. v6.0 pins the observed snapshot
+`58899784c825e954d83cf5c1bf7578aa215ecf71`, paired with unified-audio snapshot
+`5a3a49ee981baab6e1e37ddd2c45f9943c27d08f`; the overlay main branch was moving, so
+these revisions must not be replaced by a branch name.
 
 After the job finishes:
 
@@ -238,8 +241,13 @@ label noise.
 
 Use the quality manifest for all of its relevant Danish sources, not only VoxPopuli.
 Create source-filtered streams for CoRal read-aloud, CoRal conversation, FTSpeech, Nota,
-NST, and VoxPopuli so the existing per-source sampling weights remain explicit. Avoid
-loading the same source both directly and through the unified repository.
+NST, and VoxPopuli so the existing per-source sampling weights remain explicit. Each
+stream uses the same source filter on the base and overlay, strict positional row
+matching, source and reference-text equality checks, and the ordered
+`new_text`-then-`reference_text` fallback for relabel/strip actions. The reusable
+loader indexes overlay metadata in disk-backed SQLite while audio remains streaming;
+preflight invokes the same overlay and consumes the metadata without decoding audio.
+Avoid loading the same source both directly and through the unified repository.
 
 Do not use the manifest's FLEURS rows. Common Voice rows may be used only when their
 split membership is proved and all leaderboard test rows are excluded; otherwise omit
