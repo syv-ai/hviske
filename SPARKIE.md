@@ -12,7 +12,14 @@ putting credentials in this checkout:
 uv sync --python 3.11 --all-extras
 hf auth login
 hf auth whoami
+wandb login
+wandb login --verify
 ```
+
+W&B uses the authenticated user's default/personal workspace; do not set an entity
+unless an explicit workspace override is required. The production project is `hviske`.
+`wandb login --verify` must pass while the GPU service is still running. Never put a
+W&B API key in this runbook, shell history, Hydra configuration, or a command.
 
 The Hugging Face account must have accepted access to
 `CohereLabs/cohere-transcribe-03-2026`, read access to the manually gated
@@ -80,7 +87,8 @@ uv run python src/scripts/build_vtt_manifest.py \
   --language da
 ```
 
-Run the preflight while `qwen38-ar` is still serving. It resolves every required
+Run the preflight while `qwen38-ar` is still serving. It verifies stored W&B
+credentials and online API access without printing a key, then resolves every required
 environment variable, checks Hub authentication and gated model access, validates all
 pinned dataset coordinates and schemas, validates each local manifest and its first
 referenced WAV, and consumes one direct P1 example. It fully consumes every overlay to
@@ -94,7 +102,7 @@ uv run python src/scripts/finetune_asr_model.py \
   --config-name sparkie_bilingual --cfg job
 uv run python src/scripts/preflight_finetuning_data.py \
   --config-name sparkie_bilingual
-uv run pytest tests/test_sparkie_config.py \
+uv run pytest tests/test_sparkie_config.py tests/test_wandb_setup.py \
   tests/test_preflight_finetuning_data.py -q
 ```
 
@@ -111,16 +119,18 @@ Start with a two-step smoke:
 
 ```bash
 # Stop qwen38-ar now, immediately before launching this session.
+# Identity is passed in each session; it does not depend on an old tmux server's env.
 tmux new-session -d -s hviske-smoke \
-  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_steps=2 save_steps=2 eval_steps=2 max_validation_samples_per_dataset=32'
+  'WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-smoke experiment_tracking.id=sparkie-v6.0-smoke experiment_tracking.mode=online experiment_tracking.resume=allow max_steps=2 save_steps=2 eval_steps=2 max_validation_samples_per_dataset=32'
 ```
 
-Inspect the resolved log, GPU memory, and checkpoint before running a bounded 2,000-step
-pilot. Publication remains disabled in the preset.
+Inspect the resolved log, GPU memory, and checkpoint before running the bounded learning-
+rate pilot. This pilot has its own W&B run and does not alter the smoke run.
+Publication remains disabled in the preset.
 
 ```bash
-tmux new-session -d -s hviske-pilot \
-  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_steps=2000 max_validation_samples_per_dataset=256'
+tmux new-session -d -s hviske-lr-pilot \
+  'WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-lr-pilot experiment_tracking.id=sparkie-v6.0-lr-pilot experiment_tracking.mode=online experiment_tracking.resume=allow model.learning_rate=5e-6 max_steps=2000 max_validation_samples_per_dataset=256'
 ```
 
 Review pilot loss, validation metrics, throughput, checkpoint resumption, and disk use.
@@ -128,8 +138,21 @@ Only then launch the approved full run:
 
 ```bash
 tmux new-session -d -s hviske-v6-0 \
-  'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_validation_samples_per_dataset=1000'
+  'WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-full experiment_tracking.id=sparkie-v6.0-full experiment_tracking.mode=online experiment_tracking.resume=allow max_validation_samples_per_dataset=1000'
 ```
+
+If the full run is interrupted, resume from a local checkpoint while reusing the same
+full run ID and run name. This appends to the existing online W&B run rather than
+creating a replacement:
+
+```bash
+tmux new-session -d -s hviske-v6-0-resume \
+  'WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-full experiment_tracking.id=sparkie-v6.0-full experiment_tracking.mode=online experiment_tracking.resume=allow resume_from_checkpoint=models/hviske-v6.0/checkpoint-<step> max_validation_samples_per_dataset=1000'
+```
+
+The `WANDB_LOG_MODEL=false` and `WANDB_WATCH=false` settings keep checkpoints and model
+artefacts local while metrics and configuration remain online. Pass these settings in
+every session; never rely on variables exported into an existing tmux server.
 
 These command-only sessions exit when the job finishes. Attach or capture logs while a
 job is running; completed ephemeral sessions are not available afterwards.

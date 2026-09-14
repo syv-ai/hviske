@@ -322,7 +322,18 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     config = _preset(monkeypatch)
 
     assert config.push_to_hub is False
-    assert config.enable_experiment_tracking is False
+    assert config.enable_experiment_tracking is True
+    assert config.experiment_tracking.type == "wandb"
+    assert config.experiment_tracking.name_experiment == "hviske"
+    assert config.experiment_tracking.name_group == "v6.0"
+    assert config.experiment_tracking.name_run == "v6.0-full"
+    assert config.experiment_tracking.entity is None
+    assert config.experiment_tracking.resume == "allow"
+    assert config.experiment_tracking.job_type == "train"
+    assert list(config.experiment_tracking.tags) == ["v6.0", "production", "cohere"]
+    assert config.experiment_tracking.mode == "online"
+    assert config.experiment_tracking.log_model is False
+    assert config.experiment_tracking.watch is False
     assert config.model.revision == "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
     assert config.private is True
     assert config.private_only is True

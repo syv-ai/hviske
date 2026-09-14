@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added robust online W&B tracking for the production Sparkie v6.0 workflow, including
+  credential-safe preflight, resumable run IDs, and local-only model checkpoints.
 - Added reusable keyed and strict positional ASR dataset overlays with bounded SQLite
   indexing, shared preflight validation, and safe overlay provenance; configured the
   v6.0 Danish unified sources to use an environment-supplied immutable overlay revision.

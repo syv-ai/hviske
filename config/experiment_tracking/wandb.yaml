@@ -2,3 +2,13 @@ type: wandb
 name_experiment: CoRal
 name_run: ${model_id}
 name_group: default
+# Leave entity unset to use the authenticated user's default workspace.
+entity: null
+id: null
+resume: null
+job_type: null
+tags: []
+mode: null
+save_code: null
+log_model: false
+watch: false

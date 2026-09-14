@@ -39,21 +39,20 @@ def finetune(config: DictConfig) -> None:
             The Hydra configuration object.
     """
     validate_private_only_config(config=config)
-    download_background_noises()
 
     # Note if we're on the main process, if we are running in a distributed setting
     is_main_process = os.getenv("RANK", "0") == "0"
+    extracking_setup: ExTrackingSetup | None = None
+    if config.enable_experiment_tracking and is_main_process:
+        extracking_setup = load_extracking_setup(config=config)
+        extracking_setup.run_initialization()
 
+    download_background_noises()
     model_setup: ModelSetup = load_model_setup(config=config)
     processor = model_setup.load_processor()
     dataset = load_data_for_finetuning(config=config, processor=processor)
     processor.save_pretrained(save_directory=config.model_dir)
     model = model_setup.load_model()
-
-    extracking_setup: ExTrackingSetup | None = None
-    if config.enable_experiment_tracking and is_main_process:
-        extracking_setup = load_extracking_setup(config=config)
-        extracking_setup.run_initialization()
 
     vals = {
         split_name: split
