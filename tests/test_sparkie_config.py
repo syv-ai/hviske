@@ -8,6 +8,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from hydra import compose
 from omegaconf import DictConfig, OmegaConf
 
+import hviske.experiment_tracking.wandb_setup as wandb_module
 import hviske.utils as utils
 from scripts.publish_private_model import training_sources_from_config
 
@@ -328,7 +329,7 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     assert config.experiment_tracking.name_group == "v6.0"
     assert config.experiment_tracking.name_run == "v6.0-full"
     assert config.experiment_tracking.entity is None
-    assert config.experiment_tracking.resume == "allow"
+    assert config.experiment_tracking.resume == "never"
     assert config.experiment_tracking.job_type == "train"
     assert list(config.experiment_tracking.tags) == ["v6.0", "production", "cohere"]
     assert config.experiment_tracking.mode == "online"
@@ -339,6 +340,8 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     assert config.private_only is True
     assert config.save_total_limit == 3
     assert config.max_validation_samples_per_dataset == 1000
+    assert config.max_steps == 100_000
+    assert config.stop_after_steps is None
     assert list(config.model_card_languages) == ["da", "en"]
     assert list(config.training_dataset_ids) == [
         "syvai/p1-segments",
@@ -444,6 +447,21 @@ def test_sparkie_training_order_and_probabilities(
         for source in sources
         if source["language"] == "en"
     ) == pytest.approx(0.4)
+
+
+def test_sparkie_wandb_payload_redacts_local_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolved production payload contains no local filesystem locations."""
+    payload = wandb_module._resolved_config_payload(config=_preset(monkeypatch))
+
+    assert payload["model_dir"] == "[REDACTED]"
+    assert payload["cache_dir"] is None
+    datasets = t.cast(dict[str, object], payload["datasets"])
+    drtv = t.cast(dict[str, object], datasets["drtv_local"])
+    youtube = t.cast(dict[str, object], datasets["youtube_local"])
+    assert drtv["manifest_path"] == "[REDACTED]"
+    assert youtube["manifest_path"] == "[REDACTED]"
 
 
 def test_youtube_local_manifest_is_danish() -> None:

@@ -12,14 +12,14 @@ putting credentials in this checkout:
 uv sync --python 3.11 --all-extras
 hf auth login
 hf auth whoami
-wandb login
-wandb login --verify
+uv run wandb login
+uv run wandb login --verify
 ```
 
 W&B uses the authenticated user's default/personal workspace; do not set an entity
 unless an explicit workspace override is required. The production project is `hviske`.
-`wandb login --verify` must pass while the GPU service is still running. Never put a
-W&B API key in this runbook, shell history, Hydra configuration, or a command.
+`uv run wandb login --verify` must pass while the GPU service is still running. Never put
+a W&B API key in this runbook, shell history, Hydra configuration, or a command.
 
 The Hugging Face account must have accepted access to
 `CohereLabs/cohere-transcribe-03-2026`, read access to the manually gated
@@ -112,50 +112,118 @@ errors and rerun the complete preflight.
 ## GPU smoke, pilot, and full run
 
 Stop `qwen38-ar` only after the preflight passes and immediately before starting the GPU
-smoke. Do not displace it during data preparation. Run each training phase in its own
-tmux session from the repository root.
+smoke. Do not displace it during data preparation. Run every training phase in its own
+tmux session from the repository root. The commands below use `env` assignments so the
+immutable data revisions and non-secret W&B identity come from this shell, not an old
+tmux server environment.
 
-Start with a two-step smoke:
+Create a private local state directory and fresh IDs. `resume=never` makes an accidental
+ID collision fail rather than append to an old campaign. This directory is local state,
+not a credential store:
 
 ```bash
-# Stop qwen38-ar now, immediately before launching this session.
-# Identity is passed in each session; it does not depend on an old tmux server's env.
+wandb_state_dir="$PWD/.hviske-wandb"
+mkdir -p "$wandb_state_dir"
+new_wandb_id() {
+  uv run python -c 'import wandb; print(wandb.util.generate_id())'
+}
+persist_wandb_id() {
+  printf '%s\n' "$2" > "$1"
+}
+export WANDB_PROJECT=hviske
+p1_revision_q=$(printf '%q' "$P1_SEGMENTS_REVISION")
+overlay_revision_q=$(printf '%q' "$HVISKE_OVERLAY_REVISION")
+wandb_project_q=$(printf '%q' "$WANDB_PROJECT")
+```
+
+Start with a two-step smoke. Generate and persist its ID before launching it, and keep
+its model and metrics in a phase-specific directory:
+
+```bash
+smoke_id=$(new_wandb_id)
+persist_wandb_id "$wandb_state_dir/smoke.id" "$smoke_id"
+smoke_dir_q=$(printf '%q' "$PWD/runs/smoke")
+smoke_metrics_q=$(printf '%q' "$PWD/runs/smoke/metrics.jsonl")
 tmux new-session -d -s hviske-smoke \
-  'WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-smoke experiment_tracking.id=sparkie-v6.0-smoke experiment_tracking.mode=online experiment_tracking.resume=allow max_steps=2 save_steps=2 eval_steps=2 max_validation_samples_per_dataset=32'
+  "env P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-smoke experiment_tracking.id=$smoke_id experiment_tracking.mode=online experiment_tracking.resume=never model_dir=$smoke_dir_q evaluation_steps='[2]' evaluation_metrics_path=$smoke_metrics_q stop_after_steps=2 save_steps=2 max_validation_samples_per_dataset=32"
 ```
 
-Inspect the resolved log, GPU memory, and checkpoint before running the bounded learning-
-rate pilot. This pilot has its own W&B run and does not alter the smoke run.
-Publication remains disabled in the preset.
+Inspect the resolved log, GPU memory, and checkpoint before starting the pilots. Run the
+`5e-6` pilot to completion first, then run `1e-5`; they have independent fresh W&B IDs,
+model directories, and metric files. Both retain the 100,000-step cosine-scheduler
+horizon while the tested stop callback ends training at 2,000 steps. Each evaluation is
+exactly at steps 250, 500, 1,000, and 2,000.
 
 ```bash
-tmux new-session -d -s hviske-lr-pilot \
-  'WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-lr-pilot experiment_tracking.id=sparkie-v6.0-lr-pilot experiment_tracking.mode=online experiment_tracking.resume=allow model.learning_rate=5e-6 max_steps=2000 max_validation_samples_per_dataset=256'
+pilot_5e6_id=$(new_wandb_id)
+persist_wandb_id "$wandb_state_dir/pilot-5e-6-seed-4242.id" "$pilot_5e6_id"
+pilot_5e6_dir_q=$(printf '%q' "$PWD/runs/pilot-5e-6-seed-4242")
+pilot_5e6_metrics_q=$(printf '%q' "$PWD/runs/pilot-5e-6-seed-4242/metrics.jsonl")
+tmux new-session -d -s hviske-pilot-5e-6 \
+  "env P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-5e-6-seed-4242 experiment_tracking.id=$pilot_5e6_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=5e-6 seed=4242 model_dir=$pilot_5e6_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$pilot_5e6_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
 ```
 
-Review pilot loss, validation metrics, throughput, checkpoint resumption, and disk use.
-Only then launch the approved full run:
+After the `5e-6` session exits and its results are reviewed, run the independent `1e-5`
+pilot:
 
 ```bash
+pilot_1e5_id=$(new_wandb_id)
+persist_wandb_id "$wandb_state_dir/pilot-1e-5-seed-4242.id" "$pilot_1e5_id"
+pilot_1e5_dir_q=$(printf '%q' "$PWD/runs/pilot-1e-5-seed-4242")
+pilot_1e5_metrics_q=$(printf '%q' "$PWD/runs/pilot-1e-5-seed-4242/metrics.jsonl")
+tmux new-session -d -s hviske-pilot-1e-5 \
+  "env P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-1e-5-seed-4242 experiment_tracking.id=$pilot_1e5_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=1e-5 seed=4242 model_dir=$pilot_1e5_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$pilot_1e5_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
+```
+
+Review the `5e-6` pilot after its tmux session exits before launching the `1e-5` pilot;
+these pilots are intentionally serial, not concurrent. Review both results and set
+`winner_lr` to exactly `5e-6` or `1e-5`. Repeat the winner with seed 4243 in another
+isolated run before full training:
+
+```bash
+winner_lr=5e-6  # Change only after reviewing both seed-4242 pilots.
+repeat_id=$(new_wandb_id)
+persist_wandb_id "$wandb_state_dir/pilot-winner-seed-4243.id" "$repeat_id"
+repeat_dir_q=$(printf '%q' "$PWD/runs/pilot-winner-seed-4243")
+repeat_metrics_q=$(printf '%q' "$PWD/runs/pilot-winner-seed-4243/metrics.jsonl")
+tmux new-session -d -s hviske-pilot-seed-4243 \
+  "env P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-$winner_lr-seed-4243 experiment_tracking.id=$repeat_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=$winner_lr seed=4243 model_dir=$repeat_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$repeat_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
+```
+
+Only then launch the full run. Select the **seed-4242** checkpoint from the winning
+pilot (normally `checkpoint-2000`) and pass it to `resume_from_checkpoint`. Trainer then
+restores the model, optimiser, and scheduler state; do not copy only the model weights.
+The full run has a fresh persisted ID and its own output directory:
+
+```bash
+selected_checkpoint="$PWD/runs/pilot-5e-6-seed-4242/checkpoint-2000"  # Or 1e-5.
+selected_checkpoint_q=$(printf '%q' "$selected_checkpoint")
+full_id=$(new_wandb_id)
+persist_wandb_id "$wandb_state_dir/full.id" "$full_id"
+full_dir_q=$(printf '%q' "$PWD/runs/hviske-v6.0")
 tmux new-session -d -s hviske-v6-0 \
-  'WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-full experiment_tracking.id=sparkie-v6.0-full experiment_tracking.mode=online experiment_tracking.resume=allow max_validation_samples_per_dataset=1000'
+  "env P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-full experiment_tracking.id=$full_id experiment_tracking.mode=online experiment_tracking.resume=never resume_from_checkpoint=$selected_checkpoint_q model_dir=$full_dir_q max_steps=100000 max_validation_samples_per_dataset=1000"
 ```
 
-If the full run is interrupted, resume from a local checkpoint while reusing the same
-full run ID and run name. This appends to the existing online W&B run rather than
-creating a replacement:
+If the full run is interrupted, preserve the local checkpoint and read the persisted
+full ID. `resume=must` rejects a missing or wrong remote run instead of silently creating
+another one; Trainer restores the same local optimiser and scheduler state:
 
 ```bash
+full_id=$(<"$wandb_state_dir/full.id")
+checkpoint="$PWD/runs/hviske-v6.0/checkpoint-<step>"
+checkpoint_q=$(printf '%q' "$checkpoint")
 tmux new-session -d -s hviske-v6-0-resume \
-  'WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-full experiment_tracking.id=sparkie-v6.0-full experiment_tracking.mode=online experiment_tracking.resume=allow resume_from_checkpoint=models/hviske-v6.0/checkpoint-<step> max_validation_samples_per_dataset=1000'
+  "env P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-full experiment_tracking.id=$full_id experiment_tracking.mode=online experiment_tracking.resume=must resume_from_checkpoint=$checkpoint_q model_dir=$full_dir_q max_steps=100000 max_validation_samples_per_dataset=1000"
 ```
 
-The `WANDB_LOG_MODEL=false` and `WANDB_WATCH=false` settings keep checkpoints and model
-artefacts local while metrics and configuration remain online. Pass these settings in
-every session; never rely on variables exported into an existing tmux server.
-
-These command-only sessions exit when the job finishes. Attach or capture logs while a
-job is running; completed ephemeral sessions are not available afterwards.
+The full ID file is the persistence record needed for interruption recovery; never put a
+W&B API key in it. The `WANDB_LOG_MODEL=false` and `WANDB_WATCH=false` settings keep
+checkpoints and model artefacts local while metrics and configuration remain online.
+Pass the revision, identity, and policy in every session; never rely on variables
+exported into an existing tmux server. These command-only sessions exit when the job
+finishes. Attach or capture logs while a job is running; completed ephemeral sessions
+are not available afterwards.
 
 Monitor a running job with:
 

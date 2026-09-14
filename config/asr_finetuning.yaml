@@ -70,10 +70,14 @@ adam_first_momentum: 0.9
 adam_second_momentum: 0.98
 total_batch_size: 256
 per_device_batch_size: 8
+# max_steps is also the scheduler horizon; bounded runs use stop_after_steps.
 max_steps: 100_000
+stop_after_steps: null
 warmup_steps: 1_000
 logging_steps: 100
 eval_steps: 500
+evaluation_steps: null
+evaluation_metrics_path: null
 save_steps: 500
 early_stopping: false
 early_stopping_patience: 50

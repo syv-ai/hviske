@@ -22,5 +22,8 @@
 
 ### Fixed
 
+- Separated bounded pilot stopping from the 100,000-step scheduler horizon, added
+  resumable tracking finalisation with success and failure statuses, and hardened W&B
+  preflight, IDs, environment policy, and configuration redaction.
 - Restored the codebase MIT license and removed the P1 dataset license files.
 - Preserved repeated reference tokens in Parakeet RNNT metrics.
