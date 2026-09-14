@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections.abc as c
+import hashlib
 import json
 import os
 import re
@@ -20,12 +21,16 @@ from .publish import _EXPECTED_ARROW_SCHEMA
 
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_BATCH_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _PARTITIONS = tuple(range(8))
 _REPOSITORY = "syvai/p1-segments"
 _METADATA_COLUMNS = tuple(
     field.name for field in OUTPUT_SCHEMA.fields if field.name != "audio"
 )
 _TERMINAL_PROGRAMME_STATES = {"purged", "rejected"}
+_MAX_METADATA_BYTES = 16 * 1024 * 1024
+_MAX_README_BYTES = 1 * 1024 * 1024
+_MAX_HISTORY_COMMITS = 10_000
 
 
 @dataclass(frozen=True)
@@ -36,11 +41,22 @@ class _Shard:
     sha256: str
 
 
+@dataclass(frozen=True)
+class _Batch:
+    batch_id: str
+    commit_id: str
+    programme_count: int
+    row_count: int
+    rejection_counts: dict[str, int]
+    shards: tuple[_Shard, ...]
+
+
 class _LedgerSummary(t.TypedDict):
     shards: tuple[_Shard, ...]
     rows: int
     programme_states: dict[str, int]
     batches: dict[str, int]
+    batch_evidence: tuple[_Batch, ...]
 
 
 @dataclass
@@ -145,7 +161,12 @@ def finalise_public_corpus(
     if len(remote_shards) != len(expected_shards):
         raise FinalisationError("remote Parquet paths are not one-to-one")
     _check_remote_metadata(hub, repository, revision, ledger["shards"])
-    _check_manifests(Path(run_root), ledger["shards"])
+    batch_evidence = ledger.get("batch_evidence", ())
+    if batch_evidence:
+        _check_batch_ancestry(hub, repository, revision, batch_evidence)
+        _check_remote_manifests(
+            hub, repository, revision, batch_evidence, remote_files=remote_files
+        )
     stats = _scan_parquet(
         hub, repository, revision, ledger["shards"], expected_pipeline_config_sha256
     )
@@ -168,6 +189,10 @@ def finalise_public_corpus(
             "no_duplicate_segment_ids": True,
             "no_overlapping_intervals": True,
             "immutable_remote_metadata": True,
+            "batch_commit_ancestry": bool(batch_evidence),
+            "remote_manifests": bool(batch_evidence),
+            "shard_row_counts": True,
+            "v8_bounds": True,
         },
         "counts": {
             "shards": len(expected_shards),
@@ -229,8 +254,8 @@ def _cas_card_update(
     if not callable(reader) or not callable(committer):
         raise FinalisationError("card CAS is unavailable")
     try:
-        before = b"".join(
-            reader(repository, "README.md", repo_type="dataset", revision=revision)
+        before = _read_remote_bounded(
+            reader, repository, "README.md", revision, _MAX_README_BYTES
         )
         license_before = _remote_digest(hub, repository, "LICENSE", revision)
         current_files = tuple(_remote_inventory(hub, repository, revision))
@@ -241,6 +266,8 @@ def _cas_card_update(
     if tuple(current_files) != tuple(remote_files) or not _four_sections(before):
         raise FinalisationError("card or inventory changed during CAS preparation")
     updated = _add_card_statistics(before.decode("utf-8"), report).encode("utf-8")
+    if len(updated) > _MAX_README_BYTES:
+        raise FinalisationError("updated README exceeds the metadata bound")
     with tempfile.TemporaryDirectory(prefix="p1-card-") as temporary:
         path = Path(temporary) / "README.md"
         path.write_bytes(updated)
@@ -269,9 +296,11 @@ def _cas_card_update(
     if set(_remote_inventory(hub, repository, new_head)) != set(remote_files):
         raise FinalisationError("card CAS changed the remote inventory")
     try:
-        after = b"".join(
-            reader(repository, "README.md", repo_type="dataset", revision=new_head)
+        after = _read_remote_bounded(
+            reader, repository, "README.md", new_head, _MAX_README_BYTES
         )
+    except FinalisationError:
+        raise
     except Exception:
         raise FinalisationError("card CAS could not verify README bytes") from None
     if after != updated:
@@ -280,18 +309,19 @@ def _cas_card_update(
 
 
 def _add_card_statistics(card: str, report: dict[str, object]) -> str:
-    marker = "\n\n## Final structural statistics\n"
+    marker = "**Statistics:**"
     if marker in card:
         raise FinalisationError("card already contains final statistics")
     counts = t.cast(dict[str, int], report["counts"])
     audio = t.cast(dict[str, float | int], report["audio"])
     block = (
-        f"{marker}\n"
-        f"- Segments: {counts['rows']:,}\n"
-        f"- Shards: {counts['shards']:,}\n"
-        f"- Audio duration: {audio['hours']:.2f} hours\n"
+        f"{marker} {counts['rows']:,} segments across "
+        f"{counts['shards']:,} shards; {audio['hours']:.2f} hours of audio.\n\n"
     )
-    return card.rstrip("\n") + block
+    source_heading = re.search(r"(?m)^## Source\s*$", card)
+    if source_heading is None:
+        raise FinalisationError("card is missing the Source section")
+    return card[: source_heading.start()] + block + card[source_heading.start() :]
 
 
 def _four_sections(card: bytes) -> bool:
@@ -299,15 +329,34 @@ def _four_sections(card: bytes) -> bool:
         text = card.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    return all(
-        f"## {name}" in text for name in ("Dataset", "Source", "Access", "Licence")
-    )
+    headings = re.findall(r"(?m)^## ([^\r\n]+?)\s*$", text)
+    return headings == ["Dataset", "Source", "Access", "Licence"]
 
 
 def _object_value(value: object, name: str) -> object | None:
     if isinstance(value, c.Mapping):
         return value.get(name)
     return getattr(value, name, None)
+
+
+def _read_remote_bounded(
+    reader: c.Callable[..., c.Iterable[bytes]],
+    repository: str,
+    path: str,
+    revision: str,
+    maximum_size: int,
+) -> bytes:
+    content = bytearray()
+    try:
+        for chunk in reader(repository, path, repo_type="dataset", revision=revision):
+            if not isinstance(chunk, bytes):
+                raise ValueError
+            if len(content) + len(chunk) > maximum_size:
+                raise ValueError
+            content.extend(chunk)
+    except Exception:
+        raise FinalisationError("remote README exceeds the metadata bound") from None
+    return bytes(content)
 
 
 def _remote_digest(hub: object, repository: str, path: str, revision: str) -> str:
@@ -322,10 +371,75 @@ def _remote_digest(hub: object, repository: str, path: str, revision: str) -> st
         raise FinalisationError("remote metadata is unavailable") from None
     if len(values) != 1:
         raise FinalisationError("remote metadata is incomplete")
-    digest = _object_value(values[0], "sha256") or _object_value(values[0], "oid")
-    if not isinstance(digest, str):
-        raise FinalisationError("remote metadata has no immutable digest")
+    item = values[0]
+    digest = _content_digest(item)
+    if digest is not None:
+        return digest
+    size = _remote_size(item)
+    if size is None:
+        raise FinalisationError("remote metadata has no content size")
+    digest, _ = _stream_remote_file(
+        hub,
+        repository,
+        path,
+        revision,
+        expected_size=size,
+        maximum_size=_MAX_METADATA_BYTES,
+    )
     return digest
+
+
+def _content_digest(value: object) -> str | None:
+    """Return a content SHA-256, never a Git object identity."""
+    lfs = _object_value(value, "lfs")
+    candidates = (_object_value(lfs, "sha256"), _object_value(value, "sha256"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and _SHA256.fullmatch(candidate):
+            return candidate
+    return None
+
+
+def _remote_size(value: object) -> int | None:
+    size = _object_value(value, "size")
+    if size is None:
+        size = _object_value(value, "size_bytes")
+    return size if type(size) is int and size >= 0 else None
+
+
+def _stream_remote_file(
+    hub: object,
+    repository: str,
+    path: str,
+    revision: str,
+    *,
+    expected_size: int,
+    maximum_size: int,
+    retain: bool = False,
+) -> tuple[str, bytes | None]:
+    reader = getattr(hub, "stream_file", None)
+    if not callable(reader) or expected_size > maximum_size:
+        raise FinalisationError("remote object exceeds the metadata bound")
+    digest = hashlib.sha256()
+    content = bytearray() if retain else None
+    total = 0
+    try:
+        chunks = reader(repository, path, repo_type="dataset", revision=revision)
+        for chunk in chunks:
+            if not isinstance(chunk, bytes):
+                raise ValueError
+            total += len(chunk)
+            if total > expected_size or total > maximum_size:
+                raise ValueError
+            digest.update(chunk)
+            if content is not None:
+                content.extend(chunk)
+    except FinalisationError:
+        raise
+    except Exception:
+        raise FinalisationError("remote object cannot be streamed safely") from None
+    if total != expected_size:
+        raise FinalisationError("remote object has an unexpected size")
+    return digest.hexdigest(), None if content is None else bytes(content)
 
 
 def _remote_inventory(hub: object, repository: str, revision: str) -> tuple[str, ...]:
@@ -369,6 +483,40 @@ def _require_public_head(hub: object, repository: str, revision: str) -> None:
         raise FinalisationError(
             "the pinned dataset is not public at the requested revision"
         )
+
+
+def _check_batch_ancestry(
+    hub: object, repository: str, revision: str, batches: c.Sequence[_Batch]
+) -> None:
+    """Prove batch commits occur in the bounded history of the final revision.
+
+    Raises:
+        FinalisationError:
+            If the Hub history is unavailable or does not contain every batch.
+    """
+    getter = getattr(hub, "list_repo_commits", None)
+    if not callable(getter):
+        raise FinalisationError("Hub commit history is unavailable")
+    expected = {batch.commit_id for batch in batches}
+    try:
+        commits = getter(repository, repo_type="dataset", revision=revision)
+        history: set[str] = set()
+        for index, item in enumerate(commits):
+            if index >= _MAX_HISTORY_COMMITS:
+                raise FinalisationError("Hub commit history exceeds the safety bound")
+            value = (
+                _object_value(item, "commit_id")
+                or _object_value(item, "oid")
+                or _object_value(item, "sha")
+            )
+            if isinstance(value, str) and _COMMIT_SHA.fullmatch(value):
+                history.add(value)
+    except FinalisationError:
+        raise
+    except Exception:
+        raise FinalisationError("Hub commit history is unavailable") from None
+    if revision not in history or not expected.issubset(history):
+        raise FinalisationError("a ledger batch commit is not an ancestor")
 
 
 def _check_manifests(root: Path, shards: c.Sequence[_Shard]) -> None:
@@ -442,6 +590,76 @@ def _manifest_values(path: Path) -> c.Iterator[object]:
     yield json.loads(path.read_text(encoding="utf-8"))
 
 
+def _check_remote_manifests(
+    hub: object,
+    repository: str,
+    revision: str,
+    batches: c.Sequence[_Batch],
+    *,
+    remote_files: c.Sequence[str] | None = None,
+) -> None:
+    """Require and validate every immutable batch manifest at the final revision.
+
+    Raises:
+        FinalisationError:
+            If the remote inventory or any manifest differs from the ledger.
+    """
+    files = (
+        tuple(remote_files)
+        if remote_files is not None
+        else _remote_inventory(hub, repository, revision)
+    )
+    actual = {path for path in files if path.startswith("manifests/")}
+    expected_paths = {f"manifests/{batch.batch_id}.json" for batch in batches}
+    if actual != expected_paths:
+        raise FinalisationError("remote manifest inventory differs from the ledgers")
+    if len(actual) != len(expected_paths):
+        raise FinalisationError("remote manifest paths are not one-to-one")
+    for batch in batches:
+        expected = _manifest_bytes(batch)
+        path = f"manifests/{batch.batch_id}.json"
+        digest, content = _stream_remote_file(
+            hub,
+            repository,
+            path,
+            revision,
+            expected_size=len(expected),
+            maximum_size=_MAX_METADATA_BYTES,
+            retain=True,
+        )
+        if content is None:
+            raise FinalisationError("remote manifest was not retained")
+        if digest != hashlib.sha256(expected).hexdigest() or content != expected:
+            raise FinalisationError("remote manifest differs from the ledger")
+        try:
+            parsed = json.loads(content)
+        except (ValueError, UnicodeError):
+            raise FinalisationError("a remote manifest is malformed") from None
+        if parsed != json.loads(expected):
+            raise FinalisationError("remote manifest schema differs from the ledger")
+
+
+def _manifest_bytes(batch: _Batch) -> bytes:
+    payload = {
+        "batch_id": batch.batch_id,
+        "programme_count": batch.programme_count,
+        "row_count": batch.row_count,
+        "rejection_counts": dict(sorted(batch.rejection_counts.items())),
+        "shards": [
+            {
+                "byte_size": shard.byte_size,
+                "path": shard.path,
+                "row_count": shard.row_count,
+                "sha256": shard.sha256,
+            }
+            for shard in batch.shards
+        ],
+    }
+    return json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode()
+
+
 def _check_remote_metadata(
     hub: object, repository: str, revision: str, shards: c.Sequence[_Shard]
 ) -> None:
@@ -469,13 +687,22 @@ def _check_remote_metadata(
                 raise FinalisationError("remote immutable metadata is duplicated")
             seen_metadata.add(path)
             evidence = expected.get(path)
-            size = _object_value(item, "size") or _object_value(item, "size_bytes")
-            digest = _object_value(item, "sha256") or _object_value(item, "oid")
-            if (
-                evidence is None
-                or size != evidence.byte_size
-                or digest != evidence.sha256
-            ):
+            size = _remote_size(item)
+            digest = _content_digest(item)
+            if evidence is None or size != evidence.byte_size:
+                raise FinalisationError(
+                    "remote immutable metadata differs from the ledgers"
+                )
+            if digest is None:
+                digest, _ = _stream_remote_file(
+                    hub,
+                    repository,
+                    path,
+                    revision,
+                    expected_size=evidence.byte_size,
+                    maximum_size=evidence.byte_size,
+                )
+            if digest != evidence.sha256:
                 raise FinalisationError(
                     "remote immutable metadata differs from the ledgers"
                 )
@@ -493,6 +720,7 @@ def _read_run_root(root: Path, digest: str, revision: str) -> _LedgerSummary:
     accepted_total = 0
     state_counts: dict[str, int] = {}
     batch_counts: dict[str, int] = {}
+    batch_records: dict[str, dict[str, object]] = {}
     for index in _PARTITIONS:
         partition = root / f"partition-{index}"
         database = partition / "ledger.sqlite"
@@ -530,21 +758,63 @@ def _read_run_root(root: Path, digest: str, revision: str) -> _LedgerSummary:
                 if state not in _TERMINAL_PROGRAMME_STATES:
                     raise FinalisationError("a programme is not in a terminal state")
             for row in connection.execute(
-                "SELECT state, publication_artifact_purged_at, COUNT(*) "
-                "FROM batches GROUP BY state, publication_artifact_purged_at"
+                "SELECT batch_id, state, pipeline_digest, commit_id, programme_count, "
+                "row_count, rejection_counts, publication_artifact_purged_at "
+                "FROM batches"
             ):
-                state = str(row[0])
-                batch_counts[state] = batch_counts.get(state, 0) + int(row[2])
-                if state != "purged" or row[1] is None:
-                    raise FinalisationError("a publication batch is not fully closed")
-            for row in connection.execute(
-                "SELECT s.path, s.byte_size, s.row_count, s.sha256, s.state, "
-                "b.commit_id, s.local_path FROM shards AS s "
-                "JOIN batches AS b ON b.batch_id = s.batch_id"
-            ):
-                path, size, count, sha256, state, commit_id, local_path = row
+                (
+                    batch_id,
+                    state,
+                    pipeline_digest,
+                    commit_id,
+                    programme_count,
+                    row_count,
+                    rejection_counts,
+                    purged_at,
+                ) = row
                 if (
-                    not isinstance(path, str)
+                    not isinstance(batch_id, str)
+                    or _BATCH_ID.fullmatch(batch_id) is None
+                    or batch_id in batch_records
+                    or state != "purged"
+                    or pipeline_digest != digest
+                    or not isinstance(commit_id, str)
+                    or _COMMIT_SHA.fullmatch(commit_id) is None
+                    or type(programme_count) is not int
+                    or programme_count < 0
+                    or type(row_count) is not int
+                    or row_count < 1
+                    or purged_at is None
+                ):
+                    raise FinalisationError("a publication batch has invalid evidence")
+                try:
+                    parsed_rejections = json.loads(str(rejection_counts))
+                except (TypeError, ValueError, UnicodeError):
+                    raise FinalisationError(
+                        "a publication batch has invalid evidence"
+                    ) from None
+                if not isinstance(parsed_rejections, dict) or any(
+                    not isinstance(key, str) or type(value) is not int or value < 0
+                    for key, value in parsed_rejections.items()
+                ):
+                    raise FinalisationError("a publication batch has invalid evidence")
+                batch_records[batch_id] = {
+                    "commit_id": commit_id,
+                    "programme_count": programme_count,
+                    "row_count": row_count,
+                    "rejection_counts": parsed_rejections,
+                    "shards": [],
+                }
+                batch_counts[state] = batch_counts.get(state, 0) + 1
+            for row in connection.execute(
+                "SELECT s.batch_id, s.path, s.byte_size, s.row_count, s.sha256, "
+                "s.state, s.local_path FROM shards AS s"
+            ):
+                batch_id, path, size, count, sha256, state, local_path = row
+                if (
+                    not isinstance(batch_id, str)
+                    or batch_id not in batch_records
+                    or not isinstance(path, str)
                     or not is_allowed_shard_path(path)
                     or not isinstance(size, int)
                     or size < 1
@@ -553,12 +823,13 @@ def _read_run_root(root: Path, digest: str, revision: str) -> _LedgerSummary:
                     or not isinstance(sha256, str)
                     or _SHA256.fullmatch(sha256) is None
                     or state != "purged"
-                    or commit_id != revision
                 ):
                     raise FinalisationError("a shard has invalid immutable evidence")
                 if local_path and Path(str(local_path)).exists():
                     raise FinalisationError("a publication artefact remains staged")
-                shard_rows.append(_Shard(path, size, count, sha256))
+                shard = _Shard(path, size, count, sha256)
+                shard_rows.append(shard)
+                t.cast(list[_Shard], batch_records[batch_id]["shards"]).append(shard)
         finally:
             connection.close()
     extras = tuple(root.glob("partition-*/ledger.sqlite"))
@@ -573,6 +844,22 @@ def _read_run_root(root: Path, digest: str, revision: str) -> _LedgerSummary:
         raise FinalisationError("programme accepted counts differ from shard rows")
     if len({item.path for item in shard_rows}) != len(shard_rows):
         raise FinalisationError("a remote shard path occurs more than once")
+    batch_evidence: list[_Batch] = []
+    for batch_id, record in batch_records.items():
+        shards = tuple(t.cast(list[_Shard], record["shards"]))
+        row_count = t.cast(int, record["row_count"])
+        if not shards or sum(item.row_count for item in shards) != row_count:
+            raise FinalisationError("a batch row count differs from its shards")
+        batch_evidence.append(
+            _Batch(
+                batch_id=batch_id,
+                commit_id=t.cast(str, record["commit_id"]),
+                programme_count=t.cast(int, record["programme_count"]),
+                row_count=row_count,
+                rejection_counts=t.cast(dict[str, int], record["rejection_counts"]),
+                shards=shards,
+            )
+        )
     for path in root.rglob("*"):
         if path.is_file() and (
             path.suffix in {".parquet", ".tmp", ".partial"}
@@ -585,6 +872,7 @@ def _read_run_root(root: Path, digest: str, revision: str) -> _LedgerSummary:
         "rows": sum(item.row_count for item in shard_rows),
         "programme_states": dict(sorted(state_counts.items())),
         "batches": dict(sorted(batch_counts.items())),
+        "batch_evidence": tuple(batch_evidence),
     }
 
 
@@ -624,12 +912,23 @@ def _scan_parquet(
                     raise FinalisationError(
                         "a Parquet shard has the wrong Arrow schema"
                     )
+                footer = parquet.metadata
+                if footer is None or footer.num_rows != shard.row_count:
+                    raise FinalisationError(
+                        "a Parquet footer row count differs from the ledger"
+                    )
+                scanned_rows = 0
                 batches = parquet.iter_batches(
                     columns=list(_METADATA_COLUMNS), batch_size=1024
                 )
                 for batch in batches:
+                    scanned_rows += batch.num_rows
                     for row in batch.to_pylist():
                         _check_row(row, digest, seen_db, stats)
+                if scanned_rows != shard.row_count:
+                    raise FinalisationError(
+                        "a scanned row count differs from the ledger"
+                    )
             except FinalisationError:
                 raise
             except Exception:
@@ -696,6 +995,8 @@ def _check_row(
     )
     if not (0 <= start < end <= source_duration and row["duration_ms"] == end - start):
         raise FinalisationError("a row has invalid source boundaries")
+    if not (1000 <= row["duration_ms"] < 10000):
+        raise FinalisationError("a row is outside the active v8 duration bounds")
     if not (row["proposal_start_ms"] < row["proposal_end_ms"]):
         raise FinalisationError("a row has invalid proposal boundaries")
     if row["proposal_start_ms"] != start or row["proposal_end_ms"] != end:

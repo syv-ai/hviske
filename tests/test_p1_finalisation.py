@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections.abc as c
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,37 @@ from p1_dataset.validation import PinnedHubClipRetriever
 _REVISION = "a" * 40
 _DIGEST = "b" * 64
 _SHARD = finalisation._Shard("data/train/part-00000.parquet", 10, 2, "c" * 64)
+
+
+def test_batch_history_must_contain_each_recorded_commit() -> None:
+    """A complete Hub history proves ancestor status without equal SHAs."""
+    batch = finalisation._Batch("batch-001", "c" * 40, 1, 2, {}, (_SHARD,))
+
+    class HistoryHub:
+        def list_repo_commits(
+            self, repo_id: str, *, repo_type: str, revision: str
+        ) -> tuple[object, ...]:
+            del repo_id, repo_type, revision
+            return (
+                SimpleNamespace(commit_id=_REVISION),
+                SimpleNamespace(commit_id=batch.commit_id),
+            )
+
+    finalisation._check_batch_ancestry(
+        HistoryHub(), "syvai/p1-segments", _REVISION, (batch,)
+    )
+
+    class UnrelatedHistoryHub(HistoryHub):
+        def list_repo_commits(
+            self, repo_id: str, *, repo_type: str, revision: str
+        ) -> tuple[object, ...]:
+            del repo_id, repo_type, revision
+            return (SimpleNamespace(commit_id=_REVISION),)
+
+    with pytest.raises(FinalisationError, match="ancestor"):
+        finalisation._check_batch_ancestry(
+            UnrelatedHistoryHub(), "syvai/p1-segments", _REVISION, (batch,)
+        )
 
 
 def test_card_update_uses_cas_and_preserves_licence_and_inventory() -> None:
@@ -180,3 +212,73 @@ def test_pinned_retriever_can_require_public_visibility() -> None:
         expected_visibility="public",
     )
     retriever.verify_repository()
+
+
+def test_remote_manifest_is_checked_against_batch_and_shards() -> None:
+    """Finalisation validates remote manifests after local publication purge."""
+    shard = finalisation._Shard(
+        "data/train/part-00000.parquet", 3, 2, hashlib.sha256(b"abc").hexdigest()
+    )
+    batch = finalisation._Batch("batch-001", "c" * 40, 1, 2, {}, (shard,))
+    payload = finalisation._manifest_bytes(batch)
+
+    class ManifestHub:
+        def stream_file(
+            self, repo_id: str, path: str, *, repo_type: str, revision: str
+        ) -> tuple[bytes, ...]:
+            del repo_id, repo_type, revision
+            assert path == "manifests/batch-001.json"
+            return (payload[:2], payload[2:])
+
+    finalisation._check_remote_manifests(
+        ManifestHub(),
+        "syvai/p1-segments",
+        _REVISION,
+        (batch,),
+        remote_files=("README.md", "LICENSE", shard.path, "manifests/batch-001.json"),
+    )
+    with pytest.raises(FinalisationError, match="manifest inventory"):
+        finalisation._check_remote_manifests(
+            ManifestHub(),
+            "syvai/p1-segments",
+            _REVISION,
+            (batch,),
+            remote_files=(
+                "README.md",
+                "LICENSE",
+                shard.path,
+                "manifests/batch-001.json",
+                "manifests/extra.json",
+            ),
+        )
+
+
+def test_repo_file_git_metadata_uses_bounded_content_hashing() -> None:
+    """Git blob IDs trigger streaming rather than a false SHA-256 match."""
+    content = b"0123456789"
+    shard = finalisation._Shard(
+        "data/train/part-00000.parquet",
+        len(content),
+        2,
+        hashlib.sha256(content).hexdigest(),
+    )
+
+    class GitHub:
+        def get_paths_info(
+            self, repo_id: str, paths: list[str], *, repo_type: str, revision: str
+        ) -> tuple[object, ...]:
+            del repo_id, repo_type, revision
+            return tuple(
+                SimpleNamespace(path=path, size=len(content), blob_id="a" * 40)
+                for path in paths
+            )
+
+        def stream_file(
+            self, repo_id: str, path: str, *, repo_type: str, revision: str
+        ) -> tuple[bytes, ...]:
+            del repo_id, path, repo_type, revision
+            return (content[:3], content[3:])
+
+    finalisation._check_remote_metadata(
+        GitHub(), "syvai/p1-segments", _REVISION, (shard,)
+    )
