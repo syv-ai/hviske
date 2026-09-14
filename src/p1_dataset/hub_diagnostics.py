@@ -27,6 +27,15 @@ _ERROR_CODE_REASONS = {
     "GatedRepo": "authorisation",
 }
 _MISSING_UPLOADED_OBJECT_PHRASE = "lfs pointer pointed to a file that does not exist"
+_ENTRY_LIMIT_PHRASES = (
+    "maximum number of entries in a directory is 10000",
+    "cannot contain more than 10000 entries in a single directory",
+    "directory entry limit of 10000",
+    "10000 entries in a single folder",
+    "maximum of 10000 files in a directory",
+    "more than 10000 entries in a directory",
+    "maximum number of entries (10000)",
+)
 
 
 def annotate_hub_error(
@@ -75,6 +84,8 @@ def classify_hub_error(error: BaseException) -> HubErrorDiagnostic:
 
 
 def _is_retryable(*, status_code: int | None, reason: str) -> bool:
+    if reason == "repository_entry_limit":
+        return False
     if reason == "missing_uploaded_object":
         return status_code == 400
     if reason in {"stale_parent", "xet_unavailable"}:
@@ -107,6 +118,8 @@ def _reason_from_response(
     fragments = _response_fragments(response) + _error_fragments(error)
     if any(_MISSING_UPLOADED_OBJECT_PHRASE in item for item in fragments):
         return "missing_uploaded_object"
+    if any(phrase in item for item in fragments for phrase in _ENTRY_LIMIT_PHRASES):
+        return "repository_entry_limit"
     if any("a commit has happened since" in item for item in fragments) or any(
         "parent commit" in item
         and any(word in item for word in ("mismatch", "does not match", "stale"))

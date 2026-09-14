@@ -194,7 +194,7 @@ def test_build_encodes_ogg_opus_and_purges_only_verified_output(tmp_path: Path) 
     assert report.selected_programmes == 1
     assert not list((tmp_path / "scratch" / "staging").rglob("*.parquet"))
     published = pq.read_table(
-        io.BytesIO(hub.files["data/train/p1-programme-1-00000.parquet"])
+        io.BytesIO(hub.files["data-shards/train/9f/p1-programme-1/part-00000.parquet"])
     ).to_pylist()[0]["audio"]["bytes"]
     with sf.SoundFile(io.BytesIO(published)) as audio_file:
         assert audio_file.format == "OGG"
@@ -202,7 +202,10 @@ def test_build_encodes_ogg_opus_and_purges_only_verified_output(tmp_path: Path) 
         assert audio_file.samplerate == 16_000
         assert audio_file.channels == 1
     audit = (tmp_path / "scratch" / "audit-candidates.jsonl").read_text()
-    assert '"parquet_path": "data/train/p1-programme-1-00000.parquet"' in audit
+    assert (
+        '"parquet_path": "data-shards/train/9f/p1-programme-1/part-00000.parquet"'
+        in audit
+    )
     assert '"row_locator": 0' in audit
     assert any(path.startswith("manifests/p0-batch-") for path in hub.files)
 

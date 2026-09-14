@@ -31,6 +31,7 @@ from .contracts import (
     ShardEvidence,
 )
 from .hub_diagnostics import annotate_hub_error
+from .publication_layout import is_allowed_shard_path
 
 if t.TYPE_CHECKING:
     from .ledger import Ledger
@@ -388,7 +389,11 @@ def build_dataset_card(
         "from datasets import load_dataset\n\n"
         "dataset = load_dataset(\n"
         '    "syvai/p1-segments",\n'
-        '    data_files="data/train/*.parquet",\n'
+        '    # Legacy-only readers used data_files="data/train/*.parquet".\n'
+        "    data_files=[\n"
+        '        "data/train/**/*.parquet",\n'
+        '        "data-shards/train/**/*.parquet",\n'
+        "    ],\n"
         '    revision="<immutable-commit-sha>",\n'
         "    streaming=True,\n"
         ")\n"
@@ -1600,6 +1605,17 @@ def verify_batch(
     return result
 
 
+def validate_p1_publication_path(path: str) -> None:
+    """Reject P1 shard paths outside the immutable legacy and active roots.
+
+    Raises:
+        AllowListError:
+            If ``path`` is not an approved canonical shard path.
+    """
+    if not is_allowed_shard_path(path):
+        raise AllowListError("P1 publication path is outside the approved roots")
+
+
 recover_batch = verify_batch
 
 
@@ -1607,6 +1623,9 @@ def _assert_unique_paths(shards: tuple[ShardEvidence, ...]) -> None:
     paths = [shard.path for shard in shards]
     if len(paths) != len(set(paths)):
         raise AllowListError("a batch contains duplicate repository paths")
+    for path in paths:
+        if path.startswith(("data/train/", "data-shards/train/")):
+            validate_p1_publication_path(path)
 
 
 class AllowListError(PublicationError):
@@ -1905,6 +1924,9 @@ def _refuse_remote_collisions(
         AllowListError:
             If a requested path already exists in the repository.
     """
+    for item in expected:
+        if item.path.startswith(("data/train/", "data-shards/train/")):
+            validate_p1_publication_path(item.path)
     if revision is None:
         existing: set[str] = set()
     else:

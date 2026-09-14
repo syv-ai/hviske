@@ -54,6 +54,7 @@ from .contracts import (
 )
 from .hub_diagnostics import classify_hub_error
 from .ledger import Ledger
+from .publication_layout import PublicationLayout, new_shard_path
 from .segments import (
     CTCBackend,
     TimestampAlignmentBackend,
@@ -113,6 +114,7 @@ class PipelineSettings:
     target_private_repo: str
     expected_target_visibility: str
     active_governance: ActiveGovernanceContract
+    publication_layout: PublicationLayout
     active_license_path: Path
     source_audio_repository: str
     source_audio_revision: str
@@ -204,6 +206,14 @@ class PipelineSettings:
         output_raw = t.cast(dict[str, object], root["output"])
         dataset_license_raw = t.cast(dict[str, object], root["dataset_license"])
         governance = ActiveGovernanceContract.model_validate(root["active_governance"])
+        layout_raw = root.get("publication_layout", {})
+        if not isinstance(layout_raw, dict):
+            raise ValueError("publication_layout must be a mapping")
+        publication_layout = PublicationLayout(
+            version=str(layout_raw.get("version", "p1-publication-layout-2")),
+            shard_root=str(layout_raw.get("shard_root", "data-shards/train")),
+            bucket_width=_as_int(layout_raw.get("bucket_width", 2)),
+        )
         expected_visibility = runtime.get("expected_target_visibility")
         if expected_visibility != governance.expected_visibility:
             raise ValueError(
@@ -370,6 +380,7 @@ class PipelineSettings:
             target_private_repo=str(runtime["target_private_repo"]),
             expected_target_visibility=governance.expected_visibility,
             active_governance=governance,
+            publication_layout=publication_layout,
             active_license_path=active_license_path,
             source_audio_repository=str(audio["repository"]),
             source_audio_revision=str(audio["revision"]),
@@ -2044,7 +2055,7 @@ def _process_native_programmes(
             allocations = tuple(
                 ShardAllocation(
                     local_path=item.path,
-                    remote_path=f"data/train/{programme_id}-{ordinal:05d}.parquet",
+                    remote_path=new_shard_path(programme_id, ordinal),
                     sha256=item.evidence.sha256,
                     byte_size=item.evidence.byte_size,
                     row_count=item.evidence.row_count,
