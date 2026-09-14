@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
             revision=args.pilot_head,
             expected_pipeline_version=PIPELINE_VERSION,
             expected_pipeline_config_sha256=digest,
+            expected_visibility="public",
         )
         report = run_v8_sanity_gate(
             candidates,
