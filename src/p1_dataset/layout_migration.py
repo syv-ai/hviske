@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +34,27 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
             raise ValueError("duplicate JSON object key")
         result[key] = value
     return result
+
+
+def _assert_snapshot(*, path: Path, snapshots: c.Mapping[Path, bytes | None]) -> None:
+    """Ensure opening a writable ledger did not mutate its database artefacts.
+
+    Raises:
+        ValueError:
+            If opening the ledger changed its primary file or a SQLite sidecar.
+    """
+    for artifact in _ledger_artifacts(path):
+        expected = snapshots[artifact]
+        if artifact.is_symlink() or (artifact.exists() and not artifact.is_file()):
+            raise ValueError("writable ledger open changed the original database")
+        actual = artifact.read_bytes() if artifact.is_file() else None
+        if actual != expected:
+            raise ValueError("writable ledger open changed the original database")
+
+
+def _ledger_artifacts(path: Path) -> tuple[Path, ...]:
+    """Return a ledger and all SQLite sidecars that must be restorable."""
+    return (path, Path(f"{path}-journal"), Path(f"{path}-wal"), Path(f"{path}-shm"))
 
 
 def _backup_files(
@@ -143,20 +165,27 @@ class _LedgerPlan:
 
 
 def _plan_ledger(path: Path, expected_digest: str) -> _LedgerPlan:
-    with Ledger(
-        path, pipeline_digest=expected_digest, reset_processing=False
-    ) as ledger:
-        connection = ledger._connection  # noqa: SLF001 - read-only migration census
+    connection = _open_read_only_ledger(path=path)
+    try:
+        _validate_read_only_schema(
+            connection=connection, expected_digest=expected_digest
+        )
         rows = tuple(
             dict(row)
             for row in connection.execute(
-                """SELECT s.*, b.state AS batch_state, b.commit_id AS batch_commit_id,
+                """SELECT s.shard_id, s.batch_id, s.state, s.path, s.byte_size,
+                s.row_count, s.sha256, s.local_path,
+                b.state AS batch_state, b.commit_id AS batch_commit_id,
                 b.sealed AS batch_sealed, b.programme_count AS batch_programme_count,
                 b.row_count AS batch_row_count, b.rejection_counts AS batch_rejections
                 FROM shards AS s LEFT JOIN batches AS b ON b.batch_id = s.batch_id
                 ORDER BY s.shard_id"""
             ).fetchall()
         )
+    except sqlite3.Error as error:
+        raise ValueError("ledger schema is unreadable") from error
+    finally:
+        connection.close()
     all_paths = frozenset(str(row["path"]) for row in rows)
     selected = tuple(
         row
@@ -215,12 +244,99 @@ def _legacy_parts(path: str) -> tuple[str, str, int]:
     return path, match.group(1), int(match.group(2))
 
 
+def _open_read_only_ledger(*, path: Path) -> sqlite3.Connection:
+    """Open a ledger without permitting SQLite to write any database artefact.
+
+    Returns:
+        An immutable, query-only SQLite connection.
+
+    Raises:
+        ValueError:
+            If the path is not a readable SQLite database or cannot be configured
+            for read-only access.
+    """
+    try:
+        connection = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro&immutable=1",
+            isolation_level=None,
+            uri=True,
+        )
+    except sqlite3.Error as error:
+        raise ValueError("ledger is not a readable SQLite database") from error
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA foreign_keys = ON")
+    except sqlite3.Error as error:
+        connection.close()
+        raise ValueError("ledger read-only configuration failed") from error
+    return connection
+
+
 def _validate_local_evidence(*, row: dict[str, object], local_path: Path) -> None:
     if local_path.is_symlink() or not local_path.is_file():
         raise ValueError("legacy shard local evidence is unavailable")
     digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
     if digest != row["sha256"] or local_path.stat().st_size != row["byte_size"]:
         raise ValueError("legacy shard local evidence changed")
+
+
+def _validate_read_only_schema(
+    *, connection: sqlite3.Connection, expected_digest: str
+) -> None:
+    """Reject ledgers that a writable ``Ledger`` open would have to migrate.
+
+    Raises:
+        ValueError:
+            If the schema, version, or pipeline digest is incompatible.
+    """
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version != 3:
+        raise ValueError("ledger schema version is not current")
+    required_columns = {
+        "programmes": {"pipeline_digest"},
+        "batches": {
+            "batch_id",
+            "state",
+            "pipeline_digest",
+            "commit_id",
+            "programme_count",
+            "row_count",
+            "rejection_counts",
+            "sealed",
+        },
+        "shards": {
+            "shard_id",
+            "batch_id",
+            "state",
+            "path",
+            "byte_size",
+            "row_count",
+            "sha256",
+            "local_path",
+        },
+        "ledger_metadata": {"key", "value"},
+    }
+    for table, required in required_columns.items():
+        columns = {
+            str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if not required.issubset(columns):
+            raise ValueError("ledger schema is missing required columns")
+    metadata = connection.execute(
+        "SELECT value FROM ledger_metadata WHERE key = 'pipeline_digest'"
+    ).fetchone()
+    if metadata is None or str(metadata[0]) != expected_digest:
+        raise ValueError("ledger pipeline digest is not bound to the expected digest")
+    stored = {
+        str(row[0])
+        for row in connection.execute(
+            """SELECT pipeline_digest FROM programmes
+            UNION SELECT pipeline_digest FROM batches"""
+        )
+    }
+    if stored != {expected_digest} and stored:
+        raise ValueError("ledger records use a different pipeline digest")
 
 
 @dataclass(frozen=True)
@@ -439,7 +555,15 @@ def migrate_layout(
                 backup_count=0,
             )
 
-        touched = (*ledgers, *(item.path for item in manifests), *_marker_paths(root))
+        touched = (
+            *(
+                database_path
+                for ledger_path in ledgers
+                for database_path in _ledger_artifacts(ledger_path)
+            ),
+            *(item.path for item in manifests),
+            *_marker_paths(root),
+        )
         snapshots = _snapshot_files(touched)
         backup_root = _make_backup_root(root)
         backups = _backup_files(backup_root, snapshots)
@@ -453,6 +577,7 @@ def migrate_layout(
                         pipeline_digest=expected_digest,
                         reset_processing=False,
                     ) as ledger:
+                        _assert_snapshot(path=plan.path, snapshots=snapshots)
                         changed += ledger.remap_remote_paths(mapping)
             for item in manifests:
                 if item.rewritten is not None:
