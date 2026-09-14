@@ -163,6 +163,51 @@ def _parquet_bytes(root: Path) -> bytes:
     return (root / "partition-0" / "part-00000.parquet").read_bytes()
 
 
+@pytest.mark.parametrize("problem", ["missing-sealed", "unbound-digest"])
+def test_incompatible_ledgers_are_read_without_mutation(
+    tmp_path: Path, problem: str
+) -> None:
+    """Schema migration and digest binding never happen during offline planning."""
+    _make_run(tmp_path)
+    for index in range(8):
+        ledger_path = tmp_path / f"partition-{index}" / "ledger.sqlite"
+        with sqlite3.connect(ledger_path) as connection:
+            if problem == "missing-sealed":
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("ALTER TABLE batches RENAME TO batches_legacy")
+                connection.execute(
+                    """CREATE TABLE batches AS SELECT batch_id, state,
+                    pipeline_digest, commit_id, programme_count, row_count,
+                    rejection_counts FROM batches_legacy"""
+                )
+                connection.execute("DROP TABLE batches_legacy")
+                connection.execute("PRAGMA user_version = 3")
+            else:
+                connection.execute(
+                    "DELETE FROM ledger_metadata WHERE key = 'pipeline_digest'"
+                )
+            connection.commit()
+    before = _tree_bytes(tmp_path)
+    for apply in (False, True):
+        with pytest.raises(ValueError):
+            migrate_layout(run_root=tmp_path, expected_digest=DIGEST, apply=apply)
+        assert _tree_bytes(tmp_path) == before
+
+
+def _tree_bytes(root: Path) -> tuple[tuple[str, bytes], ...]:
+    """Snapshot regular files, including SQLite sidecars and markers.
+
+    Returns:
+        Relative regular-file paths and their bytes, excluding the lock inode used
+        to coordinate the migration itself.
+    """
+    return tuple(
+        (str(path.relative_to(root)), path.read_bytes())
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink() and path != root / "publish.lock"
+    )
+
+
 def test_manifest_is_validated_before_any_ledger_mutation(tmp_path: Path) -> None:
     """Malformed owned manifests abort before changing the ledger or marker."""
     _make_run(tmp_path, sealed=True, manifest=True)
