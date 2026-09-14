@@ -324,8 +324,9 @@ def _validate_table(*, connection: sqlite3.Connection, table: LedgerTable) -> No
             bool(row[3]),
             None if row[4] is None else str(row[4]),
             int(row[5]),
+            int(row[6]),
         )
-        for row in connection.execute(f"PRAGMA table_info({table.name})")
+        for row in connection.execute(f"PRAGMA table_xinfo({table.name})")
     )
     expected_columns = tuple(
         (
@@ -334,17 +335,20 @@ def _validate_table(*, connection: sqlite3.Connection, table: LedgerTable) -> No
             column.not_null,
             column.default,
             column.primary_key,
+            column.hidden,
         )
         for column in table.columns
     )
     if columns != expected_columns:
         raise ValueError("ledger schema has incompatible column declarations")
+    sql_row = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?", (table.name,)
+    ).fetchone()
+    if sql_row is None or not _matches_autoincrement(sql=str(sql_row[0]), table=table):
+        raise ValueError("ledger schema has incompatible AUTOINCREMENT declaration")
     _validate_indexes(connection=connection, table=table)
     _validate_foreign_keys(connection=connection, table=table)
-    sql_row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table.name,)
-    ).fetchone()
-    checks = () if sql_row is None else _check_expressions(str(sql_row[0]))
+    checks = _check_expressions(str(sql_row[0]))
     if checks != tuple(_normalise_sql(check) for check in table.checks):
         raise ValueError("ledger schema has incompatible constraints")
 
@@ -381,6 +385,66 @@ def _normalise_sql(value: str) -> str:
     return " ".join(value.lower().split())
 
 
+def _matches_autoincrement(*, sql: str, table: LedgerTable) -> bool:
+    """Check the table's AUTOINCREMENT keyword against its descriptor.
+
+    Returns:
+        Whether the SQL declaration matches the descriptor.
+    """
+    expected = tuple(column.name for column in table.columns if column.autoincrement)
+    primary = tuple(column.name for column in table.columns if column.primary_key)
+    actual = primary if _sql_has_keyword(sql=sql, keyword="AUTOINCREMENT") else ()
+    return actual == expected
+
+
+def _sql_has_keyword(*, sql: str, keyword: str) -> bool:
+    """Find a SQL keyword without treating quoted text or comments as SQL.
+
+    Returns:
+        Whether the unquoted SQL contains the keyword.
+    """
+    index = 0
+    length = len(sql)
+    while index < length:
+        character = sql[index]
+        if character in "'\"`":
+            quote = character
+            index += 1
+            while index < length:
+                if sql[index] == quote:
+                    if index + 1 < length and sql[index + 1] == quote:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            continue
+        if character == "[":
+            index = sql.find("]", index + 1)
+            if index < 0:
+                return False
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", index):
+            comment_end = sql.find("*/", index + 2)
+            index = length if comment_end < 0 else comment_end + 2
+            continue
+        if character.isalpha() or character == "_":
+            end = index + 1
+            while end < length and (sql[end].isalnum() or sql[end] in "_$"):
+                end += 1
+            if sql[index:end].casefold() == keyword.casefold():
+                return True
+            index = end
+            continue
+        index += 1
+    return False
+
+
 def _validate_foreign_keys(
     *, connection: sqlite3.Connection, table: LedgerTable
 ) -> None:
@@ -406,7 +470,14 @@ def _validate_foreign_keys(
 
 def _validate_indexes(*, connection: sqlite3.Connection, table: LedgerTable) -> None:
     expected = {
-        index.name: (int(index.unique), index.columns, "c", 0)
+        index.name: _index_signature(
+            unique=index.unique,
+            origin="c",
+            partial=index.partial,
+            columns=index.columns,
+            descending=index.descending,
+            collations=index.collations,
+        )
         for index in table.indexes
     }
     primary = tuple(column.name for column in table.columns if column.primary_key)
@@ -418,23 +489,70 @@ def _validate_indexes(*, connection: sqlite3.Connection, table: LedgerTable) -> 
         and primary_column is not None
         and primary_column.declared_type.upper() == "INTEGER"
     ):
-        expected[f"sqlite_autoindex_{table.name}_1"] = (1, primary, "pk", 0)
-    actual: dict[str, tuple[int, tuple[str, ...], str, int]] = {}
-    for row in connection.execute(f"PRAGMA index_list({table.name})"):
-        name = str(row[1])
-        actual[name] = (
-            int(row[2]),
-            tuple(
-                str(item[2])
-                for item in connection.execute(
-                    f"PRAGMA index_info('{name.replace(chr(39), chr(39) * 2)}')"
-                )
-            ),
-            str(row[3]),
-            int(row[4]),
+        expected[f"sqlite_autoindex_{table.name}_1"] = _index_signature(
+            unique=True,
+            origin="pk",
+            partial=False,
+            columns=primary,
+            descending=(),
+            collations=(),
         )
+    actual: dict[str, tuple[object, ...]] = {}
+    try:
+        index_rows = connection.execute(f"PRAGMA index_list({table.name})").fetchall()
+        for row in index_rows:
+            name = str(row[1])
+            xinfo = connection.execute(
+                f"PRAGMA index_xinfo('{name.replace(chr(39), chr(39) * 2)}')"
+            ).fetchall()
+            key_columns = tuple(item for item in xinfo if int(item[5]))
+            actual[name] = _index_signature(
+                unique=bool(row[2]),
+                origin=str(row[3]),
+                partial=bool(row[4]),
+                columns=tuple(
+                    None if item[2] is None else str(item[2]) for item in key_columns
+                ),
+                descending=tuple(bool(item[3]) for item in key_columns),
+                collations=tuple(str(item[4]) for item in key_columns),
+            )
+    except (IndexError, sqlite3.Error) as error:
+        raise ValueError("ledger schema has unreadable indexes") from error
     if actual != expected:
         raise ValueError("ledger schema has incompatible indexes")
+
+
+def _index_signature(
+    *,
+    unique: bool,
+    origin: str,
+    partial: bool,
+    columns: tuple[str | None, ...],
+    descending: tuple[bool, ...],
+    collations: tuple[str, ...],
+) -> tuple[object, ...]:
+    """Build a comparable signature from index_list and index_xinfo results.
+
+    Returns:
+        A normalised index signature.
+
+    Raises:
+        ValueError:
+            If the descriptor contains mismatched index column metadata.
+    """
+    expected_descending = descending or (False,) * len(columns)
+    expected_collations = collations or ("BINARY",) * len(columns)
+    if len(expected_descending) != len(columns) or len(expected_collations) != len(
+        columns
+    ):
+        raise ValueError("ledger schema descriptor has invalid index columns")
+    key_columns = tuple(
+        (column, int(is_descending), collation.upper())
+        for column, is_descending, collation in zip(
+            columns, expected_descending, expected_collations, strict=True
+        )
+    )
+    return (int(unique), key_columns, origin, int(partial))
 
 
 def _validate_table_set(*, connection: sqlite3.Connection) -> None:
