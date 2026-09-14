@@ -14,6 +14,8 @@
 
 ### Changed
 
+- Switched production Sparkie P1 training to direct `syvai/p1-segments` loading with a
+  required immutable `P1_SEGMENTS_REVISION`; generic transcript joins remain supported.
 - Removed unsupported Parakeet TDT fine-tuning and the NeMo-only Danish RNNT preset.
 
 ### Fixed

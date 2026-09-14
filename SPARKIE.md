@@ -15,29 +15,23 @@ hf auth whoami
 ```
 
 The Hugging Face account must have accepted access to
-`CohereLabs/cohere-transcribe-03-2026`, read access to private `syvai/p1` and
-`syvai/p1-transcripts`, and read access to every public source. It also needs write
-access to create and upload the private `syvai/hviske-v6.0` model. Never put tokens in
-this runbook, shell history, manifests, or Hydra configuration.
+`CohereLabs/cohere-transcribe-03-2026`, read access to the manually gated
+`syvai/p1-segments` dataset, and read access to every public source. It also needs
+write access to create and upload the private `syvai/hviske-v6.0` model. Never put
+tokens in this runbook, shell history, manifests, or Hydra configuration.
 
-Set the exact private transcript revision and join columns after checking the pinned
-private schema:
+Set the two immutable data-gate revisions:
 
 ```bash
-export P1_TRANSCRIPT_REVISION=<full-40-hex-p1-transcripts-commit-sha>
-export P1_AUDIO_JOIN_COLUMN=<p1-audio-key-column>
-export P1_TRANSCRIPT_JOIN_COLUMN=<p1-transcript-key-column>
-export P1_TRANSCRIPT_TEXT_COLUMN=<p1-transcript-text-column>
+export P1_SEGMENTS_REVISION=<full-40-hex-p1-segments-commit-sha>
 # Use the completed immutable overlay commit; branches and short SHAs are rejected.
 export HVISKE_OVERLAY_REVISION=<full-40-hex-overlay-commit-sha>
 ```
 
-All five values are required. At revision
-`41132579816d86e889635f84f30511279f026359`, the transcript repository contains
-16,640 rows: 16,638 usable texts, two empty texts, no null keys, and no duplicate
-keys. The P1 audio side remains streaming; the bounded preflight builds the compact
-usable transcript index, filters audio lazily to matching keys, and consumes one
-joined example. Training uses the same partial-index-plus-streamed-audio path.
+Both values are required. P1 is loaded directly as a normal Hub dataset with `audio`
+and `text` columns; no transcript join or join-column environment variables are used.
+The source revision is intentionally not hardcoded while the manually gated dataset is
+still being finalised. Branches, short SHAs, and non-hex revisions are rejected.
 
 ## Fixed production mix
 
@@ -45,15 +39,15 @@ Do not reorder or rebalance the preset. Its 16 streams are sampled as follows:
 
 | Language | Source | Configuration and split | Probability |
 | --- | --- | --- | ---: |
-| Danish | `syvai/p1` + `syvai/p1-transcripts` | `train` joined by the configured key | 0.08 |
-| Danish | local DRTV manifest | `train` | 0.10 |
-| Danish | local YouTube manifest | `train` | 0.07 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=coral_read_aloud` / `train` | 0.04 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=coral_conversation` / `train` | 0.10 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=ftspeech` / `train` | 0.05 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nota` / `train` | 0.05 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nst` / `train` | 0.05 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=voxpopuli` / `train` | 0.06 |
+| Danish | `syvai/p1-segments` | `train` | 0.102857 |
+| Danish | local DRTV manifest | `train` | 0.128571 |
+| Danish | local YouTube manifest | `train` | 0.09 |
+| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=coral_read_aloud` / `train` | 0.017143 |
+| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=coral_conversation` / `train` | 0.128572 |
+| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=ftspeech` / `train` | 0.040909 |
+| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nota` / `train` | 0.021428 |
+| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nst` / `train` | 0.021429 |
+| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=voxpopuli` / `train` | 0.049091 |
 | English | `MLCommons/peoples_speech` | `clean` / `train` | 0.16 |
 | English | `edinburghcstr/ami` | `sdm` / `train` | 0.04 |
 | English | `edinburghcstr/ami` | `ihm` / `train` | 0.03 |
@@ -89,7 +83,7 @@ uv run python src/scripts/build_vtt_manifest.py \
 Run the preflight while `qwen38-ar` is still serving. It resolves every required
 environment variable, checks Hub authentication and gated model access, validates all
 pinned dataset coordinates and schemas, validates each local manifest and its first
-referenced WAV, and consumes one joined P1 example. It fully consumes every overlay to
+referenced WAV, and consumes one direct P1 example. It fully consumes every overlay to
 prove positional length, duplicate, equality, and action/text integrity before lazy
 training starts. Overlay preflight casts audio with decoding disabled, so this gate
 never decodes the audio stream. The preflight does not load the ASR model, download

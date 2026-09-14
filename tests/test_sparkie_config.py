@@ -7,12 +7,11 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from hydra import compose
 from omegaconf import DictConfig, OmegaConf
-from omegaconf.errors import InterpolationResolutionError
 
 import hviske.utils as utils
 from scripts.publish_private_model import training_sources_from_config
 
-P1_TRANSCRIPT_SHA = "0123456789abcdef0123456789abcdef01234567"
+P1_SEGMENTS_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 TRAINING_NAMES = [
@@ -34,7 +33,7 @@ TRAINING_NAMES = [
     "librispeech_other_train_500",
 ]
 TRAINING_IDS = [
-    "syvai/p1",
+    "syvai/p1-segments",
     "local_vtt",
     "local_vtt",
     "syvai/danish-asr-unified",
@@ -71,34 +70,35 @@ TRAINING_PROBABILITIES = [
 ]
 
 
-def test_p1_transcript_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The private transcript revision cannot silently follow a mutable branch."""
-    monkeypatch.delenv("P1_TRANSCRIPT_REVISION", raising=False)
-    monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
-    monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
-    monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
-    config = compose(config_name="sparkie_bilingual")
-
-    with pytest.raises(InterpolationResolutionError, match="P1_TRANSCRIPT_REVISION"):
-        OmegaConf.resolve(config)
-
-
-@pytest.mark.parametrize("revision", ["main", "0123456", "g" * 40])
-def test_p1_transcript_revision_rejects_mutable_or_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, revision: str
-) -> None:
-    """P1 transcript loads reject branches, short SHAs and non-hex revisions."""
-    monkeypatch.setenv("P1_TRANSCRIPT_REVISION", revision)
-    monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
-    monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
-    monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
+def test_p1_segments_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The P1 segments revision cannot silently follow a mutable branch."""
+    monkeypatch.delenv("P1_SEGMENTS_REVISION", raising=False)
     config = compose(config_name="sparkie_bilingual")
     OmegaConf.resolve(config)
 
-    from hviske.utils import validate_transcript_revision
+    from hviske.utils import validate_immutable_source_revision
+
+    with pytest.raises(ValueError, match="P1_SEGMENTS_REVISION is required"):
+        validate_immutable_source_revision(
+            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
+        )
+
+
+@pytest.mark.parametrize("revision", ["main", "0123456", "g" * 40])
+def test_p1_segments_revision_rejects_mutable_or_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, revision: str
+) -> None:
+    """P1 segment loads reject branches, short SHAs and non-hex revisions."""
+    monkeypatch.setenv("P1_SEGMENTS_REVISION", revision)
+    config = compose(config_name="sparkie_bilingual")
+    OmegaConf.resolve(config)
+
+    from hviske.utils import validate_immutable_source_revision
 
     with pytest.raises(ValueError, match="full 40-character"):
-        validate_transcript_revision(str(config.datasets.p1.transcript_revision))
+        validate_immutable_source_revision(
+            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
+        )
 
 
 def test_sparkie_dataset_coordinates_and_revisions(
@@ -109,7 +109,7 @@ def test_sparkie_dataset_coordinates_and_revisions(
     datasets = config.datasets
 
     expected_coordinates = {
-        "p1": ("syvai/p1", None, "train", "text", "audio"),
+        "p1": ("syvai/p1-segments", None, "train", "text", "audio"),
         "coral_read_aloud": (
             "syvai/danish-asr-unified",
             "default",
@@ -184,7 +184,7 @@ def test_sparkie_dataset_coordinates_and_revisions(
     } == expected_coordinates
 
     expected_revisions = {
-        "p1": "449b9c2294026df6d0d37538f279fdec03f565ff",
+        "p1": P1_SEGMENTS_SHA,
         "coral_read_aloud": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
         "coral_conversation": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
         "ftspeech": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
@@ -202,16 +202,9 @@ def test_sparkie_dataset_coordinates_and_revisions(
     assert {
         name: datasets[name].revision for name in expected_revisions
     } == expected_revisions
-    assert (
-        datasets.p1.transcript_dataset_id,
-        datasets.p1.transcript_subset,
-        datasets.p1.transcript_split,
-        datasets.p1.audio_join_column,
-        datasets.p1.transcript_join_column,
-        datasets.p1.transcript_text_column,
-    ) == ("syvai/p1-transcripts", None, "train", "audio_id", "audio_id", "text")
-    assert datasets.p1.transcript_revision == P1_TRANSCRIPT_SHA
-    assert datasets.p1.transcript_trust_remote_code is False
+    assert datasets.p1.immutable_revision_env == "P1_SEGMENTS_REVISION"
+    assert datasets.p1.revision == P1_SEGMENTS_SHA
+    assert datasets.p1.trust_remote_code is False
     assert all(
         dataset.get("trust_remote_code", False) is False
         for dataset in datasets.values()
@@ -252,10 +245,7 @@ def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
     Returns:
         The resolved Sparkie preset.
     """
-    monkeypatch.setenv("P1_TRANSCRIPT_REVISION", P1_TRANSCRIPT_SHA)
-    monkeypatch.setenv("P1_AUDIO_JOIN_COLUMN", "audio_id")
-    monkeypatch.setenv("P1_TRANSCRIPT_JOIN_COLUMN", "audio_id")
-    monkeypatch.setenv("P1_TRANSCRIPT_TEXT_COLUMN", "text")
+    monkeypatch.setenv("P1_SEGMENTS_REVISION", P1_SEGMENTS_SHA)
     monkeypatch.setenv("HVISKE_OVERLAY_REVISION", "9" * 40)
     return compose(config_name="sparkie_bilingual")
 
@@ -340,8 +330,7 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     assert config.max_validation_samples_per_dataset == 1000
     assert list(config.model_card_languages) == ["da", "en"]
     assert list(config.training_dataset_ids) == [
-        "syvai/p1",
-        "syvai/p1-transcripts",
+        "syvai/p1-segments",
         "syvai/danish-asr-unified",
         "syvai/danish-asr-unified-hviske-v5-tiny",
         "MLCommons/peoples_speech",
@@ -409,15 +398,11 @@ def test_sparkie_publication_provenance_is_complete(
         for source in sources
         if source["id"].startswith("local_vtt:")
     )
-    p1_sources = [source for source in sources if source["id"] == "syvai/p1"]
+    p1_sources = [source for source in sources if source["id"] == "syvai/p1-segments"]
     assert len(p1_sources) == 1
     assert p1_sources[0]["probability"] == TRAINING_PROBABILITIES[0]
-    joined = t.cast(dict[str, object], p1_sources[0]["joined_transcript"])
-    assert joined["dataset_id"] == "syvai/p1-transcripts"
-    assert joined["revision"] == P1_TRANSCRIPT_SHA
-    assert joined["audio_join_column"] == "audio_id"
-    assert joined["transcript_join_column"] == "audio_id"
-    assert joined["transcript_text_column"] == "text"
+    assert p1_sources[0]["revision"] == P1_SEGMENTS_SHA
+    assert "joined_transcript" not in p1_sources[0]
 
 
 def test_sparkie_training_order_and_probabilities(

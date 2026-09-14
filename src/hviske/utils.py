@@ -1130,48 +1130,49 @@ class transformers_output_ignored:
 def validate_overlay_revision(revision: str) -> str:
     """Validate the immutable overlay revision supplied for the v6 data sources.
 
+    Returns:
+        The unchanged, validated revision.
+    """
+    return validate_immutable_source_revision(
+        revision, revision_label="HVISKE_OVERLAY_REVISION"
+    )
+
+
+def validate_immutable_source_revision(revision: str, *, revision_label: str) -> str:
+    """Validate an immutable Hub source revision.
+
     Args:
         revision:
-            The overlay Hub revision, normally resolved from
-            ``HVISKE_OVERLAY_REVISION``.
+            The resolved Hub revision.
+        revision_label:
+            Human-readable source or configuration label for validation errors.
 
     Returns:
         The unchanged, validated revision.
 
     Raises:
         ValueError:
-            If the environment-supplied revision is missing or not a full SHA.
+            If the revision is missing or not a complete hexadecimal commit SHA.
     """
     if not revision:
         raise ValueError(
-            "HVISKE_OVERLAY_REVISION is required: set it to the immutable 40-character "
-            "overlay commit SHA before running preflight or training."
+            f"{revision_label} is required: provide an immutable 40-character commit "
+            "SHA before data access or publication."
         )
     if not _FULL_COMMIT_SHA.fullmatch(revision):
         raise ValueError(
-            "HVISKE_OVERLAY_REVISION must be an immutable 40-character commit SHA; "
+            f"{revision_label} must be an immutable full 40-character commit SHA; "
             "mutable branches and abbreviated or non-hex revisions are forbidden."
         )
     return revision
 
 
 def validate_transcript_revision(revision: str) -> str:
-    """Validate an immutable private transcript dataset revision.
-
-    Args:
-        revision:
-            The Hub revision to use for the private transcript dataset.
+    """Validate an immutable revision for a generic transcript join.
 
     Returns:
         The unchanged, validated revision.
-
-    Raises:
-        ValueError:
-            If ``revision`` is not a complete hexadecimal commit SHA.
     """
-    if not _FULL_COMMIT_SHA.fullmatch(revision):
-        raise ValueError(
-            "P1 transcript revision must be a full 40-character commit SHA; "
-            "mutable branches and abbreviated or non-hex revisions are forbidden."
-        )
-    return revision
+    return validate_immutable_source_revision(
+        revision, revision_label="Transcript dataset revision"
+    )

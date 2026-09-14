@@ -48,6 +48,7 @@ from .utils import (
     convert_numeral_to_words,
     interpret_dataset_name,
     no_datasets_progress_bars,
+    validate_immutable_source_revision,
     validate_overlay_revision,
     validate_transcript_revision,
 )
@@ -1049,6 +1050,12 @@ def load_data_for_finetuning(
             logger.info(f"Loading dataset {dataset_name!r}")
 
         is_local_vtt = dataset_config.get("type") == "local_vtt"
+        immutable_revision_env = dataset_config.get("immutable_revision_env")
+        if immutable_revision_env is not None:
+            validate_immutable_source_revision(
+                str(dataset_config.get("revision") or ""),
+                revision_label=str(immutable_revision_env),
+            )
         transcript_dataset_id = dataset_config.get("transcript_dataset_id")
         transcript_revision = None
         if transcript_dataset_id is not None:
