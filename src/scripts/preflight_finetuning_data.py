@@ -21,7 +21,7 @@ from hviske.data import (
     apply_dataset_overlay,
     join_audio_and_transcripts,
 )
-from hviske.utils import validate_transcript_revision
+from hviske.utils import validate_overlay_revision, validate_transcript_revision
 
 logger = logging.getLogger("hviske_data_preflight")
 
@@ -61,6 +61,15 @@ def _preflight_hub_source(
         cache_dir=cache_dir,
         trust_remote_code=source_config.get("trust_remote_code", False),
     )
+    audio_column = str(source_config.audio_column)
+    if (
+        isinstance(dataset, Dataset | IterableDataset)
+        and audio_column in (dataset.column_names or [])
+        and dataset.features is not None
+        and isinstance(dataset.features[audio_column], Audio)
+    ):
+        dataset = dataset.cast_column(column=audio_column, feature=Audio(decode=False))
+
     source_filters = source_config.get("filters")
     if source_filters is not None:
         if not isinstance(source_filters, c.Mapping):
@@ -73,8 +82,8 @@ def _preflight_hub_source(
     overlay_config = source_config.get("overlay")
     has_overlay = overlay_config is not None
     if has_overlay:
-        overlay_revision = validate_transcript_revision(
-            str(overlay_config.get("revision"))
+        overlay_revision = validate_overlay_revision(
+            str(overlay_config.get("revision") or "")
         )
         overlay = _load_transcript_dataset(
             dataset_id=str(overlay_config.id),
@@ -87,11 +96,6 @@ def _preflight_hub_source(
         )
         if not isinstance(dataset, Dataset | IterableDataset):
             raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
-        audio_column = str(source_config.audio_column)
-        if audio_column in (dataset.column_names or []):
-            dataset = dataset.cast_column(
-                column=audio_column, feature=Audio(decode=False)
-            )
         dataset = apply_dataset_overlay(
             base_dataset=dataset,
             overlay_dataset=overlay,
@@ -303,8 +307,7 @@ def preflight_finetuning_data(
             validate_transcript_revision(str(source_config.transcript_revision))
         overlay_config = source_config.get("overlay")
         if overlay_config is not None:
-            validate_transcript_revision(str(overlay_config.revision))
-
+            validate_overlay_revision(str(overlay_config.get("revision") or ""))
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     api: HubApi = hub_api or HfApi(token=token)
     identity = api.whoami()

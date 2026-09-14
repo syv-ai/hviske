@@ -7,9 +7,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 import soundfile
-from datasets import Dataset
+from datasets import Audio, Dataset, Features, Value
 from omegaconf import OmegaConf
 
+import scripts.preflight_finetuning_data as preflight_module
 from scripts.preflight_finetuning_data import (
     _preflight_local_manifest,
     preflight_finetuning_data,
@@ -64,6 +65,78 @@ def test_local_preflight_rejects_zero_byte_wav(tmp_path: Path) -> None:
     audio_path.write_bytes(b"")
     with pytest.raises(ValueError, match="Unreadable audio"):
         _preflight_local_manifest("local", manifest_path)
+
+
+def test_overlay_preflight_disables_audio_decoding_before_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlay preflight casts audio to metadata-only features before joining."""
+    config = OmegaConf.create(
+        {
+            "model": {
+                "pretrained_model_id": "org/gated-model",
+                "revision": "b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
+            },
+            "cache_dir": None,
+            "datasets": {
+                "overlaid": {
+                    "id": "org/audio",
+                    "subset": None,
+                    "train_name": "train",
+                    "text_column": "text",
+                    "audio_column": "audio",
+                    "revision": "audio-sha",
+                    "trust_remote_code": False,
+                    "overlay": {"id": "org/overlay", "revision": "1" * 40},
+                }
+            },
+            "evaluation_datasets": [],
+        }
+    )
+    dataset = Dataset.from_dict(
+        {"audio": [{"bytes": b"metadata-only", "path": None}], "text": ["hello"]},
+        features=Features({"audio": Audio(), "text": Value("string")}),
+    )
+    observed: list[bool] = []
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        if kwargs["path"] == "org/audio":
+            return dataset
+        return Dataset.from_list([{"action": "keep", "reference_text": "hello"}])
+
+    def fake_overlay(**kwargs: object) -> Dataset:
+        overlaid = kwargs["base_dataset"]
+        assert isinstance(overlaid, Dataset)
+        observed.append(bool(overlaid.features["audio"].decode))
+        return overlaid
+
+    monkeypatch.setattr(preflight_module, "apply_dataset_overlay", fake_overlay)
+    preflight_finetuning_data(
+        config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
+    )
+
+    assert observed == [False]
+
+
+class FakeHubApi:
+    """Record authentication and model-access checks."""
+
+    def __init__(self) -> None:
+        """Initialise an empty model access log."""
+        self.model_ids: list[tuple[str, str]] = []
+
+    def model_info(self, repo_id: str, *, revision: str) -> object:
+        """Record the model repository checked by the preflight.
+
+        Returns:
+            Placeholder model metadata.
+        """
+        self.model_ids.append((repo_id, revision))
+        return object()
+
+    def whoami(self) -> dict[str, object]:
+        """Return a test identity."""
+        return {"name": "tester"}
 
 
 def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
@@ -162,27 +235,6 @@ def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
         "0123456789abcdef0123456789abcdef01234567",
         "evaluation-sha",
     ]
-
-
-class FakeHubApi:
-    """Record authentication and model-access checks."""
-
-    def __init__(self) -> None:
-        """Initialise an empty model access log."""
-        self.model_ids: list[tuple[str, str]] = []
-
-    def model_info(self, repo_id: str, *, revision: str) -> object:
-        """Record the model repository checked by the preflight.
-
-        Returns:
-            Placeholder model metadata.
-        """
-        self.model_ids.append((repo_id, revision))
-        return object()
-
-    def whoami(self) -> dict[str, object]:
-        """Return a test identity."""
-        return {"name": "tester"}
 
 
 def test_preflight_rejects_missing_schema_without_consuming_a_second_row() -> None:
