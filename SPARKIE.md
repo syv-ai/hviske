@@ -1,6 +1,6 @@
 # Sparkie bilingual runbook
 
-This runbook is for the private `syvai/hviske-v6` Cohere run. Training and
+This runbook is for the private `syvai/hviske-v6.0` Cohere run. Training and
 publication are deliberately separate.
 
 ## Prerequisites and authentication
@@ -17,7 +17,7 @@ hf auth whoami
 The Hugging Face account must have accepted access to
 `CohereLabs/cohere-transcribe-03-2026`, read access to private `syvai/p1` and
 `syvai/p1-transcripts`, and read access to every public source. It also needs write
-access to create and upload the private `syvai/hviske-v6` model. Never put tokens in
+access to create and upload the private `syvai/hviske-v6.0` model. Never put tokens in
 this runbook, shell history, manifests, or Hydra configuration.
 
 Set the exact private transcript revision and join columns after checking the pinned
@@ -129,7 +129,7 @@ Review pilot loss, validation metrics, throughput, checkpoint resumption, and di
 Only then launch the approved full run:
 
 ```bash
-tmux new-session -d -s hviske-v6 \
+tmux new-session -d -s hviske-v6-0 \
   'uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual max_validation_samples_per_dataset=1000'
 ```
 
@@ -139,7 +139,7 @@ job is running; completed ephemeral sessions are not available afterwards.
 Monitor a running job with:
 
 ```bash
-tmux attach -t hviske-v6
+tmux attach -t hviske-v6-0
 nvidia-smi
 df -h
 ```
@@ -150,69 +150,24 @@ free space for the next checkpoint and final model save.
 
 ## Olmix anchor calibration matrix
 
-The Olmix benchmark is local-only and serial. It compares the two model configs
-`whisper-xxsmall` (`openai/whisper-tiny`) and `hviske-v5-tiny`
-(`syvai/hviske-v5-tiny`) against the production, read-speech-heavy, and
-spontaneous/conversational-heavy anchors. The anchors preserve the 16-source order,
-60/40 Danish/English split, and non-zero representation of every source. The launcher
-writes one unique directory per job containing `metadata.json`, `run.log`,
-the step-tagged `evaluation_metrics.jsonl`, and the final model output. It records the
-commit, immutable model revision, command, timings, and evaluation metrics; no
-credentials are written.
+**Blocked: do not run the current Olmix launcher or anchor configurations.**
 
-Run these commands inside the externally supplied training container. This repository
-does not build or configure that image: provide the project checkout, model/cache and
-background-noise mounts, plus the usual runtime environment (including GPU access and
-an existing Hugging Face login) according to the deployment. The first command is
-credential-free: use that existing login rather than putting a token in an environment
-variable, command, or file.
+The existing read-heavy and spontaneous-heavy anchors classify P1, FTSpeech, and
+VoxPopuli incorrectly. Their tests validate that stale taxonomy rather than the
+corrected one. They are retained only as implementation history and must not be used
+for GPU runs.
 
-```bash
-docker exec -it <hviske-container> bash
-cd /workspace/hviske
-uv sync --python 3.11 --all-extras
-uv run python src/scripts/finetune_asr_model.py \
-  --config-name sparkie_bilingual +anchors=olmix_baseline --cfg job
-uv run pytest tests/test_olmix_benchmark.py -q
-```
+After the v6.0 source probabilities are frozen:
 
-Run both two-step model smokes in detached tmux sessions and inspect them while they run:
+1. regenerate all calibration anchors with P1 under broadcast/conversation and
+   FTSpeech and VoxPopuli under parliament;
+2. decide how the mixed People's Speech corpus maps into the optimisation domains;
+3. update the source map, launcher, and tests;
+4. review the resolved probabilities and 60/40 language totals; and
+5. restore reviewed smoke and matrix commands to this runbook.
 
-```bash
-tmux new-session -d -s olmix-smoke \
-  'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
-   --smoke --output-root runs/olmix'
-```
-
-After both smokes succeed, run the six jobs serially with `--skip-smoke`. If the
-matrix is launched without that flag, it repeats the two-model smoke immediately
-before the matrix. Each full job uses
-3,000 steps, caps every validation stream at 500 examples, evaluates at steps 250,
-500, 1,000, 2,000, and 3,000, and disables Hub publication and experiment tracking.
-
-```bash
-tmux new-session -d -s olmix-matrix \
-  'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
-   --matrix --skip-smoke --output-root runs/olmix'
-# Capture while the job is running; the shell exits and the ephemeral session ends on completion.
-tmux capture-pane -pt olmix-matrix:0 -S -200
-```
-
-For one selected calibration job, use the same launcher with `--model` and
-`--anchor`, for example:
-
-```bash
-tmux new-session -d -s olmix-read \
-  'set -euo pipefail; cd /workspace/hviske && uv run python src/scripts/run_olmix_benchmark.py \
-   --model hviske-v5-tiny --anchor olmix_read_speech_heavy \
-   --output-root runs/olmix'
-```
-
-The requested evaluation steps are non-uniform, so `eval_steps` alone cannot express
-this schedule. The launcher passes the schedule through `evaluation_steps`; the
-training callback suppresses evaluations at all other steps and writes exact
-step-tagged records to `evaluation_metrics.jsonl`. These are evaluation steps, not
-retained checkpoints: only the final step is saved and one final checkpoint is kept.
+Follow [`docs/olmix-benchmark-plan.md`](docs/olmix-benchmark-plan.md) for the experiment
+design. No Olmix command is approved until this blocked section is replaced.
 
 ## Explicit private publication
 
@@ -228,7 +183,7 @@ must never be uploaded.
 
 ```bash
 uv run python src/scripts/publish_private_model.py \
-  models/hviske-v6 syvai/hviske-v6 --private \
+  models/hviske-v6.0 syvai/hviske-v6.0 --private \
   --evaluation-status 'Pilot and full-run evaluation reviewed before publication.'
 ```
 

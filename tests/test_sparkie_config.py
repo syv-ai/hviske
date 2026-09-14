@@ -52,15 +52,15 @@ TRAINING_IDS = [
     "openslr/librispeech_asr",
 ]
 TRAINING_PROBABILITIES = [
-    0.08,
-    0.10,
-    0.07,
-    0.04,
-    0.10,
-    0.05,
-    0.05,
-    0.05,
-    0.06,
+    0.102857,
+    0.128571,
+    0.09,
+    0.017143,
+    0.128572,
+    0.040909,
+    0.021428,
+    0.021429,
+    0.049091,
     0.16,
     0.04,
     0.03,
@@ -359,7 +359,7 @@ def test_sparkie_publication_provenance_is_complete(
     )
     p1_sources = [source for source in sources if source["id"] == "syvai/p1"]
     assert len(p1_sources) == 1
-    assert p1_sources[0]["probability"] == 0.08
+    assert p1_sources[0]["probability"] == TRAINING_PROBABILITIES[0]
     joined = t.cast(dict[str, object], p1_sources[0]["joined_transcript"])
     assert joined["dataset_id"] == "syvai/p1-transcripts"
     assert joined["revision"] == P1_TRANSCRIPT_SHA

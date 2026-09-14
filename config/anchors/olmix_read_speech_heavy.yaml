@@ -1,4 +1,5 @@
 # @package _global_
+# STALE: P1, FTSpeech, and VoxPopuli are misclassified; People's Speech is mixed.
 # Read-speech anchor: 40% Danish read + 20% Danish conversational and
 # 30% English read + 10% English conversational. Read domains are p1, Coral
 # read-aloud, FTSpeech, Nota, NST, VoxPopuli, and LibriSpeech; DRTV, YouTube,

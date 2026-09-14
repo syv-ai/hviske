@@ -38,24 +38,34 @@ metrics; only the final model checkpoint is retained temporarily.
 
 Optimise these six groups rather than 16 independent sources:
 
-| Group | Sources | Current baseline mass |
+| Group | Sources | Baseline mass |
 | --- | --- | ---: |
-| Danish read or prepared | P1, CoRal read-aloud, FTSpeech, Nota, NST | 0.27 |
-| Danish broadcast or conversation | DRTV, Danish YouTube, CoRal conversation | 0.27 |
-| Danish parliament | VoxPopuli Danish | 0.06 |
-| English conversation or meeting | People's Speech, AMI SDM, AMI IHM | 0.23 |
-| English parliament | VoxPopuli English | 0.09 |
-| English read speech | Three LibriSpeech splits | 0.08 |
+| DA read/prepared | CoRal read-aloud, Nota, NST | 0.06 |
+| DA broadcast/conversation | P1, DRTV, YouTube, CoRal conversation | 0.45 |
+| DA parliament | FTSpeech, VoxPopuli Danish | 0.09 |
+| EN mixed/conversation/meeting | People's Speech, AMI SDM, AMI IHM | 0.23 |
+| EN parliament | VoxPopuli English | 0.09 |
+| EN read | Three LibriSpeech splits | 0.08 |
 
-The current production baseline is:
+The v6.0 production baseline allocates 75% of Danish mass to conversation while leaving
+English group masses unchanged:
 
 ```text
-p_base = [0.27, 0.27, 0.06, 0.23, 0.09, 0.08]
+p_base = [0.06, 0.45, 0.09, 0.23, 0.09, 0.08]
 ```
 
-This grouping follows the style taxonomy encoded in the existing calibration anchors,
-including their treatment of P1 as prepared speech. All three anchors preserve the
-baseline proportions inside each of these six groups.
+The per-source values within these groups remain provisional until P1's mean accepted
+duration is available.
+
+P1 is a radio programme and therefore belongs to broadcast/conversation. FTSpeech is
+recorded parliamentary meeting speech and belongs to parliament. People's Speech is a
+mixed corpus grouped with English conversation/meeting only to keep the optimisation
+six-dimensional; do not interpret all of its hours as conversational. The existing
+read-heavy and spontaneous-heavy anchor files encode P1 and FTSpeech as prepared speech
+and also
+fold VoxPopuli into read domains. They are stale. Regenerate their probabilities and
+tests after the v6.0 source weights are frozen; do not run the Olmix matrix with the
+current anchor files.
 
 This is not automatically Olmix's natural prior. After P1 publication, derive the
 natural vector from usable post-filter examples in each group:
@@ -468,6 +478,8 @@ the proxy-to-target transfer failure.
 
 After P1 integration, add:
 
+- regenerated calibration anchors that classify P1 as broadcast/conversation and
+  preserve the final v6.0 within-group source proportions;
 - a checked-in six-domain source map;
 - a deterministic swarm-manifest generator;
 - a serial tmux-friendly swarm launcher;
