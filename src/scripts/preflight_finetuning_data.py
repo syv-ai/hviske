@@ -10,12 +10,17 @@ import typing as t
 from pathlib import Path
 
 import soundfile
-from datasets import Dataset, IterableDataset, load_dataset
+from datasets import Audio, Dataset, IterableDataset, load_dataset
 from huggingface_hub import HfApi
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
-from hviske.data import _load_transcript_dataset, join_audio_and_transcripts
+from hviske.data import (
+    _filter_dataset_rows,
+    _load_transcript_dataset,
+    apply_dataset_overlay,
+    join_audio_and_transcripts,
+)
 from hviske.utils import validate_transcript_revision
 
 logger = logging.getLogger("hviske_data_preflight")
@@ -56,6 +61,42 @@ def _preflight_hub_source(
         cache_dir=cache_dir,
         trust_remote_code=source_config.get("trust_remote_code", False),
     )
+    source_filters = source_config.get("filters")
+    if source_filters is not None:
+        if not isinstance(source_filters, c.Mapping):
+            raise ValueError(f"Filters for {source_name} must be a mapping")
+        if not isinstance(dataset, Dataset | IterableDataset):
+            raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
+        dataset = _filter_dataset_rows(
+            dataset=dataset, filters=t.cast(dict[str, object], source_filters)
+        )
+    overlay_config = source_config.get("overlay")
+    has_overlay = overlay_config is not None
+    if has_overlay:
+        overlay_revision = validate_transcript_revision(
+            str(overlay_config.get("revision"))
+        )
+        overlay = _load_transcript_dataset(
+            dataset_id=str(overlay_config.id),
+            subset=overlay_config.get("subset"),
+            split=str(overlay_config.get("split", "train")),
+            revision=overlay_revision,
+            cache_dir=cache_dir,
+            trust_remote_code=overlay_config.get("trust_remote_code", False),
+            dataset_loader=dataset_loader,
+        )
+        if not isinstance(dataset, Dataset | IterableDataset):
+            raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
+        audio_column = str(source_config.audio_column)
+        if audio_column in (dataset.column_names or []):
+            dataset = dataset.cast_column(
+                column=audio_column, feature=Audio(decode=False)
+            )
+        dataset = apply_dataset_overlay(
+            base_dataset=dataset,
+            overlay_dataset=overlay,
+            overlay_config=t.cast(c.Mapping[str, object], overlay_config),
+        )
     has_transcript_join = source_config.get("transcript_dataset_id") is not None
     if has_transcript_join:
         transcript_revision = validate_transcript_revision(
@@ -85,6 +126,13 @@ def _preflight_hub_source(
             required_columns=[str(source_config.audio_column), "text"],
             source_name=f"joined {source_name}",
         )
+    elif has_overlay:
+        row = _consume_overlay(dataset=dataset, source_name=source_name)
+        _require_columns(
+            row=row,
+            required_columns=[str(source_config.audio_column), "text"],
+            source_name=f"overlaid {source_name}",
+        )
     else:
         row = _first_row(dataset=dataset, source_name=source_name)
         _require_columns(
@@ -95,11 +143,38 @@ def _preflight_hub_source(
             ],
             source_name=source_name,
         )
-    text_column = "text" if has_transcript_join else str(source_config.text_column)
+    text_column = (
+        "text" if has_transcript_join or has_overlay else str(source_config.text_column)
+    )
     text = row[text_column]
     if not isinstance(text, str) or not text.strip():
         raise ValueError(f"Configured text is empty in the first {source_name} row")
-    logger.info("Validated one joined/streamed row from %s", source_name)
+    logger.info("Validated joined/overlaid/streamed rows from %s", source_name)
+
+
+def _consume_overlay(dataset: object, source_name: str) -> dict[str, object]:
+    """Consume an overlaid stream to trigger strict length and missing-row checks.
+
+    Returns:
+        The first usable row.
+
+    Raises:
+        ValueError:
+            If the overlay is empty or emits a non-mapping row.
+    """
+    iterator = iter(t.cast(c.Iterable[object], dataset))
+    first: dict[str, object] | None = None
+    count = 0
+    for raw_row in iterator:
+        if not isinstance(raw_row, dict):
+            raise ValueError(f"A row from {source_name} is not a mapping")
+        if first is None:
+            first = t.cast(dict[str, object], raw_row)
+        count += 1
+    if first is None:
+        raise ValueError(f"Overlay produced no usable rows from {source_name}")
+    logger.info("Validated %s overlaid rows from %s", f"{count:,}", source_name)
+    return first
 
 
 def _first_row(dataset: object, source_name: str) -> dict[str, object]:
@@ -226,6 +301,9 @@ def preflight_finetuning_data(
         transcript_dataset_id = source_config.get("transcript_dataset_id")
         if transcript_dataset_id is not None:
             validate_transcript_revision(str(source_config.transcript_revision))
+        overlay_config = source_config.get("overlay")
+        if overlay_config is not None:
+            validate_transcript_revision(str(overlay_config.revision))
 
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     api: HubApi = hub_api or HfApi(token=token)

@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added reusable keyed and strict positional ASR dataset overlays with bounded SQLite
+  indexing, shared preflight validation, and safe overlay provenance; configured the
+  pinned v6.0 Danish unified-source snapshot.
 - Added optional NeMo inference for NeMo-only Parakeet RNNT, TDT, and hybrid TDT-CTC
   checkpoints, including the Danish 110M RNNT checkpoint.
 - Added Transformers-native NVIDIA Parakeet CTC and RNNT fine-tuning.

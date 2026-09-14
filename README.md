@@ -72,7 +72,9 @@ Here are some of the more important available keys:
   - `ftspeech`
   - `nota`
   - `nst`
-  - `voxpopuli_da` (Danish VoxPopuli rows from `syvai/danish-asr-unified`)
+  - `coral_read_aloud`, `coral_conversation`, `ftspeech`, `nota`, `nst`, and
+    `voxpopuli_da` (source-filtered rows from the pinned unified Danish dataset plus
+    its v5-tiny metadata overlay)
   - `p1` (streaming audio plus configurable transcript Hub join)
   - `peoples_speech_clean` (English People's Speech `clean` training split)
   - `ami_sdm` and `ami_ihm` (English AMI training splits)

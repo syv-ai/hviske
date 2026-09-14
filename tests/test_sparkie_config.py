@@ -37,11 +37,11 @@ TRAINING_IDS = [
     "syvai/p1",
     "local_vtt",
     "local_vtt",
-    "CoRal-project/coral-v3",
-    "CoRal-project/coral-v3",
-    "alexandrainst/ftspeech",
-    "alexandrainst/nota",
-    "alexandrainst/nst-da",
+    "syvai/danish-asr-unified",
+    "syvai/danish-asr-unified",
+    "syvai/danish-asr-unified",
+    "syvai/danish-asr-unified",
+    "syvai/danish-asr-unified",
     "syvai/danish-asr-unified",
     "MLCommons/peoples_speech",
     "edinburghcstr/ami",
@@ -111,22 +111,22 @@ def test_sparkie_dataset_coordinates_and_revisions(
     expected_coordinates = {
         "p1": ("syvai/p1", None, "train", "text", "audio"),
         "coral_read_aloud": (
-            "CoRal-project/coral-v3",
-            "read_aloud",
+            "syvai/danish-asr-unified",
+            "default",
             "train",
             "text",
             "audio",
         ),
         "coral_conversation": (
-            "CoRal-project/coral-v3",
-            "conversation",
+            "syvai/danish-asr-unified",
+            "default",
             "train",
             "text",
             "audio",
         ),
-        "ftspeech": ("alexandrainst/ftspeech", None, "train", "sentence", "audio"),
-        "nota": ("alexandrainst/nota", None, "train", "text", "audio"),
-        "nst": ("alexandrainst/nst-da", None, "train", "text", "audio"),
+        "ftspeech": ("syvai/danish-asr-unified", "default", "train", "text", "audio"),
+        "nota": ("syvai/danish-asr-unified", "default", "train", "text", "audio"),
+        "nst": ("syvai/danish-asr-unified", "default", "train", "text", "audio"),
         "voxpopuli_da": (
             "syvai/danish-asr-unified",
             "default",
@@ -185,11 +185,11 @@ def test_sparkie_dataset_coordinates_and_revisions(
 
     expected_revisions = {
         "p1": "449b9c2294026df6d0d37538f279fdec03f565ff",
-        "coral_read_aloud": "01f7c93c21fc9dec87fe9f7149c79569cc433f08",
-        "coral_conversation": "01f7c93c21fc9dec87fe9f7149c79569cc433f08",
-        "ftspeech": "e1b7096db63c7d996a8220b13780a547a88a9af0",
-        "nota": "acd1ad2389426f84fc3cb812c52d3d5dde5c7ce3",
-        "nst": "0f14ad2005e0aab8f56cf3213b7689da1faf23c2",
+        "coral_read_aloud": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
+        "coral_conversation": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
+        "ftspeech": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
+        "nota": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
+        "nst": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
         "voxpopuli_da": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
         "peoples_speech_clean": "f10597c5d3d3a63f8b6827701297c3afdf178272",
         "ami_sdm": "46f28f2503e2ec48f8867a84eef356c70476beab",
@@ -216,12 +216,34 @@ def test_sparkie_dataset_coordinates_and_revisions(
         dataset.get("trust_remote_code", False) is False
         for dataset in datasets.values()
     )
-    assert dict(datasets.voxpopuli_da.filters) == {"source": "voxpopuli"}
+    assert all(
+        dict(datasets[name].filters) == {"source": source}
+        for name, source in {
+            "coral_read_aloud": "coral_read_aloud",
+            "coral_conversation": "coral_conversation",
+            "ftspeech": "ftspeech",
+            "nota": "nota",
+            "nst": "nst",
+            "voxpopuli_da": "voxpopuli",
+        }.items()
+    )
     assert [
         name
         for name, dataset in datasets.items()
         if dataset.get("id") == "syvai/danish-asr-unified"
-    ] == ["voxpopuli_da"]
+    ] == [
+        "coral_read_aloud",
+        "coral_conversation",
+        "ftspeech",
+        "nota",
+        "nst",
+        "voxpopuli_da",
+    ]
+    assert all(
+        dataset.overlay.revision == "58899784c825e954d83cf5c1bf7578aa215ecf71"
+        for dataset in datasets.values()
+        if dataset.get("overlay") is not None
+    )
 
 
 def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
@@ -319,11 +341,8 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     assert list(config.training_dataset_ids) == [
         "syvai/p1",
         "syvai/p1-transcripts",
-        "CoRal-project/coral-v3",
-        "alexandrainst/ftspeech",
-        "alexandrainst/nota",
-        "alexandrainst/nst-da",
         "syvai/danish-asr-unified",
+        "syvai/danish-asr-unified-hviske-v5-tiny",
         "MLCommons/peoples_speech",
         "edinburghcstr/ami",
         "facebook/voxpopuli",
@@ -343,7 +362,32 @@ def test_sparkie_publication_provenance_is_complete(
         for source in sources
         if "joined_transcript" in source
     }
-    assert set(config.training_dataset_ids).issubset(source_ids | joined_ids)
+    overlay_ids = {
+        str(t.cast(dict[str, object], source["overlay"])["dataset_id"])
+        for source in sources
+        if "overlay" in source
+    }
+    assert set(config.training_dataset_ids).issubset(
+        source_ids | joined_ids | overlay_ids
+    )
+    overlay_sources = [source for source in sources if "overlay" in source]
+    assert len(overlay_sources) == 6
+    assert all(
+        t.cast(dict[str, object], source["overlay"])["revision"]
+        == "58899784c825e954d83cf5c1bf7578aa215ecf71"
+        for source in overlay_sources
+    )
+    first_overlay = t.cast(dict[str, object], overlay_sources[0]["overlay"])
+    assert first_overlay["strategy"] == "positional"
+    assert first_overlay["filters"] == {"source": "coral_read_aloud"}
+    assert first_overlay["base_filters"] == {"source": "coral_read_aloud"}
+    assert first_overlay["equality_checks"] == {
+        "source": "source",
+        "text": "reference_text",
+    }
+    assert first_overlay["allowed_actions"] == ["keep", "relabel", "strip"]
+    assert "text_policy" in first_overlay
+    assert all("path" not in str(source).lower() for source in overlay_sources)
     assert {"local_vtt:drtv_local", "local_vtt:youtube_local"}.issubset(source_ids)
     assert all(
         all(

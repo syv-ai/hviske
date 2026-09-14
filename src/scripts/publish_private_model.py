@@ -1,6 +1,7 @@
 """Publish a reviewed Sparkie model to a verified private Hub repository."""
 
 import pathlib
+from collections.abc import Mapping, Sequence
 
 import click
 from hydra import compose, initialize_config_dir
@@ -101,6 +102,37 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
             "probability": probabilities[index],
             "language": str(source_config.get("language") or "unspecified"),
         }
+        overlay_config = source_config.get("overlay")
+        if overlay_config is not None:
+            overlay_metadata = {
+                "dataset_id": str(overlay_config.id),
+                "subset": str(overlay_config.get("subset") or "none"),
+                "split": str(overlay_config.get("split", "train")),
+                "revision": validate_transcript_revision(str(overlay_config.revision)),
+                "filters": _safe_overlay_value(overlay_config.get("filters", {})),
+                "base_filters": _safe_overlay_value(
+                    overlay_config.get("base_filters", {})
+                ),
+                "strategy": str(overlay_config.get("strategy", "keyed")),
+                "base_join_column": str(overlay_config.get("base_join_column", "none")),
+                "overlay_join_column": str(
+                    overlay_config.get("overlay_join_column", "none")
+                ),
+                "equality_checks": _safe_overlay_value(
+                    overlay_config.get("equality_checks", {})
+                ),
+                "action_column": str(overlay_config.get("action_column", "action")),
+                "allowed_actions": _safe_overlay_value(
+                    overlay_config.get("allowed_actions", [])
+                ),
+                "text_policy": _safe_overlay_value(
+                    overlay_config.get("text_policy", {})
+                ),
+            }
+            source["overlay"] = overlay_metadata
+            source["relationship"] = (
+                "base rows overlaid by metadata-only transcript revision"
+            )
         transcript_id = source_config.get("transcript_dataset_id")
         if transcript_id is not None:
             transcript_metadata = {
@@ -134,6 +166,9 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
         joined_transcript = source.get("joined_transcript")
         if isinstance(joined_transcript, dict):
             derived_ids.add(str(joined_transcript["dataset_id"]))
+        overlay = source.get("overlay")
+        if isinstance(overlay, dict):
+            derived_ids.add(str(overlay["dataset_id"]))
     missing = configured_ids - derived_ids
     if missing:
         raise ValueError(
@@ -141,6 +176,21 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
             + ", ".join(sorted(missing))
         )
     return sources
+
+
+def _safe_overlay_value(value: object) -> object:
+    """Convert overlay config values to provenance-safe scalar containers.
+
+    Returns:
+        A recursively serialisable value without local path resolution.
+    """
+    if isinstance(value, Mapping):
+        return {str(key): _safe_overlay_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_safe_overlay_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 if __name__ == "__main__":

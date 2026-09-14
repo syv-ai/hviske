@@ -862,6 +862,11 @@ def _validate_training_sources(
             dataset_id = joined_transcript.get("dataset_id")
             if dataset_id is not None:
                 ids.add(str(dataset_id))
+        overlay = source.get("overlay")
+        if isinstance(overlay, dict):
+            dataset_id = overlay.get("dataset_id")
+            if dataset_id is not None:
+                ids.add(str(dataset_id))
     missing = sorted(set(training_dataset_ids) - ids)
     if missing:
         raise ValueError("Model-card provenance misses datasets: " + ", ".join(missing))

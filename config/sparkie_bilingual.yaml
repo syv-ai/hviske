@@ -101,11 +101,8 @@ dataset_probabilities:
 training_dataset_ids:
   - syvai/p1
   - syvai/p1-transcripts
-  - CoRal-project/coral-v3
-  - alexandrainst/ftspeech
-  - alexandrainst/nota
-  - alexandrainst/nst-da
   - syvai/danish-asr-unified
+  - syvai/danish-asr-unified-hviske-v5-tiny
   - MLCommons/peoples_speech
   - edinburghcstr/ami
   - facebook/voxpopuli
