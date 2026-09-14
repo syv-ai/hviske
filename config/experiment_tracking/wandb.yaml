@@ -1,14 +1,17 @@
 type: wandb
-name_experiment: CoRal
+name_experiment: hviske
 name_run: ${model_id}
 name_group: default
 # Leave entity unset to use the authenticated user's default workspace.
 entity: null
 id: null
-resume: null
+resume: never
 job_type: null
-tags: []
-mode: null
+tags:
+  - hviske
+mode: online
 save_code: null
-log_model: false
-watch: false
+# Null leaves generic callers' existing W&B environment policy unchanged.
+log_model: null
+watch: null
+production: false
