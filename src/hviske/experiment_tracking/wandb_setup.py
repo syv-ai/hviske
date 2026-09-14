@@ -6,6 +6,7 @@ import typing as t
 
 import wandb
 from omegaconf import DictConfig, OmegaConf
+from wandb.sdk.lib import auth as wandb_auth
 
 from .extracking_setup import ExTrackingSetup
 
@@ -102,9 +103,25 @@ _PATH_KEYS = {
     "path",
     "models_dir",
     "output_dir",
+    "resume_from_checkpoint",
     "source_dir",
     "source_wav_path",
 }
+
+
+def _read_stored_wandb_api_key() -> str | None:
+    """Read a W&B key from settings, the environment, or netrc without prompting.
+
+    Returns:
+        The stored W&B API key, or ``None`` when no key is configured.
+    """
+    settings = wandb.Settings()
+    api_key = getattr(settings, "api_key", None) or os.environ.get("WANDB_API_KEY")
+    if api_key:
+        return str(api_key)
+
+    base_url = os.environ.get("WANDB_BASE_URL") or str(settings.base_url)
+    return wandb_auth.read_netrc_auth(host=base_url)
 
 
 def _remove_sensitive_values(value: object, key: str = "") -> object:
@@ -123,6 +140,8 @@ def _remove_sensitive_values(value: object, key: str = "") -> object:
         A recursively redacted plain value.
     """
     lowered_key = key.lower().replace("-", "_")
+    if lowered_key == "resume_from_checkpoint":
+        return value if value is None or isinstance(value, bool) else "[REDACTED]"
     if value is not None and lowered_key in _SENSITIVE_KEYS:
         return "[REDACTED]"
     if value is not None and (
@@ -151,7 +170,9 @@ def _set_artifact_logging_environment(tracking: DictConfig) -> None:
 
 
 def preflight_wandb_access(
-    config: DictConfig, api_factory: c.Callable[[], object] | None = None
+    config: DictConfig,
+    api_factory: c.Callable[..., object] | None = None,
+    credential_lookup: c.Callable[[], str | None] | None = None,
 ) -> None:
     """Verify stored W&B credentials and online API access non-interactively.
 
@@ -163,15 +184,31 @@ def preflight_wandb_access(
             The complete Hydra configuration.
         api_factory (optional):
             Authenticated API client factory, injectable for unit tests.
+        credential_lookup (optional):
+            Non-interactive stored-key lookup, injectable for unit tests.
 
     Raises:
         RuntimeError:
             If stored credentials are unavailable or the online API cannot be read.
     """
     validate_wandb_config(config=config)
+    credential_lookup_fn = credential_lookup or _read_stored_wandb_api_key
+    try:
+        api_key = credential_lookup_fn()
+    except Exception as error:
+        raise RuntimeError(
+            "W&B preflight could not use stored credentials or reach the online API; "
+            "run `uv run wandb login --verify` first"
+        ) from error
+    if not api_key:
+        raise RuntimeError(
+            "W&B preflight could not use stored credentials or reach the online API; "
+            "run `uv run wandb login --verify` first"
+        )
+
     api_factory_fn = api_factory or wandb.Api
     try:
-        api = api_factory_fn()
+        api = api_factory_fn(api_key=api_key)
         viewer = getattr(api, "viewer")
     except Exception as error:
         raise RuntimeError(

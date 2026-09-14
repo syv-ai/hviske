@@ -279,6 +279,7 @@ def test_wandb_payload_redacts_resolved_paths_without_redacting_hyperparameters(
                 "cache_dir": "/private/cache",
                 "tokenizer_token": "benign-value",
                 "wandb_api_key": "secret-value",
+                "resume_from_checkpoint": "/private/checkpoints/checkpoint-2000",
                 "datasets": {
                     "drtv_local": {"manifest_path": "/private/audio/drtv.jsonl"}
                 },
@@ -295,17 +296,41 @@ def test_wandb_payload_redacts_resolved_paths_without_redacting_hyperparameters(
     assert drtv["manifest_path"] == "[REDACTED]"
     assert payload["tokenizer_token"] == "benign-value"
     assert payload["wandb_api_key"] == "[REDACTED]"
+    assert payload["resume_from_checkpoint"] == "[REDACTED]"
+
+    false_config = OmegaConf.merge(
+        _config(), OmegaConf.create({"resume_from_checkpoint": False})
+    )
+    false_payload = wandb_module._resolved_config_payload(
+        config=t.cast(DictConfig, false_config)
+    )
+    assert false_payload["resume_from_checkpoint"] is False
+
+
+def test_wandb_preflight_default_path_does_not_prompt_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default path never constructs an API client without a stored key."""
+    monkeypatch.setattr(wandb_module, "_read_stored_wandb_api_key", lambda: None)
+    monkeypatch.setattr(
+        wandb_module.wandb,
+        "login",
+        lambda **kwargs: pytest.fail("preflight must not call wandb.login"),
+    )
+    monkeypatch.setattr(
+        wandb_module.wandb,
+        "Api",
+        lambda **kwargs: pytest.fail("preflight must not construct wandb.Api"),
+    )
+
+    with pytest.raises(RuntimeError, match="stored credentials"):
+        preflight_wandb_access(config=_config())
 
 
 def test_wandb_preflight_reports_missing_credentials() -> None:
     """Missing stored credentials produce an actionable error."""
-
-    class Api:
-        def __init__(self) -> None:
-            raise RuntimeError("no credentials")
-
     with pytest.raises(RuntimeError, match="stored credentials"):
-        preflight_wandb_access(config=_config(), api_factory=Api)
+        preflight_wandb_access(config=_config(), credential_lookup=lambda: None)
 
 
 def test_wandb_preflight_uses_api_without_a_login_prompt(
@@ -319,9 +344,14 @@ def test_wandb_preflight_uses_api_without_a_login_prompt(
     )
 
     class Api:
+        def __init__(self, *, api_key: str) -> None:
+            assert api_key == "stored-key"
+
         viewer = {"username": "personal"}
 
-    preflight_wandb_access(config=_config(), api_factory=Api)
+    preflight_wandb_access(
+        config=_config(), api_factory=Api, credential_lookup=lambda: "stored-key"
+    )
 
 
 def test_wandb_rejects_ambiguous_fresh_resume() -> None:
