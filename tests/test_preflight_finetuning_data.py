@@ -237,6 +237,39 @@ def test_preflight_bounds_non_overlay_source_consumption(tmp_path: Path) -> None
     ]
 
 
+@pytest.mark.parametrize("revision", ["", "main", "0123456", "g" * 40])
+def test_preflight_rejects_missing_or_invalid_immutable_source_revision(
+    revision: str,
+) -> None:
+    """Preflight requires configured environment-backed source revisions."""
+    config = OmegaConf.create(
+        {
+            "model": {
+                "pretrained_model_id": "org/gated-model",
+                "revision": "b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
+            },
+            "cache_dir": None,
+            "datasets": {
+                "p1": {
+                    "id": "syvai/p1-segments",
+                    "subset": None,
+                    "train_name": "train",
+                    "text_column": "text",
+                    "audio_column": "audio",
+                    "revision": revision,
+                    "immutable_revision_env": "P1_SEGMENTS_REVISION",
+                }
+            },
+            "evaluation_datasets": [],
+        }
+    )
+
+    with pytest.raises(ValueError, match="P1_SEGMENTS_REVISION"):
+        preflight_finetuning_data(
+            config=config, dataset_loader=lambda **kwargs: None, hub_api=FakeHubApi()
+        )
+
+
 def test_preflight_rejects_missing_schema_without_consuming_a_second_row() -> None:
     """A schema error stops after the first streamed row."""
     config = OmegaConf.create(

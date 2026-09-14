@@ -73,7 +73,7 @@ Here are some of the more important available keys:
   - `coral_read_aloud`, `coral_conversation`, `ftspeech`, `nota`, `nst`, and
     `voxpopuli_da` (source-filtered rows from the pinned unified Danish dataset plus
     its v5-tiny metadata overlay)
-  - `p1` (streaming audio plus configurable transcript Hub join)
+  - `p1` (streaming audio and text from the pinned `syvai/p1-segments` dataset)
   - `peoples_speech_clean` (English People's Speech `clean` training split)
   - `ami_sdm` and `ami_ihm` (English AMI training splits)
   - `voxpopuli_en` (English VoxPopuli training split)
@@ -112,7 +112,7 @@ Here are some of the more important available keys:
   parameters that you can tweak, although it shouldn't really be needed.
 
 Dataset entries may set `language` to override the model-level Cohere prompt for
-that source. A Hub audio source can be joined to a compact transcript Hub dataset
+that source. A Hub audio source can still be joined to a compact transcript Hub dataset
 without downloading the audio by setting `transcript_dataset_id`,
 `transcript_subset`, `transcript_split`, `audio_join_column`,
 `transcript_join_column`, and `transcript_text_column`. `revision` and
@@ -122,9 +122,9 @@ while the transcript side is indexed in memory. Column names are deliberately
 configuration fields because private transcript schemas must be verified before use.
 The supplied `voxpopuli_da` config selects only rows whose `source` is exactly
 `voxpopuli`; the unified repository's ftspeech, CoRal, NST, and Nota rows remain
-separately sourced. The supplied `p1` config requires `P1_TRANSCRIPT_REVISION`,
-`P1_AUDIO_JOIN_COLUMN`, `P1_TRANSCRIPT_JOIN_COLUMN`, and
-`P1_TRANSCRIPT_TEXT_COLUMN`.
+separately sourced. The supplied `p1` config reads `audio` and `text` directly from
+`syvai/p1-segments` and requires `P1_SEGMENTS_REVISION`, a full immutable 40-character
+commit SHA. Other dataset configs retain generic transcript-join support.
 
 For local WAV/VTT data, first build a manifest without copying audio:
 
@@ -140,8 +140,8 @@ configuration. Training seeks and reads only each cue from the original WAV when
 is consumed; the manifest stores paths, offsets, text, IDs, durations, and language.
 
 The reproducible Sparkie bilingual preset is `config/sparkie_bilingual.yaml`. Export
-`HVISKE_OVERLAY_REVISION` with the completed immutable 40-character overlay commit,
-resolve the preset with the existing fixed Hydra entry point using
+`P1_SEGMENTS_REVISION` and `HVISKE_OVERLAY_REVISION` with their immutable
+40-character commits, resolve the preset with the existing fixed Hydra entry point using
 `--config-name sparkie_bilingual`, then run the bounded data preflight before stopping
 other Sparkie services:
 

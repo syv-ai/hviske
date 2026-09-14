@@ -99,8 +99,7 @@ dataset_probabilities:
 
 # Exact source metadata for the separate private publication step.
 training_dataset_ids:
-  - syvai/p1
-  - syvai/p1-transcripts
+  - syvai/p1-segments
   - syvai/danish-asr-unified
   - syvai/danish-asr-unified-hviske-v5-tiny
   - MLCommons/peoples_speech

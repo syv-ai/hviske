@@ -1,5 +1,12 @@
 # Hviske v6.0 initial Danish ASR release training plan
 
+## Status
+
+The production consumer now loads `syvai/p1-segments` directly as a normal Hub dataset
+with `audio` and `text`. Training remains gated until the manually gated dataset's final
+immutable revision is supplied as `P1_SEGMENTS_REVISION` and the complete data preflight
+passes; the revision must not be replaced with a moving branch or a provisional snapshot.
+
 ## Decision summary
 
 Train and release `syvai/hviske-v6.0` as a Danish-specialised continuation of
@@ -313,10 +320,11 @@ p_s proportional to a_s / d_s
 ```
 
 Do not set probabilities from repository bytes or total hours alone. DRTV averages 4.44
-seconds per accepted example, while YouTube averages 2.25 seconds. Their current 0.10 to
-0.07 probability ratio therefore already produces an audio-exposure ratio close to their
-6,391 to 2,002 hour corpus ratio. P1's roughly 7,500 hours suggest its 0.08 probability
-will likely increase, but its final row count and mean duration determine by how much.
+seconds per accepted example, while YouTube averages 2.25 seconds. Their current
+0.128571 to 0.09 probability ratio therefore already produces an audio-exposure ratio
+close to their 6,391 to 2,002 hour corpus ratio. The P1 share is frozen at 0.102857 for
+this production preset; measure its final row count and mean duration rather than
+silently changing the configured source order or probability.
 
 Freeze the revised probabilities before either learning-rate pilot. Record realised
 examples and audio seconds per source during every pilot and the full run. Missing
@@ -444,8 +452,9 @@ Run in parallel with workstream A.
 
 ### Gate 1: data-only Sparkie preflight
 
-Set `HVISKE_OVERLAY_REVISION` before resolving the preset. Preflight rejects a missing,
-mutable, abbreviated, or non-hex value with an actionable error and fully consumes each
+Set `P1_SEGMENTS_REVISION` and `HVISKE_OVERLAY_REVISION` before resolving the preset.
+Preflight rejects either missing, mutable, abbreviated, or non-hex value with an
+actionable error and fully consumes each
 overlay before training. This full integrity pass is required because positional training
 is lazy; it establishes the strict extra-row, missing-row, duplicate, and equality gates
 before any training iterator is created.
