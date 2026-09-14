@@ -17,7 +17,9 @@ from transformers import (
 )
 from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.parakeet import (
+    ParakeetCTCConfig,
     ParakeetEncoderConfig,
+    ParakeetForCTC,
     ParakeetForRNNT,
     ParakeetRNNTConfig,
 )
@@ -106,6 +108,132 @@ def test_parakeet_collator_pads_rnnt_decoder_inputs() -> None:
 
     assert batch["labels"].tolist() == [[1, 2], [3, 0]]
     assert batch["decoder_input_ids"].tolist() == [[0, 1, 2], [0, 3, 0]]
+
+
+def test_parakeet_danish_tokens_resize_ctc_and_save_processor(tmp_path: Path) -> None:
+    """Danish additions preserve CTC rows, IDs, and processor persistence."""
+    setup = _tiny_parakeet_setup()
+    processor = setup._adapt_processor(processor=_tiny_parakeet_processor())
+    tokenizer = processor.tokenizer
+    assert tokenizer("æøå", add_special_tokens=False)["input_ids"] == [6, 7, 8]
+    assert tokenizer("a", add_special_tokens=False)["input_ids"] == [1]
+    assert tokenizer.pad_token_id == 0
+    assert tokenizer.convert_tokens_to_ids("<blank>") == 5
+
+    processor.save_pretrained(save_directory=tmp_path)
+    reloaded = ParakeetProcessor.from_pretrained(tmp_path)
+    assert reloaded.tokenizer("æøå", add_special_tokens=False)["input_ids"] == [6, 7, 8]
+
+    model = ParakeetForCTC(
+        ParakeetCTCConfig(
+            encoder_config=_tiny_parakeet_encoder_config(), vocab_size=6, pad_token_id=0
+        )
+    )
+    old_weight = model.ctc_head.weight.detach().clone()
+    assert model.ctc_head.bias is not None
+    old_bias = model.ctc_head.bias.detach().clone()
+    setup.processor = processor
+    setup._resize_model_vocabulary(model=model, family="ctc")
+    assert model.ctc_head.out_channels == 9
+    assert torch.equal(model.ctc_head.weight[:6], old_weight)
+    assert model.ctc_head.bias is not None
+    assert torch.equal(model.ctc_head.bias[:6], old_bias)
+    assert model.config.vocab_size == 9
+
+    outputs = model(
+        input_features=torch.randn(2, 64, 16),
+        attention_mask=torch.ones(2, 64),
+        labels=torch.tensor([[6, 7, 8], [6, 7, 0]]),
+    )
+    assert outputs.loss is not None
+    assert torch.isfinite(outputs.loss)
+
+
+def _tiny_parakeet_encoder_config() -> ParakeetEncoderConfig:
+    return ParakeetEncoderConfig(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        conv_kernel_size=3,
+        subsampling_conv_channels=4,
+        num_mel_bins=16,
+        max_position_embeddings=100,
+        dropout=0.0,
+        layerdrop=0.0,
+        activation_dropout=0.0,
+        attention_dropout=0.0,
+    )
+
+
+def _tiny_parakeet_processor() -> ParakeetProcessor:
+    tokenizer = ParakeetTokenizer(
+        vocab={"<pad>": 0, "a": 1, "<unk>": 2, "<s>": 3, "</s>": 4, "<blank>": 5},
+        pad_token="<pad>",
+        unk_token="<unk>",
+        bos_token="<s>",
+        eos_token="</s>",
+        blank_token="<blank>",
+    )
+    return ParakeetProcessor(
+        feature_extractor=ParakeetFeatureExtractor(feature_size=1),
+        tokenizer=tokenizer,
+        blank_token="<blank>",
+        decoder_type="rnnt",
+    )
+
+
+def _tiny_parakeet_setup() -> ParakeetModelSetup:
+    return ParakeetModelSetup(
+        config=OmegaConf.create(
+            {
+                "model": {
+                    "type": "parakeet",
+                    "characters_to_keep": "æøå",
+                    "pretrained_model_id": "checkpoint",
+                }
+            }
+        )
+    )
+
+
+def test_parakeet_danish_tokens_resize_rnnt_and_keep_blank() -> None:
+    """RNNT heads retain rows while the blank remains the generation start."""
+    setup = _tiny_parakeet_setup()
+    processor = setup._adapt_processor(processor=_tiny_parakeet_processor())
+    model = ParakeetForRNNT(
+        ParakeetRNNTConfig(
+            encoder_config=_tiny_parakeet_encoder_config(),
+            vocab_size=6,
+            decoder_hidden_size=4,
+            num_decoder_layers=1,
+            pad_token_id=0,
+            blank_token_id=5,
+        )
+    )
+    old_embedding = model.decoder.embedding.weight.detach().clone()
+    old_head_weight = model.joint.head.weight.detach().clone()
+    old_head_bias = model.joint.head.bias.detach().clone()
+    setup.processor = processor
+    setup._resize_model_vocabulary(model=model, family="rnnt")
+
+    assert model.decoder.embedding.num_embeddings == 9
+    assert model.joint.head.out_features == 9
+    assert torch.equal(model.decoder.embedding.weight[:6], old_embedding)
+    assert torch.equal(model.joint.head.weight[:6], old_head_weight)
+    assert torch.equal(model.joint.head.bias[:6], old_head_bias)
+    assert model.config.vocab_size == 9
+    assert model.config.blank_token_id == 5
+    assert model.generation_config.decoder_start_token_id == 5
+
+    outputs = model(
+        input_features=torch.randn(2, 64, 16),
+        attention_mask=torch.ones(2, 64),
+        decoder_input_ids=torch.tensor([[5, 6, 7, 8], [5, 6, 7, 0]]),
+        labels=torch.tensor([[6, 7, 8], [6, 7, 5]]),
+    )
+    assert outputs.loss is not None
+    assert torch.isfinite(outputs.loss)
 
 
 def test_parakeet_dispatch() -> None:

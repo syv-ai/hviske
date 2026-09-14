@@ -5,6 +5,8 @@
 ### Added
 
 - Added Transformers-native NVIDIA Parakeet CTC and RNNT fine-tuning.
+- Added Danish vocabulary adaptation for native Parakeet tokenizers, preserving
+  existing vocabulary and blank-token IDs while resizing CTC and RNNT heads.
 - Added Parakeet CTC and RNNT model presets.
 
 ### Changed

@@ -50,7 +50,10 @@ Here are some of the more important available keys:
   Transformers stack because its native loss is broken; use NVIDIA NeMo instead.
   The Danish `parakeet-rnnt-da-dk` repository is NeMo-only and is not supported.
   Parakeet RNNT evaluation uses native generation and does not pass Whisper
-  language or task generation arguments.
+  language or task generation arguments. The Parakeet configs extend the native
+  tokenizer with retained Danish characters (such as `æ`, `ø`, and `å`) when
+  they would otherwise become unknown tokens; existing vocabulary and blank
+  token IDs are preserved.
 
   The `cohere` config fine-tunes `CohereLabs/cohere-transcribe-03-2026` with a
   Danish language and punctuation prompt at 16 kHz. The official Cohere checkpoint
