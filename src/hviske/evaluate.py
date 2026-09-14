@@ -20,6 +20,7 @@ from transformers.pipelines.pt_utils import KeyDataset
 from .cohere import CohereASRTranscriber, get_asr_call_kwargs, load_asr_transcriber
 from .data import DEFAULT_CONVERSION_DICT, load_dataset_for_evaluation, process_example
 from .metrics import cer, wer
+from .nemo import NemoASRTranscriber, load_nemo_asr_transcriber
 from .utils import transformers_output_ignored
 
 load_dotenv()
@@ -53,6 +54,7 @@ def evaluate(config: DictConfig) -> pd.DataFrame:
         punctuation=getattr(config, "punctuation", True),
         max_new_tokens=getattr(config, "max_new_tokens", 256),
         revision=getattr(config, "model_revision", None),
+        inference_backend=getattr(config, "inference_backend", "transformers"),
     )
 
     predictions: list[str] = list()
@@ -194,7 +196,8 @@ def load_asr_pipeline(
     punctuation: bool = True,
     max_new_tokens: int = 256,
     revision: str | None = None,
-) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber:
+    inference_backend: str = "transformers",
+) -> AutomaticSpeechRecognitionPipeline | CohereASRTranscriber | NemoASRTranscriber:
     """Load the ASR pipeline.
 
     Args:
@@ -211,14 +214,26 @@ def load_asr_pipeline(
             Maximum number of tokens generated per audio input. Defaults to ``256``.
         revision (optional):
             Immutable Hub revision for a native Cohere checkpoint.
+        inference_backend (optional):
+            Inference implementation, either ``transformers`` or ``nemo``. Defaults
+            to ``transformers``.
 
     Returns:
-        The ASR pipeline or native Cohere transcriber.
+        The ASR pipeline or native Cohere/NeMo transcriber.
+
+    Raises:
+        ValueError:
+            If ``inference_backend`` is unsupported.
     """
+    if inference_backend not in {"transformers", "nemo"}:
+        raise ValueError("inference_backend must be either 'transformers' or 'nemo'.")
     if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
+
+    if inference_backend == "nemo":
+        return load_nemo_asr_transcriber(source=model_id, device=device)
 
     with transformers_output_ignored():
         transcriber = load_asr_transcriber(

@@ -46,9 +46,11 @@ Here are some of the more important available keys:
   - `parakeet-rnnt`
 
   The `parakeet-*` configs use the Transformers-native NVIDIA Parakeet CTC and
-  RNNT implementations. Parakeet TDT fine-tuning is not supported on the
-  Transformers stack because its native loss is broken; use NVIDIA NeMo instead.
-  The Danish `parakeet-rnnt-da-dk` repository is NeMo-only and is not supported.
+  RNNT implementations. Parakeet TDT fine-tuning is not implemented on the
+  Transformers stack because its native loss is broken, and NeMo fine-tuning is not
+  implemented either.
+  The Danish `parakeet-rnnt-da-dk` repository is NeMo-only. It is supported for
+  inference and evaluation with the optional NeMo backend, but not for fine-tuning.
   Parakeet RNNT evaluation uses native generation and does not pass Whisper
   language or task generation arguments. The Parakeet configs extend the native
   tokenizer with retained Danish characters (such as `æ`, `ø`, and `å`) when
@@ -175,6 +177,18 @@ Here are some of the more important available keys:
   to `text`.
 - `audio_column`: The name of the column in the dataset that contains the audio. Defaults
   to `audio`.
+
+For NeMo-only checkpoints, install the optional backend and select it explicitly:
+
+```bash
+uv sync --extra nemo
+uv run python src/scripts/evaluate_model.py \
+  model_id=nvidia/parakeet-rnnt-110m-da-dk inference_backend=nemo
+```
+
+Local NeMo archives can be evaluated by setting `model_id=/path/to/model.nemo` with
+`inference_backend=nemo`. NeMo inference supports RNNT, TDT, and hybrid TDT-CTC
+checkpoints. NeMo fine-tuning and Transformers TDT fine-tuning are not implemented.
 
 See all the evaluation options in the `config/evaluation.yaml` file.
 

@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added optional NeMo inference for NeMo-only Parakeet RNNT, TDT, and hybrid TDT-CTC
+  checkpoints, including the Danish 110M RNNT checkpoint.
 - Added Transformers-native NVIDIA Parakeet CTC and RNNT fine-tuning.
 - Added Danish vocabulary adaptation for native Parakeet tokenizers, preserving
   existing vocabulary and blank-token IDs while resizing CTC and RNNT heads.
