@@ -28,6 +28,7 @@ from .contracts import (
     ShardEvidence,
     valid_ledger_transition,
 )
+from .publication_layout import is_allowed_shard_path
 
 _SCHEMA_VERSION = 3
 _SEQUENCE_TABLE = "ledger_sequences"
@@ -1630,6 +1631,134 @@ class Ledger:
                 ),
             ).fetchall()
         return tuple(self._shard_record(row) for row in rows)
+
+    def remap_remote_paths(
+        self, mapping: Mapping[str, str], *, verify_local: bool = True
+    ) -> int:
+        """Atomically remap legacy paths for local, uncommitted shard evidence.
+
+        Returns:
+            Number of remapped shard records.
+
+        Raises:
+            EvidenceError:
+                If mapping coverage, state, collisions, or local evidence is unsafe.
+        """
+        if not isinstance(mapping, Mapping):
+            raise EvidenceError("path mapping must be a mapping")
+        if any(
+            not isinstance(old, str) or not isinstance(new, str)
+            for old, new in mapping.items()
+        ):
+            raise EvidenceError("path mapping must contain only strings")
+        safe_mapping = dict(mapping)
+        for old, new in safe_mapping.items():
+            if not is_allowed_shard_path(old) or not is_allowed_shard_path(new):
+                raise EvidenceError("path mapping contains a noncanonical path")
+            if not old.startswith("data/train/") or not new.startswith(
+                "data-shards/train/"
+            ):
+                raise EvidenceError("migration paths must move legacy shards only")
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM shards ORDER BY shard_id"
+            ).fetchall()
+            uncommitted = [
+                row
+                for row in rows
+                if row["state"]
+                not in {
+                    LedgerState.COMMITTED.value,
+                    LedgerState.VERIFIED.value,
+                    LedgerState.PURGED.value,
+                }
+            ]
+            pending = [row for row in uncommitted if row["local_path"] is not None]
+            legacy = {
+                str(row["path"])
+                for row in uncommitted
+                if str(row["path"]).startswith("data/train/")
+            }
+            if set(safe_mapping) != legacy:
+                raise EvidenceError("path mapping is incomplete")
+            if any(
+                str(row["path"]).startswith("data/train/")
+                and row["state"]
+                in {
+                    LedgerState.COMMITTED.value,
+                    LedgerState.VERIFIED.value,
+                    LedgerState.PURGED.value,
+                }
+                for row in rows
+            ):
+                raise EvidenceError("committed legacy paths are immutable")
+            if any(
+                row["local_path"] is None
+                for row in uncommitted
+                if str(row["path"]) in safe_mapping
+            ):
+                raise EvidenceError("legacy shard has no local evidence")
+            targets = tuple(safe_mapping.values())
+            if len(targets) != len(set(targets)):
+                raise EvidenceError("path mapping contains a collision")
+            existing = {
+                str(row["path"]) for row in rows if str(row["path"]) not in safe_mapping
+            }
+            if existing.intersection(targets):
+                raise EvidenceError("path mapping collides with ledger evidence")
+            for row in pending:
+                old = str(row["path"])
+                if old not in safe_mapping:
+                    continue
+                local_path = Path(str(row["local_path"]))
+                if verify_local:
+                    if local_path.is_symlink() or not local_path.is_file():
+                        raise EvidenceError("local shard evidence is unavailable")
+                    digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
+                    if (
+                        digest != row["sha256"]
+                        or local_path.stat().st_size != row["byte_size"]
+                    ):
+                        raise EvidenceError("local shard evidence changed")
+                connection.execute(
+                    "UPDATE shards SET path = ?, updated_at = ? WHERE shard_id = ?",
+                    (safe_mapping[old], self._now(), row["shard_id"]),
+                )
+            candidates = connection.execute(
+                "SELECT candidate_id, candidate_json FROM audit_candidates"
+            ).fetchall()
+            for candidate in candidates:
+                payload = json.loads(str(candidate["candidate_json"]))
+                rewritten = self._replace_audit_paths(payload, safe_mapping)
+                if rewritten != payload:
+                    connection.execute(
+                        (
+                            "UPDATE audit_candidates SET candidate_json = ? "
+                            "WHERE candidate_id = ?"
+                        ),
+                        (
+                            json.dumps(
+                                rewritten, sort_keys=True, separators=(",", ":")
+                            ),
+                            candidate["candidate_id"],
+                        ),
+                    )
+        return len(safe_mapping)
+
+    remap_uncommitted_paths = remap_remote_paths
+
+    @staticmethod
+    def _replace_audit_paths(value: object, mapping: Mapping[str, str]) -> object:
+        if isinstance(value, str):
+            return mapping.get(value, value)
+        if isinstance(value, list):
+            return [Ledger._replace_audit_paths(item, mapping) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): Ledger._replace_audit_paths(item, mapping)
+                for key, item in value.items()
+            }
+        return value
 
     def programme(self, programme_id: str) -> ProgrammeRecord:
         """Return one programme record."""

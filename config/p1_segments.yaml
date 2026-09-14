@@ -120,6 +120,12 @@ active_governance:
   license_sha256: 33ea2032bdd0cabac95c158d66f03646f3d8ba77d9a8cb118d3ba02f2fb84d8f
   license_bytes: 2437
 
+# Publication layout is governance/runtime metadata, not canonical row identity.
+publication_layout:
+  version: p1-publication-layout-2
+  shard_root: data-shards/train
+  bucket_width: 2
+
 output:
   audio_format: ogg-opus
   sampling_rate: 16000
