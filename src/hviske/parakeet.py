@@ -6,6 +6,7 @@ import typing as t
 from functools import partial
 from pathlib import Path
 
+import numpy as np
 import torch
 from omegaconf import DictConfig
 from transformers import (
@@ -27,11 +28,11 @@ from .wav2vec2 import Wav2Vec2ModelSetup
 logger = logging.getLogger(__package__)
 
 
-ParakeetFamily: t.TypeAlias = t.Literal["ctc", "rnnt", "tdt"]
+ParakeetFamily: t.TypeAlias = t.Literal["ctc", "rnnt"]
 
 
 class ParakeetGenerationTrainer(Trainer):
-    """Trainer prediction step for Parakeet RNNT and TDT generation outputs."""
+    """Trainer prediction step for Parakeet RNNT generation outputs."""
 
     def prediction_step(
         self,
@@ -77,9 +78,9 @@ class ParakeetGenerationTrainer(Trainer):
 class ParakeetModelSetup(Wav2Vec2ModelSetup):
     """Model setup for Transformers-native NVIDIA Parakeet checkpoints.
 
-    CTC checkpoints are loaded through ``AutoModelForCTC``.  RNNT and TDT are
-    registered as general ``AutoModel`` architectures in Transformers 5.17 and
-    therefore deliberately do not use a speech-to-sequence auto class.
+    CTC checkpoints are loaded through ``AutoModelForCTC``.  RNNT is registered
+    as a general ``AutoModel`` architecture in Transformers 5.17 and therefore
+    deliberately does not use a speech-to-sequence auto class.
     """
 
     def __init__(self, config: DictConfig) -> None:
@@ -96,7 +97,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         """Load the model class selected from the Transformers checkpoint config.
 
         Returns:
-            A Parakeet CTC, RNNT, or TDT model.
+            A Parakeet CTC or RNNT model.
 
         """
         model_id = str(self.config.model.pretrained_model_id)
@@ -165,6 +166,8 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
                 f"Parakeet checkpoint {model_id!r} does not provide a "
                 "Transformers feature extractor and tokenizer."
             )
+        if self._load_family(model_id=model_id) == "rnnt":
+            setattr(processor, "decoder_type", "rnnt")
         self.processor = processor
         return processor
 
@@ -185,7 +188,16 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
 
         try:
             processor = AutoProcessor.from_pretrained(model_path, **self._hub_kwargs())
-            family = self._load_family(model_id=model_path)
+        except (OSError, ValueError, KeyError) as error:
+            raise ValueError(
+                f"Parakeet checkpoint {model_path!r} is not a Transformers-native "
+                "checkpoint. NeMo collection .nemo files are unsupported."
+            ) from error
+
+        family = self._load_family(model_id=model_path)
+        if family == "rnnt":
+            setattr(processor, "decoder_type", "rnnt")
+        try:
             if family == "ctc":
                 model = AutoModelForCTC.from_pretrained(
                     model_path, **self._hub_kwargs()
@@ -207,8 +219,8 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         )
 
     def load_compute_metrics(self) -> t.Callable[[EvalPrediction], dict]:
-        """Return metrics that decode Parakeet CTC or generated transducer IDs."""
-        return partial(compute_error_rate_metrics, processor=self.processor)
+        """Return metrics that decode Parakeet CTC or generated RNNT IDs."""
+        return partial(_compute_parakeet_metrics, processor=self.processor)
 
     def load_data_collator(self) -> DataCollatorParakeetWithPadding:
         """Return the feature-aware Parakeet collator."""
@@ -219,7 +231,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         )
 
     def load_trainer_class(self) -> t.Type[Trainer]:
-        """Return Trainer or the generation-compatible transducer Trainer."""
+        """Return Trainer or the generation-compatible RNNT Trainer."""
         family = self._load_family(model_id=str(self.config.model.pretrained_model_id))
         return Trainer if family == "ctc" else ParakeetGenerationTrainer
 
@@ -236,7 +248,8 @@ def parakeet_family(config: PreTrainedConfig) -> ParakeetFamily:
 
     Raises:
         ValueError:
-            If the config is not a supported CTC, RNNT, or TDT checkpoint.
+            If the config is not a supported CTC or RNNT checkpoint, or if it
+            is a TDT checkpoint.
     """
     model_type = str(getattr(config, "model_type", "")).lower()
     architectures = " ".join(
@@ -245,13 +258,35 @@ def parakeet_family(config: PreTrainedConfig) -> ParakeetFamily:
     )
     descriptor = f"{model_type} {architectures}"
     if "tdt" in descriptor:
-        return "tdt"
+        raise ValueError(
+            "Parakeet TDT fine-tuning is unsupported: native TDT loss is broken "
+            "on the supported Transformers stack. Use NVIDIA NeMo for TDT "
+            "fine-tuning."
+        )
     if "rnnt" in descriptor or "transducer" in descriptor:
         return "rnnt"
     if "ctc" in descriptor:
         return "ctc"
     raise ValueError(
         "Unsupported Parakeet checkpoint architecture. Expected a "
-        "Transformers-native ParakeetForCTC, ParakeetForRNNT, or ParakeetForTDT "
+        "Transformers-native ParakeetForCTC or ParakeetForRNNT "
         f"config, got model_type={model_type!r}, architectures={architectures!r}."
+    )
+
+
+def _compute_parakeet_metrics(
+    pred: EvalPrediction, processor: Processor
+) -> dict[str, float]:
+    """Decode Parakeet predictions without Trainer's concatenation sentinel.
+
+    Returns:
+        Character and word error rates for the predictions.
+    """
+    predictions = np.asarray(pred.predictions).copy()
+    if predictions.ndim == 2:
+        predictions[predictions == -100] = processor.tokenizer.pad_token_id
+    return compute_error_rate_metrics(
+        pred=EvalPrediction(predictions=predictions, label_ids=pred.label_ids),
+        processor=processor,
+        log_examples=False,
     )

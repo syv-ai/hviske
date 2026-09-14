@@ -1104,8 +1104,10 @@ def _processing_features(
     if processor is None:
         return None
     model_input_names = getattr(processor, "model_input_names", [])
-    if "input_features" in model_input_names and not hasattr(
-        processor, "get_decoder_prompt_ids"
+    if (
+        "input_features" in model_input_names
+        and not hasattr(processor, "get_decoder_prompt_ids")
+        and not _is_parakeet_rnnt_processor(processor)
     ):
         return Features(
             input_features=Sequence(Sequence(Value("float64"))),
@@ -1114,7 +1116,9 @@ def _processing_features(
             input_length=Value("int64"),
             num_seconds=Value("float64"),
         )
-    if not hasattr(processor, "get_decoder_prompt_ids"):
+    if not hasattr(
+        processor, "get_decoder_prompt_ids"
+    ) and not _is_parakeet_rnnt_processor(processor):
         return Features(
             input_values=Sequence(Value("float64")),
             labels=Sequence(Value("int64")),
@@ -1133,6 +1137,15 @@ def _processing_features(
     else:
         feature_schema["attention_mask"] = Sequence(Value("int64"))
     return Features(**feature_schema)
+
+
+def _is_parakeet_rnnt_processor(processor: Callable | None) -> bool:
+    """Return whether a processor follows the Parakeet RNNT contract."""
+    return (
+        processor is not None
+        and hasattr(processor, "blank_token")
+        and str(getattr(processor, "decoder_type", "")).lower() == "rnnt"
+    )
 
 
 def load_dataset_for_evaluation(config: DictConfig) -> Dataset:
@@ -1333,6 +1346,7 @@ def process_example(
     audio = example[audio_column]
     audio_array = audio["array"]
     sampling_rate = audio["sampling_rate"]
+    num_seconds = len(audio_array) / sampling_rate
 
     # Normalise and augment audio
     download_background_noises()
@@ -1386,22 +1400,28 @@ def process_example(
         # Whisper's prefix is mutable processor state. Set it immediately before each
         # example so a multilingual stream cannot inherit the previous example's prompt.
         set_prefix_tokens(language=example_language, task="transcribe")
-    elif example_language is not None and hasattr(processor, "get_decoder_prompt_ids"):
-        # Cohere needs the language prompt and transcript in one processor call.
-        processed = processor(
-            audio_array,
-            language=example_language,
-            text=example[text_column],
-            punctuation=punctuation,
-            sampling_rate=sampling_rate,
-        )
+    elif _is_parakeet_rnnt_processor(processor) or (
+        example_language is not None and hasattr(processor, "get_decoder_prompt_ids")
+    ):
+        if _is_parakeet_rnnt_processor(processor):
+            # RNNT processors must create decoder inputs from audio and text together.
+            processed = processor(
+                audio_array, text=example[text_column], sampling_rate=sampling_rate
+            )
+        else:
+            # Cohere needs the language prompt and transcript in one processor call.
+            processed = processor(
+                audio_array,
+                language=example_language,
+                text=example[text_column],
+                punctuation=punctuation,
+                sampling_rate=sampling_rate,
+            )
         example["input_features"] = _to_python(processed["input_features"][0])
         if "attention_mask" in processed:
             example["attention_mask"] = _to_python(processed["attention_mask"][0])
-            frame_count = len(t.cast(Sized, example["attention_mask"]))
         elif "length" in processed:
             example["length"] = _to_python(processed["length"][0])
-            frame_count = int(t.cast(int | float, example["length"]))
         else:
             raise ValueError(
                 "Prompt-aware processor must return attention_mask or length."
@@ -1410,7 +1430,7 @@ def process_example(
         example["labels"] = _to_python(processed["labels"][0])
         labels = t.cast(Sized, example["labels"])
         example["input_length"] = len(labels)
-        example["num_seconds"] = frame_count / 100
+        example["num_seconds"] = num_seconds
         return example
 
     # Process the audio for Whisper and Wav2Vec2.
@@ -1422,7 +1442,7 @@ def process_example(
     example[audio_feature_name] = audio_array
     if audio_feature_name == "input_features" and "attention_mask" in processed:
         example["attention_mask"] = _to_python(processed["attention_mask"][0])
-    example["num_seconds"] = len(example[audio_feature_name]) / sampling_rate
+    example["num_seconds"] = num_seconds
 
     # Some remote processors require audio for every call, so tokenise labels through
     # their tokenizer rather than invoking the processor with text alone.
