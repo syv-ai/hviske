@@ -1134,20 +1134,18 @@ def validate_overlay_revision(revision: str) -> str:
         The unchanged, validated revision.
     """
     return validate_immutable_source_revision(
-        revision, environment_variable="HVISKE_OVERLAY_REVISION"
+        revision, revision_label="HVISKE_OVERLAY_REVISION"
     )
 
 
-def validate_immutable_source_revision(
-    revision: str, *, environment_variable: str
-) -> str:
-    """Validate a Hub source revision supplied by an environment variable.
+def validate_immutable_source_revision(revision: str, *, revision_label: str) -> str:
+    """Validate an immutable Hub source revision.
 
     Args:
         revision:
             The resolved Hub revision.
-        environment_variable:
-            The environment variable that supplies the revision.
+        revision_label:
+            Human-readable source or configuration label for validation errors.
 
     Returns:
         The unchanged, validated revision.
@@ -1158,14 +1156,13 @@ def validate_immutable_source_revision(
     """
     if not revision:
         raise ValueError(
-            f"{environment_variable} is required: set it to the immutable "
-            "40-character commit SHA before running preflight or training."
+            f"{revision_label} is required: provide an immutable 40-character commit "
+            "SHA before data access or publication."
         )
     if not _FULL_COMMIT_SHA.fullmatch(revision):
         raise ValueError(
-            f"{environment_variable} must be an immutable full 40-character "
-            "commit SHA; mutable branches and abbreviated or non-hex revisions are "
-            "forbidden."
+            f"{revision_label} must be an immutable full 40-character commit SHA; "
+            "mutable branches and abbreviated or non-hex revisions are forbidden."
         )
     return revision
 
@@ -1177,5 +1174,5 @@ def validate_transcript_revision(revision: str) -> str:
         The unchanged, validated revision.
     """
     return validate_immutable_source_revision(
-        revision, environment_variable="P1_TRANSCRIPT_REVISION"
+        revision, revision_label="Transcript dataset revision"
     )

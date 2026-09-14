@@ -310,7 +310,7 @@ def preflight_finetuning_data(
         if immutable_revision_env is not None:
             validate_immutable_source_revision(
                 str(source_config.get("revision") or ""),
-                environment_variable=str(immutable_revision_env),
+                revision_label=str(immutable_revision_env),
             )
         transcript_dataset_id = source_config.get("transcript_dataset_id")
         if transcript_dataset_id is not None:

@@ -1054,7 +1054,7 @@ def load_data_for_finetuning(
         if immutable_revision_env is not None:
             validate_immutable_source_revision(
                 str(dataset_config.get("revision") or ""),
-                environment_variable=str(immutable_revision_env),
+                revision_label=str(immutable_revision_env),
             )
         transcript_dataset_id = dataset_config.get("transcript_dataset_id")
         transcript_revision = None

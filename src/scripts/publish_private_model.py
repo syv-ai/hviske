@@ -98,7 +98,7 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
         if immutable_revision_env is not None:
             validate_immutable_source_revision(
                 str(source_config.get("revision") or ""),
-                environment_variable=str(immutable_revision_env),
+                revision_label=str(immutable_revision_env),
             )
         is_local = source_config.get("type") == "local_vtt"
         source_id = f"local_vtt:{source_name}" if is_local else str(source_config.id)

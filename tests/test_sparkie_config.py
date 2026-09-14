@@ -80,8 +80,7 @@ def test_p1_segments_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> No
 
     with pytest.raises(ValueError, match="P1_SEGMENTS_REVISION is required"):
         validate_immutable_source_revision(
-            str(config.datasets.p1.revision),
-            environment_variable="P1_SEGMENTS_REVISION",
+            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
         )
 
 
@@ -98,8 +97,7 @@ def test_p1_segments_revision_rejects_mutable_or_invalid_values(
 
     with pytest.raises(ValueError, match="full 40-character"):
         validate_immutable_source_revision(
-            str(config.datasets.p1.revision),
-            environment_variable="P1_SEGMENTS_REVISION",
+            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
         )
 
 
