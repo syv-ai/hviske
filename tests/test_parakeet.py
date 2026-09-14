@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
-from transformers import EvalPrediction, TrainingArguments
+from transformers import (
+    EvalPrediction,
+    ParakeetProcessor,
+    ParakeetTokenizer,
+    TrainingArguments,
+)
 from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.parakeet import (
     ParakeetEncoderConfig,
@@ -358,3 +363,31 @@ def test_parakeet_rnnt_forward_computes_native_loss() -> None:
 
     assert outputs.loss is not None
     assert torch.isfinite(outputs.loss)
+
+
+def test_parakeet_rnnt_metrics_keep_repeated_reference_tokens() -> None:
+    """RNNT metrics retain consecutive identical tokens in reference labels."""
+    tokenizer = ParakeetTokenizer(
+        vocab={"<pad>": 0, "a": 1, "<blank>": 2, "<unk>": 3},
+        pad_token="<pad>",
+        unk_token="<unk>",
+        blank_token="<blank>",
+    )
+    processor = ParakeetProcessor(
+        feature_extractor=ParakeetFeatureExtractor(feature_size=1),
+        tokenizer=tokenizer,
+        blank_token="<blank>",
+        decoder_type="rnnt",
+    )
+    setup = ParakeetModelSetup(
+        config=OmegaConf.create(
+            {"model": {"type": "parakeet", "pretrained_model_id": "checkpoint"}}
+        )
+    )
+    setup.processor = processor
+
+    metrics = setup.load_compute_metrics()(
+        EvalPrediction(predictions=np.array([[1, 1]]), label_ids=np.array([[1, 1]]))
+    )
+
+    assert metrics == {"cer": 0.0, "wer": 0.0}
