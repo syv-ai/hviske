@@ -208,6 +208,86 @@ def _tree_bytes(root: Path) -> tuple[tuple[str, bytes], ...]:
     )
 
 
+@pytest.mark.parametrize(
+    "problem",
+    ["missing-sequences", "missing-accepted-count", "missing-index", "missing-fk"],
+)
+def test_incomplete_schema_fails_before_backups_or_writes(
+    tmp_path: Path, problem: str
+) -> None:
+    """Every structural preflight failure leaves database artefacts untouched."""
+    _make_run(tmp_path)
+    ledger_path = tmp_path / "partition-0" / "ledger.sqlite"
+    with sqlite3.connect(ledger_path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        if problem == "missing-sequences":
+            connection.execute("DROP TABLE ledger_sequences")
+        elif problem == "missing-accepted-count":
+            connection.execute("ALTER TABLE programmes RENAME TO programmes_legacy")
+            connection.execute(
+                """CREATE TABLE programmes AS SELECT programme_id, source_file_id,
+                state, source_revisions, pipeline_digest, commit_id, attempts,
+                rejected_count, source_duration_ms, processed_duration_ms,
+                rejection_counts, processing_started_at, discovered_at,
+                verification_time, purge_time, source_temp_purged_at,
+                source_temp_purge_evidence, last_evidence, last_error, updated_at
+                FROM programmes_legacy"""
+            )
+            connection.execute("DROP TABLE programmes_legacy")
+        elif problem == "missing-index":
+            connection.execute("DROP INDEX shards_batch")
+        else:
+            connection.execute("ALTER TABLE shards RENAME TO shards_legacy")
+            connection.execute(
+                """CREATE TABLE shards (
+                    shard_id TEXT PRIMARY KEY, programme_id TEXT, batch_id TEXT,
+                    state TEXT NOT NULL, path TEXT NOT NULL, byte_size INTEGER NOT NULL,
+                    row_count INTEGER NOT NULL, sha256 TEXT NOT NULL, local_path TEXT,
+                    verification_time TEXT, purge_time TEXT, last_evidence TEXT NOT NULL
+                    DEFAULT '{}', last_error TEXT, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO shards SELECT shard_id, programme_id, batch_id, state,
+                path, byte_size, row_count, sha256, local_path, verification_time,
+                purge_time, last_evidence, last_error, created_at, updated_at
+                FROM shards_legacy"""
+            )
+            connection.execute("DROP TABLE shards_legacy")
+            connection.execute(
+                "CREATE INDEX shards_batch ON shards(batch_id, shard_id)"
+            )
+        connection.commit()
+    ledger_artifacts = tuple(
+        path
+        for index in range(8)
+        for path in (
+            tmp_path / f"partition-{index}" / "ledger.sqlite",
+            tmp_path / f"partition-{index}" / "ledger.sqlite-journal",
+            tmp_path / f"partition-{index}" / "ledger.sqlite-wal",
+            tmp_path / f"partition-{index}" / "ledger.sqlite-shm",
+        )
+    )
+    before = {
+        path: (path.read_bytes() if path.is_file() else None, path.stat().st_mtime_ns)
+        for path in ledger_artifacts
+        if path.exists()
+    }
+    for apply in (False, True):
+        with pytest.raises(ValueError):
+            migrate_layout(run_root=tmp_path, expected_digest=DIGEST, apply=apply)
+        assert {
+            path: (
+                path.read_bytes() if path.is_file() else None,
+                path.stat().st_mtime_ns,
+            )
+            for path in ledger_artifacts
+            if path.exists()
+        } == before
+        assert not (tmp_path / "publication-layout-backups").exists()
+
+
 def test_manifest_is_validated_before_any_ledger_mutation(tmp_path: Path) -> None:
     """Malformed owned manifests abort before changing the ledger or marker."""
     _make_run(tmp_path, sealed=True, manifest=True)
