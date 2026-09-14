@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
             "The gate is structural and model-free."
         ),
         epilog=(
-            "Pass requires private immutable retrieval, matching hashes, the exact "
+            "Pass requires public immutable retrieval, matching hashes, the exact "
             "schema and audio encoding, one v8 digest, and single-speaker anchors."
         ),
     )

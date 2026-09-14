@@ -37,6 +37,7 @@ from p1_dataset.publish import (
     UploadOperation,
     VerificationError,
     _commit_sha,
+    _remote_digest,
     _stream_remote,
     build_dataset_card,
     initialise_private_dataset,
@@ -1182,6 +1183,19 @@ def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
             expected_pipeline_config_sha256="b" * 64,
         )
     assert not hub.commits
+
+
+def test_repo_file_metadata_distinguishes_lfs_and_git_identity() -> None:
+    """RepoFile metadata never mistakes a Git SHA-1 for content SHA-256."""
+    payload = b"realistic remote object"
+    lfs = SimpleNamespace(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    lfs_file = SimpleNamespace(
+        path="data/one.parquet", size=len(payload), blob_id="a" * 40, lfs=lfs
+    )
+    git_file = SimpleNamespace(path="README.md", size=len(payload), blob_id="b" * 40)
+
+    assert _remote_digest(lfs_file) == lfs.sha256
+    assert _remote_digest(git_file) is None
 
 
 def test_stream_decode_failure_retains_the_pending_batch(tmp_path: Path) -> None:

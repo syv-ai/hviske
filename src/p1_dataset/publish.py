@@ -1762,13 +1762,16 @@ def validate_local_shard(
         batch = next(batches, None)
         if batch is None or batch.num_rows == 0:
             raise VerificationError(f"empty local shard: {path}")
-        _validate_row(
-            batch.to_pylist()[0],
-            str(path),
-            expected_pipeline_version=expected_pipeline_version,
-            expected_pipeline_config_sha256=expected_pipeline_config_sha256,
-        )
+        scanned_rows = batch.num_rows
+        for row in batch.to_pylist():
+            _validate_row(
+                row,
+                str(path),
+                expected_pipeline_version=expected_pipeline_version,
+                expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+            )
         for batch in batches:
+            scanned_rows += batch.num_rows
             for row in batch.to_pylist():
                 _validate_row(
                     row,
@@ -1776,6 +1779,8 @@ def validate_local_shard(
                     expected_pipeline_version=expected_pipeline_version,
                     expected_pipeline_config_sha256=expected_pipeline_config_sha256,
                 )
+        if expected_row_count is not None and scanned_rows != expected_row_count:
+            raise VerificationError(f"scanned row count mismatch for {path}")
     except VerificationError:
         raise
     except Exception as error:
@@ -1865,6 +1870,11 @@ def _validate_row(
         or source_end > source_duration
     ):
         raise VerificationError(f"source duration is inconsistent: {shard_path}")
+    if (
+        expected_pipeline_version == "p1-segmentation-8"
+        and not 1000 <= duration < 10000
+    ):
+        raise VerificationError(f"v8 duration is outside active bounds: {shard_path}")
     if decoded.shape[0] != duration * 16:
         raise VerificationError(f"decoded duration is inconsistent: {shard_path}")
     if row.get("pipeline_version") == "p1-segmentation-7":
@@ -2126,10 +2136,17 @@ def _verify_remote(
 
 
 def _remote_digest(info: object) -> str | None:
+    """Return only a content SHA-256 exposed by remote file metadata.
+
+    ``blob_id`` is a Git SHA-1 and is deliberately not accepted as a content
+    digest. Git-backed files therefore fall through to bounded streaming in
+    ``_verify_remote``.
+    """
     lfs = _value(info, "lfs")
-    digest = _value(info, "sha256", "digest") or _value(lfs, "sha256")
-    if isinstance(digest, str) and _SHA256.fullmatch(digest):
-        return digest
+    candidates = (_value(lfs, "sha256"), _value(info, "sha256"))
+    for digest in candidates:
+        if isinstance(digest, str) and _SHA256.fullmatch(digest):
+            return digest
     return None
 
 
