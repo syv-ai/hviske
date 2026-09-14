@@ -17,7 +17,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .ledger import Ledger
+from .ledger import LEDGER_SCHEMA, Ledger, LedgerTable
 from .publication_layout import is_allowed_shard_path, new_shard_path
 
 _LEGACY_FLAT = re.compile(
@@ -284,45 +284,22 @@ def _validate_local_evidence(*, row: dict[str, object], local_path: Path) -> Non
 def _validate_read_only_schema(
     *, connection: sqlite3.Connection, expected_digest: str
 ) -> None:
-    """Reject ledgers that a writable ``Ledger`` open would have to migrate.
+    """Reject anything other than the complete current Ledger schema.
+
+    This runs over an immutable connection before any writable Ledger connection or
+    backup is created.  It deliberately compares SQLite's introspection results rather
+    than merely checking the columns used by the migration query.
 
     Raises:
         ValueError:
             If the schema, version, or pipeline digest is incompatible.
     """
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version != 3:
+    if version != LEDGER_SCHEMA.version:
         raise ValueError("ledger schema version is not current")
-    required_columns = {
-        "programmes": {"pipeline_digest"},
-        "batches": {
-            "batch_id",
-            "state",
-            "pipeline_digest",
-            "commit_id",
-            "programme_count",
-            "row_count",
-            "rejection_counts",
-            "sealed",
-        },
-        "shards": {
-            "shard_id",
-            "batch_id",
-            "state",
-            "path",
-            "byte_size",
-            "row_count",
-            "sha256",
-            "local_path",
-        },
-        "ledger_metadata": {"key", "value"},
-    }
-    for table, required in required_columns.items():
-        columns = {
-            str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
-        }
-        if not required.issubset(columns):
-            raise ValueError("ledger schema is missing required columns")
+    _validate_table_set(connection=connection)
+    for table in LEDGER_SCHEMA.tables + LEDGER_SCHEMA.internal_tables:
+        _validate_table(connection=connection, table=table)
     metadata = connection.execute(
         "SELECT value FROM ledger_metadata WHERE key = 'pipeline_digest'"
     ).fetchone()
@@ -337,6 +314,151 @@ def _validate_read_only_schema(
     }
     if stored != {expected_digest} and stored:
         raise ValueError("ledger records use a different pipeline digest")
+
+
+def _validate_table(*, connection: sqlite3.Connection, table: LedgerTable) -> None:
+    columns = tuple(
+        (
+            str(row[1]),
+            str(row[2]),
+            bool(row[3]),
+            None if row[4] is None else str(row[4]),
+            int(row[5]),
+        )
+        for row in connection.execute(f"PRAGMA table_info({table.name})")
+    )
+    expected_columns = tuple(
+        (
+            column.name,
+            column.declared_type,
+            column.not_null,
+            column.default,
+            column.primary_key,
+        )
+        for column in table.columns
+    )
+    if columns != expected_columns:
+        raise ValueError("ledger schema has incompatible column declarations")
+    _validate_indexes(connection=connection, table=table)
+    _validate_foreign_keys(connection=connection, table=table)
+    sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table.name,)
+    ).fetchone()
+    checks = () if sql_row is None else _check_expressions(str(sql_row[0]))
+    if checks != tuple(_normalise_sql(check) for check in table.checks):
+        raise ValueError("ledger schema has incompatible constraints")
+
+
+def _check_expressions(sql: str) -> tuple[str, ...]:
+    expressions: list[str] = []
+    for match in re.finditer(r"\bCHECK\s*\(", sql, flags=re.IGNORECASE):
+        start = match.end()
+        depth = 1
+        quote: str | None = None
+        index = start
+        while index < len(sql) and depth:
+            character = sql[index]
+            if quote is not None:
+                if character == quote:
+                    if index + 1 < len(sql) and sql[index + 1] == quote:
+                        index += 1
+                    else:
+                        quote = None
+            elif character in "'\\\"`":
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            index += 1
+        if depth:
+            raise ValueError("ledger schema has unreadable constraints")
+        expressions.append(_normalise_sql(sql[start : index - 1]))
+    return tuple(expressions)
+
+
+def _normalise_sql(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
+def _validate_foreign_keys(
+    *, connection: sqlite3.Connection, table: LedgerTable
+) -> None:
+    actual = sorted(
+        (str(row[2]), str(row[3]), str(row[4]), str(row[5]), str(row[6]), str(row[7]))
+        for row in connection.execute(f"PRAGMA foreign_key_list({table.name})")
+    )
+    expected = sorted(
+        (
+            key.referred_table,
+            key.columns[index],
+            key.referred_columns[index],
+            key.on_update,
+            key.on_delete,
+            key.match,
+        )
+        for key in table.foreign_keys
+        for index in range(len(key.columns))
+    )
+    if actual != expected:
+        raise ValueError("ledger schema has incompatible foreign keys")
+
+
+def _validate_indexes(*, connection: sqlite3.Connection, table: LedgerTable) -> None:
+    expected = {
+        index.name: (int(index.unique), index.columns, "c", 0)
+        for index in table.indexes
+    }
+    primary = tuple(column.name for column in table.columns if column.primary_key)
+    primary_column = next(
+        (column for column in table.columns if column.primary_key), None
+    )
+    if primary and not (
+        len(primary) == 1
+        and primary_column is not None
+        and primary_column.declared_type.upper() == "INTEGER"
+    ):
+        expected[f"sqlite_autoindex_{table.name}_1"] = (1, primary, "pk", 0)
+    actual: dict[str, tuple[int, tuple[str, ...], str, int]] = {}
+    for row in connection.execute(f"PRAGMA index_list({table.name})"):
+        name = str(row[1])
+        actual[name] = (
+            int(row[2]),
+            tuple(
+                str(item[2])
+                for item in connection.execute(
+                    f"PRAGMA index_info('{name.replace(chr(39), chr(39) * 2)}')"
+                )
+            ),
+            str(row[3]),
+            int(row[4]),
+        )
+    if actual != expected:
+        raise ValueError("ledger schema has incompatible indexes")
+
+
+def _validate_table_set(*, connection: sqlite3.Connection) -> None:
+    objects = tuple(
+        (str(row[0]), str(row[1]))
+        for row in connection.execute(
+            """SELECT type, name FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'trigger')"""
+        )
+    )
+    actual_tables = {name for kind, name in objects if kind == "table"}
+    if actual_tables != LEDGER_SCHEMA.table_names or any(
+        kind != "table" for kind, _ in objects
+    ):
+        raise ValueError("ledger schema has unexpected tables or objects")
+    internal_tables = {
+        name
+        for kind, name in connection.execute(
+            "SELECT type, name FROM sqlite_master WHERE name LIKE 'sqlite_%'"
+        )
+        if kind == "table"
+    }
+    if internal_tables != {table.name for table in LEDGER_SCHEMA.internal_tables}:
+        raise ValueError("ledger schema has unexpected SQLite tables")
 
 
 @dataclass(frozen=True)

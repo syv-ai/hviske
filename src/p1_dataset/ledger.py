@@ -57,6 +57,227 @@ _FORBIDDEN_PATH_PARTS = {".cache", "cache", "scratch", "tmp"}
 
 
 @dataclass(frozen=True)
+class LedgerColumn:
+    """Canonical declaration shape for one ledger column."""
+
+    name: str
+    declared_type: str
+    not_null: bool
+    default: str | None
+    primary_key: int
+    autoincrement: bool = False
+
+    def declaration(self) -> str:
+        """Return the SQL declaration used for a fresh ledger."""
+        declaration = f"{self.name} {self.declared_type}"
+        if self.primary_key:
+            declaration += " PRIMARY KEY"
+            if self.autoincrement:
+                declaration += " AUTOINCREMENT"
+        if self.not_null:
+            declaration += " NOT NULL"
+        if self.default is not None:
+            declaration += f" DEFAULT {self.default}"
+        return declaration
+
+
+@dataclass(frozen=True)
+class LedgerForeignKey:
+    """Canonical shape for one ledger foreign-key relationship."""
+
+    columns: tuple[str, ...]
+    referred_table: str
+    referred_columns: tuple[str, ...]
+    on_update: str = "NO ACTION"
+    on_delete: str = "NO ACTION"
+    match: str = "NONE"
+
+
+@dataclass(frozen=True)
+class LedgerIndex:
+    """Canonical shape for one explicitly declared ledger index."""
+
+    name: str
+    columns: tuple[str, ...]
+    unique: bool = False
+
+
+@dataclass(frozen=True)
+class LedgerTable:
+    """Canonical declaration and introspection shape for one ledger table."""
+
+    name: str
+    columns: tuple[LedgerColumn, ...]
+    indexes: tuple[LedgerIndex, ...] = ()
+    foreign_keys: tuple[LedgerForeignKey, ...] = ()
+    checks: tuple[str, ...] = ()
+
+    def create_statement(self) -> str:
+        """Return the canonical CREATE TABLE statement."""
+        definitions = [column.declaration() for column in self.columns]
+        definitions.extend(
+            f"FOREIGN KEY ({', '.join(key.columns)}) REFERENCES "
+            f"{key.referred_table} ({', '.join(key.referred_columns)})"
+            for key in self.foreign_keys
+        )
+        definitions.extend(f"CHECK ({check})" for check in self.checks)
+        return f"CREATE TABLE {self.name} (" + ", ".join(definitions) + ")"
+
+
+@dataclass(frozen=True)
+class LedgerSchema:
+    """Canonical current Ledger schema shared by creation and preflight."""
+
+    version: int
+    tables: tuple[LedgerTable, ...]
+    internal_tables: tuple[LedgerTable, ...] = ()
+
+    @property
+    def all_table_names(self) -> frozenset[str]:
+        """Declared user and SQLite-internal table names."""
+        return self.table_names | frozenset(
+            table.name for table in self.internal_tables
+        )
+
+    @property
+    def table_names(self) -> frozenset[str]:
+        """Declared user-table names."""
+        return frozenset(table.name for table in self.tables)
+
+
+LEDGER_SCHEMA = LedgerSchema(
+    version=_SCHEMA_VERSION,
+    tables=(
+        LedgerTable(
+            name="ledger_sequences",
+            columns=(
+                LedgerColumn("kind", "TEXT", False, None, 1),
+                LedgerColumn("next_value", "INTEGER", True, None, 0),
+            ),
+            checks=("next_value > 0",),
+        ),
+        LedgerTable(
+            name="programmes",
+            columns=(
+                LedgerColumn("programme_id", "TEXT", False, None, 1),
+                LedgerColumn("source_file_id", "TEXT", True, None, 0),
+                LedgerColumn("state", "TEXT", True, None, 0),
+                LedgerColumn("source_revisions", "TEXT", True, None, 0),
+                LedgerColumn("pipeline_digest", "TEXT", True, None, 0),
+                LedgerColumn("commit_id", "TEXT", False, None, 0),
+                LedgerColumn("attempts", "INTEGER", True, "0", 0),
+                LedgerColumn("accepted_count", "INTEGER", True, "0", 0),
+                LedgerColumn("rejected_count", "INTEGER", True, "0", 0),
+                LedgerColumn("source_duration_ms", "INTEGER", False, None, 0),
+                LedgerColumn("processed_duration_ms", "INTEGER", False, None, 0),
+                LedgerColumn("rejection_counts", "TEXT", True, "'{}'", 0),
+                LedgerColumn("processing_started_at", "TEXT", False, None, 0),
+                LedgerColumn("discovered_at", "TEXT", True, None, 0),
+                LedgerColumn("verification_time", "TEXT", False, None, 0),
+                LedgerColumn("purge_time", "TEXT", False, None, 0),
+                LedgerColumn("source_temp_purged_at", "TEXT", False, None, 0),
+                LedgerColumn("source_temp_purge_evidence", "TEXT", True, "'{}'", 0),
+                LedgerColumn("last_evidence", "TEXT", True, "'{}'", 0),
+                LedgerColumn("last_error", "TEXT", False, None, 0),
+                LedgerColumn("updated_at", "TEXT", True, None, 0),
+            ),
+            indexes=(LedgerIndex("programmes_state", ("state",)),),
+        ),
+        LedgerTable(
+            name="batches",
+            columns=(
+                LedgerColumn("batch_id", "TEXT", False, None, 1),
+                LedgerColumn("state", "TEXT", True, None, 0),
+                LedgerColumn("pipeline_digest", "TEXT", True, None, 0),
+                LedgerColumn("commit_id", "TEXT", False, None, 0),
+                LedgerColumn("attempts", "INTEGER", True, "0", 0),
+                LedgerColumn("programme_count", "INTEGER", True, "0", 0),
+                LedgerColumn("row_count", "INTEGER", True, "0", 0),
+                LedgerColumn("rejection_counts", "TEXT", True, "'{}'", 0),
+                LedgerColumn("duration_ms", "INTEGER", False, None, 0),
+                LedgerColumn("processing_started_at", "TEXT", False, None, 0),
+                LedgerColumn("verification_time", "TEXT", False, None, 0),
+                LedgerColumn("purge_time", "TEXT", False, None, 0),
+                LedgerColumn("publication_artifact_purged_at", "TEXT", False, None, 0),
+                LedgerColumn(
+                    "publication_artifact_purge_evidence", "TEXT", True, "'{}'", 0
+                ),
+                LedgerColumn("remote_checked_at", "TEXT", False, None, 0),
+                LedgerColumn("remote_present", "INTEGER", False, None, 0),
+                LedgerColumn("last_evidence", "TEXT", True, "'{}'", 0),
+                LedgerColumn("last_error", "TEXT", False, None, 0),
+                LedgerColumn("created_at", "TEXT", True, None, 0),
+                LedgerColumn("updated_at", "TEXT", True, None, 0),
+                LedgerColumn("sealed", "INTEGER", True, "0", 0),
+            ),
+            indexes=(LedgerIndex("batches_state", ("state",)),),
+        ),
+        LedgerTable(
+            name="shards",
+            columns=(
+                LedgerColumn("shard_id", "TEXT", False, None, 1),
+                LedgerColumn("programme_id", "TEXT", False, None, 0),
+                LedgerColumn("batch_id", "TEXT", False, None, 0),
+                LedgerColumn("state", "TEXT", True, None, 0),
+                LedgerColumn("path", "TEXT", True, None, 0),
+                LedgerColumn("byte_size", "INTEGER", True, None, 0),
+                LedgerColumn("row_count", "INTEGER", True, None, 0),
+                LedgerColumn("sha256", "TEXT", True, None, 0),
+                LedgerColumn("local_path", "TEXT", False, None, 0),
+                LedgerColumn("verification_time", "TEXT", False, None, 0),
+                LedgerColumn("purge_time", "TEXT", False, None, 0),
+                LedgerColumn("last_evidence", "TEXT", True, "'{}'", 0),
+                LedgerColumn("last_error", "TEXT", False, None, 0),
+                LedgerColumn("created_at", "TEXT", True, None, 0),
+                LedgerColumn("updated_at", "TEXT", True, None, 0),
+            ),
+            indexes=(LedgerIndex("shards_batch", ("batch_id", "shard_id")),),
+            foreign_keys=(
+                LedgerForeignKey(("programme_id",), "programmes", ("programme_id",)),
+                LedgerForeignKey(("batch_id",), "batches", ("batch_id",)),
+            ),
+        ),
+        LedgerTable(
+            name="audit_candidates",
+            columns=(
+                LedgerColumn("candidate_id", "INTEGER", False, None, 1, True),
+                LedgerColumn("batch_id", "TEXT", True, None, 0),
+                LedgerColumn("programme_id", "TEXT", True, None, 0),
+                LedgerColumn("candidate_json", "TEXT", True, None, 0),
+                LedgerColumn("local_path", "TEXT", True, None, 0),
+                LedgerColumn("local_row_locator", "INTEGER", True, None, 0),
+                LedgerColumn("created_at", "TEXT", True, None, 0),
+            ),
+            indexes=(
+                LedgerIndex("audit_candidates_batch", ("batch_id", "candidate_id")),
+            ),
+            foreign_keys=(
+                LedgerForeignKey(("batch_id",), "batches", ("batch_id",)),
+                LedgerForeignKey(("programme_id",), "programmes", ("programme_id",)),
+            ),
+            checks=("local_row_locator >= 0",),
+        ),
+        LedgerTable(
+            name="ledger_metadata",
+            columns=(
+                LedgerColumn("key", "TEXT", False, None, 1),
+                LedgerColumn("value", "TEXT", True, None, 0),
+            ),
+        ),
+    ),
+    internal_tables=(
+        LedgerTable(
+            name="sqlite_sequence",
+            columns=(
+                LedgerColumn("name", "", False, None, 0),
+                LedgerColumn("seq", "", False, None, 0),
+            ),
+        ),
+    ),
+)
+
+
+@dataclass(frozen=True)
 class BatchRecord:
     """Metadata and durable evidence for one bounded publication batch."""
 
@@ -1935,6 +2156,22 @@ class Ledger:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if version > _SCHEMA_VERSION:
             raise LedgerError("ledger schema is newer than this package")
+        if (
+            version == 0
+            and not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
+            ).fetchone()
+        ):
+            for table in LEDGER_SCHEMA.tables:
+                connection.execute(table.create_statement())
+                for index in table.indexes:
+                    columns = ", ".join(index.columns)
+                    unique = "UNIQUE " if index.unique else ""
+                    connection.execute(
+                        f"CREATE {unique}INDEX {index.name} ON {table.name} ({columns})"
+                    )
+            connection.execute(f"PRAGMA user_version = {LEDGER_SCHEMA.version}")
+            return
         connection.execute(
             f"""CREATE TABLE IF NOT EXISTS {_SEQUENCE_TABLE} (
                 kind TEXT PRIMARY KEY,
