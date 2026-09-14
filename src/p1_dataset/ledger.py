@@ -58,7 +58,7 @@ _FORBIDDEN_PATH_PARTS = {".cache", "cache", "scratch", "tmp"}
 
 @dataclass(frozen=True)
 class LedgerColumn:
-    """Canonical declaration shape for one ledger column."""
+    """Canonical declaration and introspection shape for one ledger column."""
 
     name: str
     declared_type: str
@@ -66,6 +66,7 @@ class LedgerColumn:
     default: str | None
     primary_key: int
     autoincrement: bool = False
+    hidden: int = 0
 
     def declaration(self) -> str:
         """Return the SQL declaration used for a fresh ledger."""
@@ -95,11 +96,27 @@ class LedgerForeignKey:
 
 @dataclass(frozen=True)
 class LedgerIndex:
-    """Canonical shape for one explicitly declared ledger index."""
+    """Canonical declaration and introspection shape for one ledger index."""
 
     name: str
     columns: tuple[str, ...]
     unique: bool = False
+    descending: tuple[bool, ...] = ()
+    collations: tuple[str, ...] = ()
+    partial: bool = False
+
+    def column_definitions(self) -> tuple[str, ...]:
+        """Return the canonical SQL definitions for indexed columns."""
+        descending = self.descending or (False,) * len(self.columns)
+        collations = self.collations or ("BINARY",) * len(self.columns)
+        return tuple(
+            f"{column}"
+            + (f" COLLATE {collation}" if collation.upper() != "BINARY" else "")
+            + (" DESC" if is_descending else "")
+            for column, collation, is_descending in zip(
+                self.columns, collations, descending, strict=True
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -2165,10 +2182,12 @@ class Ledger:
             for table in LEDGER_SCHEMA.tables:
                 connection.execute(table.create_statement())
                 for index in table.indexes:
-                    columns = ", ".join(index.columns)
+                    columns = ", ".join(index.column_definitions())
                     unique = "UNIQUE " if index.unique else ""
+                    partial = " WHERE 1" if index.partial else ""
                     connection.execute(
-                        f"CREATE {unique}INDEX {index.name} ON {table.name} ({columns})"
+                        f"CREATE {unique}INDEX {index.name} ON {table.name} "
+                        f"({columns}){partial}"
                     )
             connection.execute(f"PRAGMA user_version = {LEDGER_SCHEMA.version}")
             return

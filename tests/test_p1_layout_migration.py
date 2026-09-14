@@ -347,3 +347,81 @@ def test_migration_preserves_audit_json_and_excludes_other_states(
             ).fetchone()[0]
             == audit_before
         )
+
+
+@pytest.mark.parametrize(
+    "problem", ["extra-generated-column", "removed-autoincrement", "changed-index"]
+)
+def test_remaining_schema_gaps_fail_before_any_mutation(
+    tmp_path: Path, problem: str
+) -> None:
+    """Schema changes fail in both modes without backups or artefact writes."""
+    _make_run(tmp_path)
+    ledger_path = tmp_path / "partition-0" / "ledger.sqlite"
+    with sqlite3.connect(ledger_path) as connection:
+        if problem == "extra-generated-column":
+            connection.execute(
+                """ALTER TABLE programmes ADD COLUMN generated_marker TEXT
+                GENERATED ALWAYS AS (programme_id) VIRTUAL"""
+            )
+        elif problem == "removed-autoincrement":
+            connection.execute("ALTER TABLE audit_candidates RENAME TO audit_legacy")
+            connection.execute(
+                """CREATE TABLE audit_candidates (
+                    candidate_id INTEGER PRIMARY KEY,
+                    batch_id TEXT NOT NULL,
+                    programme_id TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    local_path TEXT NOT NULL,
+                    local_row_locator INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (batch_id) REFERENCES batches (batch_id),
+                    FOREIGN KEY (programme_id) REFERENCES programmes (programme_id),
+                    CHECK (local_row_locator >= 0)
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO audit_candidates
+                SELECT * FROM audit_legacy"""
+            )
+            connection.execute("DROP TABLE audit_legacy")
+            connection.execute(
+                """CREATE INDEX audit_candidates_batch
+                ON audit_candidates (batch_id, candidate_id)"""
+            )
+        else:
+            connection.execute("DROP INDEX programmes_state")
+            connection.execute(
+                """CREATE INDEX programmes_state ON programmes
+                (state COLLATE NOCASE DESC)"""
+            )
+        connection.commit()
+
+    tracked = (
+        tuple(
+            path
+            for index in range(8)
+            for path in (
+                tmp_path / f"partition-{index}" / "ledger.sqlite",
+                tmp_path / f"partition-{index}" / "ledger.sqlite-journal",
+                tmp_path / f"partition-{index}" / "ledger.sqlite-wal",
+                tmp_path / f"partition-{index}" / "ledger.sqlite-shm",
+            )
+        )
+        + (tmp_path / "supervisor" / "FAILED", tmp_path / "supervisor" / "DONE")
+        + tuple((tmp_path / "supervisor" / "markers").glob("*"))
+    )
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tracked
+        if path.is_file()
+    }
+    for apply in (False, True):
+        with pytest.raises(ValueError):
+            migrate_layout(run_root=tmp_path, expected_digest=DIGEST, apply=apply)
+        assert {
+            path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in tracked
+            if path.is_file()
+        } == before
+        assert not (tmp_path / "publication-layout-backups").exists()
