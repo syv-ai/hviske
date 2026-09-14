@@ -139,8 +139,8 @@ class FakeHubApi:
         return {"name": "tester"}
 
 
-def test_preflight_consumes_at_most_one_row_per_source(tmp_path: Path) -> None:
-    """Audio and validation stay bounded while transcripts are fully indexed."""
+def test_preflight_bounds_non_overlay_source_consumption(tmp_path: Path) -> None:
+    """Ordinary audio validation stays bounded while transcripts are fully indexed."""
     audio_path = tmp_path / "audio.wav"
     soundfile.write(audio_path, np.zeros(16_000, dtype=np.float32), 16_000)
     manifest_path = tmp_path / "manifest.jsonl"

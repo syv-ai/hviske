@@ -291,7 +291,7 @@ def preflight_finetuning_data(
     dataset_loader: DatasetLoader = load_dataset,
     hub_api: HubApi | None = None,
 ) -> None:
-    """Validate Hub access and inspect no more than one row from each source.
+    """Validate Hub access, source samples, and complete configured overlays.
 
     Args:
         config:
