@@ -16,6 +16,8 @@ SHARD_ROOT = "data-shards/train"
 BUCKET_WIDTH = 2
 _PART_NAME = re.compile(r"part-[0-9]{5}\.parquet\Z")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_LEGACY_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9_.-]*)-([0-9]{5})\.parquet\Z")
+_BUCKET = re.compile(r"[0-9a-f]{2}\Z")
 
 
 @dataclass(frozen=True)
@@ -48,18 +50,37 @@ def is_allowed_shard_path(path: str) -> bool:
     if not isinstance(path, str) or "\\" in path or "\x00" in path:
         return False
     parsed = PurePosixPath(path)
-    if parsed.is_absolute() or ".." in parsed.parts or "." in parsed.parts:
+    # PurePosixPath deliberately normalises aliases.  Comparing its spelling is
+    # therefore part of the allowlist, rather than merely inspecting its parts.
+    if (
+        parsed.is_absolute()
+        or parsed.as_posix() != path
+        or ".." in parsed.parts
+        or "." in parsed.parts
+    ):
         return False
     parts = parsed.parts
-    if len(parts) == 4 and parts[:2] == ("data", "train"):
-        return bool(_ID.fullmatch(parts[2]) and _PART_NAME.fullmatch(parts[3]))
+    if len(parts) == 3 and parts[:2] == ("data", "train"):
+        match = _LEGACY_NAME.fullmatch(parts[2])
+        return match is not None and _ID.fullmatch(match.group(1)) is not None
     if len(parts) == 5 and parts[:2] == ("data-shards", "train"):
-        return bool(
-            re.fullmatch(r"[0-9a-f]{2}", parts[2])
-            and _ID.fullmatch(parts[3])
-            and _PART_NAME.fullmatch(parts[4])
-        )
+        if not _BUCKET.fullmatch(parts[2]) or not _ID.fullmatch(parts[3]):
+            return False
+        if not _PART_NAME.fullmatch(parts[4]):
+            return False
+        return parts[2] == shard_bucket(parts[3])
     return False
+
+
+def shard_bucket(deterministic_id: str) -> str:
+    """Return the two-hex-digit bucket for an existing deterministic path ID."""
+    _validate_id(deterministic_id)
+    return hashlib.sha256(deterministic_id.encode("utf-8")).hexdigest()[:BUCKET_WIDTH]
+
+
+def _validate_id(value: str) -> None:
+    if not isinstance(value, str) or not _ID.fullmatch(value):
+        raise ValueError("deterministic path ID is not safe")
 
 
 def legacy_shard_path(deterministic_id: str, ordinal: int) -> str:
@@ -76,12 +97,7 @@ def legacy_shard_path(deterministic_id: str, ordinal: int) -> str:
         or not 0 <= ordinal <= 99999
     ):
         raise ValueError("shard ordinal must be between zero and 99999")
-    return f"{LEGACY_SHARD_ROOT}/{deterministic_id}/part-{ordinal:05d}.parquet"
-
-
-def _validate_id(value: str) -> None:
-    if not isinstance(value, str) or not _ID.fullmatch(value):
-        raise ValueError("deterministic path ID is not safe")
+    return f"{LEGACY_SHARD_ROOT}/{deterministic_id}-{ordinal:05d}.parquet"
 
 
 def new_shard_path(deterministic_id: str, ordinal: int) -> str:
@@ -102,12 +118,6 @@ def new_shard_path(deterministic_id: str, ordinal: int) -> str:
         f"{SHARD_ROOT}/{shard_bucket(deterministic_id)}/{deterministic_id}/"
         f"part-{ordinal:05d}.parquet"
     )
-
-
-def shard_bucket(deterministic_id: str) -> str:
-    """Return the two-hex-digit bucket for an existing deterministic path ID."""
-    _validate_id(deterministic_id)
-    return hashlib.sha256(deterministic_id.encode("utf-8")).hexdigest()[:BUCKET_WIDTH]
 
 
 bucket_for_deterministic_id = shard_bucket

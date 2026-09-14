@@ -1661,43 +1661,27 @@ class Ledger:
                 raise EvidenceError("migration paths must move legacy shards only")
         with self.transaction() as connection:
             rows = connection.execute(
-                "SELECT * FROM shards ORDER BY shard_id"
+                """SELECT s.*, b.state AS batch_state, b.commit_id AS batch_commit_id
+                FROM shards AS s LEFT JOIN batches AS b ON b.batch_id = s.batch_id
+                ORDER BY s.shard_id"""
             ).fetchall()
-            uncommitted = [
+            # A migration is deliberately narrower than ``pending_shards``.  Rows
+            # which are still being discovered, retrying, or already published are
+            # recovery work for the normal pipeline, not migration candidates.
+            eligible = [
                 row
                 for row in rows
-                if row["state"]
-                not in {
-                    LedgerState.COMMITTED.value,
-                    LedgerState.VERIFIED.value,
-                    LedgerState.PURGED.value,
-                }
+                if row["state"] == LedgerState.SHARDED.value
+                and row["batch_state"] == LedgerState.SHARDED.value
+                and row["batch_commit_id"] is None
+                and row["local_path"] is not None
+                and str(row["path"]).startswith("data/train/")
             ]
-            pending = [row for row in uncommitted if row["local_path"] is not None]
-            legacy = {
-                str(row["path"])
-                for row in uncommitted
-                if str(row["path"]).startswith("data/train/")
-            }
-            if set(safe_mapping) != legacy:
+            legacy_occurrences = [str(row["path"]) for row in eligible]
+            if len(legacy_occurrences) != len(set(legacy_occurrences)):
+                raise EvidenceError("a legacy path occurs more than once")
+            if set(safe_mapping) != set(legacy_occurrences):
                 raise EvidenceError("path mapping is incomplete")
-            if any(
-                str(row["path"]).startswith("data/train/")
-                and row["state"]
-                in {
-                    LedgerState.COMMITTED.value,
-                    LedgerState.VERIFIED.value,
-                    LedgerState.PURGED.value,
-                }
-                for row in rows
-            ):
-                raise EvidenceError("committed legacy paths are immutable")
-            if any(
-                row["local_path"] is None
-                for row in uncommitted
-                if str(row["path"]) in safe_mapping
-            ):
-                raise EvidenceError("legacy shard has no local evidence")
             targets = tuple(safe_mapping.values())
             if len(targets) != len(set(targets)):
                 raise EvidenceError("path mapping contains a collision")
@@ -1706,10 +1690,8 @@ class Ledger:
             }
             if existing.intersection(targets):
                 raise EvidenceError("path mapping collides with ledger evidence")
-            for row in pending:
+            for row in eligible:
                 old = str(row["path"])
-                if old not in safe_mapping:
-                    continue
                 local_path = Path(str(row["local_path"]))
                 if verify_local:
                     if local_path.is_symlink() or not local_path.is_file():
@@ -1724,25 +1706,6 @@ class Ledger:
                     "UPDATE shards SET path = ?, updated_at = ? WHERE shard_id = ?",
                     (safe_mapping[old], self._now(), row["shard_id"]),
                 )
-            candidates = connection.execute(
-                "SELECT candidate_id, candidate_json FROM audit_candidates"
-            ).fetchall()
-            for candidate in candidates:
-                payload = json.loads(str(candidate["candidate_json"]))
-                rewritten = self._replace_audit_paths(payload, safe_mapping)
-                if rewritten != payload:
-                    connection.execute(
-                        (
-                            "UPDATE audit_candidates SET candidate_json = ? "
-                            "WHERE candidate_id = ?"
-                        ),
-                        (
-                            json.dumps(
-                                rewritten, sort_keys=True, separators=(",", ":")
-                            ),
-                            candidate["candidate_id"],
-                        ),
-                    )
         return len(safe_mapping)
 
     remap_uncommitted_paths = remap_remote_paths
