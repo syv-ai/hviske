@@ -9,6 +9,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from hviske.utils import (
     publish_model_folder,
+    validate_immutable_source_revision,
     validate_overlay_revision,
     validate_transcript_revision,
 )
@@ -93,6 +94,12 @@ def training_sources_from_config(config: DictConfig) -> list[dict[str, object]]:
     probabilities = list(config.dataset_probabilities)
     sources: list[dict[str, object]] = []
     for index, (source_name, source_config) in enumerate(config.datasets.items()):
+        immutable_revision_env = source_config.get("immutable_revision_env")
+        if immutable_revision_env is not None:
+            validate_immutable_source_revision(
+                str(source_config.get("revision") or ""),
+                environment_variable=str(immutable_revision_env),
+            )
         is_local = source_config.get("type") == "local_vtt"
         source_id = f"local_vtt:{source_name}" if is_local else str(source_config.id)
         source: dict[str, object] = {

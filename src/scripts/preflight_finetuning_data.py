@@ -21,7 +21,11 @@ from hviske.data import (
     apply_dataset_overlay,
     join_audio_and_transcripts,
 )
-from hviske.utils import validate_overlay_revision, validate_transcript_revision
+from hviske.utils import (
+    validate_immutable_source_revision,
+    validate_overlay_revision,
+    validate_transcript_revision,
+)
 
 logger = logging.getLogger("hviske_data_preflight")
 
@@ -302,6 +306,12 @@ def preflight_finetuning_data(
             Hub API client. Defaults to an authenticated ``HfApi`` client.
     """
     for source_config in config.datasets.values():
+        immutable_revision_env = source_config.get("immutable_revision_env")
+        if immutable_revision_env is not None:
+            validate_immutable_source_revision(
+                str(source_config.get("revision") or ""),
+                environment_variable=str(immutable_revision_env),
+            )
         transcript_dataset_id = source_config.get("transcript_dataset_id")
         if transcript_dataset_id is not None:
             validate_transcript_revision(str(source_config.transcript_revision))
