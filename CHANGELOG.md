@@ -20,7 +20,5 @@
 
 ### Fixed
 
-- Accepted Transformers ``KeyDataset`` inputs and passed the resolved device to NeMo
-  checkpoint loading.
 - Restored the codebase MIT license and removed the P1 dataset license files.
 - Preserved repeated reference tokens in Parakeet RNNT metrics.

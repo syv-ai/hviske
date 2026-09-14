@@ -1,6 +1,5 @@
 """Focused tests for optional NeMo ASR inference."""
 
-import collections.abc as c
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +8,6 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
-from transformers.pipelines.pt_utils import KeyDataset
 
 import hviske.evaluate as evaluation
 import hviske.nemo as nemo
@@ -39,18 +37,18 @@ class _Model:
 
 
 class _Factory:
-    restored: list[tuple[str, torch.device]] = []
-    pretrained: list[tuple[str, torch.device]] = []
+    restored: list[str] = []
+    pretrained: list[str] = []
     model = _Model()
 
     @classmethod
-    def from_pretrained(cls, model_name: str, map_location: torch.device) -> _Model:
-        cls.pretrained.append((model_name, map_location))
+    def from_pretrained(cls, model_name: str) -> _Model:
+        cls.pretrained.append(model_name)
         return cls.model
 
     @classmethod
-    def restore_from(cls, restore_path: str, map_location: torch.device) -> _Model:
-        cls.restored.append((restore_path, map_location))
+    def restore_from(cls, restore_path: str) -> _Model:
+        cls.restored.append(restore_path)
         return cls.model
 
 
@@ -130,11 +128,9 @@ def test_loader_uses_pretrained_for_registry_id(
     """Registry IDs use NeMo's generic pretrained API."""
     _patch_nemo(monkeypatch)
 
-    nemo.load_nemo_asr_model(source="nvidia/parakeet-rnnt-110m-da-dk", device="cpu")
+    nemo.load_nemo_asr_model(source="nvidia/parakeet-rnnt-110m-da-dk")
 
-    assert _Factory.pretrained == [
-        ("nvidia/parakeet-rnnt-110m-da-dk", torch.device("cpu"))
-    ]
+    assert _Factory.pretrained == ["nvidia/parakeet-rnnt-110m-da-dk"]
 
 
 def test_loader_uses_restore_for_local_archive(
@@ -148,7 +144,7 @@ def test_loader_uses_restore_for_local_archive(
     model = nemo.load_nemo_asr_model(source=archive, device="cpu")
 
     assert model is _Factory.model
-    assert _Factory.restored == [(str(archive), torch.device("cpu"))]
+    assert _Factory.restored == [str(archive)]
     assert model.device == torch.device("cpu")
     assert model.evaluated is True
 
@@ -179,34 +175,6 @@ class _HypothesisModel(_Model):
 class _Hypothesis:
     def __init__(self, text: str) -> None:
         self.text = text
-
-
-def test_transcriber_accepts_transformers_key_dataset() -> None:
-    """A Transformers KeyDataset follows the evaluation input contract."""
-    model = _Model()
-    transcriber = nemo.NemoASRTranscriber(model=model)
-    inputs = KeyDataset(dataset=_AudioDataset(), key="audio")
-
-    assert not isinstance(inputs, c.Iterable)
-    assert list(transcriber(inputs, batch_size=2)) == [
-        {"text": "text-0"},
-        {"text": "text-1"},
-    ]
-
-
-class _AudioDataset(torch.utils.data.Dataset[dict[str, object]]):
-    def __getitem__(self, index: int) -> dict[str, object]:
-        if index >= len(self):
-            raise IndexError(index)
-        return {
-            "audio": {
-                "array": np.full(2, index, dtype=np.float32),
-                "sampling_rate": 16_000,
-            }
-        }
-
-    def __len__(self) -> int:
-        return 2
 
 
 def test_transcriber_batches_and_normalises_inputs() -> None:
