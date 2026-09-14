@@ -36,11 +36,11 @@ class _NemoASRModelFactory(t.Protocol):
     """The class-level part of NeMo's generic ASR model API."""
 
     @classmethod
-    def from_pretrained(cls, model_name: str) -> object:
+    def from_pretrained(cls, model_name: str, map_location: torch.device) -> object:
         """Load a NeMo registry model."""
 
     @classmethod
-    def restore_from(cls, restore_path: str) -> object:
+    def restore_from(cls, restore_path: str, map_location: torch.device) -> object:
         """Restore a local NeMo archive."""
 
 
@@ -84,15 +84,17 @@ class NemoASRTranscriber:
         del kwargs
         if _is_single_audio(inputs):
             return self._transcribe_batch(batch=[inputs])[0]
-        if isinstance(inputs, (str, bytes, pathlib.Path)) or not isinstance(
-            inputs, c.Iterable
-        ):
+        try:
+            iter(inputs)
+        except TypeError as error:
             raise TypeError(
                 "NeMo ASR inputs must be audio or an iterable of audio inputs."
-            )
+            ) from error
         if batch_size < 1:
             raise ValueError("batch_size must be at least one.")
-        return self._transcribe_iter(inputs=inputs, batch_size=batch_size)
+        return self._transcribe_iter(
+            inputs=t.cast(c.Iterable[object], inputs), batch_size=batch_size
+        )
 
     def _transcribe_batch(self, batch: list[object]) -> list[dict[str, str]]:
         prepared = [self._prepare_audio(item=item) for item in batch]
@@ -264,9 +266,13 @@ def load_nemo_asr_model(
 
     asr_model = _load_asr_model_class()
     if local_path is not None:
-        model = asr_model.restore_from(restore_path=str(local_path))
+        model = asr_model.restore_from(
+            restore_path=str(local_path), map_location=resolved_device
+        )
     else:
-        model = asr_model.from_pretrained(model_name=str(source))
+        model = asr_model.from_pretrained(
+            model_name=str(source), map_location=resolved_device
+        )
     loaded_model = t.cast(_NemoASRModel, model)
     loaded_model.to(resolved_device)
     loaded_model.eval()
