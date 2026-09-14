@@ -22,6 +22,8 @@
 
 ### Fixed
 
+- Made W&B preflight non-interactive, scrubbed inherited Sparkie W&B identity, and
+  redacted checkpoint paths from online configuration payloads.
 - Separated bounded pilot stopping from the 100,000-step scheduler horizon, added
   resumable tracking finalisation with success and failure statuses, and hardened W&B
   preflight, IDs, environment policy, and configuration redaction.
