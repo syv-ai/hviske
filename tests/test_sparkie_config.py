@@ -217,10 +217,13 @@ def test_sparkie_dataset_coordinates_and_revisions(
             "coral_conversation": "coral_conversation",
             "ftspeech": "ftspeech",
             "nota": "nota",
-            "nst": "nst",
+            "nst": "nst_da",
             "voxpopuli_da": "voxpopuli",
         }.items()
     )
+    assert dict(datasets.nst.filters) == {"source": "nst_da"}
+    assert dict(datasets.nst.overlay.base_filters) == {"source": "nst_da"}
+    assert dict(datasets.nst.overlay.filters) == {"source": "nst_da"}
     assert [
         name
         for name, dataset in datasets.items()

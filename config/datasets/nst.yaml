@@ -6,7 +6,7 @@ nst:
   audio_column: audio
   filter_dataset: true
   filters:
-    source: nst
+    source: nst_da
   language: da
   revision: 5a3a49ee981baab6e1e37ddd2c45f9943c27d08f
   trust_remote_code: false
@@ -17,9 +17,9 @@ nst:
     revision: ${oc.env:HVISKE_OVERLAY_REVISION,""}
     strategy: positional
     base_filters:
-      source: nst
+      source: nst_da
     filters:
-      source: nst
+      source: nst_da
     equality_checks:
       source: source
       text: reference_text

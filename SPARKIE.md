@@ -53,7 +53,7 @@ Do not reorder or rebalance the preset. Its 16 streams are sampled as follows:
 | Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=coral_conversation` / `train` | 0.128572 |
 | Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=ftspeech` / `train` | 0.040909 |
 | Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nota` / `train` | 0.021428 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nst` / `train` | 0.021429 |
+| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nst_da` / `train` | 0.021429 |
 | Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=voxpopuli` / `train` | 0.049091 |
 | English | `MLCommons/peoples_speech` | `clean` / `train` | 0.16 |
 | English | `edinburghcstr/ami` | `sdm` / `train` | 0.04 |
