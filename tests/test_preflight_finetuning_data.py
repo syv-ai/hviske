@@ -18,59 +18,35 @@ from scripts.preflight_finetuning_data import (
 )
 
 
-def test_grouped_positional_preflight_loads_and_consumes_once(
+def test_ambiguous_discriminator_checks_use_independent_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Equivalent source views share one strict base/overlay consumption."""
+    """Duplicate mappings cannot establish one overlay discriminator."""
     config = _grouped_config()
-    base = Dataset.from_list(
-        [
-            {"audio": [0.0], "text": "one", "source": "one"},
-            {"audio": [0.0], "text": "two", "source": "two"},
-            {"audio": [0.0], "text": "one", "source": "one"},
-            {"audio": [0.0], "text": "two", "source": "two"},
-        ]
-    )
-    overlay = Dataset.from_list(
-        [
-            {"action": "keep", "source": "one", "reference_text": "one"},
-            {"action": "keep", "source": "two", "reference_text": "two"},
-            {"action": "keep", "source": "one", "reference_text": "one"},
-            {"action": "keep", "source": "two", "reference_text": "two"},
-        ]
-    )
-    calls: list[dict[str, object]] = []
-    consumption_count = 0
-    real_apply = preflight_module.apply_dataset_overlay
+    checks = [
+        {"base_column": "source", "overlay_column": "source"},
+        {"base_column": "source", "overlay_column": "source"},
+        {"base_column": "text", "overlay_column": "reference_text"},
+    ]
+    for source in config.datasets.values():
+        source.overlay.equality_checks = checks
 
-    def fake_loader(**kwargs: object) -> Dataset:
-        calls.append(kwargs)
-        return base if kwargs["path"] == "org/audio" else overlay
+    _assert_independent_preflight(config=config, monkeypatch=monkeypatch)
 
-    def counting_overlay(**kwargs: object) -> c.Iterator[object]:
-        nonlocal consumption_count
-        result = real_apply(
-            base_dataset=t.cast(Dataset | IterableDataset, kwargs["base_dataset"]),
-            overlay_dataset=t.cast(Dataset, kwargs["overlay_dataset"]),
-            overlay_config=t.cast(c.Mapping[str, object], kwargs["overlay_config"]),
-        )
 
-        def stream() -> c.Iterator[object]:
-            nonlocal consumption_count
-            consumption_count += 1
-            yield from result
+def _assert_independent_preflight(
+    config: DictConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Assert that both configured views use the established preflight path."""
+    handled: list[str] = []
 
-        return stream()
+    def fake_preflight(**kwargs: object) -> None:
+        handled.append(str(kwargs["source_name"]))
 
-    before = [config.datasets[name].filters.copy() for name in ("one", "two")]
-    monkeypatch.setattr(preflight_module, "apply_dataset_overlay", counting_overlay)
-    preflight_finetuning_data(
-        config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
-    )
+    monkeypatch.setattr(preflight_module, "_preflight_hub_source", fake_preflight)
+    preflight_finetuning_data(config=config, hub_api=FakeHubApi())
 
-    assert [call["streaming"] for call in calls] == [True, False]
-    assert consumption_count == 1
-    assert [config.datasets[name].filters for name in ("one", "two")] == before
+    assert handled == ["one", "two"]
 
 
 class FakeHubApi:
@@ -153,6 +129,64 @@ def _grouped_overlay_config(value: str) -> dict[str, object]:
     }
 
 
+def test_grouped_positional_preflight_loads_and_consumes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Equivalent source views share one strict base/overlay consumption."""
+    config = _grouped_config()
+    for source_name, source in config.datasets.items():
+        source.overlay.filters = {"overlay_source": source_name}
+        source.overlay.equality_checks.source = "overlay_source"
+    base = Dataset.from_list(
+        [
+            {"audio": [0.0], "text": "one", "source": "one"},
+            {"audio": [0.0], "text": "two", "source": "two"},
+            {"audio": [0.0], "text": "one", "source": "one"},
+            {"audio": [0.0], "text": "two", "source": "two"},
+        ]
+    )
+    overlay = Dataset.from_list(
+        [
+            {"action": "keep", "overlay_source": "one", "reference_text": "one"},
+            {"action": "keep", "overlay_source": "two", "reference_text": "two"},
+            {"action": "keep", "overlay_source": "one", "reference_text": "one"},
+            {"action": "keep", "overlay_source": "two", "reference_text": "two"},
+        ]
+    )
+    calls: list[dict[str, object]] = []
+    consumption_count = 0
+    real_apply = preflight_module.apply_dataset_overlay
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        calls.append(kwargs)
+        return base if kwargs["path"] == "org/audio" else overlay
+
+    def counting_overlay(**kwargs: object) -> c.Iterator[object]:
+        nonlocal consumption_count
+        result = real_apply(
+            base_dataset=t.cast(Dataset | IterableDataset, kwargs["base_dataset"]),
+            overlay_dataset=t.cast(Dataset, kwargs["overlay_dataset"]),
+            overlay_config=t.cast(c.Mapping[str, object], kwargs["overlay_config"]),
+        )
+
+        def stream() -> c.Iterator[object]:
+            nonlocal consumption_count
+            consumption_count += 1
+            yield from result
+
+        return stream()
+
+    before = [config.datasets[name].filters.copy() for name in ("one", "two")]
+    monkeypatch.setattr(preflight_module, "apply_dataset_overlay", counting_overlay)
+    preflight_finetuning_data(
+        config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
+    )
+
+    assert [call["streaming"] for call in calls] == [True, False]
+    assert consumption_count == 1
+    assert [config.datasets[name].filters for name in ("one", "two")] == before
+
+
 def test_grouped_positional_preflight_requires_each_source_to_emit_a_row() -> None:
     """A valid global overlay cannot hide an empty configured source view."""
     config = _grouped_config()
@@ -200,21 +234,72 @@ def test_grouped_positional_preflight_surfaces_length_mismatch() -> None:
         )
 
 
+def test_grouped_preflight_preserves_discriminator_distribution_checks() -> None:
+    """Unequal filtered stream lengths still fail on the independent path."""
+    config = _grouped_config()
+    for source in config.datasets.values():
+        source.overlay.equality_checks = {"text": "reference_text"}
+    base = Dataset.from_list(
+        [
+            {"audio": [0.0], "text": "a", "source": "one"},
+            {"audio": [0.0], "text": "b", "source": "one"},
+            {"audio": [0.0], "text": "c", "source": "two"},
+        ]
+    )
+    overlay = Dataset.from_list(
+        [
+            {"action": "keep", "source": "one", "reference_text": "a"},
+            {"action": "keep", "source": "two", "reference_text": "b"},
+            {"action": "keep", "source": "two", "reference_text": "c"},
+        ]
+    )
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        return base if kwargs["path"] == "org/audio" else overlay
+
+    with pytest.raises(ValueError, match="length mismatch"):
+        preflight_finetuning_data(
+            config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
+        )
+
+
+def test_grouped_preflight_requires_overlay_discriminator_column() -> None:
+    """Absent distribution checks retain ordinary overlay schema validation."""
+    config = _grouped_config()
+    for source in config.datasets.values():
+        source.overlay.equality_checks = {"text": "reference_text"}
+    base = Dataset.from_list(
+        [
+            {"audio": [0.0], "text": "one", "source": "one"},
+            {"audio": [0.0], "text": "two", "source": "two"},
+        ]
+    )
+    overlay = Dataset.from_list(
+        [
+            {"action": "keep", "reference_text": "one"},
+            {"action": "keep", "reference_text": "two"},
+        ]
+    )
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        return base if kwargs["path"] == "org/audio" else overlay
+
+    with pytest.raises(
+        ValueError, match=r"Missing overlay dataset columns: \['source'\]"
+    ):
+        preflight_finetuning_data(
+            config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
+        )
+
+
 def test_ineligible_positional_views_use_independent_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Multi-column filters do not enter the shared path."""
     config = _grouped_config()
     config.datasets.two.filters = {"source": "two", "language": "da"}
-    handled: list[str] = []
 
-    def fake_preflight(**kwargs: object) -> None:
-        handled.append(str(kwargs["source_name"]))
-
-    monkeypatch.setattr(preflight_module, "_preflight_hub_source", fake_preflight)
-    preflight_finetuning_data(config=config, hub_api=FakeHubApi())
-
-    assert handled == ["one", "two"]
+    _assert_independent_preflight(config=config, monkeypatch=monkeypatch)
 
 
 def test_local_preflight_accepts_valid_wav(tmp_path: Path) -> None:
@@ -265,6 +350,46 @@ def test_local_preflight_rejects_zero_byte_wav(tmp_path: Path) -> None:
     audio_path.write_bytes(b"")
     with pytest.raises(ValueError, match="Unreadable audio"):
         _preflight_local_manifest("local", manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("first_value", "second_value"),
+    [(1, True), (1, 1.0)],
+    ids=["integer-and-boolean", "integer-and-float"],
+)
+def test_non_string_discriminators_use_independent_preflight(
+    first_value: object, second_value: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scalar values with overlapping equality semantics cannot be grouped."""
+    config = _grouped_config()
+    _set_grouped_discriminator(config=config, source_name="one", value=first_value)
+    _set_grouped_discriminator(config=config, source_name="two", value=second_value)
+
+    _assert_independent_preflight(config=config, monkeypatch=monkeypatch)
+
+
+def _set_grouped_discriminator(
+    config: DictConfig, source_name: str, value: object
+) -> None:
+    """Set every discriminator filter for one grouped source."""
+    source = config.datasets[source_name]
+    source.filters.source = value
+    source.overlay.base_filters.source = value
+    source.overlay.filters.source = value
+
+
+def test_output_text_discriminator_collision_uses_independent_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default text output cannot overwrite the grouped routing column."""
+    config = _grouped_config()
+    for source_name, source in config.datasets.items():
+        source.filters = {"text": source_name}
+        source.overlay.base_filters = {"text": source_name}
+        source.overlay.filters = {"reference_text": source_name}
+        source.overlay.equality_checks = {"text": "reference_text"}
+
+    _assert_independent_preflight(config=config, monkeypatch=monkeypatch)
 
 
 def test_overlay_preflight_disables_audio_decoding_before_overlay(

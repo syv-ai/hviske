@@ -22,6 +22,8 @@
 
 ### Fixed
 
+- Restricted shared positional-overlay preflight to string source discriminators with
+  unambiguous equality checks and non-colliding output columns.
 - Projected overlay metadata before applying row filters, avoiding large unused model
   columns and audio requests during Sparkie v6 preflight while validating the original
   audio schema.
