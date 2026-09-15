@@ -29,8 +29,8 @@
 
 ### Fixed
 
-- Restored background-noise augmentation with torchaudio 2.10 by using soundfile for
-  audio metadata while retaining torch-audiomentations loading and resampling.
+- Restored background-noise augmentation with torchaudio 2.10 by using a project-owned
+  soundfile decoder while retaining torch-audiomentations resampling semantics.
 - Recognised refreshed Danish overlay `review` actions while continuing to exclude
   them from training alongside the other disallowed actions.
 - Removed package-import logging configuration so Hydra's policy controls both main
