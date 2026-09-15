@@ -367,7 +367,8 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     assert config.private_only is True
     assert config.save_total_limit == 3
     assert config.max_validation_samples_per_dataset == 1000
-    assert config.max_steps == 100_000
+    assert config.shuffle_buffer_size == 128
+    assert config.max_steps == 200_000
     assert config.stop_after_steps is None
     assert list(config.model_card_languages) == ["da", "en"]
     assert list(config.training_dataset_ids) == [

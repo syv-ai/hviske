@@ -27,6 +27,7 @@ def test_sparkie_full_commands_match_training_plan_evaluation_cadence() -> None:
 
     assert len(full_commands) == 2
     assert all("eval_steps=2000" in command for command in full_commands)
+    assert all("max_steps=200000" in command for command in full_commands)
     assert (
         "Evaluate the full frozen development suite every 2,000 steps" in training_plan
     )

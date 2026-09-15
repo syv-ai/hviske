@@ -81,7 +81,7 @@ dataloader_num_workers: 1
 streaming: true
 cache_dir: null
 # Fill the bounded shuffle with joined metadata, before any audio is decoded.
-shuffle_buffer_size: 1000
+shuffle_buffer_size: 128
 padding: longest
 
 # The first nine entries are Danish (60%); the final seven are English (40%).
@@ -159,7 +159,7 @@ adam_second_momentum: 0.98
 total_batch_size: 256
 per_device_batch_size: 8
 # Keep the cosine scheduler at the full horizon; bounded pilots use the callback.
-max_steps: 100_000
+max_steps: 200_000
 stop_after_steps: null
 warmup_steps: 1_000
 logging_steps: 100
