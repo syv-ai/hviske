@@ -39,6 +39,7 @@ def test_sparkie_runbook_preserves_safe_stream_worker_counts() -> None:
     assert "dataset_num_workers=1" in runbook
     assert "dataloader_num_workers=4" in runbook
     assert "CLOSE-WAIT" in runbook
+    assert "not a one-worker child process" in runbook
     assert "Do not raise `dataset_num_workers` for Hub streams" in runbook
 
 

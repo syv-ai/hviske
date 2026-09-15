@@ -1,7 +1,8 @@
 """Unit tests for the `utils` module."""
 
-import multiprocessing
+import collections.abc as c
 import os
+import typing as t
 from collections.abc import Iterator
 from pathlib import Path
 from types import TracebackType
@@ -9,7 +10,7 @@ from types import TracebackType
 import datasets.utils.logging as ds_logging
 import pytest
 import transformers.utils.logging as hf_logging
-from datasets import Features, IterableDataset, Value
+from datasets import Dataset, Features, IterableDataset, Value
 from datasets import config as datasets_config
 
 from hviske.utils import (
@@ -48,6 +49,50 @@ class output_blocked:
         ds_logging.set_verbosity_warning()
 
 
+def test_convert_iterable_dataset_does_not_request_multiprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Iterable conversion passes no process count to the generator loader."""
+    calls: list[dict[str, object]] = []
+    original_from_generator = Dataset.from_generator
+
+    def spy_from_generator(*args: object, **kwargs: object) -> Dataset:
+        """Record generator arguments and call the datasets implementation.
+
+        Returns:
+            The generated dataset.
+        """
+        calls.append(kwargs)
+        return t.cast(c.Callable[..., Dataset], original_from_generator)(
+            *args, **kwargs
+        )
+
+    monkeypatch.setattr(Dataset, "from_generator", spy_from_generator)
+
+    converted = convert_iterable_dataset_to_dataset(
+        iterable_dataset=_iterable_dataset("serial")
+    )
+
+    assert converted["text"] == ["serial"]
+    assert calls
+    assert "num_proc" not in calls[-1]
+
+
+def _iterable_dataset(text: str) -> IterableDataset:
+    """Create a small typed iterable dataset for conversion tests.
+
+    Returns:
+        A one-row iterable dataset containing ``text``.
+    """
+
+    def rows() -> Iterator[dict[str, str]]:
+        yield {"text": text}
+
+    return IterableDataset.from_generator(
+        rows, features=Features(text=Value(dtype="string"))
+    )
+
+
 def test_convert_iterable_dataset_preserves_explicit_cache_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -55,7 +100,6 @@ def test_convert_iterable_dataset_preserves_explicit_cache_dir(
     canonical_cache = tmp_path / "canonical"
     explicit_cache = tmp_path / "explicit"
     monkeypatch.setattr(datasets_config, "HF_DATASETS_CACHE", str(canonical_cache))
-    monkeypatch.setattr(multiprocessing, "cpu_count", lambda: 1)
     dataset_id = "campaign-dataset"
 
     converted = convert_iterable_dataset_to_dataset(
@@ -77,28 +121,12 @@ def test_convert_iterable_dataset_preserves_explicit_cache_dir(
     assert loaded["text"] == ["explicit"]
 
 
-def _iterable_dataset(text: str) -> IterableDataset:
-    """Create a small typed iterable dataset for conversion tests.
-
-    Returns:
-        A one-row iterable dataset containing ``text``.
-    """
-
-    def rows() -> Iterator[dict[str, str]]:
-        yield {"text": text}
-
-    return IterableDataset.from_generator(
-        rows, features=Features(text=Value(dtype="string"))
-    )
-
-
 def test_convert_iterable_dataset_uses_datasets_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A missing cache directory uses the path resolved by `datasets`."""
     canonical_cache = tmp_path / "canonical"
     monkeypatch.setattr(datasets_config, "HF_DATASETS_CACHE", str(canonical_cache))
-    monkeypatch.setattr(multiprocessing, "cpu_count", lambda: 1)
     monkeypatch.setenv("HF_DATASETS_CACHE", str(tmp_path / "environment"))
     environment_cache = os.environ["HF_DATASETS_CACHE"]
     dataset_id = "campaign-dataset"

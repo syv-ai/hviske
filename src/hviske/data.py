@@ -1744,7 +1744,7 @@ def filter_dataset(
     if isinstance(dataset, Dataset | DatasetDict):
         filtered = t.cast(Dataset | DatasetDict, dataset).filter(
             function=filter_fn,
-            num_proc=num_proc,
+            num_proc=None if num_proc == 1 else num_proc,
             desc="Filtering dataset",
             keep_in_memory=True,
         )
@@ -1888,7 +1888,7 @@ def process_dataset(
     if isinstance(dataset, Dataset | DatasetDict):
         mapped = t.cast(Dataset | DatasetDict, dataset).map(
             function=map_fn,
-            num_proc=num_proc,
+            num_proc=None if num_proc == 1 else num_proc,
             desc="Processing dataset",
             remove_columns=column_names if remove_input_dataset_columns else None,
             features=mapped_features,
