@@ -1,13 +1,28 @@
 """Unit tests for the `data` module."""
 
+import collections.abc as c
 import re
+import typing as t
 from collections.abc import Generator
 
 import pytest
-from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
+from datasets import (
+    Audio,
+    Dataset,
+    DatasetDict,
+    Features,
+    IterableDataset,
+    IterableDatasetDict,
+    Value,
+)
 from omegaconf import DictConfig
 
-from hviske.data import load_data_for_finetuning, process_dataset, process_example
+from hviske.data import (
+    filter_dataset,
+    load_data_for_finetuning,
+    process_dataset,
+    process_example,
+)
 
 
 class TestLoadDataForFinetuning:
@@ -230,3 +245,108 @@ class TestProcessExample:
             augment_audio=False,
         )[text_column]
         assert cleaned_transcription == expected
+
+
+@pytest.mark.parametrize("as_dict", [False, True])
+@pytest.mark.parametrize("num_proc, expected_num_proc", [(1, None), (2, 2)])
+def test_filter_dataset_normalises_single_worker(
+    as_dict: bool,
+    num_proc: int,
+    expected_num_proc: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regular dataset filtering does not fork for one configured worker."""
+    base_dataset = Dataset.from_list(
+        [
+            {
+                "audio": {"array": [0.0] * 16_001, "sampling_rate": 16_000},
+                "text": "Hello",
+            }
+        ],
+        features=Features(
+            {"audio": Audio(sampling_rate=16_000), "text": Value("string")}
+        ),
+    )
+    dataset: Dataset | DatasetDict = (
+        DatasetDict({"train": base_dataset}) if as_dict else base_dataset
+    )
+    calls: list[int | None] = []
+    original_filter = Dataset.filter
+
+    def spy_filter(*args: object, **kwargs: object) -> Dataset:
+        """Record the process count and call the datasets implementation.
+
+        Returns:
+            The filtered dataset.
+        """
+        calls.append(t.cast(int | None, kwargs["num_proc"]))
+        return t.cast(c.Callable[..., Dataset], original_filter)(*args, **kwargs)
+
+    monkeypatch.setattr(Dataset, "filter", spy_filter)
+
+    filtered = filter_dataset(
+        dataset=dataset,
+        audio_column="audio",
+        text_column="text",
+        min_seconds_per_example=1.0,
+        max_seconds_per_example=10,
+        is_main_process=True,
+        num_proc=num_proc,
+    )
+
+    assert calls == [expected_num_proc]
+    if as_dict:
+        filtered_dict = t.cast(DatasetDict, filtered)
+        assert filtered_dict["train"]["text"] == ["Hello"]
+    else:
+        filtered_dataset = t.cast(Dataset, filtered)
+        assert filtered_dataset["text"] == ["Hello"]
+
+
+@pytest.mark.parametrize("as_dict", [False, True])
+@pytest.mark.parametrize("num_proc, expected_num_proc", [(1, None), (2, 2)])
+def test_process_dataset_normalises_single_worker(
+    as_dict: bool,
+    num_proc: int,
+    expected_num_proc: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regular dataset processing does not fork for one configured worker."""
+    base_dataset = Dataset.from_list([{"text": "Hello"}])
+    dataset: Dataset | DatasetDict = (
+        DatasetDict({"train": base_dataset}) if as_dict else base_dataset
+    )
+    calls: list[int | None] = []
+    original_map = Dataset.map
+
+    def spy_map(*args: object, **kwargs: object) -> Dataset:
+        """Record the process count and call the datasets implementation.
+
+        Returns:
+            The mapped dataset.
+        """
+        calls.append(t.cast(int | None, kwargs["num_proc"]))
+        return t.cast(c.Callable[..., Dataset], original_map)(*args, **kwargs)
+
+    monkeypatch.setattr(Dataset, "map", spy_map)
+
+    processed = process_dataset(
+        dataset=dataset,
+        lower_case=True,
+        characters_to_keep=None,
+        text_column="text",
+        remove_input_dataset_columns=False,
+        audio_column=None,
+        convert_numerals=False,
+        normalise_audio=False,
+        augment_audio=False,
+        num_proc=num_proc,
+    )
+
+    assert calls == [expected_num_proc]
+    if as_dict:
+        processed_dict = t.cast(DatasetDict, processed)
+        assert processed_dict["train"]["text"] == ["hello"]
+    else:
+        processed_dataset = t.cast(Dataset, processed)
+        assert processed_dataset["text"] == ["hello"]

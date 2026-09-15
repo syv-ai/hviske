@@ -72,8 +72,8 @@ max_validation_samples_per_dataset: 1000
 
 min_seconds_per_example: 1.0
 max_seconds_per_example: 10.0
-# Keep Hub-stream preprocessing in the parent process: validation filtering and
-# materialisation can inherit live HTTP connections across forked workers.
+# Keep Hub-stream preprocessing in the parent process. The configured one worker is
+# normalised to num_proc=None, avoiding forks while Hub HTTP connections are live.
 dataset_num_workers: 1
 dataloader_num_workers: 4
 streaming: true

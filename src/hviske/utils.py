@@ -4,7 +4,6 @@ import collections.abc as c
 import contextlib
 import json
 import logging
-import multiprocessing as mp
 import os
 import re
 import shutil
@@ -167,7 +166,6 @@ def convert_iterable_dataset_to_dataset(
             generator=gen_from_iterable_dataset,
             features=iterable_dataset.features,
             split=NamedSplit(name=split_name),
-            num_proc=mp.cpu_count(),
         )
     assert isinstance(dataset, Dataset)
 
