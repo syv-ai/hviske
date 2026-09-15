@@ -3,6 +3,7 @@
 import json
 import typing as t
 import wave
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -166,6 +167,26 @@ def test_exact_row_filters_fail_for_missing_features() -> None:
 
     with pytest.raises(ValueError, match="missing dataset features: source"):
         _filter_dataset_rows(dataset=dataset, filters={"source": "voxpopuli"})
+
+
+def test_exact_row_filters_infer_features_for_untyped_streams() -> None:
+    """Row filters infer a bounded schema without consuming the stream."""
+    consumed = 0
+
+    def rows() -> Iterable[dict[str, str]]:
+        nonlocal consumed
+        index = 0
+        while True:
+            consumed += 1
+            yield {"source": "keep" if index % 2 == 0 else "drop", "text": str(index)}
+            index += 1
+
+    dataset = IterableDataset.from_generator(rows)
+    filtered = _filter_dataset_rows(dataset=dataset, filters={"source": "keep"})
+
+    assert consumed <= 5
+    assert [row["text"] for row in filtered.take(3)] == ["0", "2", "4"]
+    assert [row["text"] for row in filtered.take(3)] == ["0", "2", "4"]
 
 
 def test_join_rejects_duplicate_transcript_keys() -> None:

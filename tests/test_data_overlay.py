@@ -5,7 +5,7 @@ import multiprocessing
 import pickle
 
 import pytest
-from datasets import Dataset
+from datasets import Dataset, IterableDataset
 
 from hviske.data import apply_dataset_overlay
 
@@ -283,6 +283,39 @@ def test_positional_overlay_filters_and_uses_ordered_text_fallback() -> None:
     result = list(apply_dataset_overlay(base, overlay, _config()))
 
     assert [row["text"] for row in result] == ["one", " revised "]
+    assert [row["audio"] for row in result] == ["a", "b"]
+
+
+def test_positional_overlay_infers_features_for_untyped_base() -> None:
+    """Positional overlays retain exact rows from an untyped base stream."""
+    base = IterableDataset.from_generator(
+        lambda: iter(
+            [
+                {"source": "demo", "text": "one", "audio": "a"},
+                {"source": "demo", "text": "two", "audio": "b"},
+            ]
+        )
+    )
+    overlay = Dataset.from_list(
+        [
+            {
+                "source": "demo",
+                "reference_text": "one",
+                "new_text": None,
+                "action": "keep",
+            },
+            {
+                "source": "demo",
+                "reference_text": "two",
+                "new_text": "revised",
+                "action": "relabel",
+            },
+        ]
+    )
+
+    result = list(apply_dataset_overlay(base, overlay, _config()))
+
+    assert [row["text"] for row in result] == ["one", "revised"]
     assert [row["audio"] for row in result] == ["a", "b"]
 
 

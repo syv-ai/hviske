@@ -22,6 +22,8 @@
 
 ### Fixed
 
+- Resolved features for untyped streaming datasets before filtering and overlaying,
+  without materialising or decoding the audio stream.
 - Made W&B preflight non-interactive, scrubbed inherited Sparkie W&B identity, and
   redacted checkpoint paths from online configuration payloads.
 - Separated bounded pilot stopping from the 100,000-step scheduler horizon, added
