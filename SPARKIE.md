@@ -107,16 +107,21 @@ uv run pytest tests/test_sparkie_config.py tests/test_wandb_setup.py \
 ```
 
 The preset deliberately uses `dataset_num_workers=1` and
-`dataloader_num_workers=4`. For regular datasets, `dataset_num_workers=1` maps to
+`dataloader_num_workers=1`. For regular datasets, `dataset_num_workers=1` maps to
 in-process preprocessing (`num_proc=None`), not a one-worker child process. Validation
 filtering and materialisation happen while Hub and `httpx` connections may already be
 open; forking preprocessing workers can inherit one of those sockets and deadlock in
-`CLOSE-WAIT`. Keep preprocessing serial for this streaming campaign. The training-time
-audio loader remains parallel at four workers. The finetuning entrypoint selects
-PyTorch's `spawn` start method before experiment tracking, Hub data loading, or
-Trainer/DataLoader construction, preventing workers from inheriting Hub HTTP clients
-and sockets. An already-selected `spawn` method is reused; a conflicting method fails
-clearly instead of silently falling back to `fork`.
+`CLOSE-WAIT`. Keep preprocessing serial for this streaming campaign. The training graph
+also contains positional overlays over multi-shard bases: each nested iterable base
+would independently shard under more than one DataLoader worker, while the positional
+SQLite index starts globally at position zero. Consequently, `dataloader_num_workers > 1`
+is incompatible with this production graph. Keep positional equality checks strict and
+do not relax them to hide worker-local offsets. This is not a generic restriction:
+keyed overlays and graphs without positional overlays retain their existing behaviour.
+The finetuning entrypoint selects PyTorch's `spawn` start method before experiment
+tracking, Hub data loading, or Trainer/DataLoader construction, preventing workers from
+inheriting Hub HTTP clients and sockets. An already-selected `spawn` method is reused; a
+conflicting method fails clearly instead of silently falling back to `fork`.
 Do not raise `dataset_num_workers` for Hub streams. Every smoke, pilot, full-run, and
 interruption-recovery command below inherits these values from
 `config/sparkie_bilingual.yaml`; do not add a preprocessing-worker override.
