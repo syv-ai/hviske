@@ -13,6 +13,11 @@ handlers:
     class: logging.FileHandler
     formatter: simple
     filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+loggers:
+  httpcore:
+    level: WARNING
+  httpx:
+    level: WARNING
 root:
   handlers: [console, file]
 

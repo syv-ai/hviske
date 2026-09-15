@@ -27,6 +27,8 @@
 
 ### Fixed
 
+- Suppressed HTTP client INFO logs so temporary signed dataset URLs are not written to
+  training logs.
 - Made local VTT and standardised streaming training graphs pickleable for PyTorch
   `spawn` workers without changing lazy audio loading or restartability.
 - Normalised Sparkie `dataset_num_workers=1` to in-process filtering and mapping, and
