@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import collections.abc as c
 import hashlib
+import io
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -282,3 +284,139 @@ def test_repo_file_git_metadata_uses_bounded_content_hashing() -> None:
     finalisation._check_remote_metadata(
         GitHub(), "syvai/p1-segments", _REVISION, (shard,)
     )
+
+
+def test_scan_batches_metadata_and_checks_overlaps_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bulk scanning uses one transaction and one corpus-wide overlap query."""
+    rows = [_metadata_row(index=index, start=index * 1_000) for index in range(3_000)]
+    traces: list[str] = []
+    real_connect = finalisation.sqlite3.connect
+
+    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)
+        connection.set_trace_callback(traces.append)
+        return connection
+
+    class Batch:
+        def __init__(self, values: list[dict[str, object]]) -> None:
+            self.values = values
+            self.num_rows = len(values)
+
+        def to_pylist(self) -> list[dict[str, object]]:
+            return self.values
+
+    class Parquet:
+        schema_arrow = finalisation._EXPECTED_ARROW_SCHEMA
+        metadata = SimpleNamespace(num_rows=len(rows))
+
+        def iter_batches(
+            self, *, columns: list[str], batch_size: int
+        ) -> c.Iterator[Batch]:
+            assert columns == list(finalisation._METADATA_COLUMNS)
+            assert batch_size == finalisation._ARROW_BATCH_SIZE
+            for offset in range(0, len(rows), batch_size):
+                yield Batch(rows[offset : offset + batch_size])
+
+    class ScanHub:
+        def open_file(
+            self, repo_id: str, path: str, *, repo_type: str, revision: str
+        ) -> io.BytesIO:
+            del repo_id, path, repo_type, revision
+            return io.BytesIO()
+
+    monkeypatch.setattr(finalisation.sqlite3, "connect", traced_connect)
+    monkeypatch.setattr(finalisation.pq, "ParquetFile", lambda handle: Parquet())
+
+    stats = finalisation._scan_parquet(
+        ScanHub(),
+        "syvai/p1-segments",
+        _REVISION,
+        (finalisation._Shard("part.parquet", 3_000, 3_000, "c" * 64),),
+        _DIGEST,
+    )
+
+    assert stats["rows"] == 3_000
+    assert stats["programmes"] == 1
+    assert stats["duration_ms"] == 3_000_000
+    assert stats["speakers"] == {"1": 3_000}
+    assert sum(trace == "COMMIT" for trace in traces) == 1
+    assert sum(trace.startswith("WITH ordered") for trace in traces) == 1
+
+
+def _metadata_row(
+    *, index: int, start: int, end: int | None = None
+) -> dict[str, object]:
+    """Build one valid metadata-only row for scanner tests.
+
+    Returns:
+        A metadata-only row satisfying the v8 scanner contract.
+    """
+    interval_end = end if end is not None else start + 1_000
+    return {
+        "audio_sha256": "a" * 64,
+        "text": "et eksempel",
+        "alignment_text": "et eksempel",
+        "alignment_word_map": ["et", " eksempel"],
+        "language": "da",
+        "segment_id": f"{index:064x}",
+        "source_file_id": "source",
+        "source_start_ms": start,
+        "source_end_ms": interval_end,
+        "source_duration_ms": 3_000_000,
+        "duration_ms": interval_end - start,
+        "speaker_ids": ["speaker"],
+        "proposal_start_ms": start,
+        "proposal_end_ms": interval_end,
+        "alignment_score": None,
+        "alignment_score_type": "not_applicable:source_timestamps",
+        "start_drift_ms": None,
+        "end_drift_ms": None,
+        "vad_speech_ratio": None,
+        "alignment_backend": "timestamp-native",
+        "alignment_method": "timestamp-native:p1-transcripts.words",
+        "pipeline_version": "p1-segmentation-8",
+        "pipeline_config_sha256": _DIGEST,
+    }
+
+
+def test_scan_rejects_nested_source_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The interval query catches an earlier long interval around later rows."""
+    rows = [
+        _metadata_row(index=0, start=0, end=5_000),
+        _metadata_row(index=1, start=1_000, end=2_000),
+    ]
+
+    class Batch:
+        num_rows = len(rows)
+
+        def to_pylist(self) -> list[dict[str, object]]:
+            return rows
+
+    class Parquet:
+        schema_arrow = finalisation._EXPECTED_ARROW_SCHEMA
+        metadata = SimpleNamespace(num_rows=len(rows))
+
+        def iter_batches(
+            self, *, columns: list[str], batch_size: int
+        ) -> c.Iterator[Batch]:
+            del columns, batch_size
+            yield Batch()
+
+    class ScanHub:
+        def open_file(
+            self, repo_id: str, path: str, *, repo_type: str, revision: str
+        ) -> io.BytesIO:
+            del repo_id, path, repo_type, revision
+            return io.BytesIO()
+
+    monkeypatch.setattr(finalisation.pq, "ParquetFile", lambda handle: Parquet())
+    with pytest.raises(FinalisationError, match="overlapping"):
+        finalisation._scan_parquet(
+            ScanHub(),
+            "syvai/p1-segments",
+            _REVISION,
+            (finalisation._Shard("part.parquet", 3_000, 2, "c" * 64),),
+            _DIGEST,
+        )

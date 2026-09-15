@@ -31,6 +31,7 @@ _TERMINAL_PROGRAMME_STATES = {"purged", "rejected"}
 _MAX_METADATA_BYTES = 16 * 1024 * 1024
 _MAX_README_BYTES = 1 * 1024 * 1024
 _MAX_HISTORY_COMMITS = 10_000
+_ARROW_BATCH_SIZE = 1024
 
 
 @dataclass(frozen=True)
@@ -889,12 +890,6 @@ def _open_readonly(path: Path) -> sqlite3.Connection:
 def _scan_parquet(
     hub: object, repository: str, revision: str, shards: c.Sequence[_Shard], digest: str
 ) -> _ScanStats:
-    temporary = tempfile.TemporaryDirectory(prefix="p1-finalisation-")
-    seen_db = sqlite3.connect(str(Path(temporary.name) / "metadata.sqlite"))
-    seen_db.execute(
-        "CREATE TABLE rows ("
-        "segment_id TEXT PRIMARY KEY, source TEXT, start INTEGER, end INTEGER)"
-    )
     stats: _ScanStats = {
         "rows": 0,
         "programmes": 0,
@@ -903,52 +898,93 @@ def _scan_parquet(
         "words": _Stats(),
         "speakers": {},
     }
-    try:
-        for shard in shards:
-            handle = _open_remote_file(hub, repository, shard.path, revision)
-            try:
-                parquet = pq.ParquetFile(handle)
-                if parquet.schema_arrow != _EXPECTED_ARROW_SCHEMA:
-                    raise FinalisationError(
-                        "a Parquet shard has the wrong Arrow schema"
+    with tempfile.TemporaryDirectory(prefix="p1-finalisation-") as temporary_name:
+        database_path = Path(temporary_name) / "metadata.sqlite"
+        seen_db = sqlite3.connect(str(database_path))
+        try:
+            _configure_scan_database(seen_db)
+            seen_db.execute(
+                "CREATE TABLE rows ("
+                "segment_id TEXT PRIMARY KEY, source TEXT, start INTEGER, end INTEGER)"
+            )
+            for shard in shards:
+                handle = _open_remote_file(hub, repository, shard.path, revision)
+                try:
+                    parquet = pq.ParquetFile(handle)
+                    if parquet.schema_arrow != _EXPECTED_ARROW_SCHEMA:
+                        raise FinalisationError(
+                            "a Parquet shard has the wrong Arrow schema"
+                        )
+                    footer = parquet.metadata
+                    if footer is None or footer.num_rows != shard.row_count:
+                        raise FinalisationError(
+                            "a Parquet footer row count differs from the ledger"
+                        )
+                    scanned_rows = 0
+                    batches = parquet.iter_batches(
+                        columns=list(_METADATA_COLUMNS), batch_size=_ARROW_BATCH_SIZE
                     )
-                footer = parquet.metadata
-                if footer is None or footer.num_rows != shard.row_count:
+                    for batch in batches:
+                        scanned_rows += batch.num_rows
+                        metadata_rows = [
+                            _check_row(row, digest, stats) for row in batch.to_pylist()
+                        ]
+                        try:
+                            seen_db.executemany(
+                                "INSERT INTO rows VALUES (?, ?, ?, ?)", metadata_rows
+                            )
+                        except sqlite3.IntegrityError:
+                            raise FinalisationError(
+                                "duplicate segment IDs were found"
+                            ) from None
+                    if scanned_rows != shard.row_count:
+                        raise FinalisationError(
+                            "a scanned row count differs from the ledger"
+                        )
+                except FinalisationError:
+                    raise
+                except Exception:
                     raise FinalisationError(
-                        "a Parquet footer row count differs from the ledger"
-                    )
-                scanned_rows = 0
-                batches = parquet.iter_batches(
-                    columns=list(_METADATA_COLUMNS), batch_size=1024
-                )
-                for batch in batches:
-                    scanned_rows += batch.num_rows
-                    for row in batch.to_pylist():
-                        _check_row(row, digest, seen_db, stats)
-                if scanned_rows != shard.row_count:
-                    raise FinalisationError(
-                        "a scanned row count differs from the ledger"
-                    )
-            except FinalisationError:
-                raise
-            except Exception:
-                raise FinalisationError("a Parquet shard cannot be scanned") from None
-            finally:
-                close = getattr(handle, "close", None)
-                if callable(close):
-                    close()
-    finally:
-        stats["programmes"] = int(
-            seen_db.execute("SELECT COUNT(DISTINCT source) FROM rows").fetchone()[0]
-        )
-        seen_db.close()
-        temporary.cleanup()
+                        "a Parquet shard cannot be scanned"
+                    ) from None
+                finally:
+                    close = getattr(handle, "close", None)
+                    if callable(close):
+                        close()
+            seen_db.execute(
+                "CREATE INDEX rows_source_interval "
+                "ON rows (source, start, end, segment_id)"
+            )
+            seen_db.commit()
+            _check_overlapping_intervals(seen_db)
+            stats["programmes"] = int(
+                seen_db.execute("SELECT COUNT(DISTINCT source) FROM rows").fetchone()[0]
+            )
+        finally:
+            seen_db.close()
     return stats
 
 
-def _check_row(
-    row: object, digest: str, seen_db: sqlite3.Connection, stats: _ScanStats
-) -> None:
+def _check_overlapping_intervals(connection: sqlite3.Connection) -> None:
+    """Reject any overlapping intervals using one indexed corpus-wide query.
+
+    Raises:
+        FinalisationError:
+            If two intervals from one source overlap.
+    """
+    overlap = connection.execute(
+        "WITH ordered AS ("
+        "SELECT segment_id, source, start, end, "
+        "max(end) OVER (PARTITION BY source ORDER BY start, end, segment_id "
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_max_end "
+        "FROM rows) "
+        "SELECT 1 FROM ordered WHERE prior_max_end > start LIMIT 1"
+    ).fetchone()
+    if overlap is not None:
+        raise FinalisationError("overlapping source intervals were found")
+
+
+def _check_row(row: object, digest: str, stats: _ScanStats) -> tuple[object, ...]:
     if not isinstance(row, dict) or set(row) != set(_METADATA_COLUMNS):
         raise FinalisationError("a row does not have the exact metadata schema")
     strings = (
@@ -1020,21 +1056,6 @@ def _check_row(
     if not row["text"].strip() or not row["alignment_text"].strip():
         raise FinalisationError("a row has empty text")
     words = len(row["text"].split())
-    try:
-        seen_db.execute(
-            "INSERT INTO rows VALUES (?, ?, ?, ?)",
-            (row["segment_id"], row["source_file_id"], start, end),
-        )
-    except sqlite3.IntegrityError:
-        raise FinalisationError("duplicate segment IDs were found") from None
-    overlap = seen_db.execute(
-        "SELECT 1 FROM rows WHERE source = ? AND start < ? AND end > ? "
-        "AND segment_id != ? LIMIT 1",
-        (row["source_file_id"], end, start, row["segment_id"]),
-    ).fetchone()
-    if overlap is not None:
-        raise FinalisationError("overlapping source intervals were found")
-    seen_db.commit()
     stats["rows"] = int(stats["rows"]) + 1
     stats["duration_ms"] = int(stats["duration_ms"]) + row["duration_ms"]
     stats["duration"].add(row["duration_ms"])
@@ -1043,6 +1064,15 @@ def _check_row(
     speaker_counts[str(len(row["speaker_ids"]))] = (
         speaker_counts.get(str(len(row["speaker_ids"])), 0) + 1
     )
+    return (row["segment_id"], row["source_file_id"], start, end)
+
+
+def _configure_scan_database(connection: sqlite3.Connection) -> None:
+    """Configure a disposable metadata database for bounded bulk ingestion."""
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA cache_size=-65536")
 
 
 def _open_remote_file(hub: object, repository: str, path: str, revision: str) -> object:
