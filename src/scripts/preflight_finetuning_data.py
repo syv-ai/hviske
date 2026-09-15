@@ -20,6 +20,8 @@ from omegaconf import DictConfig, OmegaConf
 from hviske.data import (
     _filter_dataset_rows,
     _load_transcript_dataset,
+    _resolve_hub_data_files,
+    _validate_positional_shard_parity,
     apply_dataset_overlay,
     join_audio_and_transcripts,
 )
@@ -55,6 +57,7 @@ def _preflight_grouped_hub_sources(
     dataset_loader: DatasetLoader,
     cache_dir: str | None,
     token: str | None,
+    hub_api: "HubApi",
 ) -> set[str]:
     """Preflight equivalent positional views with one shared stream.
 
@@ -71,26 +74,48 @@ def _preflight_grouped_hub_sources(
             continue
         representative = group[0]
         source_config = representative.config
-        dataset = dataset_loader(
-            path=source_config.id,
-            name=source_config.get("subset"),
-            split=source_config.train_name,
-            revision=source_config.get("revision"),
-            token=token or True,
-            streaming=True,
-            cache_dir=cache_dir,
-            trust_remote_code=source_config.get("trust_remote_code", False),
-        )
         overlay_config = t.cast(c.Mapping[str, object], source_config.overlay)
+        base_data_files = _resolve_hub_data_files(
+            dataset_id=str(source_config.id),
+            revision=source_config.get("revision"),
+            selection=t.cast(
+                c.Mapping[str, object] | None, source_config.get("data_file_shards")
+            ),
+            hub_api=hub_api,
+        )
+        overlay_revision = validate_overlay_revision(
+            str(overlay_config.get("revision") or "")
+        )
+        overlay_data_files = _resolve_hub_data_files(
+            dataset_id=str(overlay_config["id"]),
+            revision=overlay_revision,
+            selection=t.cast(
+                c.Mapping[str, object] | None, overlay_config.get("data_file_shards")
+            ),
+            hub_api=hub_api,
+        )
+        _validate_positional_shard_parity(
+            base_files=base_data_files, overlay_files=overlay_data_files
+        )
+        load_kwargs: dict[str, object] = {
+            "path": source_config.id,
+            "name": source_config.get("subset"),
+            "split": source_config.train_name,
+            "revision": source_config.get("revision"),
+            "token": token or True,
+            "streaming": True,
+            "cache_dir": cache_dir,
+            "trust_remote_code": source_config.get("trust_remote_code", False),
+        }
+        if base_data_files is not None:
+            load_kwargs["data_files"] = base_data_files
+        dataset = dataset_loader(**load_kwargs)
         dataset, overlay_base_columns = _project_overlay_base_dataset(
             dataset=dataset,
             audio_column=str(source_config.audio_column),
             source_config=source_config,
             overlay_config=overlay_config,
             source_name=f"group containing {representative.name}",
-        )
-        overlay_revision = validate_overlay_revision(
-            str(overlay_config.get("revision") or "")
         )
         overlay = _load_transcript_dataset(
             dataset_id=str(overlay_config["id"]),
@@ -100,6 +125,7 @@ def _preflight_grouped_hub_sources(
             cache_dir=cache_dir,
             trust_remote_code=bool(overlay_config.get("trust_remote_code", False)),
             dataset_loader=dataset_loader,
+            data_files=overlay_data_files,
         )
         unfiltered_overlay_config = copy.deepcopy(dict(overlay_config))
         unfiltered_overlay_config.pop("base_filters", None)
@@ -533,19 +559,47 @@ def _preflight_hub_source(
     dataset_loader: DatasetLoader,
     cache_dir: str | None,
     token: str | None,
+    hub_api: "HubApi",
 ) -> None:
-    dataset = dataset_loader(
-        path=source_config.id,
-        name=source_config.get("subset"),
-        split=source_config[split_key],
+    base_data_files = _resolve_hub_data_files(
+        dataset_id=str(source_config.id),
         revision=source_config.get("revision"),
-        token=token or True,
-        streaming=True,
-        cache_dir=cache_dir,
-        trust_remote_code=source_config.get("trust_remote_code", False),
+        selection=t.cast(
+            c.Mapping[str, object] | None, source_config.get("data_file_shards")
+        ),
+        hub_api=hub_api,
     )
-    audio_column = str(source_config.audio_column)
     overlay_config = source_config.get("overlay")
+    overlay_data_files: list[str] | None = None
+    if overlay_config is not None:
+        overlay_revision = validate_overlay_revision(
+            str(overlay_config.get("revision") or "")
+        )
+        overlay_data_files = _resolve_hub_data_files(
+            dataset_id=str(overlay_config.id),
+            revision=overlay_revision,
+            selection=t.cast(
+                c.Mapping[str, object] | None, overlay_config.get("data_file_shards")
+            ),
+            hub_api=hub_api,
+        )
+        _validate_positional_shard_parity(
+            base_files=base_data_files, overlay_files=overlay_data_files
+        )
+    load_kwargs: dict[str, object] = {
+        "path": source_config.id,
+        "name": source_config.get("subset"),
+        "split": source_config[split_key],
+        "revision": source_config.get("revision"),
+        "token": token or True,
+        "streaming": True,
+        "cache_dir": cache_dir,
+        "trust_remote_code": source_config.get("trust_remote_code", False),
+    }
+    if base_data_files is not None:
+        load_kwargs["data_files"] = base_data_files
+    dataset = dataset_loader(**load_kwargs)
+    audio_column = str(source_config.audio_column)
     has_overlay = overlay_config is not None
     has_transcript_join = source_config.get("transcript_dataset_id") is not None
     if has_overlay and not has_transcript_join:
@@ -577,9 +631,6 @@ def _preflight_hub_source(
             dataset=dataset, filters=t.cast(dict[str, object], source_filters)
         )
     if has_overlay:
-        overlay_revision = validate_overlay_revision(
-            str(overlay_config.get("revision") or "")
-        )
         overlay = _load_transcript_dataset(
             dataset_id=str(overlay_config.id),
             subset=overlay_config.get("subset"),
@@ -588,6 +639,7 @@ def _preflight_hub_source(
             cache_dir=cache_dir,
             trust_remote_code=overlay_config.get("trust_remote_code", False),
             dataset_loader=dataset_loader,
+            data_files=overlay_data_files,
         )
         if not isinstance(dataset, Dataset | IterableDataset):
             raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
@@ -819,6 +871,7 @@ def preflight_finetuning_data(
         dataset_loader=dataset_loader,
         cache_dir=config.get("cache_dir"),
         token=token,
+        hub_api=api,
     )
     for source_name, source_config in config.datasets.items():
         source_name = str(source_name)
@@ -836,6 +889,7 @@ def preflight_finetuning_data(
                 dataset_loader=dataset_loader,
                 cache_dir=config.get("cache_dir"),
                 token=token,
+                hub_api=api,
             )
 
     for index, source_config in enumerate(config.evaluation_datasets):
@@ -846,6 +900,7 @@ def preflight_finetuning_data(
             dataset_loader=dataset_loader,
             cache_dir=config.get("cache_dir"),
             token=token,
+            hub_api=api,
         )
 
 

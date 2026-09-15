@@ -29,6 +29,9 @@
 
 ### Fixed
 
+- Bounded Sparkie startup by selecting only each Danish source's pinned base and
+  positional-overlay shards, validating mirrored shard order, and shuffling joined
+  metadata before audio decoding.
 - Restored background-noise augmentation with torchaudio 2.10 by using a project-owned
   soundfile decoder while retaining torch-audiomentations resampling semantics.
 - Recognised refreshed Danish overlay `review` actions while continuing to exclude

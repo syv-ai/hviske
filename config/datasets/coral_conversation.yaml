@@ -10,11 +10,19 @@ coral_conversation:
   language: da
   revision: 5a3a49ee981baab6e1e37ddd2c45f9943c27d08f
   trust_remote_code: false
+  data_file_shards:
+    template: data/train-{shard:05d}.parquet
+    start: 623
+    end: 653
   overlay:
     id: syvai/danish-asr-unified-hviske-v5-tiny
     subset: default
     split: train
     revision: ${oc.env:HVISKE_OVERLAY_REVISION,""}
+    data_file_shards:
+      template: data/train-{shard:05d}.parquet
+      start: 623
+      end: 653
     strategy: positional
     base_filters:
       source: coral_conversation

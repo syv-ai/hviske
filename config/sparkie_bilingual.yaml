@@ -80,6 +80,8 @@ dataset_num_workers: 1
 dataloader_num_workers: 1
 streaming: true
 cache_dir: null
+# Fill the bounded shuffle with joined metadata, before any audio is decoded.
+shuffle_buffer_size: 1000
 padding: longest
 
 # The first nine entries are Danish (60%); the final seven are English (40%).

@@ -241,6 +241,30 @@ def test_sparkie_dataset_coordinates_and_revisions(
         for dataset in datasets.values()
         if dataset.get("overlay") is not None
     )
+    expected_shard_ranges = {
+        "voxpopuli_da": (0, 354),
+        "nota": (354, 367),
+        "ftspeech": (367, 563),
+        "coral_read_aloud": (563, 623),
+        "coral_conversation": (623, 653),
+        "nst": (653, 689),
+    }
+    assert {
+        name: (dataset.data_file_shards.start, dataset.data_file_shards.end)
+        for name, dataset in datasets.items()
+        if dataset.get("data_file_shards") is not None
+    } == expected_shard_ranges
+    for name, bounds in expected_shard_ranges.items():
+        dataset = datasets[name]
+        assert dataset.data_file_shards.template == "data/train-{shard:05d}.parquet"
+        assert (
+            dataset.overlay.data_file_shards.start,
+            dataset.overlay.data_file_shards.end,
+        ) == bounds
+        assert (
+            dataset.overlay.data_file_shards.template
+            == dataset.data_file_shards.template
+        )
 
 
 def _preset(monkeypatch: MonkeyPatch) -> DictConfig:

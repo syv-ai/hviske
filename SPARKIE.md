@@ -80,8 +80,14 @@ weights proportional to row count. Large formal or read-aloud corpora are delibe
 capped. The Danish total is exactly 60% and the English total 40%. FLEURS `en_us` is
 evaluation-only. The unified Danish repository is filtered into six separately weighted
 streams and uses the `HVISKE_OVERLAY_REVISION` v5-tiny metadata overlay; its rows are not
-loaded directly from the obsolete source repositories. Common Voice,
-GigaSpeech, SPGISpeech, older CoRal data, and CoRal TTS are not part of this run.
+loaded directly from the obsolete source repositories. Each stream resolves only its
+inclusive source-contiguous shard range at both immutable revisions (`voxpopuli` 0--354,
+`nota` 354--367, `ftspeech` 367--563, `coral_read_aloud` 563--623,
+`coral_conversation` 623--653, and `nst_da` 653--689). Boundary shards deliberately
+appear in both adjacent ranges so filters retain complete source coverage. Empty shard
+numbers may be absent, but the resolved base and overlay basename order must match.
+Common Voice, GigaSpeech, SPGISpeech, older CoRal data, and CoRal TTS are not part of
+this run.
 
 ## Local manifests and bounded preflight
 
@@ -130,6 +136,14 @@ SQLite index starts globally at position zero. Consequently, `dataloader_num_wor
 is incompatible with this production graph. Keep positional equality checks strict and
 do not relax them to hide worker-local offsets. This is not a generic restriction:
 keyed overlays and graphs without positional overlays retain their existing behaviour.
+The per-source streaming shuffle is applied only after the positional overlay and its
+strict equality checks, but before audio decoding and duration filtering. Its bounded
+1,000-row buffer therefore reads metadata rather than decoding 1,000 clips before the
+first training example. This ordering is important: shuffling before a positional join
+would corrupt base/overlay alignment. The shard bounds avoid the previous full 273 GB
+scan in each of six source-filtered streams while keeping the source filters as runtime
+validation.
+
 The finetuning entrypoint selects PyTorch's `spawn` start method before experiment
 tracking, Hub data loading, or Trainer/DataLoader construction, preventing workers from
 inheriting Hub HTTP clients and sockets. An already-selected `spawn` method is reused; a
