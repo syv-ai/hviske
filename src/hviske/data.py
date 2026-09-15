@@ -22,6 +22,7 @@ from typing import Any
 from unicodedata import normalize
 from zipfile import ZipFile
 
+import datasets
 import httpx
 import torch
 import torch_audiomentations as ta
@@ -947,19 +948,21 @@ def join_audio_and_transcripts(
     if not transcript_by_key:
         raise ValueError("Transcript dataset contains no usable transcripts")
 
-    def has_transcript(example: dict[str, Any]) -> bool:
-        key = example[audio_join_column]
-        _validate_join_key(key=key, expected_type=key_type, side="audio")
-        return key in transcript_by_key
-
-    def add_transcript(example: dict[str, Any]) -> dict[str, Any]:
-        example["text"] = transcript_by_key[example[audio_join_column]]
-        return example
-
     if audio_dataset.features is None:
         raise ValueError("Audio dataset must declare features")
     joined_features = audio_dataset.features.copy()
     joined_features["text"] = Value("string")
+    has_transcript = partial(
+        _has_transcript,
+        audio_join_column=audio_join_column,
+        transcript_by_key=transcript_by_key,
+        key_type=key_type,
+    )
+    add_transcript = partial(
+        _add_transcript,
+        audio_join_column=audio_join_column,
+        transcript_by_key=transcript_by_key,
+    )
     if isinstance(audio_dataset, IterableDataset):
         filtered_audio = _filter_streaming_dataset(
             dataset=audio_dataset, function=has_transcript
@@ -1020,6 +1023,32 @@ DEFAULT_CONVERSION_DICT = {
 FILLER_WORDS_PATTERN = re.compile(
     pattern=r"\b(eh+m*|øh+m*|h+m+|m+h+)\b", flags=re.IGNORECASE
 )
+
+
+def _add_transcript(
+    example: dict[str, Any],
+    audio_join_column: str,
+    transcript_by_key: dict[object, str],
+) -> dict[str, Any]:
+    """Add the indexed transcript to an audio example.
+
+    Returns:
+        The audio example with its transcript.
+    """
+    example["text"] = transcript_by_key[example[audio_join_column]]
+    return example
+
+
+def _has_transcript(
+    example: dict[str, Any],
+    audio_join_column: str,
+    transcript_by_key: dict[object, str],
+    key_type: type[object] | None,
+) -> bool:
+    """Return whether an audio example has a usable indexed transcript."""
+    key = example[audio_join_column]
+    _validate_join_key(key=key, expected_type=key_type, side="audio")
+    return key in transcript_by_key
 
 
 def _row_matches_filters(
@@ -1566,14 +1595,12 @@ def _filter_streaming_dataset(
     try:
         return dataset.filter(function=function)
     except TypeError as error:
-        ex_iterable = getattr(dataset, "_ex_iterable", None)
-        if (
-            dataset.features is None
-            or ex_iterable is None
-            or not getattr(ex_iterable, "is_typed", False)
+        if not _is_datasets_360_filter_construction_defect(
+            dataset=dataset, error=error
         ):
             raise
 
+        ex_iterable = dataset._ex_iterable
         underlying_features = getattr(ex_iterable, "features", None)
         formatted_type = getattr(datasets_iterable, "FormattedExamplesIterable", None)
         filtered_type = getattr(datasets_iterable, "FilteredExamplesIterable", None)
@@ -1611,6 +1638,48 @@ def _filter_streaming_dataset(
                 "Cannot apply repeated streaming filters safely: datasets private "
                 "iterable APIs are incompatible"
             ) from compatibility_error
+
+
+def _is_datasets_360_filter_construction_defect(
+    dataset: IterableDataset, error: TypeError
+) -> bool:
+    """Return whether an error is datasets 3.6.0's repeated-filter defect."""
+    if datasets.__version__ != "3.6.0" or error.args != (
+        "'NoneType' object is not a mapping",
+    ):
+        return False
+
+    ex_iterable = getattr(dataset, "_ex_iterable", None)
+    if (
+        dataset.features is None
+        or ex_iterable is None
+        or not getattr(ex_iterable, "is_typed", False)
+        or getattr(ex_iterable, "features", None) is None
+    ):
+        return False
+
+    formatted_type = getattr(datasets_iterable, "FormattedExamplesIterable", None)
+    filtered_type = getattr(datasets_iterable, "FilteredExamplesIterable", None)
+    if not isinstance(formatted_type, type) or not isinstance(filtered_type, type):
+        return False
+
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (
+            frame.f_globals.get("__name__") == datasets_iterable.__name__
+            and frame.f_code.co_name == "__init__"
+            and isinstance(frame.f_locals.get("self"), filtered_type)
+        ):
+            formatted = frame.f_locals.get("ex_iterable")
+            if (
+                isinstance(formatted, formatted_type)
+                and getattr(formatted, "is_typed", False)
+                and getattr(formatted, "features", None) is None
+            ):
+                return True
+        traceback = traceback.tb_next
+    return False
 
 
 def filter_dataset(
