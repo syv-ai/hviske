@@ -16,7 +16,7 @@ training corpus compared with previous Hviske releases.
 
 Use one architecture and one fixed data mixture. Do not spend the first training window
 on an architecture bake-off or manual mixture tuning. Hviske v6.0 should establish the
-released full-model baseline for the subsequent architecture and Olmix data-mixture
+released full-model baseline for the subsequent architecture and data-mixture
 experiments.
 
 The critical path is:
@@ -63,7 +63,7 @@ decoding settings, and model card draft are frozen.
 If the model materially improves the earlier Hviske v5 releases but misses the current
 leader, it may still be released honestly as v6.0. Do not claim state of the art. Record
 the miss and use the frozen result as the full-model baseline for later architecture and
-Olmix experiments rather than tuning against the leaderboard test sets.
+data-mixture experiments rather than tuning against the leaderboard test sets.
 
 ## Architecture decision
 
@@ -79,8 +79,8 @@ Use the 2.06B-parameter Conformer encoder-decoder model
   Its card reports strong multilingual accuracy and efficient inference.
 - The checkpoint is Apache-2.0, supported natively in Transformers and vLLM, and already
   pinned and implemented in Hviske.
-- `config/sparkie_bilingual.yaml`, the Sparkie runbook, model loading, training, and the
-  existing Olmix tooling already target this exact checkpoint.
+- `config/sparkie_bilingual.yaml`, the Sparkie runbook, model loading, and training
+  already target this exact checkpoint.
 - Reusing that path avoids delaying the release for a second training stack and makes
   the released v6.0 checkpoint the natural full-model baseline for the experiments that
   follow.
@@ -96,8 +96,9 @@ full experiment path are ready for it, not because Danish quality is assumed.
 809M-parameter MIT-licensed model at 11.45% mean WER and can be trained cheaply.
 
 It is not the primary choice because changing to Whisper would fork the current Sparkie
-path, while v6.0 is meant to establish a Cohere full-model baseline before architecture
-and Olmix experiments. Whisper also needs explicit short-form hallucination checks: the
+path, while v6.0 is meant to establish a Cohere full-model baseline before later
+architecture and data-mixture experiments. Whisper also needs explicit short-form
+hallucination checks: the
 leaderboard documents repetition and subtitle-credit failures on very short clips for
 members of this model family.
 
@@ -117,8 +118,8 @@ pseudo-labelled stream. Its card currently names datasets but not exact splits,
 revisions, or pseudo-label provenance. Without complete evidence, it may be used only
 for an internal engineering run, not as the basis of a leakage-free leaderboard claim.
 
-Do not start both full-size architectures in parallel. That spends the time and compute
-that Olmix is intended to allocate more systematically.
+Do not start both full-size architectures in parallel. Reserve the time and compute
+for systematic mixture experiments instead.
 
 ### Why not Parakeet for the primary run
 
@@ -642,7 +643,7 @@ The following are explicitly not part of this first release:
 - training on leaderboard test splits;
 - repeated leaderboard submissions used as a tuning loop;
 - long-form or diarisation feature development; and
-- the Olmix swarm itself.
+- the follow-on mixture-optimisation programme.
 
 After release, freeze the exact v6.0 checkpoint, fixed mixture, realised exposures,
 development outputs, and official benchmark outputs as the full-model baseline for the
@@ -653,7 +654,7 @@ post-v6.0 experiments.
 Keep the post-v6.0 programme separate from this initial release:
 
 1. compare alternative ASR architectures, including full-size and compact candidates;
-2. run Olmix data-mixture experiments for the viable architecture candidates;
+2. run data-mixture experiments for the viable architecture candidates;
 3. confirm that mixture conclusions transfer to the selected full-size and compact
    models; and
 4. train and release the selected models with complete evaluation and provenance.
@@ -673,5 +674,4 @@ version.
 - [Parakeet TDT 0.6B v3](https://hf.co/nvidia/parakeet-tdt-0.6b-v3)
 - [v5-tiny manifest](https://hf.co/datasets/syvai/danish-asr-unified-hviske-v5-tiny)
 - [`docs/p1-segmentation-plan.md`](p1-segmentation-plan.md)
-- [`docs/olmix-benchmark-plan.md`](olmix-benchmark-plan.md)
 - [`SPARKIE.md`](../SPARKIE.md)
