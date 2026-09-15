@@ -32,6 +32,16 @@ def test_sparkie_full_commands_match_training_plan_evaluation_cadence() -> None:
     )
 
 
+def test_sparkie_runbook_preserves_safe_stream_worker_counts() -> None:
+    """The runbook explains why Hub-stream preprocessing remains serial."""
+    runbook = RUNBOOK.read_text()
+
+    assert "dataset_num_workers=1" in runbook
+    assert "dataloader_num_workers=4" in runbook
+    assert "CLOSE-WAIT" in runbook
+    assert "Do not raise `dataset_num_workers` for Hub streams" in runbook
+
+
 def test_sparkie_tmux_launches_scrub_inherited_wandb_identity() -> None:
     """Every tmux training process starts with a clean W&B identity."""
     runbook = RUNBOOK.read_text()

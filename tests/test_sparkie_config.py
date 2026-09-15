@@ -467,6 +467,16 @@ def test_sparkie_wandb_payload_redacts_local_paths(
     assert youtube["manifest_path"] == "[REDACTED]"
 
 
+def test_sparkie_worker_counts_keep_hub_preprocessing_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hub preprocessing is serial while training audio loading stays parallel."""
+    config = _preset(monkeypatch)
+
+    assert config.dataset_num_workers == 1
+    assert config.dataloader_num_workers == 4
+
+
 def test_youtube_local_manifest_is_danish() -> None:
     """The Sparkie YouTube manifest uses Danish VTT transcripts."""
     contents = Path("config/datasets/youtube_local.yaml").read_text()

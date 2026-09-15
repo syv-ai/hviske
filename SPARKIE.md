@@ -106,8 +106,21 @@ uv run pytest tests/test_sparkie_config.py tests/test_wandb_setup.py \
   tests/test_preflight_finetuning_data.py -q
 ```
 
+The preset deliberately uses `dataset_num_workers=1` and
+`dataloader_num_workers=4`. Validation filtering and materialisation happen while Hub
+and `httpx` connections may already be open; forking preprocessing workers can inherit
+one of those sockets and deadlock in `CLOSE-WAIT`. Keep preprocessing serial for this
+streaming campaign. The training-time audio loader remains parallel at four workers.
+Do not raise `dataset_num_workers` for Hub streams unless the worker start method and
+all inherited clients have been proved fork/spawn-safe. Every smoke, pilot, full-run,
+and interruption-recovery command below inherits these values from
+`config/sparkie_bilingual.yaml`; do not add a preprocessing-worker override.
+
 Do not proceed if any preflight check fails. Fix access, schema, revision, or local-file
-errors and rerun the complete preflight.
+errors and rerun the complete preflight. If a run hangs during validation materialisation,
+stop that tmux session, leave `dataset_num_workers` at 1, and restart the same command
+(or the resume command below after a checkpoint exists); do not retry by increasing
+preprocessing workers.
 
 ## GPU smoke, pilot, and full run
 
