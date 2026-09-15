@@ -67,13 +67,27 @@ def _preflight_hub_source(
         trust_remote_code=source_config.get("trust_remote_code", False),
     )
     audio_column = str(source_config.audio_column)
-    if (
+    overlay_config = source_config.get("overlay")
+    has_overlay = overlay_config is not None
+    has_transcript_join = source_config.get("transcript_dataset_id") is not None
+    if has_overlay and not has_transcript_join:
+        dataset, overlay_base_columns = _project_overlay_base_dataset(
+            dataset=dataset,
+            audio_column=audio_column,
+            source_config=source_config,
+            overlay_config=t.cast(c.Mapping[str, object], overlay_config),
+            source_name=source_name,
+        )
+    elif (
         isinstance(dataset, Dataset | IterableDataset)
         and audio_column in (dataset.column_names or [])
         and dataset.features is not None
         and isinstance(dataset.features[audio_column], Audio)
     ):
         dataset = dataset.cast_column(column=audio_column, feature=Audio(decode=False))
+        overlay_base_columns = set()
+    else:
+        overlay_base_columns = set()
 
     source_filters = source_config.get("filters")
     if source_filters is not None:
@@ -84,8 +98,6 @@ def _preflight_hub_source(
         dataset = _filter_dataset_rows(
             dataset=dataset, filters=t.cast(dict[str, object], source_filters)
         )
-    overlay_config = source_config.get("overlay")
-    has_overlay = overlay_config is not None
     if has_overlay:
         overlay_revision = validate_overlay_revision(
             str(overlay_config.get("revision") or "")
@@ -106,7 +118,6 @@ def _preflight_hub_source(
             overlay_dataset=overlay,
             overlay_config=t.cast(c.Mapping[str, object], overlay_config),
         )
-    has_transcript_join = source_config.get("transcript_dataset_id") is not None
     if has_transcript_join:
         transcript_revision = validate_transcript_revision(
             str(source_config.transcript_revision)
@@ -139,7 +150,7 @@ def _preflight_hub_source(
         row = _consume_overlay(dataset=dataset, source_name=source_name)
         _require_columns(
             row=row,
-            required_columns=[str(source_config.audio_column), "text"],
+            required_columns=["text", *sorted(overlay_base_columns)],
             source_name=f"overlaid {source_name}",
         )
     else:
@@ -195,6 +206,126 @@ def _first_row(dataset: object, source_name: str) -> dict[str, object]:
     if not isinstance(raw_row, dict):
         raise ValueError(f"The first row from {source_name} is not a mapping")
     return t.cast(dict[str, object], raw_row)
+
+
+def _project_overlay_base_dataset(
+    dataset: object,
+    audio_column: str,
+    source_config: c.Mapping[str, object],
+    overlay_config: c.Mapping[str, object],
+    source_name: str,
+) -> tuple[Dataset | IterableDataset, set[str]]:
+    """Validate and remove lazy audio before running an overlay preflight.
+
+    Returns:
+        The metadata-only base dataset and the base columns required by the overlay.
+
+    Raises:
+        ValueError:
+            If the source is not a supported dataset or lacks its audio column.
+    """
+    if not isinstance(dataset, Dataset | IterableDataset):
+        raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
+    column_names = list(dataset.column_names or [])
+    if audio_column not in column_names:
+        raise ValueError(f"Missing audio column from {source_name}: {audio_column!r}")
+
+    if (
+        dataset.features is not None
+        and audio_column in dataset.features
+        and isinstance(dataset.features[audio_column], Audio)
+    ):
+        dataset = dataset.cast_column(column=audio_column, feature=Audio(decode=False))
+
+    required_columns = _overlay_base_columns(
+        source_config=source_config, overlay_config=overlay_config
+    )
+    columns = [
+        column
+        for column in column_names
+        if column != audio_column or audio_column in required_columns
+    ]
+    return dataset.select_columns(columns), required_columns
+
+
+def _overlay_base_columns(
+    source_config: c.Mapping[str, object], overlay_config: c.Mapping[str, object]
+) -> set[str]:
+    """Return source columns needed while applying an overlay."""
+    columns: set[str] = set()
+    text_column = source_config.get("text_column")
+    if text_column is not None:
+        columns.add(str(text_column))
+    columns.update(_mapping_keys(source_config.get("filters")))
+    columns.update(_mapping_keys(overlay_config.get("base_filters")))
+
+    equality_checks = overlay_config.get(
+        "equality_checks", overlay_config.get("checks", {})
+    )
+    if isinstance(equality_checks, c.Mapping):
+        columns.update(str(column) for column in equality_checks)
+    elif not isinstance(equality_checks, str) and isinstance(
+        equality_checks, c.Iterable
+    ):
+        for check in equality_checks:
+            if isinstance(check, c.Mapping):
+                base_column = check.get("base_column", check.get("base"))
+                if base_column is not None:
+                    columns.add(str(base_column))
+
+    strategy = str(
+        overlay_config.get(
+            "strategy",
+            overlay_config.get(
+                "join_strategy",
+                _mapping_value(overlay_config, "join", "strategy", "keyed"),
+            ),
+        )
+    ).lower()
+    if strategy == "keyed":
+        join_config = overlay_config.get("join")
+        nested_join = join_config if isinstance(join_config, c.Mapping) else {}
+        base_join_column = _first_configured_value(
+            overlay_config, ("base_join_column", "base_column")
+        )
+        if base_join_column is None:
+            base_join_column = nested_join.get("base_column")
+        if base_join_column is None:
+            base_join_column = overlay_config.get("join_column")
+        if base_join_column is not None:
+            columns.add(str(base_join_column))
+    return columns
+
+
+def _first_configured_value(
+    mapping: c.Mapping[str, object], keys: tuple[str, ...]
+) -> object:
+    """Return the value for the first explicitly configured key."""
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _mapping_keys(value: object) -> set[str]:
+    """Return string keys from a configured mapping."""
+    if not isinstance(value, c.Mapping):
+        return set()
+    return {str(key) for key in value}
+
+
+def _mapping_value(
+    mapping: c.Mapping[str, object], outer_key: str, nested_key: str, default: object
+) -> object:
+    """Read a nested mapping value without assuming valid overlay configuration.
+
+    Returns:
+        The nested value, or ``default`` when the nested configuration is absent.
+    """
+    nested = mapping.get(outer_key)
+    if isinstance(nested, c.Mapping):
+        return nested.get(nested_key, default)
+    return default
 
 
 def _require_columns(
