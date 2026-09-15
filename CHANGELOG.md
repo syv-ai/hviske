@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added reproducible PyTorch 2.10 CUDA resolution for Sparkie, with a fail-fast check
+  that prevents the production preset from starting without a usable CUDA device.
 - Added robust online W&B tracking for the production Sparkie v6.0 workflow, including
   credential-safe preflight, resumable run IDs, and local-only model checkpoints.
 - Added reusable keyed and strict positional ASR dataset overlays with bounded SQLite

@@ -47,6 +47,7 @@ padding: longest
 dataset_probabilities: null
 
 # Model parameters
+require_cuda: false
 model_id: ${model.name}-${now:%Y-%m-%d}
 models_dir: models
 model_dir: ${models_dir}/${model_id}

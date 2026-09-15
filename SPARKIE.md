@@ -18,8 +18,20 @@ uv run wandb login --verify
 
 W&B uses the authenticated user's default/personal workspace; do not set an entity
 unless an explicit workspace override is required. The production project is `hviske`.
-`uv run wandb login --verify` must pass while the GPU service is still running. Never put
-a W&B API key in this runbook, shell history, Hydra configuration, or a command.
+`uv run wandb login --verify` must pass while the GPU service is still running. Never
+put a W&B API key in this runbook, shell history, Hydra configuration, or a command.
+
+The Sparkie preset requires a working CUDA device. The lockfile resolves matching
+PyTorch and torchaudio 2.10 releases; Linux aarch64 installs the CUDA 13.0 wheels from
+the explicit PyTorch index, while other platforms use the normal PyPI wheels. The
+training entrypoint checks `torch.cuda.is_available()` before W&B, model, or dataset
+initialisation and reports the installed torch version and CUDA build when it fails.
+Check the driver before starting a run:
+
+```bash
+nvidia-smi
+uv run python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+```
 
 The Hugging Face account must have accepted access to
 `CohereLabs/cohere-transcribe-03-2026`, read access to the manually gated

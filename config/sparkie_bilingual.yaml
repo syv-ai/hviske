@@ -111,6 +111,7 @@ training_dataset_ids:
   - facebook/voxpopuli
   - openslr/librispeech_asr
 
+require_cuda: true
 model_id: hviske-v6.0
 models_dir: models
 model_dir: ${models_dir}/${model_id}
