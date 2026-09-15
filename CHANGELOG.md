@@ -29,7 +29,8 @@
 
 - Recognised refreshed Danish overlay `review` actions while continuing to exclude
   them from training alongside the other disallowed actions.
-- Suppressed HTTP client INFO logs so temporary signed dataset URLs are not written to
+- Removed package-import logging configuration so Hydra's policy controls both main
+  and spawned DataLoader worker logs, keeping temporary signed dataset URLs out of
   training logs.
 - Made local VTT and standardised streaming training graphs pickleable for PyTorch
   `spawn` workers without changing lazy audio loading or restartability.
