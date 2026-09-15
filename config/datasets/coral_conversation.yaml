@@ -25,7 +25,7 @@ coral_conversation:
       text: reference_text
     action_column: action
     allowed_actions: [keep, relabel, strip]
-    recognised_actions: [keep, relabel, strip, drop, flag, quarantine]
+    recognised_actions: [keep, relabel, strip, drop, flag, quarantine, review]
     text_policy:
       candidates:
         - column: new_text

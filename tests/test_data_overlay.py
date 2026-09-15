@@ -205,6 +205,37 @@ def test_overlay_consumers_are_pickleable_and_isolated() -> None:
         assert pool.apply(_consume_pickled_overlay, (payload,)) == ["one", "deux"]
 
 
+def test_overlay_filters_recognised_but_disallowed_review_action() -> None:
+    """Recognised review rows are filtered without weakening positional joins."""
+    base = Dataset.from_list(
+        [{"source": "demo", "text": "one"}, {"source": "demo", "text": "two"}]
+    )
+    overlay = Dataset.from_list(
+        [
+            {
+                "source": "demo",
+                "reference_text": "one",
+                "new_text": None,
+                "action": "keep",
+            },
+            {
+                "source": "demo",
+                "reference_text": "two",
+                "new_text": "",
+                "action": "review",
+            },
+        ]
+    )
+
+    overlaid = apply_dataset_overlay(
+        base,
+        overlay,
+        _config(recognised_actions=["keep", "relabel", "strip", "review"]),
+    )
+
+    assert list(overlaid) == [{"source": "demo", "text": "one"}]
+
+
 def test_overlay_projects_columns_before_filtering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -293,7 +324,21 @@ def test_overlay_rejects_null_and_unknown_actions() -> None:
             ]
         )
         with pytest.raises(ValueError, match="expected one of"):
-            apply_dataset_overlay(base, overlay, _config())
+            apply_dataset_overlay(
+                base,
+                overlay,
+                _config(
+                    recognised_actions=[
+                        "keep",
+                        "relabel",
+                        "strip",
+                        "drop",
+                        "flag",
+                        "quarantine",
+                        "review",
+                    ]
+                ),
+            )
 
 
 def test_overlay_rejects_retained_rows_without_text_among_usable_rows() -> None:

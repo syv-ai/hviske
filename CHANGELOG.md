@@ -27,6 +27,8 @@
 
 ### Fixed
 
+- Recognised refreshed Danish overlay `review` actions while continuing to exclude
+  them from training alongside the other disallowed actions.
 - Suppressed HTTP client INFO logs so temporary signed dataset URLs are not written to
   training logs.
 - Made local VTT and standardised streaming training graphs pickleable for PyTorch
