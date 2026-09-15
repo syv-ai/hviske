@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 
+import torch.multiprocessing as torch_mp
 from omegaconf import DictConfig
 from transformers.trainer_callback import (
     EarlyStoppingCallback,
@@ -38,6 +39,7 @@ def finetune(config: DictConfig) -> None:
         config:
             The Hydra configuration object.
     """
+    _configure_dataloader_multiprocessing(config=config)
     validate_private_only_config(config=config)
 
     # Note if we're on the main process, if we are running in a distributed setting
@@ -241,6 +243,34 @@ class StopAfterStepCallback(TrainerCallback):
         if state.global_step >= self.stop_after_steps:
             control.should_training_stop = True
         return control
+
+
+def _configure_dataloader_multiprocessing(config: DictConfig) -> None:
+    """Configure worker creation before loading tracking or datasets.
+
+    Args:
+        config:
+            The Hydra configuration object.
+
+    Raises:
+        RuntimeError:
+            If another multiprocessing start method has already been selected.
+    """
+    dataloader_num_workers = int(config.get("dataloader_num_workers") or 0)
+    if dataloader_num_workers <= 0:
+        return
+
+    start_method = torch_mp.get_start_method(allow_none=True)
+    if start_method == "spawn":
+        return
+    if start_method is not None:
+        raise RuntimeError(
+            "PyTorch multiprocessing start method is already set to "
+            f"{start_method!r}; finetuning with dataloader_num_workers > 0 requires "
+            "'spawn'. Set the start method to 'spawn' before starting finetuning."
+        )
+
+    torch_mp.set_start_method("spawn")
 
 
 def _finalize_tracking_after_failure(setup: ExTrackingSetup) -> None:

@@ -3,9 +3,13 @@
 import concurrent.futures
 import multiprocessing
 import pickle
+import sys
+import typing as t
 
 import pytest
 from datasets import Dataset, IterableDataset
+from torch.utils.data import DataLoader
+from torch.utils.data import IterableDataset as TorchIterableDataset
 
 import hviske.data as data_module
 from hviske.data import apply_dataset_overlay
@@ -111,6 +115,53 @@ def test_keyed_overlay_rejects_missing_and_mismatched_keys() -> None:
     )
     with pytest.raises(ValueError, match="key type mismatch"):
         list(apply_dataset_overlay(base, mismatched_types, config))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux worker runtime regression")
+def test_overlaid_iterable_feeds_spawn_dataloader() -> None:
+    """A joined and filtered overlay remains consumable by a spawned worker."""
+    base = Dataset.from_list(
+        [
+            {"id": 1, "source": "demo", "text": "one"},
+            {"id": 2, "source": "demo", "text": "two"},
+            {"id": 3, "source": "other", "text": "ignored"},
+        ]
+    )
+    overlay = Dataset.from_list(
+        [
+            {
+                "id": 1,
+                "source": "demo",
+                "reference_text": "one",
+                "new_text": None,
+                "action": "keep",
+            },
+            {
+                "id": 2,
+                "source": "demo",
+                "reference_text": "two",
+                "new_text": "deux",
+                "action": "relabel",
+            },
+        ]
+    )
+    overlaid = apply_dataset_overlay(
+        base_dataset=base,
+        overlay_dataset=overlay,
+        overlay_config=_config(
+            strategy="keyed", base_join_column="id", overlay_join_column="id"
+        ),
+    )
+
+    torch_dataset = t.cast(TorchIterableDataset[dict[str, object]], overlaid)
+    loader = DataLoader(
+        torch_dataset, batch_size=1, num_workers=1, multiprocessing_context="spawn"
+    )
+
+    assert [t.cast(dict[str, list[str]], batch)["text"][0] for batch in loader] == [
+        "one",
+        "deux",
+    ]
 
 
 def test_overlay_consumers_are_pickleable_and_isolated() -> None:
