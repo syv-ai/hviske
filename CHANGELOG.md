@@ -22,6 +22,8 @@
 
 ### Fixed
 
+- Corrected the production NST source discriminator to `nst_da` across the base and
+  overlay filters, restoring accepted NST rows.
 - Restricted shared positional-overlay preflight to string source discriminators with
   unambiguous equality checks and non-colliding output columns.
 - Projected overlay metadata before applying row filters, avoiding large unused model
