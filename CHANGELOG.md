@@ -20,6 +20,11 @@
   required immutable `P1_SEGMENTS_REVISION`; generic transcript joins remain supported.
 - Removed unsupported Parakeet TDT fine-tuning and the NeMo-only Danish RNNT preset.
 
+### Removed
+
+- Removed the inactive calibration launcher, anchor configurations, model preset, tests,
+  and runbook instructions; retained the design plan for future reference.
+
 ### Fixed
 
 - Made local VTT and standardised streaming training graphs pickleable for PyTorch

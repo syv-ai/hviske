@@ -10,10 +10,10 @@ The pipeline must never materialise the complete source or derived corpus on loc
 disk or Sparkie. It processes bounded batches, uploads completed Parquet shards,
 verifies the remote bytes, and deletes the local copies.
 
-This dataset is a hard prerequisite for the Olmix benchmark. The current runtime join
-between `syvai/p1` and `syvai/p1-transcripts` is not a training solution because each
-usable transcript covers a complete radio programme while Hviske rejects audio at or
-above 10 seconds.
+This dataset is a hard prerequisite for the post-v6.0 data-mixture experiments. The
+current runtime join between `syvai/p1` and `syvai/p1-transcripts` is not a training
+solution because each usable transcript covers a complete radio programme while Hviske
+rejects audio at or above 10 seconds.
 
 The active v8 quality policy is deliberately relaxed: source timestamps and structural
 integrity are the acceptance criteria. Best-effort lexical ownership is retained and
@@ -520,8 +520,7 @@ processes at least one genuine post-filter segment. It must decode the audio, ve
 text, duration, language, and required metadata, and prove that
 `load_data_for_finetuning` yields a training example.
 
-Update `SPARKIE.md`, tests, and the Olmix launcher documentation with the pinned derived
-revision.
+Update `SPARKIE.md` and tests with the pinned derived revision.
 
 **Gate:** focused tests, Ruff, Ty, and the two-step model-free structural smoke pass
 using the private segmented P1 dataset. Model-backed training smokes are separate from

@@ -255,27 +255,6 @@ The preset retains at most three checkpoints. Stop the run if free disk space, G
 memory, temperatures, or repeated streaming failures become unsafe. Preserve enough
 free space for the next checkpoint and final model save.
 
-## Olmix anchor calibration matrix
-
-**Blocked: do not run the current Olmix launcher or anchor configurations.**
-
-The existing read-heavy and spontaneous-heavy anchors classify P1, FTSpeech, and
-VoxPopuli incorrectly. Their tests validate that stale taxonomy rather than the
-corrected one. They are retained only as implementation history and must not be used
-for GPU runs.
-
-After the v6.0 source probabilities are frozen:
-
-1. regenerate all calibration anchors with P1 under broadcast/conversation and
-   FTSpeech and VoxPopuli under parliament;
-2. decide how the mixed People's Speech corpus maps into the optimisation domains;
-3. update the source map, launcher, and tests;
-4. review the resolved probabilities and 60/40 language totals; and
-5. restore reviewed smoke and matrix commands to this runbook.
-
-Follow [`docs/olmix-benchmark-plan.md`](docs/olmix-benchmark-plan.md) for the experiment
-design. No Olmix command is approved until this blocked section is replaced.
-
 ## Explicit private publication
 
 Publish only after reviewing the selected pilot or full-run checkpoint. The separate
