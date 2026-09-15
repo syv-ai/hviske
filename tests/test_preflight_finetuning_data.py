@@ -70,7 +70,7 @@ def test_local_preflight_rejects_zero_byte_wav(tmp_path: Path) -> None:
 def test_overlay_preflight_disables_audio_decoding_before_overlay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Overlay preflight casts audio to metadata-only features before joining."""
+    """Overlay preflight removes audio before filtering and joining."""
     config = OmegaConf.create(
         {
             "model": {
@@ -85,19 +85,41 @@ def test_overlay_preflight_disables_audio_decoding_before_overlay(
                     "train_name": "train",
                     "text_column": "text",
                     "audio_column": "audio",
+                    "filters": {"source": "demo"},
                     "revision": "audio-sha",
                     "trust_remote_code": False,
-                    "overlay": {"id": "org/overlay", "revision": "1" * 40},
+                    "overlay": {
+                        "id": "org/overlay",
+                        "revision": "1" * 40,
+                        "strategy": "keyed",
+                        "base_filters": {"metadata": "keep"},
+                        "equality_checks": {"text": "reference_text"},
+                        "base_join_column": "recording_id",
+                    },
                 }
             },
             "evaluation_datasets": [],
         }
     )
     dataset = Dataset.from_dict(
-        {"audio": [{"bytes": b"metadata-only", "path": None}], "text": ["hello"]},
-        features=Features({"audio": Audio(), "text": Value("string")}),
+        {
+            "audio": [{"bytes": b"metadata-only", "path": None}],
+            "text": ["hello"],
+            "source": ["demo"],
+            "metadata": ["keep"],
+            "recording_id": ["recording-1"],
+        },
+        features=Features(
+            {
+                "audio": Audio(),
+                "text": Value("string"),
+                "source": Value("string"),
+                "metadata": Value("string"),
+                "recording_id": Value("string"),
+            }
+        ),
     )
-    observed: list[bool] = []
+    observed: list[tuple[bool, set[str]]] = []
 
     def fake_loader(**kwargs: object) -> Dataset:
         if kwargs["path"] == "org/audio":
@@ -107,7 +129,7 @@ def test_overlay_preflight_disables_audio_decoding_before_overlay(
     def fake_overlay(**kwargs: object) -> Dataset:
         overlaid = kwargs["base_dataset"]
         assert isinstance(overlaid, Dataset)
-        observed.append(bool(overlaid.features["audio"].decode))
+        observed.append(("audio" in overlaid.column_names, set(overlaid.column_names)))
         return overlaid
 
     monkeypatch.setattr(preflight_module, "apply_dataset_overlay", fake_overlay)
@@ -115,7 +137,7 @@ def test_overlay_preflight_disables_audio_decoding_before_overlay(
         config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
     )
 
-    assert observed == [False]
+    assert observed == [(False, {"text", "source", "metadata", "recording_id"})]
 
 
 class FakeHubApi:
@@ -137,6 +159,43 @@ class FakeHubApi:
     def whoami(self) -> dict[str, object]:
         """Return a test identity."""
         return {"name": "tester"}
+
+
+def test_overlay_preflight_rejects_missing_source_audio_column() -> None:
+    """Overlay sources must validate audio schema before loading overlay rows."""
+    config = OmegaConf.create(
+        {
+            "model": {
+                "pretrained_model_id": "org/model",
+                "revision": "b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
+            },
+            "datasets": {
+                "overlaid": {
+                    "id": "org/audio",
+                    "subset": None,
+                    "train_name": "train",
+                    "text_column": "text",
+                    "audio_column": "audio",
+                    "revision": "audio-sha",
+                    "overlay": {"id": "org/overlay", "revision": "1" * 40},
+                }
+            },
+            "evaluation_datasets": [],
+        }
+    )
+    overlay_loaded = False
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        nonlocal overlay_loaded
+        if kwargs["path"] == "org/overlay":
+            overlay_loaded = True
+        return Dataset.from_list([{"text": "hello"}])
+
+    with pytest.raises(ValueError, match="Missing audio column"):
+        preflight_finetuning_data(
+            config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
+        )
+    assert not overlay_loaded
 
 
 def test_preflight_bounds_non_overlay_source_consumption(tmp_path: Path) -> None:

@@ -23,7 +23,8 @@
 ### Fixed
 
 - Projected overlay metadata before applying row filters, avoiding large unused model
-  columns during Sparkie v6 preflight.
+  columns and audio requests during Sparkie v6 preflight while validating the original
+  audio schema.
 - Resolved features for untyped streaming datasets before filtering and overlaying,
   and made repeated streaming filters safe without materialising or decoding audio.
 - Made W&B preflight non-interactive, scrubbed inherited Sparkie W&B identity, and
