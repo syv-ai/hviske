@@ -40,6 +40,7 @@ from datasets import (
     load_dataset,
 )
 from datasets import iterable_dataset as datasets_iterable
+from huggingface_hub import HfApi
 from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
@@ -58,6 +59,18 @@ from .utils import (
 )
 
 logger = logging.getLogger(__package__)
+
+_MAX_HUB_SHARD_CANDIDATES = 100_000
+
+
+class _HubFileLister(t.Protocol):
+    """Hub operation needed for bounded data-file resolution."""
+
+    def list_repo_files(
+        self, repo_id: str, *, repo_type: str, revision: str
+    ) -> list[str]:
+        """Return repository-relative filenames at one revision."""
+        ...
 
 
 def _dataset_cache_identity(
@@ -136,6 +149,7 @@ def _load_transcript_dataset(
     cache_dir: str | None,
     trust_remote_code: bool = False,
     dataset_loader: Callable[..., object] = load_dataset,
+    data_files: list[str] | None = None,
 ) -> Dataset:
     """Load the compact transcript side without streaming.
 
@@ -157,6 +171,8 @@ def _load_transcript_dataset(
     }
     if revision is not None:
         kwargs["revision"] = revision
+    if data_files is not None:
+        kwargs["data_files"] = data_files
     with no_datasets_progress_bars():
         dataset = dataset_loader(**kwargs)
     if isinstance(dataset, Dataset):
@@ -168,6 +184,112 @@ def _load_transcript_dataset(
     if not all(isinstance(row, dict) for row in rows):
         raise ValueError("The transcript dataset rows must be mappings")
     return Dataset.from_list(t.cast(list[dict[str, object]], rows))
+
+
+def _resolve_hub_data_files(
+    dataset_id: str,
+    revision: str | None,
+    selection: Mapping[str, object] | None,
+    *,
+    hub_api: object | None = None,
+) -> list[str] | None:
+    """Resolve an inclusive, numeric Hub shard selection at a pinned revision.
+
+    The result contains repository-relative filenames only. Missing shard numbers are
+    allowed because some exports omit empty shards, but at least one configured file
+    must exist.
+
+    Args:
+        dataset_id:
+            Hub dataset repository identifier.
+        revision:
+            Immutable dataset commit SHA.
+        selection:
+            Optional mapping with ``template``, ``start``, and inclusive ``end``.
+        hub_api (optional):
+            Hugging Face API-compatible client. Defaults to an authenticated client.
+
+    Returns:
+        Ordered existing filenames, or ``None`` when no selection is configured.
+
+    Raises:
+        ValueError:
+            If the configuration is invalid or selects no existing pinned files.
+    """
+    if selection is None:
+        return None
+    if not isinstance(selection, Mapping):
+        raise ValueError("Hub data_file_shards must be a mapping")
+    if set(selection) != {"template", "start", "end"}:
+        raise ValueError(
+            "Hub data_file_shards requires exactly template, start, and end"
+        )
+    template = selection["template"]
+    start = selection["start"]
+    end = selection["end"]
+    if not isinstance(template, str) or not template:
+        raise ValueError("Hub data-file shard template must be a non-empty string")
+    fields = re.findall(r"\{([^{}]+)\}", template)
+    if (
+        template.startswith(("/", "http://", "https://"))
+        or "?" in template
+        or "#" in template
+        or len(fields) != 1
+        or re.fullmatch(r"shard(?::0?\d*d)?", fields[0]) is None
+        or "{" in re.sub(r"\{[^{}]+\}", "", template)
+        or "}" in re.sub(r"\{[^{}]+\}", "", template)
+    ):
+        raise ValueError(
+            "Hub data-file shard template must be a relative path with one "
+            "{shard} field"
+        )
+    if (
+        not isinstance(start, int)
+        or isinstance(start, bool)
+        or not isinstance(end, int)
+        or isinstance(end, bool)
+        or start < 0
+        or end < start
+        or end - start + 1 > _MAX_HUB_SHARD_CANDIDATES
+    ):
+        raise ValueError(
+            "Hub data-file shard bounds must be non-negative integers with start <= "
+            f"end and at most {_MAX_HUB_SHARD_CANDIDATES:,} candidates"
+        )
+    validate_immutable_source_revision(
+        str(revision or ""), revision_label=f"{dataset_id} data-file revision"
+    )
+    try:
+        candidates = [template.format(shard=shard) for shard in range(start, end + 1)]
+    except (IndexError, KeyError, ValueError) as error:
+        raise ValueError("Invalid Hub data-file shard template") from error
+    if len(set(candidates)) != len(candidates) or any(
+        candidate.startswith(("/", "http://", "https://"))
+        or "?" in candidate
+        or "#" in candidate
+        or "{" in candidate
+        or "}" in candidate
+        for candidate in candidates
+    ):
+        raise ValueError(
+            "Hub data-file shard template must produce unique relative filenames"
+        )
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    api = t.cast(_HubFileLister, hub_api) if hub_api is not None else HfApi(token=token)
+    try:
+        repo_files = api.list_repo_files(
+            repo_id=dataset_id, repo_type="dataset", revision=str(revision)
+        )
+    except AttributeError as error:
+        raise ValueError("Hub API client cannot list repository files") from error
+    existing = set(repo_files)
+    resolved = [candidate for candidate in candidates if candidate in existing]
+    if not resolved:
+        raise ValueError(
+            f"Hub data-file shard selection for {dataset_id} resolved no existing files"
+        )
+    return resolved
 
 
 def _set_source_language(
@@ -308,6 +430,29 @@ def _validate_dataset_probabilities(
     if not math.isclose(total, 1.0, rel_tol=0, abs_tol=1e-8):
         raise ValueError(f"Dataset probabilities must sum to 1, but sum to {total}")
     return validated
+
+
+def _validate_positional_shard_parity(
+    base_files: list[str] | None, overlay_files: list[str] | None
+) -> None:
+    """Require selected positional base and overlay shards to mirror each other.
+
+    Raises:
+        ValueError:
+            If only one side is selected or their basename order differs.
+    """
+    if base_files is None and overlay_files is None:
+        return
+    if base_files is None or overlay_files is None:
+        raise ValueError(
+            "Positional shard selection must be configured for both base and overlay"
+        )
+    base_names = [Path(path).name for path in base_files]
+    overlay_names = [Path(path).name for path in overlay_files]
+    if base_names != overlay_names:
+        raise ValueError(
+            "Positional base and overlay shard basenames/orders do not match"
+        )
 
 
 def apply_dataset_overlay(
@@ -1134,7 +1279,7 @@ def load_data_for_finetuning(
             probabilities=probabilities, dataset_count=len(config.datasets)
         )
 
-    all_datasets: list[IterableDataset] | list[Dataset] = list()
+    all_datasets: list[Dataset | IterableDataset] = []
     for dataset_name, dataset_config in config.datasets.items():
         if is_main_process:
             logger.info(f"Loading dataset {dataset_name!r}")
@@ -1152,6 +1297,35 @@ def load_data_for_finetuning(
             transcript_revision = validate_transcript_revision(
                 str(dataset_config.transcript_revision)
             )
+        overlay_config = dataset_config.get("overlay")
+        overlay_revision = None
+        if overlay_config is not None:
+            overlay_revision = validate_overlay_revision(
+                str(overlay_config.get("revision") or "")
+            )
+        base_data_files: list[str] | None = None
+        overlay_data_files: list[str] | None = None
+        is_hub_dataset = not is_local_vtt and not Path(dataset_config.id).exists()
+        if is_hub_dataset:
+            base_data_files = _resolve_hub_data_files(
+                dataset_id=str(dataset_config.id),
+                revision=dataset_config.get("revision"),
+                selection=t.cast(
+                    Mapping[str, object] | None, dataset_config.get("data_file_shards")
+                ),
+            )
+            if overlay_config is not None:
+                overlay_data_files = _resolve_hub_data_files(
+                    dataset_id=str(overlay_config.id),
+                    revision=overlay_revision,
+                    selection=t.cast(
+                        Mapping[str, object] | None,
+                        overlay_config.get("data_file_shards"),
+                    ),
+                )
+                _validate_positional_shard_parity(
+                    base_files=base_data_files, overlay_files=overlay_data_files
+                )
 
         if is_local_vtt:
             ds = load_vtt_manifest(
@@ -1214,6 +1388,8 @@ def load_data_for_finetuning(
             }
             if dataset_config.get("revision") is not None:
                 kwargs["revision"] = dataset_config.revision
+            if base_data_files is not None:
+                kwargs["data_files"] = base_data_files
             with no_datasets_progress_bars():
                 ds = load_dataset(**kwargs)
 
@@ -1232,11 +1408,7 @@ def load_data_for_finetuning(
                 dataset=ds, filters=t.cast(Mapping[str, object], row_filters)
             )
 
-        overlay_config = dataset_config.get("overlay")
         if overlay_config is not None:
-            overlay_revision = validate_overlay_revision(
-                str(overlay_config.get("revision") or "")
-            )
             overlay = _load_transcript_dataset(
                 dataset_id=str(overlay_config.id),
                 subset=overlay_config.get("subset"),
@@ -1244,6 +1416,7 @@ def load_data_for_finetuning(
                 revision=overlay_revision,
                 cache_dir=config.cache_dir,
                 trust_remote_code=overlay_config.get("trust_remote_code", False),
+                data_files=overlay_data_files,
             )
             ds = apply_dataset_overlay(
                 base_dataset=ds,
@@ -1255,10 +1428,6 @@ def load_data_for_finetuning(
             ds = ds.rename_column(dataset_config.text_column, "text")
         if not is_local_vtt and dataset_config.audio_column != "audio":
             ds = ds.rename_column(dataset_config.audio_column, "audio")
-        if not is_local_vtt:
-            ds = ds.cast_column(
-                column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
-            )
 
         if transcript_dataset_id is not None:
             transcript = _load_transcript_dataset(
@@ -1279,7 +1448,24 @@ def load_data_for_finetuning(
                 transcript_text_column=dataset_config.transcript_text_column,
             )
 
+        shuffle_buffer_size = dataset_config.get(
+            "shuffle_buffer_size", config.get("shuffle_buffer_size", 1000)
+        )
+        if (
+            not isinstance(shuffle_buffer_size, int)
+            or isinstance(shuffle_buffer_size, bool)
+            or shuffle_buffer_size <= 0
+        ):
+            raise ValueError("shuffle_buffer_size must be a positive integer")
+        if isinstance(ds, IterableDataset):
+            ds = ds.shuffle(seed=config.seed, buffer_size=shuffle_buffer_size)
+        else:
+            ds = ds.shuffle(seed=config.seed)
+
         if not is_local_vtt:
+            ds = ds.cast_column(
+                column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
+            )
             if ds.features is None:
                 raise ValueError("Hub datasets must declare features")
             language_features = ds.features.copy()
@@ -1320,9 +1506,9 @@ def load_data_for_finetuning(
 
         ds = _standardise_training_dataset(
             dataset=ds, sampling_rate=config.model.sampling_rate
-        ).shuffle(seed=config.seed)
+        )
 
-        all_datasets.append(ds)  # type: ignore[bad-argument-type]
+        all_datasets.append(ds)
 
     if len(all_datasets) == 0:
         raise ValueError("No datasets were loaded")
@@ -1343,7 +1529,7 @@ def load_data_for_finetuning(
             probabilities = [1 / len(all_datasets)] * len(all_datasets)
 
         train = interleave_datasets(
-            datasets=all_datasets,  # type: ignore[bad-argument-type]
+            datasets=t.cast(list[IterableDataset], all_datasets),
             probabilities=probabilities,
             seed=config.seed,
             split=NamedSplit("train"),

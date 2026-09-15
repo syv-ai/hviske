@@ -37,6 +37,8 @@ dataset_num_workers: 4
 dataloader_num_workers: 4
 streaming: true
 cache_dir: null
+# Streaming examples are shuffled before audio decoding with this bounded buffer.
+shuffle_buffer_size: 1000
 
 # Can be `longest`, `max_length` or `do_not_pad`
 # NOTE: This is automatically set to `max_length` in a multi-gpu setting
