@@ -1,13 +1,20 @@
 """Unit tests for the `utils` module."""
 
+import multiprocessing
+import os
+from collections.abc import Iterator
+from pathlib import Path
 from types import TracebackType
 
 import datasets.utils.logging as ds_logging
 import pytest
 import transformers.utils.logging as hf_logging
+from datasets import Features, IterableDataset, Value
+from datasets import config as datasets_config
 
 from hviske.utils import (
     block_terminal_output,
+    convert_iterable_dataset_to_dataset,
     convert_numeral_to_words,
     transformers_output_ignored,
 )
@@ -39,6 +46,77 @@ class output_blocked:
     ) -> None:
         """Unblock terminal output."""
         ds_logging.set_verbosity_warning()
+
+
+def test_convert_iterable_dataset_preserves_explicit_cache_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit cache directory takes precedence over the library default."""
+    canonical_cache = tmp_path / "canonical"
+    explicit_cache = tmp_path / "explicit"
+    monkeypatch.setattr(datasets_config, "HF_DATASETS_CACHE", str(canonical_cache))
+    monkeypatch.setattr(multiprocessing, "cpu_count", lambda: 1)
+    dataset_id = "campaign-dataset"
+
+    converted = convert_iterable_dataset_to_dataset(
+        iterable_dataset=_iterable_dataset("explicit"),
+        cache_dir=explicit_cache,
+        dataset_id=dataset_id,
+    )
+
+    assert converted["text"] == ["explicit"]
+    assert (explicit_cache / dataset_id).is_dir()
+    assert not (canonical_cache / dataset_id).exists()
+
+    loaded = convert_iterable_dataset_to_dataset(
+        iterable_dataset=_iterable_dataset("should not be used"),
+        cache_dir=explicit_cache,
+        dataset_id=dataset_id,
+    )
+
+    assert loaded["text"] == ["explicit"]
+
+
+def _iterable_dataset(text: str) -> IterableDataset:
+    """Create a small typed iterable dataset for conversion tests.
+
+    Returns:
+        A one-row iterable dataset containing ``text``.
+    """
+
+    def rows() -> Iterator[dict[str, str]]:
+        yield {"text": text}
+
+    return IterableDataset.from_generator(
+        rows, features=Features(text=Value(dtype="string"))
+    )
+
+
+def test_convert_iterable_dataset_uses_datasets_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing cache directory uses the path resolved by `datasets`."""
+    canonical_cache = tmp_path / "canonical"
+    monkeypatch.setattr(datasets_config, "HF_DATASETS_CACHE", str(canonical_cache))
+    monkeypatch.setattr(multiprocessing, "cpu_count", lambda: 1)
+    monkeypatch.setenv("HF_DATASETS_CACHE", str(tmp_path / "environment"))
+    environment_cache = os.environ["HF_DATASETS_CACHE"]
+    dataset_id = "campaign-dataset"
+
+    converted = convert_iterable_dataset_to_dataset(
+        iterable_dataset=_iterable_dataset("canonical"), dataset_id=dataset_id
+    )
+
+    assert converted["text"] == ["canonical"]
+    assert (canonical_cache / dataset_id).is_dir()
+    assert not (Path(environment_cache) / dataset_id).exists()
+
+    loaded = convert_iterable_dataset_to_dataset(
+        iterable_dataset=_iterable_dataset("should not be used"), dataset_id=dataset_id
+    )
+
+    assert loaded["text"] == ["canonical"]
+    assert os.environ["HF_DATASETS_CACHE"] == environment_cache
 
 
 @pytest.mark.parametrize(

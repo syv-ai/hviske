@@ -22,6 +22,8 @@
 
 ### Fixed
 
+- Used the configured Hugging Face datasets cache when materialising validation
+  streaming datasets without an explicit cache directory.
 - Corrected the production NST source discriminator to `nst_da` across the base and
   overlay filters, restoring accepted NST rows.
 - Restricted shared positional-overlay preflight to string source discriminators with
