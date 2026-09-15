@@ -1,6 +1,7 @@
 """Focused tests for bilingual and zero-copy data foundations."""
 
 import json
+import pickle
 import typing as t
 import wave
 from collections.abc import Iterable
@@ -16,7 +17,9 @@ from datasets import (
     IterableDataset,
     Value,
     interleave_datasets,
+    load_dataset,
 )
+from datasets import config as datasets_config
 
 from hviske.data import (
     _dataset_cache_identity,
@@ -187,6 +190,96 @@ def test_exact_row_filters_infer_features_for_untyped_streams() -> None:
     assert consumed <= 5
     assert [row["text"] for row in filtered.take(3)] == ["0", "2", "4"]
     assert [row["text"] for row in filtered.take(3)] == ["0", "2", "4"]
+
+
+def test_exact_row_filters_repeat_on_local_parquet_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local Parquet streams retain typed decode-free audio across filters."""
+    monkeypatch.setattr(datasets_config, "HF_DATASETS_OFFLINE", True)
+    parquet_path = tmp_path / "audio.parquet"
+    Dataset.from_list(
+        [
+            {
+                "source": "keep" if index % 2 == 0 else "drop",
+                "partition": "train" if index % 4 == 0 else "other",
+                "audio": {"path": f"{index}.wav", "bytes": None},
+            }
+            for index in range(9)
+        ]
+    ).to_parquet(parquet_path)
+    dataset = t.cast(
+        IterableDataset,
+        load_dataset(
+            "parquet", data_files=str(parquet_path), split="train", streaming=True
+        ),
+    ).cast_column("audio", Audio(decode=False))
+
+    filtered_once = _filter_dataset_rows(dataset=dataset, filters={"source": "keep"})
+    assert isinstance(filtered_once, IterableDataset)
+    assert filtered_once._ex_iterable.is_typed
+    filtered_twice = _filter_dataset_rows(
+        dataset=filtered_once, filters={"partition": "train"}
+    )
+
+    assert isinstance(filtered_twice, IterableDataset)
+    features = filtered_twice.features
+    assert features == dataset.features
+    assert features is not None
+    assert filtered_twice.n_shards == dataset.n_shards
+    assert [row["audio"]["path"] for row in filtered_twice] == [
+        "0.wav",
+        "4.wav",
+        "8.wav",
+    ]
+    assert [row["audio"]["path"] for row in filtered_twice] == [
+        "0.wav",
+        "4.wav",
+        "8.wav",
+    ]
+    assert isinstance(features["audio"], Audio)
+    assert not features["audio"].decode
+    assert list(pickle.loads(pickle.dumps(filtered_twice))) == list(filtered_twice)
+
+
+def test_exact_row_filters_repeat_on_typed_streams_without_read_ahead() -> None:
+    """Sequential filters remain restartable and bounded on a typed iterable."""
+    consumed = 0
+    features = Features(
+        source=Value("string"), partition=Value("string"), audio=Audio(decode=False)
+    )
+
+    def rows() -> Iterable[dict[str, object]]:
+        nonlocal consumed
+        index = 0
+        while True:
+            consumed += 1
+            yield {
+                "source": "keep" if index % 2 == 0 else "drop",
+                "partition": "train" if index % 4 == 0 else "other",
+                "audio": {"path": f"{index}.wav", "bytes": None},
+            }
+            index += 1
+
+    dataset = IterableDataset.from_generator(rows, features=features)
+    filtered_once = _filter_dataset_rows(dataset=dataset, filters={"source": "keep"})
+    assert isinstance(filtered_once, IterableDataset)
+    assert filtered_once.features == features
+    assert filtered_once._ex_iterable.is_typed
+
+    filtered_twice = _filter_dataset_rows(
+        dataset=filtered_once, filters={"partition": "train"}
+    )
+
+    assert isinstance(filtered_twice, IterableDataset)
+    assert filtered_twice.features == features
+    assert consumed == 0
+    first_pass = [row["audio"]["path"] for row in filtered_twice.take(3)]
+    assert first_pass == ["0.wav", "4.wav", "8.wav"]
+    assert consumed <= 9
+    second_pass = [row["audio"]["path"] for row in filtered_twice.take(3)]
+    assert second_pass == first_pass
+    assert consumed <= 18
 
 
 def test_join_rejects_duplicate_transcript_keys() -> None:

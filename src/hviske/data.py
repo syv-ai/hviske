@@ -1,6 +1,7 @@
 """Functions related to the data loading and processing."""
 
 import atexit
+import copy
 import hashlib
 import io
 import json
@@ -37,6 +38,7 @@ from datasets import (
     interleave_datasets,
     load_dataset,
 )
+from datasets import iterable_dataset as datasets_iterable
 from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
@@ -958,7 +960,12 @@ def join_audio_and_transcripts(
         raise ValueError("Audio dataset must declare features")
     joined_features = audio_dataset.features.copy()
     joined_features["text"] = Value("string")
-    filtered_audio = audio_dataset.filter(has_transcript)
+    if isinstance(audio_dataset, IterableDataset):
+        filtered_audio = _filter_streaming_dataset(
+            dataset=audio_dataset, function=has_transcript
+        )
+    else:
+        filtered_audio = audio_dataset.filter(has_transcript)
     return t.cast(
         Dataset | IterableDataset,
         filtered_audio.map(add_transcript, features=joined_features),
@@ -1013,6 +1020,13 @@ DEFAULT_CONVERSION_DICT = {
 FILLER_WORDS_PATTERN = re.compile(
     pattern=r"\b(eh+m*|øh+m*|h+m+|m+h+)\b", flags=re.IGNORECASE
 )
+
+
+def _row_matches_filters(
+    row: Mapping[str, object], filters: Mapping[str, object]
+) -> bool:
+    """Return whether a row exactly matches every configured filter."""
+    return all(row[column] == expected for column, expected in filters.items())
 
 
 def filter_example(
@@ -1506,13 +1520,97 @@ def _filter_dataset_rows_from_split(
         )
 
     original_features = dataset.features
-    filtered = dataset.filter(
-        function=lambda row: all(
-            row[column] == expected_value for column, expected_value in filters.items()
-        )
-    )
+    function = partial(_row_matches_filters, filters=dict(filters))
+    if isinstance(dataset, IterableDataset):
+        filtered = _filter_streaming_dataset(dataset=dataset, function=function)
+    else:
+        filtered = dataset.filter(function=function)
     filtered.info.features = original_features
     return filtered
+
+
+def _filter_streaming_dataset(
+    dataset: IterableDataset, function: Callable[..., bool]
+) -> IterableDataset:
+    """Filter a stream, working around repeated-filter failures in datasets 3.6.0.
+
+    In datasets 3.6.0, ``IterableDataset.filter`` gives a formatting wrapper no
+    features when its underlying iterable is already typed. The wrapper reports
+    itself as typed, and the next filter then fails while expanding its missing
+    features. This is the state produced by one ordinary filter over a stream with
+    declared features. Try the public API first so later datasets releases use their
+    native implementation; only reconstruct the failed operation through private
+    iterable classes when that exact typed-underlying state triggers the defect.
+
+    The compatibility path mirrors datasets 3.6.0's public implementation while
+    supplying the underlying declared features. It retains the lazy iterable graph,
+    formatting, shuffling, distributed sharding and repository tokens. If those
+    private internals change or no usable underlying features exist, it fails with a
+    clear ``RuntimeError`` rather than silently changing stream semantics.
+
+    Args:
+        dataset:
+            Streaming dataset to filter.
+        function:
+            Predicate used to retain rows.
+
+    Returns:
+        A lazy filtered streaming dataset.
+
+    Raises:
+        RuntimeError:
+            If the datasets compatibility internals are unavailable or incompatible.
+        TypeError:
+            If filtering fails for a reason other than the datasets 3.6.0 defect.
+    """
+    try:
+        return dataset.filter(function=function)
+    except TypeError as error:
+        ex_iterable = getattr(dataset, "_ex_iterable", None)
+        if (
+            dataset.features is None
+            or ex_iterable is None
+            or not getattr(ex_iterable, "is_typed", False)
+        ):
+            raise
+
+        underlying_features = getattr(ex_iterable, "features", None)
+        formatted_type = getattr(datasets_iterable, "FormattedExamplesIterable", None)
+        filtered_type = getattr(datasets_iterable, "FilteredExamplesIterable", None)
+        if (
+            underlying_features is None
+            or formatted_type is None
+            or filtered_type is None
+        ):
+            raise RuntimeError(
+                "Cannot apply repeated streaming filters safely: the datasets "
+                "compatibility internals or typed features are unavailable"
+            ) from error
+
+        try:
+            formatted = formatted_type(
+                ex_iterable,
+                formatting=dataset._formatting,
+                features=underlying_features,
+                token_per_repo_id=dataset._token_per_repo_id,
+            )
+            filtered = filtered_type(
+                formatted, function=function, formatting=dataset._formatting
+            )
+            return IterableDataset(
+                ex_iterable=filtered,
+                info=dataset._info,
+                split=dataset._split,
+                formatting=dataset._formatting,
+                shuffling=copy.deepcopy(dataset._shuffling),
+                distributed=copy.deepcopy(dataset._distributed),
+                token_per_repo_id=dataset._token_per_repo_id,
+            )
+        except (AttributeError, TypeError) as compatibility_error:
+            raise RuntimeError(
+                "Cannot apply repeated streaming filters safely: datasets private "
+                "iterable APIs are incompatible"
+            ) from compatibility_error
 
 
 def filter_dataset(
@@ -1581,10 +1679,19 @@ def filter_dataset(
             desc="Filtering dataset",
             keep_in_memory=True,
         )
-    else:
-        filtered = t.cast(IterableDataset | IterableDatasetDict, dataset).filter(
-            function=filter_fn
+    elif isinstance(dataset, IterableDataset):
+        filtered = _filter_streaming_dataset(dataset=dataset, function=filter_fn)
+    elif isinstance(dataset, IterableDatasetDict):
+        filtered = IterableDatasetDict(
+            {
+                split_name: _filter_streaming_dataset(
+                    dataset=split_dataset, function=filter_fn
+                )
+                for split_name, split_dataset in dataset.items()
+            }
         )
+    else:
+        raise ValueError(f"Unsupported dataset type: {type(dataset)}")
 
     # Add info back in the filtered dataset, as it gets removed after calling `filter`
     if isinstance(dataset, Dataset | IterableDataset) and isinstance(
