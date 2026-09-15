@@ -29,6 +29,10 @@
 
 ### Fixed
 
+- Restricted mirrored base and overlay shard validation to effective positional joins,
+  preserving independent keyed-overlay shard selection in training and preflight.
+- Hardened finetuning-data preflight transport logging before Hub access, preventing
+  signed URLs and credentials from entering its logs.
 - Bounded Sparkie startup by selecting only each Danish source's pinned base and
   positional-overlay shards, validating mirrored shard order, and shuffling joined
   metadata before audio decoding.

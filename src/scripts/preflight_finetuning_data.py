@@ -18,6 +18,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 from hviske.data import (
+    _effective_overlay_strategy,
     _filter_dataset_rows,
     _load_transcript_dataset,
     _resolve_hub_data_files,
@@ -31,6 +32,7 @@ from hviske.utils import (
     validate_overlay_revision,
     validate_transcript_revision,
 )
+from p1_dataset.source import harden_p1_logging
 
 logger = logging.getLogger("hviske_data_preflight")
 
@@ -330,22 +332,6 @@ def _grouped_source_candidate(
     )
 
 
-def _effective_overlay_strategy(overlay_config: c.Mapping[str, object]) -> str:
-    """Resolve the overlay strategy using the same precedence as the data path.
-
-    Returns:
-        The normalised configured strategy.
-    """
-    nested_join = overlay_config.get("join")
-    join_config = nested_join if isinstance(nested_join, c.Mapping) else {}
-    return str(
-        overlay_config.get(
-            "strategy",
-            overlay_config.get("join_strategy", join_config.get("strategy", "keyed")),
-        )
-    ).lower()
-
-
 def _has_exact_discriminator_check(
     equality_checks: object, base_column: str, overlay_column: str
 ) -> bool:
@@ -497,15 +483,7 @@ def _overlay_base_columns(
                 if base_column is not None:
                     columns.add(str(base_column))
 
-    strategy = str(
-        overlay_config.get(
-            "strategy",
-            overlay_config.get(
-                "join_strategy",
-                _mapping_value(overlay_config, "join", "strategy", "keyed"),
-            ),
-        )
-    ).lower()
+    strategy = _effective_overlay_strategy(overlay_config=overlay_config)
     if strategy == "keyed":
         join_config = overlay_config.get("join")
         nested_join = join_config if isinstance(join_config, c.Mapping) else {}
@@ -536,20 +514,6 @@ def _mapping_keys(value: object) -> set[str]:
     if not isinstance(value, c.Mapping):
         return set()
     return {str(key) for key in value}
-
-
-def _mapping_value(
-    mapping: c.Mapping[str, object], outer_key: str, nested_key: str, default: object
-) -> object:
-    """Read a nested mapping value without assuming valid overlay configuration.
-
-    Returns:
-        The nested value, or ``default`` when the nested configuration is absent.
-    """
-    nested = mapping.get(outer_key)
-    if isinstance(nested, c.Mapping):
-        return nested.get(nested_key, default)
-    return default
 
 
 def _preflight_hub_source(
@@ -583,9 +547,15 @@ def _preflight_hub_source(
             ),
             hub_api=hub_api,
         )
-        _validate_positional_shard_parity(
-            base_files=base_data_files, overlay_files=overlay_data_files
-        )
+        if (
+            _effective_overlay_strategy(
+                overlay_config=t.cast(c.Mapping[str, object], overlay_config)
+            )
+            == "positional"
+        ):
+            _validate_positional_shard_parity(
+                base_files=base_data_files, overlay_files=overlay_data_files
+            )
     load_kwargs: dict[str, object] = {
         "path": source_config.id,
         "name": source_config.get("subset"),
@@ -839,6 +809,8 @@ def preflight_finetuning_data(
         hub_api (optional):
             Hub API client. Defaults to an authenticated ``HfApi`` client.
     """
+    harden_p1_logging()
+
     if config.get("enable_experiment_tracking", False):
         if config.experiment_tracking.type == "wandb":
             preflight_wandb_access(config=config)

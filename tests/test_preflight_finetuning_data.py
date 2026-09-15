@@ -2,6 +2,7 @@
 
 import collections.abc as c
 import json
+import logging
 import typing as t
 from pathlib import Path
 
@@ -302,6 +303,64 @@ def test_ineligible_positional_views_use_independent_preflight(
     _assert_independent_preflight(config=config, monkeypatch=monkeypatch)
 
 
+def test_keyed_preflight_allows_independent_shard_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keyed overlays do not require base and overlay shards to mirror."""
+    config = _grouped_config()
+    del config.datasets["two"]
+    source = config.datasets.one
+    source.overlay.strategy = "keyed"
+    source.overlay.base_join_column = "source"
+    source.overlay.overlay_join_column = "source"
+    source.data_file_shards = {
+        "template": "data/base-{shard}.parquet",
+        "start": 0,
+        "end": 0,
+    }
+    source.overlay.data_file_shards = {
+        "template": "data/overlay-{shard}.parquet",
+        "start": 1,
+        "end": 1,
+    }
+    base = Dataset.from_list([{"audio": [0.0], "text": "one", "source": "one"}])
+    overlay = Dataset.from_list(
+        [{"action": "keep", "source": "one", "reference_text": "one"}]
+    )
+    resolved: list[tuple[str, object]] = []
+
+    def fake_resolve(
+        dataset_id: str,
+        revision: str | None,
+        selection: c.Mapping[str, object] | None,
+        *,
+        hub_api: object,
+    ) -> list[str]:
+        resolved.append((dataset_id, selection))
+        return [
+            "data/base-000.parquet"
+            if dataset_id == "org/audio"
+            else "data/overlay-001.parquet"
+        ]
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        return base if kwargs["path"] == "org/audio" else overlay
+
+    monkeypatch.setattr(preflight_module, "_resolve_hub_data_files", fake_resolve)
+    preflight_module._preflight_hub_source(
+        source_name="one",
+        source_config=source,
+        split_key="train_name",
+        dataset_loader=fake_loader,
+        cache_dir=None,
+        token=None,
+        hub_api=FakeHubApi(),
+    )
+
+    assert [item[0] for item in resolved] == ["org/audio", "org/overlay"]
+    assert resolved[0][1] != resolved[1][1]
+
+
 def test_local_preflight_accepts_valid_wav(tmp_path: Path) -> None:
     """A readable WAV with an in-bounds cue passes."""
     _preflight_local_manifest("local", _write_local_manifest(tmp_path))
@@ -598,6 +657,48 @@ def test_preflight_bounds_non_overlay_source_consumption(tmp_path: Path) -> None
         "0123456789abcdef0123456789abcdef01234567",
         "evaluation-sha",
     ]
+
+
+def test_preflight_hardens_transport_logging(caplog: pytest.LogCaptureFixture) -> None:
+    """Hub transport records cannot leak signed URL material."""
+    signed_url = (
+        "https://cas-server.xethub.hf.co/object"
+        "?X-Amz-Signature=signature-value&token=token-value"
+    )
+    transport_loggers = (logging.getLogger("httpx"), logging.getLogger("httpcore"))
+    previous_levels = tuple(logger.level for logger in transport_loggers)
+
+    class LoggingHubApi(FakeHubApi):
+        """Emit a transport record during the first Hub operation."""
+
+        def whoami(self) -> dict[str, object]:
+            logging.getLogger("httpx").warning("Hub request %s", signed_url)
+            logging.getLogger("httpcore").warning("Hub retry %s", signed_url)
+            return super().whoami()
+
+    try:
+        with caplog.at_level(logging.INFO, logger="httpx"):
+            preflight_finetuning_data(
+                config=OmegaConf.create(
+                    {
+                        "model": {
+                            "pretrained_model_id": "org/model",
+                            "revision": "model-sha",
+                        },
+                        "datasets": {},
+                        "evaluation_datasets": [],
+                    }
+                ),
+                hub_api=LoggingHubApi(),
+            )
+    finally:
+        for logger, level in zip(transport_loggers, previous_levels):
+            logger.setLevel(level)
+
+    assert "X-Amz-Signature" not in caplog.text
+    assert "signature-value" not in caplog.text
+    assert "token-value" not in caplog.text
+    assert signed_url not in caplog.text
 
 
 @pytest.mark.parametrize("revision", ["", "main", "0123456", "g" * 40])

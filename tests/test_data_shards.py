@@ -170,10 +170,11 @@ def test_positional_shard_parity_tolerates_only_mirrored_gaps() -> None:
         _validate_positional_shard_parity(base_files=mirrored, overlay_files=None)
 
 
+@pytest.mark.parametrize("strategy", ["positional", "keyed"])
 def test_streaming_shuffle_precedes_audio_decode_after_overlay(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, strategy: str
 ) -> None:
-    """The positional join and shuffle buffer operate on decode-free metadata."""
+    """Overlay joins and shuffle operate on decode-free metadata."""
     events: list[str] = []
     original_cast = IterableDataset.cast_column
     original_shuffle = IterableDataset.shuffle
@@ -238,7 +239,9 @@ def test_streaming_shuffle_precedes_audio_decode_after_overlay(
                     "overlay": {
                         "id": "organisation/overlay",
                         "revision": REVISION,
-                        "strategy": "positional",
+                        "strategy": strategy,
+                        "base_join_column": "source",
+                        "overlay_join_column": "source",
                         "base_filters": {"source": "source"},
                         "filters": {"source": "source"},
                         "equality_checks": {
@@ -274,6 +277,27 @@ def test_streaming_shuffle_precedes_audio_decode_after_overlay(
             "evaluation_characters_to_keep": None,
         }
     )
+
+    if strategy == "keyed":
+        config.datasets.source.data_file_shards = {
+            "template": "data/base-{shard}.parquet",
+            "start": 0,
+            "end": 0,
+        }
+        config.datasets.source.overlay.data_file_shards = {
+            "template": "data/overlay-{shard}.parquet",
+            "start": 1,
+            "end": 1,
+        }
+        monkeypatch.setattr(
+            data_module,
+            "_resolve_hub_data_files",
+            lambda dataset_id, revision, selection: [
+                "data/base-000.parquet"
+                if dataset_id == "organisation/base"
+                else "data/overlay-001.parquet"
+            ],
+        )
 
     dataset = load_data_for_finetuning(config=config)
 
