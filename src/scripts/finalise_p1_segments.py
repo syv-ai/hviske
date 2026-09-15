@@ -5,10 +5,21 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import warnings
 from pathlib import Path
 
-from p1_dataset.finalisation import finalise_public_corpus
-from p1_dataset.publish import HfApiAdapter
+warnings.filterwarnings(
+    "ignore",
+    message=(
+        r'^Field name "schema" in "OutputEncodingContract" shadows '
+        r'an attribute in parent "ContractModel"$'
+    ),
+    category=UserWarning,
+    module=r"p1_dataset\.contracts",
+)
+
+from p1_dataset.finalisation import finalise_public_corpus  # noqa: E402
+from p1_dataset.publish import HfApiAdapter  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
