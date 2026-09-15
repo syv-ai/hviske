@@ -24,8 +24,8 @@ The critical path is:
 1. finish and pin the data;
 2. remove leaderboard leakage and materialise a training-ready quality manifest;
 3. run bounded data and model smokes on Sparkie;
-4. choose between two learning rates using short pilots;
-5. continue the winner, releasing the earliest checkpoint that clears the quality gates;
+4. launch the direct full run at the measured 200,000-step horizon;
+5. release the earliest checkpoint that clears the quality gates;
 6. run the official leaderboard harness once after checkpoint selection; and
 7. publish the model, provenance, and raw benchmark outputs.
 
@@ -178,9 +178,14 @@ Use the final immutable revision of `syvai/p1-segments` directly with its `audio
 `text` columns. Do not use the old runtime join between `syvai/p1` and
 `syvai/p1-transcripts`.
 
+The authoritative final publication manifest at commit `ee6ab0...` records 1,044
+manifests covering 16,634 shards/programmes, 4,767,938 published rows, and 230,963
+duration rejections. Use these immutable publication totals when checking the P1
+coverage of the production campaign.
+
 Before training:
 
-- wait for the publication finalisation report;
+- verify the publication finalisation report against these immutable totals;
 - pin the final 40-character revision;
 - resolve the current mismatch between the plan's private-repository requirement and the
   live manually gated public repository;
@@ -411,21 +416,28 @@ defaults unless a pilot shows a concrete failure:
 - **Augmentation:** existing peak normalisation, gain, background/coloured noise, and
   filtering.
 - **Seed:** 4242 for selection; 4243 for confirmation.
-- **Scheduler horizon:** 100,000 steps for pilots and the full run.
-- **Pilot stop:** 2,000 steps, controlled separately from the scheduler horizon.
+- **Scheduler horizon:** 200,000 steps for the direct full run.
+- **Pilot stop:** 2,000 steps, controlled separately from the optional pilot horizon.
 - **Checkpoints:** best, latest resumable, and one rollback checkpoint.
 
 Training uses `max_steps` for the cosine-scheduler horizon and the tested
-`stop_after_steps` callback for bounded stopping. Set `max_steps=100000` and
-`stop_after_steps=2000` for each pilot. A 2,000-step pilot therefore follows the first
-2,000 steps of the 100,000-step schedule; it does not decay to zero and then resume with
-a learning-rate jump. The full run must pass the selected seed-4242 pilot checkpoint as
-`resume_from_checkpoint`, so Trainer restores its optimiser and scheduler state before
-continuing to 100,000 steps.
+`stop_after_steps` callback for bounded stopping. The current direct full run sets
+`max_steps=200000` and leaves `stop_after_steps` unset. The owner-waived 2,000-step
+learning-rate pilots, if requested as optional diagnostics, retain their explicit
+`max_steps=100000` horizon; they do not gate or redefine the full run. The direct run
+starts from the pinned Cohere checkpoint and continues to 200,000 steps.
 
-Do not add a broad hyperparameter sweep. Compare only learning rates `5e-6` and `1e-5`.
-All other settings, source ordering, data revisions, development examples, and seed
-remain fixed.
+At batch 256 and the frozen source probabilities, the campaign coverage is:
+
+| Source | Published/accepted rows | Minimum steps | Expected rows at 200,000 steps | Coverage |
+| --- | ---: | ---: | ---: | ---: |
+| P1 | 4,767,938 | 181,075 | 5,266,278 | 110.5% |
+| DRTV | 5,178,843 | 157,344 | 6,582,835 | 127.1% |
+| YouTube | 3,208,785 | 139,271 | 4,608,000 | 143.6% |
+
+Do not add a broad hyperparameter sweep. If the owner requests the waived diagnostics,
+compare only learning rates `5e-6` and `1e-5`. All other settings, source ordering, data
+revisions, development examples, and seed remain fixed.
 
 ## Execution plan
 
@@ -486,10 +498,12 @@ resume from checkpoint. Confirm Danish and English examples both decode sensibly
 Failure here triggers a focused fix. If Cohere remains incompatible or unsafe on
 Sparkie, activate the pinned Whisper fallback rather than opening an architecture sweep.
 
-### Gate 3: bounded learning-rate pilots
+### Gate 3: owner-waived learning-rate pilots
 
-Run the pilots serially with seed 4242. Both use a 100,000-step scheduler horizon and
-stop through the separate 2,000-step run limit:
+The owner has waived the learning-rate pilots for the current campaign. They are not a
+prerequisite for the direct full run. If a diagnostic pilot is requested, run the pilots
+serially with seed 4242, using their explicit 100,000-step scheduler horizon and separate
+2,000-step run limit:
 
 1. 2,000 steps at `5e-6`;
 2. 2,000 steps at `1e-5`; and
@@ -497,32 +511,26 @@ stop through the separate 2,000-step run limit:
 
 Choose by the predeclared five-domain macro WER and tie-break. Require finite losses,
 stable memory, successful resume, the minimum pilot improvement, all Danish domain
-guardrails, and the English-retention threshold.
-
-If neither pilot improves the Danish objective, stop. Do not burn 100,000 steps hoping
-that a failed recipe recovers. Diagnose the data path first; if it is sound, activate
-the Whisper fallback.
-
-Repeat the winning 2,000-step pilot with seed 4243 and the same scheduler horizon.
-Continue only if it also reaches the pilot-improvement threshold without crossing a
-guardrail.
+guardrails, and the English-retention threshold. Do not delay or block the direct full
+run on these optional diagnostics.
 
 ### Full release run
 
-Resume the selected seed-4242 checkpoint with its unchanged optimiser and scheduler
+Launch directly from the pinned Cohere checkpoint with its fresh optimiser and scheduler
 state. Evaluate the full frozen development suite every 2,000 steps and make
 continuation decisions at 10k, 25k, 50k, and 75k steps.
 
 At each gate:
 
-- compare against the untouched Cohere base, Hviske v5, and both pilot checkpoints;
+- compare against the untouched Cohere base, Hviske v5, and any optional pilot
+  checkpoints;
 - inspect all five Danish domains and the P1/DRTV/YouTube diagnostics;
 - inspect subtitle-credit, repetition, silence, and short-clip failures;
 - verify realised examples and audio seconds per source;
 - verify throughput, memory, temperature, disk, and checkpoint reload; and
 - apply the predeclared patience-reset rule.
 
-The 100,000-step value is a ceiling. At stopping or at the ceiling, apply the final
+The 200,000-step value is a ceiling. At stopping or at the ceiling, apply the final
 checkpoint order exactly. The minimum useful-release gate determines whether the result
 is releasable; the leaderboard and headline targets determine the claims that may be
 made. Do not continue merely to consume the budget.
@@ -615,13 +623,12 @@ leaderboard maintainers independently reproduce and publish the result.
 ### First free GPU window
 
 - stop the conflicting GPU service only after preflight;
-- run the two-step smoke;
-- run the two learning-rate pilots and confirmation; and
-- continue the winning checkpoint into the full run.
+- run the two-step smoke; and
+- launch the direct full run at the 200,000-step horizon.
 
-This ordering keeps data and evaluation work off the critical GPU path. The first real
-wall-time estimate should be made from measured examples per second and checkpoint size
-in the 2,000-step pilot, not from another architecture's published training time.
+This ordering keeps data and evaluation work off the critical GPU path. The campaign
+horizon and source coverage are based on the immutable publication totals and measured
+batch probabilities, not another architecture's published training time.
 
 ## Stop conditions and non-goals
 
