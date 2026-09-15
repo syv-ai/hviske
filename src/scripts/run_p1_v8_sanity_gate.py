@@ -7,15 +7,26 @@ import json
 import logging
 import sys
 import typing as t
+import warnings
 from pathlib import Path
 
-from p1_dataset.publish import HfApiAdapter
-from p1_dataset.v8_sanity_gate import (
+warnings.filterwarnings(
+    "ignore",
+    message=(
+        r'^Field name "schema" in "OutputEncodingContract" shadows '
+        r'an attribute in parent "ContractModel"$'
+    ),
+    category=UserWarning,
+    module=r"p1_dataset\.contracts",
+)
+
+from p1_dataset.publish import HfApiAdapter  # noqa: E402
+from p1_dataset.v8_sanity_gate import (  # noqa: E402
     PILOT_REPOSITORY,
     PIPELINE_VERSION,
     run_v8_sanity_gate,
 )
-from p1_dataset.validation import PinnedHubClipRetriever
+from p1_dataset.validation import PinnedHubClipRetriever  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
