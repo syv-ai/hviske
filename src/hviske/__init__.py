@@ -4,16 +4,11 @@
 """
 
 import importlib.metadata
-import logging
 
 # Fetch the version of the package as defined in pyproject.toml.  Keep package import
 # lightweight: model utilities import Transformers and must not run for P1 modules.
 __version__ = importlib.metadata.version(__package__ or "")
 __all__ = ["__version__", "block_terminal_output"]
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s ⋅ %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
 
 
 def block_terminal_output() -> None:

@@ -2,6 +2,8 @@
 
 import importlib.util
 import pkgutil
+import subprocess
+import sys
 
 import hviske
 import p1_dataset
@@ -24,6 +26,29 @@ def test_hviske_namespace_is_available() -> None:
     """The renamed package can be imported from its public namespace."""
     assert hviske.__name__ == "hviske"
     assert importlib.util.find_spec("hviske") is not None
+
+
+def test_import_hviske_does_not_configure_root_logging() -> None:
+    """Importing the package leaves the process logging policy untouched."""
+    check = """
+import importlib
+import logging
+
+root = logging.getLogger()
+before_level = root.level
+before_handlers = root.handlers.copy()
+assert before_level == logging.WARNING
+assert not before_handlers
+
+importlib.import_module("hviske")
+
+assert root.level == before_level
+assert root.handlers == before_handlers
+"""
+    imported = subprocess.run(
+        [sys.executable, "-c", check], capture_output=True, text=True, check=False
+    )
+    assert imported.returncode == 0, imported.stderr
 
 
 def test_p1_dataset_namespace_is_available() -> None:
