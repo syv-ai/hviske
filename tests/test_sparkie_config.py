@@ -383,6 +383,18 @@ def test_sparkie_publication_provenance_is_complete(
         t.cast(dict[str, object], source["overlay"])["revision"] == "9" * 40
         for source in overlay_sources
     )
+    for source in overlay_sources:
+        overlay = t.cast(dict[str, object], source["overlay"])
+        assert overlay["allowed_actions"] == ["keep", "relabel", "strip"]
+        assert overlay["recognised_actions"] == [
+            "keep",
+            "relabel",
+            "strip",
+            "drop",
+            "flag",
+            "quarantine",
+            "review",
+        ]
     first_overlay = t.cast(dict[str, object], overlay_sources[0]["overlay"])
     assert first_overlay["strategy"] == "positional"
     assert first_overlay["filters"] == {"source": "coral_read_aloud"}
@@ -391,16 +403,6 @@ def test_sparkie_publication_provenance_is_complete(
         "source": "source",
         "text": "reference_text",
     }
-    assert first_overlay["allowed_actions"] == ["keep", "relabel", "strip"]
-    assert first_overlay["recognised_actions"] == [
-        "keep",
-        "relabel",
-        "strip",
-        "drop",
-        "flag",
-        "quarantine",
-        "review",
-    ]
     assert "text_policy" in first_overlay
     assert all("path" not in str(source).lower() for source in overlay_sources)
     assert {"local_vtt:drtv_local", "local_vtt:youtube_local"}.issubset(source_ids)
