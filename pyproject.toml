@@ -34,8 +34,9 @@ dependencies = [
     "scipy>=1.16.3",
     "sentencepiece>=0.2.2",
     "soundfile>=0.13.1",
+    "torch>=2.10.0,<2.11.0",
     "torch-audiomentations>=0.12.0",
-    "torchaudio>=2.6.0,<2.7.0",  # Upper bound for compatibility with audiomentations
+    "torchaudio>=2.10.0,<2.11.0",
     "transformers>=5.17.0",
     "wandb>=0.23.1",
 ]
@@ -82,6 +83,17 @@ quality = [
 
 [tool.uv.sources]
 kenlm = { url = "https://github.com/kpu/kenlm/archive/master.zip" }
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+]
+torchaudio = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.uv]
 # Slopo currently declares NumPy 2.5, while pyctcdecode (used by the n-gram

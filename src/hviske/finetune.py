@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 
+import torch
 import torch.multiprocessing as torch_mp
 from omegaconf import DictConfig
 from transformers.trainer_callback import (
@@ -39,6 +40,7 @@ def finetune(config: DictConfig) -> None:
         config:
             The Hydra configuration object.
     """
+    check_cuda_requirement(config=config)
     _configure_dataloader_multiprocessing(config=config)
     validate_private_only_config(config=config)
 
@@ -279,3 +281,43 @@ def _finalize_tracking_after_failure(setup: ExTrackingSetup) -> None:
         setup.run_finalization(exit_code=1)
     except BaseException:
         logger.exception("Experiment tracking finalisation failed after training error")
+
+
+def check_cuda_requirement(config: DictConfig) -> None:
+    """Fail early when a configuration requires an unavailable CUDA device.
+
+    Args:
+        config:
+            The Hydra configuration object.
+
+    Raises:
+        RuntimeError:
+            If CUDA is required but PyTorch cannot access a CUDA device.
+    """
+    if not config.get("require_cuda", False):
+        return
+
+    cuda_available = False
+    availability_error: str | None = None
+    try:
+        cuda_available = torch.cuda.is_available()
+    except Exception as error:
+        availability_error = f"{type(error).__name__}: {error}"
+
+    if cuda_available:
+        return
+
+    torch_version = getattr(torch, "__version__", "unknown")
+    torch_cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+    torch_cuda_version = torch_cuda_version or "none"
+    error_detail = (
+        f" CUDA availability check raised {availability_error}."
+        if availability_error is not None
+        else ""
+    )
+    raise RuntimeError(
+        "CUDA is required by this configuration, but no CUDA device is available "
+        f"(torch {torch_version}; CUDA build {torch_cuda_version}).{error_detail} "
+        "Install a CUDA-enabled PyTorch build and verify the NVIDIA driver before "
+        "starting training."
+    )
