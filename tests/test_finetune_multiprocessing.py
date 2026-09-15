@@ -1,6 +1,13 @@
 """Tests for the finetuning DataLoader multiprocessing policy."""
 
+import io
+import json
+import logging
+import multiprocessing
+import runpy
+import sys
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -8,6 +15,30 @@ from _pytest.monkeypatch import MonkeyPatch
 from omegaconf import DictConfig, OmegaConf
 
 import hviske.finetune as finetune_module
+
+
+def _probe_finetune_spawn_import(script_path: str, result_path: str) -> None:
+    """Execute the finetuning entry point as a multiprocessing worker import."""
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.WARNING)
+    captured_stderr = io.StringIO()
+    sys.stderr = captured_stderr
+
+    root_logger.info("before finetuning entry-point import")
+    runpy.run_path(script_path, run_name="__mp_main__")
+    root_logger.info("after finetuning entry-point import")
+
+    Path(result_path).write_text(
+        json.dumps(
+            {
+                "level": root_logger.level,
+                "handlers": len(root_logger.handlers),
+                "stderr": captured_stderr.getvalue(),
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_conflicting_start_method_fails_clearly(monkeypatch: MonkeyPatch) -> None:
@@ -146,6 +177,25 @@ def test_spawn_is_configured_before_tracking_and_training_work(
     assert events.index("spawn") < events.index("noise")
     assert events.index("spawn") < events.index("model")
     assert events.index("spawn") < events.index("data")
+
+
+def test_spawn_worker_import_does_not_configure_root_logging(tmp_path: Path) -> None:
+    """A spawn import does not emit INFO markers or install root handlers."""
+    script_path = Path(__file__).parents[1] / "src/scripts/finetune_asr_model.py"
+    result_path = tmp_path / "spawn-import-result.json"
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_probe_finetune_spawn_import, args=(str(script_path), str(result_path))
+    )
+    process.start()
+    process.join(timeout=60)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+
+    assert process.exitcode == 0
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result == {"level": logging.WARNING, "handlers": 0, "stderr": ""}
 
 
 def test_zero_workers_do_not_configure_multiprocessing(

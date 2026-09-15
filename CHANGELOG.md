@@ -31,7 +31,7 @@
   them from training alongside the other disallowed actions.
 - Removed package-import logging configuration so Hydra's policy controls both main
   and spawned DataLoader worker logs, keeping temporary signed dataset URLs out of
-  training logs.
+  training logs; CLI fallback logging no longer runs during spawned worker imports.
 - Made local VTT and standardised streaming training graphs pickleable for PyTorch
   `spawn` workers without changing lazy audio loading or restartability.
 - Normalised Sparkie `dataset_num_workers=1` to in-process filtering and mapping, and
