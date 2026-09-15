@@ -503,12 +503,7 @@ def apply_dataset_overlay(
     join_config = config.get("join", {})
     if not isinstance(join_config, Mapping):
         raise ValueError("Overlay join must be a mapping")
-    strategy = str(
-        config.get(
-            "strategy",
-            config.get("join_strategy", join_config.get("strategy", "keyed")),
-        )
-    ).lower()
+    strategy = _effective_overlay_strategy(overlay_config=config)
     if strategy not in {"keyed", "positional"}:
         raise ValueError(
             f"Unsupported overlay join strategy {strategy!r}; use keyed or positional"
@@ -957,6 +952,22 @@ def _validate_overlay_action(
     return action
 
 
+def _effective_overlay_strategy(overlay_config: Mapping[str, object]) -> str:
+    """Resolve the overlay strategy using the overlay implementation's precedence.
+
+    Returns:
+        The normalised configured strategy.
+    """
+    nested_join = overlay_config.get("join")
+    join_config = nested_join if isinstance(nested_join, Mapping) else {}
+    return str(
+        overlay_config.get(
+            "strategy",
+            overlay_config.get("join_strategy", join_config.get("strategy", "keyed")),
+        )
+    ).lower()
+
+
 def _overlay_equality_checks(value: object) -> list[tuple[str, str]]:
     """Normalise equality-check mappings and list forms.
 
@@ -1323,9 +1334,15 @@ def load_data_for_finetuning(
                         overlay_config.get("data_file_shards"),
                     ),
                 )
-                _validate_positional_shard_parity(
-                    base_files=base_data_files, overlay_files=overlay_data_files
-                )
+                if (
+                    _effective_overlay_strategy(
+                        overlay_config=t.cast(Mapping[str, object], overlay_config)
+                    )
+                    == "positional"
+                ):
+                    _validate_positional_shard_parity(
+                        base_files=base_data_files, overlay_files=overlay_data_files
+                    )
 
         if is_local_vtt:
             ds = load_vtt_manifest(
