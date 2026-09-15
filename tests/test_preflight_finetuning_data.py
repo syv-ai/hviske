@@ -2,19 +2,219 @@
 
 import collections.abc as c
 import json
+import typing as t
 from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile
-from datasets import Audio, Dataset, Features, Value
-from omegaconf import OmegaConf
+from datasets import Audio, Dataset, Features, IterableDataset, Value
+from omegaconf import DictConfig, OmegaConf
 
 import scripts.preflight_finetuning_data as preflight_module
 from scripts.preflight_finetuning_data import (
     _preflight_local_manifest,
     preflight_finetuning_data,
 )
+
+
+def test_grouped_positional_preflight_loads_and_consumes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Equivalent source views share one strict base/overlay consumption."""
+    config = _grouped_config()
+    base = Dataset.from_list(
+        [
+            {"audio": [0.0], "text": "one", "source": "one"},
+            {"audio": [0.0], "text": "two", "source": "two"},
+            {"audio": [0.0], "text": "one", "source": "one"},
+            {"audio": [0.0], "text": "two", "source": "two"},
+        ]
+    )
+    overlay = Dataset.from_list(
+        [
+            {"action": "keep", "source": "one", "reference_text": "one"},
+            {"action": "keep", "source": "two", "reference_text": "two"},
+            {"action": "keep", "source": "one", "reference_text": "one"},
+            {"action": "keep", "source": "two", "reference_text": "two"},
+        ]
+    )
+    calls: list[dict[str, object]] = []
+    consumption_count = 0
+    real_apply = preflight_module.apply_dataset_overlay
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        calls.append(kwargs)
+        return base if kwargs["path"] == "org/audio" else overlay
+
+    def counting_overlay(**kwargs: object) -> c.Iterator[object]:
+        nonlocal consumption_count
+        result = real_apply(
+            base_dataset=t.cast(Dataset | IterableDataset, kwargs["base_dataset"]),
+            overlay_dataset=t.cast(Dataset, kwargs["overlay_dataset"]),
+            overlay_config=t.cast(c.Mapping[str, object], kwargs["overlay_config"]),
+        )
+
+        def stream() -> c.Iterator[object]:
+            nonlocal consumption_count
+            consumption_count += 1
+            yield from result
+
+        return stream()
+
+    before = [config.datasets[name].filters.copy() for name in ("one", "two")]
+    monkeypatch.setattr(preflight_module, "apply_dataset_overlay", counting_overlay)
+    preflight_finetuning_data(
+        config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
+    )
+
+    assert [call["streaming"] for call in calls] == [True, False]
+    assert consumption_count == 1
+    assert [config.datasets[name].filters for name in ("one", "two")] == before
+
+
+class FakeHubApi:
+    """Record authentication and model-access checks."""
+
+    def __init__(self) -> None:
+        """Initialise an empty model access log."""
+        self.model_ids: list[tuple[str, str]] = []
+
+    def model_info(self, repo_id: str, *, revision: str) -> object:
+        """Record the model repository checked by the preflight.
+
+        Returns:
+            Placeholder model metadata.
+        """
+        self.model_ids.append((repo_id, revision))
+        return object()
+
+    def whoami(self) -> dict[str, object]:
+        """Return a test identity."""
+        return {"name": "tester"}
+
+
+def _grouped_config() -> DictConfig:
+    """Build a minimal two-view training configuration.
+
+    Returns:
+        An OmegaConf configuration object.
+    """
+    return OmegaConf.create(
+        {
+            "model": {"pretrained_model_id": "org/model", "revision": "model-sha"},
+            "cache_dir": None,
+            "datasets": {
+                "one": _grouped_overlay_config("one"),
+                "two": _grouped_overlay_config("two"),
+            },
+            "evaluation_datasets": [],
+        }
+    )
+
+
+def _grouped_overlay_config(value: str) -> dict[str, object]:
+    """Build one source config for grouped positional-preflight tests.
+
+    Returns:
+        A source configuration mapping.
+    """
+    return {
+        "id": "org/audio",
+        "subset": "default",
+        "train_name": "train",
+        "text_column": "text",
+        "audio_column": "audio",
+        "filters": {"source": value},
+        "revision": "audio-sha",
+        "trust_remote_code": False,
+        "overlay": {
+            "id": "org/overlay",
+            "subset": "default",
+            "split": "train",
+            "revision": "1" * 40,
+            "strategy": "positional",
+            "base_filters": {"source": value},
+            "filters": {"source": value},
+            "equality_checks": {"source": "source", "text": "reference_text"},
+            "action_column": "action",
+            "allowed_actions": ["keep", "relabel", "strip"],
+            "recognised_actions": [
+                "keep",
+                "relabel",
+                "strip",
+                "drop",
+                "flag",
+                "quarantine",
+            ],
+            "text_policy": {"candidates": [{"column": "reference_text"}]},
+            "trust_remote_code": False,
+        },
+    }
+
+
+def test_grouped_positional_preflight_requires_each_source_to_emit_a_row() -> None:
+    """A valid global overlay cannot hide an empty configured source view."""
+    config = _grouped_config()
+    base = Dataset.from_list(
+        [
+            {"audio": [0.0], "text": "one", "source": "one"},
+            {"audio": [0.0], "text": "two", "source": "two"},
+        ]
+    )
+    overlay = Dataset.from_list(
+        [
+            {"action": "keep", "source": "one", "reference_text": "one"},
+            {"action": "drop", "source": "two", "reference_text": "two"},
+        ]
+    )
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        return base if kwargs["path"] == "org/audio" else overlay
+
+    with pytest.raises(ValueError, match="two.*no accepted rows"):
+        preflight_finetuning_data(
+            config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
+        )
+
+
+def test_grouped_positional_preflight_surfaces_length_mismatch() -> None:
+    """The shared path retains strict positional length validation."""
+    config = _grouped_config()
+    base = Dataset.from_list(
+        [
+            {"audio": [0.0], "text": "one", "source": "one"},
+            {"audio": [0.0], "text": "two", "source": "two"},
+        ]
+    )
+    overlay = Dataset.from_list(
+        [{"action": "keep", "source": "one", "reference_text": "one"}]
+    )
+
+    def fake_loader(**kwargs: object) -> Dataset:
+        return base if kwargs["path"] == "org/audio" else overlay
+
+    with pytest.raises(ValueError, match="length mismatch"):
+        preflight_finetuning_data(
+            config=config, dataset_loader=fake_loader, hub_api=FakeHubApi()
+        )
+
+
+def test_ineligible_positional_views_use_independent_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-column filters do not enter the shared path."""
+    config = _grouped_config()
+    config.datasets.two.filters = {"source": "two", "language": "da"}
+    handled: list[str] = []
+
+    def fake_preflight(**kwargs: object) -> None:
+        handled.append(str(kwargs["source_name"]))
+
+    monkeypatch.setattr(preflight_module, "_preflight_hub_source", fake_preflight)
+    preflight_finetuning_data(config=config, hub_api=FakeHubApi())
+
+    assert handled == ["one", "two"]
 
 
 def test_local_preflight_accepts_valid_wav(tmp_path: Path) -> None:
@@ -138,27 +338,6 @@ def test_overlay_preflight_disables_audio_decoding_before_overlay(
     )
 
     assert observed == [(False, {"text", "source", "metadata", "recording_id"})]
-
-
-class FakeHubApi:
-    """Record authentication and model-access checks."""
-
-    def __init__(self) -> None:
-        """Initialise an empty model access log."""
-        self.model_ids: list[tuple[str, str]] = []
-
-    def model_info(self, repo_id: str, *, revision: str) -> object:
-        """Record the model repository checked by the preflight.
-
-        Returns:
-            Placeholder model metadata.
-        """
-        self.model_ids.append((repo_id, revision))
-        return object()
-
-    def whoami(self) -> dict[str, object]:
-        """Return a test identity."""
-        return {"name": "tester"}
 
 
 def test_overlay_preflight_rejects_missing_source_audio_column() -> None:
