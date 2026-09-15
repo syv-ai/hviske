@@ -14,6 +14,7 @@ from functools import partialmethod
 from pathlib import Path
 from types import TracebackType
 
+import datasets.config as ds_config
 import datasets.utils.logging as ds_logging
 import tqdm as tqdm_package
 import transformers.utils.logging as hf_logging
@@ -135,14 +136,15 @@ def convert_iterable_dataset_to_dataset(
             The ID of the dataset, which is used to store and re-load the dataset. If
             None then the dataset is not stored. Defaults to None.
         cache_dir (optional):
-            The directory to store the dataset. If None then the default cache
-            `~/.cache/huggingface/datasets` is used. Defaults to None.
+            The directory to store the dataset. If None then the cache directory
+            configured by the `datasets` library is used, respecting Hugging Face and
+            XDG cache environment variables. Defaults to None.
 
     Returns:
         The converted Dataset.
     """
     if cache_dir is None:
-        cache_dir = Path.home() / ".cache" / "huggingface" / "datasets"
+        cache_dir = Path(ds_config.HF_DATASETS_CACHE)
 
     dataset_dir = None
     if dataset_id is not None:
