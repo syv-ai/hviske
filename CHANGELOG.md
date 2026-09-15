@@ -22,6 +22,8 @@
 
 ### Fixed
 
+- Made local VTT and standardised streaming training graphs pickleable for PyTorch
+  `spawn` workers without changing lazy audio loading or restartability.
 - Normalised Sparkie `dataset_num_workers=1` to in-process filtering and mapping, and
   stopped requesting multiprocessing when materialising iterable validation datasets;
   four training audio loader workers remain enabled with PyTorch's `spawn` start

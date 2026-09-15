@@ -103,6 +103,11 @@ def _dataset_cache_identity(
     return f"{dataset_id.replace('/', '--')}-{digest}"
 
 
+def _identity_example(example: dict[str, Any]) -> dict[str, Any]:
+    """Return an example unchanged while preserving its streaming features."""
+    return example
+
+
 def _limit_validation_dataset(
     dataset: IterableDataset, max_samples: int | None
 ) -> IterableDataset:
@@ -200,7 +205,7 @@ def _standardise_training_dataset(
     features = _standard_training_features(sampling_rate=sampling_rate)
     standardised = dataset.select_columns(["audio", "text", "language"]).cast(features)
     if isinstance(standardised, IterableDataset):
-        standardised = standardised.map(function=lambda example: example)
+        standardised = standardised.map(function=_identity_example)
         standardised.info.features = features
     return standardised
 
@@ -2182,7 +2187,8 @@ def process_example(
     num_seconds = len(audio_array) / sampling_rate
 
     # Normalise and augment audio
-    download_background_noises()
+    if augment_audio:
+        download_background_noises()
     normalise = ta.PeakNormalization(p=1.0) if normalise_audio else ta.Identity()
     augment = (
         ta.Compose(

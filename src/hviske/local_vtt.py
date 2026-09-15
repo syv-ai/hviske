@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import typing as t
+from functools import partial
 from pathlib import Path
 
 import soundfile as sf
@@ -50,6 +51,25 @@ _TIMESTAMP_PATTERN = re.compile(
 )
 _INLINE_TIMESTAMP_PATTERN = re.compile(r"<(?:(?:\d{2}:)?\d{2}:\d{2}[.,]\d{3})>")
 _MARKUP_PATTERN = re.compile(r"<[^>]*>")
+
+
+def _manifest_rows(
+    manifest_path: Path, min_seconds: float, max_seconds: float
+) -> t.Iterator[dict[str, t.Any]]:
+    """Yield duration-filtered rows from a JSONL VTT manifest.
+
+    Raises:
+        ValueError:
+            If a manifest row has a negative duration.
+    """
+    with manifest_path.open(encoding="utf-8") as manifest_file:
+        for line_number, line in enumerate(manifest_file, start=1):
+            row = json.loads(line)
+            duration = float(row["duration"])
+            if duration < 0:
+                raise ValueError(f"Negative duration on manifest line {line_number}")
+            if min_seconds < duration < max_seconds:
+                yield row
 
 
 def build_vtt_manifest(
@@ -316,21 +336,13 @@ def load_vtt_manifest(
     Returns:
         An iterable dataset containing metadata only.
     """
-
-    def manifest_rows() -> t.Iterator[dict[str, t.Any]]:
-        with manifest_path.open(encoding="utf-8") as manifest_file:
-            for line_number, line in enumerate(manifest_file, start=1):
-                row = json.loads(line)
-                duration = float(row["duration"])
-                if duration < 0:
-                    raise ValueError(
-                        f"Negative duration on manifest line {line_number}"
-                    )
-                if min_seconds < duration < max_seconds:
-                    yield row
-
     return IterableDataset.from_generator(
-        generator=manifest_rows,
+        generator=partial(
+            _manifest_rows,
+            manifest_path=manifest_path,
+            min_seconds=min_seconds,
+            max_seconds=max_seconds,
+        ),
         features=Features(
             source_wav_path=Value("string"),
             start=Value("float64"),
