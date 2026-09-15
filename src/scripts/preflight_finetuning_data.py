@@ -2,6 +2,8 @@
 
 import argparse
 import collections.abc as c
+import copy
+import dataclasses
 import json
 import logging
 import math
@@ -46,6 +48,436 @@ def main() -> None:
     OmegaConf.resolve(config)
     preflight_finetuning_data(config=config)
     logger.info("Preflight passed for every configured training and validation source")
+
+
+def _preflight_grouped_hub_sources(
+    datasets: c.Mapping[str, DictConfig],
+    dataset_loader: DatasetLoader,
+    cache_dir: str | None,
+    token: str | None,
+) -> set[str]:
+    """Preflight equivalent positional views with one shared stream.
+
+    Returns:
+        Names handled by the shared preflight path.
+
+    Raises:
+        ValueError:
+            If a shared stream fails the ordinary overlay validation.
+    """
+    handled: set[str] = set()
+    for group in _grouped_source_candidates(datasets=datasets):
+        if len(group) < 2:
+            continue
+        representative = group[0]
+        source_config = representative.config
+        dataset = dataset_loader(
+            path=source_config.id,
+            name=source_config.get("subset"),
+            split=source_config.train_name,
+            revision=source_config.get("revision"),
+            token=token or True,
+            streaming=True,
+            cache_dir=cache_dir,
+            trust_remote_code=source_config.get("trust_remote_code", False),
+        )
+        overlay_config = t.cast(c.Mapping[str, object], source_config.overlay)
+        dataset, overlay_base_columns = _project_overlay_base_dataset(
+            dataset=dataset,
+            audio_column=str(source_config.audio_column),
+            source_config=source_config,
+            overlay_config=overlay_config,
+            source_name=f"group containing {representative.name}",
+        )
+        overlay_revision = validate_overlay_revision(
+            str(overlay_config.get("revision") or "")
+        )
+        overlay = _load_transcript_dataset(
+            dataset_id=str(overlay_config["id"]),
+            subset=t.cast(str | None, overlay_config.get("subset")),
+            split=str(overlay_config.get("split", "train")),
+            revision=overlay_revision,
+            cache_dir=cache_dir,
+            trust_remote_code=bool(overlay_config.get("trust_remote_code", False)),
+            dataset_loader=dataset_loader,
+        )
+        unfiltered_overlay_config = copy.deepcopy(dict(overlay_config))
+        unfiltered_overlay_config.pop("base_filters", None)
+        unfiltered_overlay_config.pop("filters", None)
+        if not isinstance(dataset, Dataset | IterableDataset):
+            raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
+        overlaid = apply_dataset_overlay(
+            base_dataset=dataset,
+            overlay_dataset=overlay,
+            overlay_config=unfiltered_overlay_config,
+        )
+        _consume_grouped_overlay(
+            dataset=overlaid, group=group, required_base_columns=overlay_base_columns
+        )
+        handled.update(source.name for source in group)
+    return handled
+
+
+def _require_columns(
+    row: dict[str, object], required_columns: list[str], source_name: str
+) -> None:
+    missing = sorted(set(required_columns) - set(row))
+    if missing:
+        raise ValueError(f"Missing columns from {source_name}: {missing}")
+
+
+def _same_filter_value(left: object, right: object) -> bool:
+    """Compare filter values without collapsing distinct scalar types.
+
+    Returns:
+        Whether both values have the same type and exact value.
+    """
+    return type(left) is type(right) and left == right
+
+
+@dataclasses.dataclass(frozen=True)
+class _GroupedSource:
+    """A training source that can participate in a positional overlay group."""
+
+    name: str
+    config: DictConfig
+    filter_column: str
+    filter_value: object
+    base_signature: object
+    overlay_signature: object
+
+
+def _consume_grouped_overlay(
+    dataset: object, group: list[_GroupedSource], required_base_columns: set[str]
+) -> None:
+    """Consume a shared overlay and validate every configured source view.
+
+    Raises:
+        ValueError:
+            If a row is malformed, missing metadata, or no source has an accepted
+            row.
+    """
+    counts = {source.name: 0 for source in group}
+    first_rows: dict[str, dict[str, object]] = {}
+    filter_column = group[0].filter_column
+    iterator = iter(t.cast(c.Iterable[object], dataset))
+    for raw_row in iterator:
+        if not isinstance(raw_row, dict):
+            raise ValueError(
+                "A row from the grouped positional overlay is not a mapping"
+            )
+        row = t.cast(dict[str, object], raw_row)
+        _require_columns(
+            row=row,
+            required_columns=["text", filter_column, *sorted(required_base_columns)],
+            source_name="grouped positional overlay",
+        )
+        text = row["text"]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Grouped positional overlay emitted empty text")
+        for source in group:
+            if _same_filter_value(row[filter_column], source.filter_value):
+                counts[source.name] += 1
+                first_rows.setdefault(source.name, row)
+                break
+
+    for source in group:
+        count = counts[source.name]
+        if count == 0:
+            raise ValueError(
+                f"Configured source {source.name} emitted no accepted rows for "
+                f"{source.filter_column}={source.filter_value!r}"
+            )
+        # Retaining the first row makes the per-source validation explicit while
+        # keeping the full stream consumption above as the single strict pass.
+        first_row = first_rows.get(source.name)
+        if first_row is None:
+            raise ValueError(f"No retained row available from {source.name}")
+        _require_columns(
+            row=first_row,
+            required_columns=["text", source.filter_column],
+            source_name=source.name,
+        )
+        logger.info("Validated %s accepted rows from %s", f"{count:,}", source.name)
+
+
+def _grouped_source_candidates(
+    datasets: c.Mapping[str, DictConfig],
+) -> list[list[_GroupedSource]]:
+    """Return eligible source groups, retaining singleton groups for the caller."""
+    candidates: list[_GroupedSource] = []
+    for raw_name, source_config in datasets.items():
+        candidate = _grouped_source_candidate(
+            name=str(raw_name), source_config=source_config
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    groups: list[list[_GroupedSource]] = []
+    for candidate in candidates:
+        group = next(
+            (
+                group
+                for group in groups
+                if group[0].base_signature == candidate.base_signature
+                and group[0].overlay_signature == candidate.overlay_signature
+                and group[0].filter_column == candidate.filter_column
+            ),
+            None,
+        )
+        if group is None:
+            groups.append([candidate])
+        else:
+            group.append(candidate)
+
+    # Reusing a value would make the shared result ambiguous, so it is safer to
+    # leave every source in such a group on the established independent path.
+    return [
+        group
+        for group in groups
+        if len(group) >= 2
+        and all(
+            not _same_filter_value(left.filter_value, right.filter_value)
+            for index, left in enumerate(group)
+            for right in group[index + 1 :]
+        )
+    ] + [group for group in groups if len(group) == 1]
+
+
+def _grouped_source_candidate(
+    name: str, source_config: DictConfig
+) -> _GroupedSource | None:
+    """Describe a source only when its overlay is safe to coalesce.
+
+    Returns:
+        An eligible source descriptor, or ``None`` when it must be independent.
+    """
+    if source_config.get("type") == "local_vtt":
+        return None
+    if source_config.get("transcript_dataset_id") is not None:
+        return None
+    raw_overlay = source_config.get("overlay")
+    if not isinstance(raw_overlay, c.Mapping):
+        return None
+    overlay_config = t.cast(c.Mapping[str, object], raw_overlay)
+    strategy = _effective_overlay_strategy(overlay_config)
+    if strategy != "positional" or "overlay_filters" in overlay_config:
+        return None
+    source_filter = _matching_singleton_filter(source_config.get("filters"))
+    base_filter = _matching_singleton_filter(overlay_config.get("base_filters"))
+    overlay_filter = _matching_singleton_filter(overlay_config.get("filters"))
+    if source_filter is None or base_filter is None or overlay_filter is None:
+        return None
+    if not (
+        source_filter[0] == base_filter[0] == overlay_filter[0]
+        and _same_filter_value(source_filter[1], base_filter[1])
+        and _same_filter_value(source_filter[1], overlay_filter[1])
+    ):
+        return None
+
+    source_without_filters = _without_config_keys(
+        source_config, excluded={"filters", "overlay"}
+    )
+    overlay_without_filters = _without_config_keys(
+        overlay_config, excluded={"base_filters", "filters"}
+    )
+    return _GroupedSource(
+        name=name,
+        config=source_config,
+        filter_column=source_filter[0],
+        filter_value=source_filter[1],
+        base_signature=_normalise_config(source_without_filters),
+        overlay_signature=_normalise_config(overlay_without_filters),
+    )
+
+
+def _effective_overlay_strategy(overlay_config: c.Mapping[str, object]) -> str:
+    """Resolve the overlay strategy using the same precedence as the data path.
+
+    Returns:
+        The normalised configured strategy.
+    """
+    nested_join = overlay_config.get("join")
+    join_config = nested_join if isinstance(nested_join, c.Mapping) else {}
+    return str(
+        overlay_config.get(
+            "strategy",
+            overlay_config.get("join_strategy", join_config.get("strategy", "keyed")),
+        )
+    ).lower()
+
+
+def _matching_singleton_filter(value: object) -> tuple[str, object] | None:
+    """Return a conservative scalar singleton filter, if configured."""
+    if not isinstance(value, c.Mapping) or len(value) != 1:
+        return None
+    column, filter_value = next(iter(value.items()))
+    if not isinstance(column, str) or not _is_exact_filter_scalar(filter_value):
+        return None
+    return column, filter_value
+
+
+def _is_exact_filter_scalar(value: object) -> bool:
+    """Whether a filter value has unambiguous equality semantics.
+
+    Returns:
+        Whether the value is a finite, scalar equality operand.
+    """
+    if value is None or isinstance(value, str | bool | int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _normalise_config(value: object) -> object:
+    """Convert config containers into deterministic, comparable values.
+
+    Returns:
+        A recursively normalised value suitable for equality comparison.
+    """
+    if isinstance(value, c.Mapping):
+        return tuple(
+            sorted((str(key), _normalise_config(item)) for key, item in value.items())
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_normalise_config(item) for item in value)
+    if isinstance(value, (str, bool, int, float)) or value is None:
+        return (type(value).__name__, value)
+    return (type(value).__name__, repr(value))
+
+
+def _without_config_keys(
+    config: c.Mapping[str, object], excluded: set[str]
+) -> dict[str, object]:
+    """Copy a config mapping while excluding explicitly source-specific keys.
+
+    Returns:
+        A deep-copied mapping without excluded keys.
+    """
+    return {
+        str(key): copy.deepcopy(value)
+        for key, value in config.items()
+        if str(key) not in excluded
+    }
+
+
+def _project_overlay_base_dataset(
+    dataset: object,
+    audio_column: str,
+    source_config: c.Mapping[str, object],
+    overlay_config: c.Mapping[str, object],
+    source_name: str,
+) -> tuple[Dataset | IterableDataset, set[str]]:
+    """Validate and remove lazy audio before running an overlay preflight.
+
+    Returns:
+        The metadata-only base dataset and the base columns required by the overlay.
+
+    Raises:
+        ValueError:
+            If the source is not a supported dataset or lacks its audio column.
+    """
+    if not isinstance(dataset, Dataset | IterableDataset):
+        raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
+    column_names = list(dataset.column_names or [])
+    if audio_column not in column_names:
+        raise ValueError(f"Missing audio column from {source_name}: {audio_column!r}")
+
+    if (
+        dataset.features is not None
+        and audio_column in dataset.features
+        and isinstance(dataset.features[audio_column], Audio)
+    ):
+        dataset = dataset.cast_column(column=audio_column, feature=Audio(decode=False))
+
+    required_columns = _overlay_base_columns(
+        source_config=source_config, overlay_config=overlay_config
+    )
+    columns = [
+        column
+        for column in column_names
+        if column != audio_column or audio_column in required_columns
+    ]
+    return dataset.select_columns(columns), required_columns
+
+
+def _overlay_base_columns(
+    source_config: c.Mapping[str, object], overlay_config: c.Mapping[str, object]
+) -> set[str]:
+    """Return source columns needed while applying an overlay."""
+    columns: set[str] = set()
+    text_column = source_config.get("text_column")
+    if text_column is not None:
+        columns.add(str(text_column))
+    columns.update(_mapping_keys(source_config.get("filters")))
+    columns.update(_mapping_keys(overlay_config.get("base_filters")))
+
+    equality_checks = overlay_config.get(
+        "equality_checks", overlay_config.get("checks", {})
+    )
+    if isinstance(equality_checks, c.Mapping):
+        columns.update(str(column) for column in equality_checks)
+    elif not isinstance(equality_checks, str) and isinstance(
+        equality_checks, c.Iterable
+    ):
+        for check in equality_checks:
+            if isinstance(check, c.Mapping):
+                base_column = check.get("base_column", check.get("base"))
+                if base_column is not None:
+                    columns.add(str(base_column))
+
+    strategy = str(
+        overlay_config.get(
+            "strategy",
+            overlay_config.get(
+                "join_strategy",
+                _mapping_value(overlay_config, "join", "strategy", "keyed"),
+            ),
+        )
+    ).lower()
+    if strategy == "keyed":
+        join_config = overlay_config.get("join")
+        nested_join = join_config if isinstance(join_config, c.Mapping) else {}
+        base_join_column = _first_configured_value(
+            overlay_config, ("base_join_column", "base_column")
+        )
+        if base_join_column is None:
+            base_join_column = nested_join.get("base_column")
+        if base_join_column is None:
+            base_join_column = overlay_config.get("join_column")
+        if base_join_column is not None:
+            columns.add(str(base_join_column))
+    return columns
+
+
+def _first_configured_value(
+    mapping: c.Mapping[str, object], keys: tuple[str, ...]
+) -> object:
+    """Return the value for the first explicitly configured key."""
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _mapping_keys(value: object) -> set[str]:
+    """Return string keys from a configured mapping."""
+    if not isinstance(value, c.Mapping):
+        return set()
+    return {str(key) for key in value}
+
+
+def _mapping_value(
+    mapping: c.Mapping[str, object], outer_key: str, nested_key: str, default: object
+) -> object:
+    """Read a nested mapping value without assuming valid overlay configuration.
+
+    Returns:
+        The nested value, or ``default`` when the nested configuration is absent.
+    """
+    nested = mapping.get(outer_key)
+    if isinstance(nested, c.Mapping):
+        return nested.get(nested_key, default)
+    return default
 
 
 def _preflight_hub_source(
@@ -208,134 +640,6 @@ def _first_row(dataset: object, source_name: str) -> dict[str, object]:
     return t.cast(dict[str, object], raw_row)
 
 
-def _project_overlay_base_dataset(
-    dataset: object,
-    audio_column: str,
-    source_config: c.Mapping[str, object],
-    overlay_config: c.Mapping[str, object],
-    source_name: str,
-) -> tuple[Dataset | IterableDataset, set[str]]:
-    """Validate and remove lazy audio before running an overlay preflight.
-
-    Returns:
-        The metadata-only base dataset and the base columns required by the overlay.
-
-    Raises:
-        ValueError:
-            If the source is not a supported dataset or lacks its audio column.
-    """
-    if not isinstance(dataset, Dataset | IterableDataset):
-        raise ValueError(f"Unsupported audio dataset type: {type(dataset)}")
-    column_names = list(dataset.column_names or [])
-    if audio_column not in column_names:
-        raise ValueError(f"Missing audio column from {source_name}: {audio_column!r}")
-
-    if (
-        dataset.features is not None
-        and audio_column in dataset.features
-        and isinstance(dataset.features[audio_column], Audio)
-    ):
-        dataset = dataset.cast_column(column=audio_column, feature=Audio(decode=False))
-
-    required_columns = _overlay_base_columns(
-        source_config=source_config, overlay_config=overlay_config
-    )
-    columns = [
-        column
-        for column in column_names
-        if column != audio_column or audio_column in required_columns
-    ]
-    return dataset.select_columns(columns), required_columns
-
-
-def _overlay_base_columns(
-    source_config: c.Mapping[str, object], overlay_config: c.Mapping[str, object]
-) -> set[str]:
-    """Return source columns needed while applying an overlay."""
-    columns: set[str] = set()
-    text_column = source_config.get("text_column")
-    if text_column is not None:
-        columns.add(str(text_column))
-    columns.update(_mapping_keys(source_config.get("filters")))
-    columns.update(_mapping_keys(overlay_config.get("base_filters")))
-
-    equality_checks = overlay_config.get(
-        "equality_checks", overlay_config.get("checks", {})
-    )
-    if isinstance(equality_checks, c.Mapping):
-        columns.update(str(column) for column in equality_checks)
-    elif not isinstance(equality_checks, str) and isinstance(
-        equality_checks, c.Iterable
-    ):
-        for check in equality_checks:
-            if isinstance(check, c.Mapping):
-                base_column = check.get("base_column", check.get("base"))
-                if base_column is not None:
-                    columns.add(str(base_column))
-
-    strategy = str(
-        overlay_config.get(
-            "strategy",
-            overlay_config.get(
-                "join_strategy",
-                _mapping_value(overlay_config, "join", "strategy", "keyed"),
-            ),
-        )
-    ).lower()
-    if strategy == "keyed":
-        join_config = overlay_config.get("join")
-        nested_join = join_config if isinstance(join_config, c.Mapping) else {}
-        base_join_column = _first_configured_value(
-            overlay_config, ("base_join_column", "base_column")
-        )
-        if base_join_column is None:
-            base_join_column = nested_join.get("base_column")
-        if base_join_column is None:
-            base_join_column = overlay_config.get("join_column")
-        if base_join_column is not None:
-            columns.add(str(base_join_column))
-    return columns
-
-
-def _first_configured_value(
-    mapping: c.Mapping[str, object], keys: tuple[str, ...]
-) -> object:
-    """Return the value for the first explicitly configured key."""
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    return None
-
-
-def _mapping_keys(value: object) -> set[str]:
-    """Return string keys from a configured mapping."""
-    if not isinstance(value, c.Mapping):
-        return set()
-    return {str(key) for key in value}
-
-
-def _mapping_value(
-    mapping: c.Mapping[str, object], outer_key: str, nested_key: str, default: object
-) -> object:
-    """Read a nested mapping value without assuming valid overlay configuration.
-
-    Returns:
-        The nested value, or ``default`` when the nested configuration is absent.
-    """
-    nested = mapping.get(outer_key)
-    if isinstance(nested, c.Mapping):
-        return nested.get(nested_key, default)
-    return default
-
-
-def _require_columns(
-    row: dict[str, object], required_columns: list[str], source_name: str
-) -> None:
-    missing = sorted(set(required_columns) - set(row))
-    if missing:
-        raise ValueError(f"Missing columns from {source_name}: {missing}")
-
-
 def _preflight_local_manifest(source_name: str, manifest_path: Path) -> None:
     manifest_path = manifest_path.expanduser()
     if not manifest_path.is_file():
@@ -464,15 +768,23 @@ def preflight_finetuning_data(
     )
     logger.info("Confirmed access to model %s", config.model.pretrained_model_id)
 
+    handled_sources = _preflight_grouped_hub_sources(
+        datasets=config.datasets,
+        dataset_loader=dataset_loader,
+        cache_dir=config.get("cache_dir"),
+        token=token,
+    )
     for source_name, source_config in config.datasets.items():
+        source_name = str(source_name)
+        if source_name in handled_sources:
+            continue
         if source_config.get("type") == "local_vtt":
             _preflight_local_manifest(
-                source_name=str(source_name),
-                manifest_path=Path(source_config.manifest_path),
+                source_name=source_name, manifest_path=Path(source_config.manifest_path)
             )
         else:
             _preflight_hub_source(
-                source_name=str(source_name),
+                source_name=source_name,
                 source_config=source_config,
                 split_key="train_name",
                 dataset_loader=dataset_loader,
