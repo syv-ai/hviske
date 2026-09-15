@@ -22,11 +22,6 @@ from omegaconf import DictConfig
 
 from hviske.finetune import finetune
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s ⋅ %(name)s ⋅ %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger("hviske_finetuning")
 
 
@@ -81,4 +76,9 @@ def main(config: DictConfig) -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s ⋅ %(name)s ⋅ %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     main()
