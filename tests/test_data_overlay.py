@@ -52,15 +52,16 @@ def _first_spawn_batch(rows: list[dict[str, object]]) -> dict[str, object]:
     return rows[0]
 
 
-def _spawn_remote_rows() -> t.Iterator[dict[str, object]]:
-    """Yield typed, Hub-shaped rows for the Linux spawn graph test."""
-    for text in ("remote one", "remote two"):
-        yield {
-            "audio": {"array": [0.0] * 16_000, "sampling_rate": 16_000},
-            "text": text,
-            "language": "en",
-            "source": "remote",
-        }
+def _spawn_remote_rows(shards: list[tuple[str, ...]]) -> t.Iterator[dict[str, object]]:
+    """Yield typed, Hub-shaped rows from multiple streaming shards."""
+    for shard in shards:
+        for text in shard:
+            yield {
+                "audio": {"array": [0.0] * 16_000, "sampling_rate": 16_000},
+                "text": text,
+                "language": "en",
+                "source": "remote",
+            }
 
 
 def test_keyed_overlay_rejects_duplicate_keys() -> None:
@@ -482,7 +483,7 @@ def test_positional_overlay_rejects_length_and_equality_mismatches() -> None:
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux worker runtime regression")
 def test_production_graph_feeds_spawn_dataloader(tmp_path: Path) -> None:
-    """A production-shaped local/remote graph remains pickleable under spawn."""
+    """A multi-shard positional overlay is complete and restartable under spawn."""
     wav_path = tmp_path / "programme.wav"
     _write_spawn_wav(wav_path)
     manifest_path = tmp_path / "manifest.jsonl"
@@ -514,6 +515,7 @@ def test_production_graph_feeds_spawn_dataloader(tmp_path: Path) -> None:
 
     remote = IterableDataset.from_generator(
         _spawn_remote_rows,
+        gen_kwargs={"shards": [("remote one",), ("remote two",)]},
         features=Features(
             audio=Audio(sampling_rate=16_000),
             text=Value("string"),
@@ -521,6 +523,7 @@ def test_production_graph_feeds_spawn_dataloader(tmp_path: Path) -> None:
             source=Value("string"),
         ),
     )
+    assert remote.n_shards == 2
     remote = t.cast(
         IterableDataset, _standardise_training_dataset(remote, sampling_rate=16_000)
     )
@@ -543,6 +546,7 @@ def test_production_graph_feeds_spawn_dataloader(tmp_path: Path) -> None:
             overlay_dataset=overlay,
             overlay_config={
                 "strategy": "positional",
+                "equality_checks": {"text": "reference_text"},
                 "action_column": "action",
                 "allowed_actions": ["keep", "relabel"],
                 "text_policy": {
@@ -554,6 +558,18 @@ def test_production_graph_feeds_spawn_dataloader(tmp_path: Path) -> None:
             },
         ),
     )
+    remote_torch = t.cast(TorchIterableDataset[dict[str, object]], remote)
+    overlay_loader = DataLoader(
+        remote_torch,
+        batch_size=1,
+        num_workers=1,
+        multiprocessing_context="spawn",
+        collate_fn=_first_spawn_batch,
+    )
+    expected_texts = ["remote one", "remote revised"]
+    assert _consume_spawn_loader(loader=overlay_loader) == expected_texts
+    assert _consume_spawn_loader(loader=overlay_loader) == expected_texts
+
     train = interleave_datasets(
         datasets=[local, remote],
         probabilities=[0.5, 0.5],
@@ -586,6 +602,15 @@ def test_production_graph_feeds_spawn_dataloader(tmp_path: Path) -> None:
     batches = list(loader)
     assert len(batches) >= 1
     assert all("audio" in batch and "text" in batch for batch in batches)
+
+
+def _consume_spawn_loader(loader: DataLoader) -> list[str]:
+    """Consume a spawn DataLoader and return its transcripts.
+
+    Returns:
+        Transcripts emitted by the loader.
+    """
+    return [t.cast(str, batch["text"]) for batch in loader]
 
 
 def _write_spawn_wav(path: Path) -> None:

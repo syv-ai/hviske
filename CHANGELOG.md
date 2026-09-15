@@ -36,8 +36,9 @@
   `spawn` workers without changing lazy audio loading or restartability.
 - Normalised Sparkie `dataset_num_workers=1` to in-process filtering and mapping, and
   stopped requesting multiprocessing when materialising iterable validation datasets;
-  four training audio loader workers remain enabled with PyTorch's `spawn` start
-  method to avoid inheriting Hub HTTP sockets.
+  the production positional-overlay graph now uses one training audio loader worker
+  because multi-shard bases are incompatible with worker-local positional offsets.
+  Generic keyed and non-positional graphs remain unchanged.
 - Used the configured Hugging Face datasets cache when materialising validation
   streaming datasets without an explicit cache directory.
 - Corrected the production NST source discriminator to `nst_da` across the base and

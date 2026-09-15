@@ -75,7 +75,9 @@ max_seconds_per_example: 10.0
 # Keep Hub-stream preprocessing in the parent process. The configured one worker is
 # normalised to num_proc=None, avoiding forks while Hub HTTP connections are live.
 dataset_num_workers: 1
-dataloader_num_workers: 4
+# Positional overlays use one global SQLite position stream; multi-shard bases cannot
+# be independently sharded across multiple DataLoader workers.
+dataloader_num_workers: 1
 streaming: true
 cache_dir: null
 padding: longest
