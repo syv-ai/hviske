@@ -4,8 +4,12 @@ import collections.abc as c
 import re
 import typing as t
 from collections.abc import Generator
+from pathlib import Path
 
 import pytest
+import soundfile as sf
+import torch
+import torchaudio
 from datasets import (
     Audio,
     Dataset,
@@ -16,7 +20,10 @@ from datasets import (
     Value,
 )
 from omegaconf import DictConfig
+from torch_audiomentations import AddBackgroundNoise
 
+import hviske.data as data
+from hviske.audio import SoundfileAudio
 from hviske.data import (
     filter_dataset,
     load_data_for_finetuning,
@@ -350,3 +357,109 @@ def test_process_dataset_normalises_single_worker(
     else:
         processed_dataset = t.cast(Dataset, processed)
         assert processed_dataset["text"] == ["hello"]
+
+
+def test_process_example_augments_without_torchaudio_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Background noise augmentation uses the soundfile-backed audio adapter."""
+    monkeypatch.chdir(tmp_path)
+    background_path = tmp_path / "background-noises" / "noise.wav"
+    background_path.parent.mkdir()
+    sf.write(file=background_path, data=[0.1] * 8_000, samplerate=8_000)
+    monkeypatch.delattr(torchaudio, "info", raising=False)
+
+    def load_audio(
+        path: str | Path, frame_offset: int = 0, num_frames: int = -1
+    ) -> tuple[torch.Tensor, int]:
+        """Provide the decoder used by torch-audiomentations in this test.
+
+        Returns:
+            A decoded waveform and its sample rate.
+        """
+        waveform, sample_rate = sf.read(file=path, dtype="float32", always_2d=True)
+        waveform_tensor = torch.from_numpy(waveform.T)
+        end = None if num_frames < 0 else frame_offset + num_frames
+        return waveform_tensor[:, frame_offset:end], sample_rate
+
+    monkeypatch.setattr(torchaudio, "load", load_audio)
+    created: list[AddBackgroundNoise] = []
+    original_add_background_noise = data.ta.AddBackgroundNoise
+
+    def create_background_noise(
+        *, background_paths: Path, p: float, sample_rate: int
+    ) -> AddBackgroundNoise:
+        """Make the probabilistic transform deterministic for this test.
+
+        Returns:
+            A background-noise transform configured to always run.
+        """
+        del p
+        transform = original_add_background_noise(
+            background_paths=background_paths, p=1.0, sample_rate=sample_rate
+        )
+        created.append(transform)
+        return transform
+
+    monkeypatch.setattr(data.ta, "AddBackgroundNoise", create_background_noise)
+    original_audio = torch.full((16_000,), 0.2)
+    example = {
+        "text": "Hello",
+        "audio": {"array": original_audio.tolist(), "sampling_rate": 16_000},
+    }
+
+    processed = process_example(
+        example=example,
+        characters_to_keep=None,
+        conversion_dict={},
+        text_column="text",
+        audio_column="audio",
+        lower_case=False,
+        convert_numerals=False,
+        processor=None,
+        normalise_audio=False,
+        augment_audio=True,
+    )
+
+    assert len(created) == 1
+    assert isinstance(created[0].audio, SoundfileAudio)
+    assert created[0].sample_rate == 16_000
+    assert processed["audio"]["array"].shape == (16_000,)
+    assert not torch.allclose(processed["audio"]["array"], original_audio)
+
+
+def test_process_example_skips_augmentation_when_disabled() -> None:
+    """Disabling augmentation does not require background-noise files."""
+    audio = torch.full((16_000,), 0.2)
+    example = {
+        "text": "Hello",
+        "audio": {"array": audio.tolist(), "sampling_rate": 16_000},
+    }
+
+    processed = process_example(
+        example=example,
+        characters_to_keep=None,
+        conversion_dict={},
+        text_column="text",
+        audio_column="audio",
+        lower_case=False,
+        convert_numerals=False,
+        processor=None,
+        normalise_audio=False,
+        augment_audio=False,
+    )
+
+    assert torch.equal(processed["audio"]["array"], audio)
+
+
+def test_soundfile_audio_reads_metadata_without_torchaudio_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Soundfile metadata supports torch-audiomentations on torchaudio 2.10."""
+    audio_path = tmp_path / "noise.wav"
+    sf.write(file=audio_path, data=[0.1] * 8_000, samplerate=8_000)
+    monkeypatch.delattr(torchaudio, "info", raising=False)
+
+    audio = SoundfileAudio(sample_rate=16_000)
+
+    assert audio.get_num_samples(audio_path) == 16_000

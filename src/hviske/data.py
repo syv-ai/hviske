@@ -43,6 +43,7 @@ from datasets import iterable_dataset as datasets_iterable
 from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
+from .audio import SoundfileAudio
 from .local_vtt import decode_vtt_audio, load_vtt_manifest
 from .types import Data
 from .utils import (
@@ -2183,21 +2184,22 @@ def process_example(
     # Extract audio from example
     audio = example[audio_column]
     audio_array = audio["array"]
-    sampling_rate = audio["sampling_rate"]
+    sampling_rate = int(audio["sampling_rate"])
     num_seconds = len(audio_array) / sampling_rate
 
     # Normalise and augment audio
+    normalise = ta.PeakNormalization(p=1.0) if normalise_audio else ta.Identity()
     if augment_audio:
         download_background_noises()
-    normalise = ta.PeakNormalization(p=1.0) if normalise_audio else ta.Identity()
-    augment = (
-        ta.Compose(
+        background_noise = ta.AddBackgroundNoise(
+            background_paths=Path("background-noises"), p=0.7, sample_rate=sampling_rate
+        )
+        background_noise.audio = SoundfileAudio(sample_rate=sampling_rate, mono=True)
+        augment = ta.Compose(
             [
                 ta.PeakNormalization(p=1.0),
                 ta.Gain(p=1.0),
-                ta.AddBackgroundNoise(
-                    background_paths=Path("background-noises"), p=0.7
-                ),
+                background_noise,
                 ta.AddColoredNoise(p=0.2),
                 ta.OneOf(
                     [
@@ -2211,9 +2213,8 @@ def process_example(
             ],
             p=1.0,
         )
-        if augment_audio
-        else ta.Identity()
-    )
+    else:
+        augment = ta.Identity()
     normalise_and_augment = ta.Compose([normalise, augment], p=1.0)
     audio_array = normalise_and_augment(
         torch.tensor(audio_array).unsqueeze(0).unsqueeze(0), sample_rate=sampling_rate
