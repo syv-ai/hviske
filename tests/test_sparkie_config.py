@@ -399,6 +399,7 @@ def test_sparkie_publication_provenance_is_complete(
         "drop",
         "flag",
         "quarantine",
+        "review",
     ]
     assert "text_policy" in first_overlay
     assert all("path" not in str(source).lower() for source in overlay_sources)
