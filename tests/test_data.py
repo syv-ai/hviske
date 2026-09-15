@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import soundfile as sf
 import torch
-import torchaudio
 from datasets import (
     Audio,
     Dataset,
@@ -22,7 +21,6 @@ from datasets import (
 from omegaconf import DictConfig
 from torch_audiomentations import AddBackgroundNoise
 
-import hviske.data as data
 from hviske.audio import SoundfileAudio
 from hviske.data import (
     filter_dataset,
@@ -254,6 +252,26 @@ class TestProcessExample:
         assert cleaned_transcription == expected
 
 
+def test_add_background_noise_decodes_8khz_wav_for_16khz_audio(tmp_path: Path) -> None:
+    """AddBackgroundNoise can resample a soundfile-decoded path."""
+    background_path = tmp_path / "noise.wav"
+    sf.write(file=background_path, data=[0.1] * 8_000, samplerate=8_000)
+    transform = AddBackgroundNoise(
+        background_paths=background_path,
+        min_snr_in_db=0.0,
+        max_snr_in_db=0.0,
+        p=1.0,
+        sample_rate=16_000,
+    )
+    transform.audio = SoundfileAudio(sample_rate=16_000, mono=True)
+    original_audio = torch.full((1, 1, 16_000), 0.2)
+
+    augmented = transform(original_audio, sample_rate=16_000)
+
+    assert augmented.shape == original_audio.shape
+    assert not torch.allclose(augmented, original_audio)
+
+
 @pytest.mark.parametrize("as_dict", [False, True])
 @pytest.mark.parametrize("num_proc, expected_num_proc", [(1, None), (2, 2)])
 def test_filter_dataset_normalises_single_worker(
@@ -359,75 +377,6 @@ def test_process_dataset_normalises_single_worker(
         assert processed_dataset["text"] == ["hello"]
 
 
-def test_process_example_augments_without_torchaudio_info(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Background noise augmentation uses the soundfile-backed audio adapter."""
-    monkeypatch.chdir(tmp_path)
-    background_path = tmp_path / "background-noises" / "noise.wav"
-    background_path.parent.mkdir()
-    sf.write(file=background_path, data=[0.1] * 8_000, samplerate=8_000)
-    monkeypatch.delattr(torchaudio, "info", raising=False)
-
-    def load_audio(
-        path: str | Path, frame_offset: int = 0, num_frames: int = -1
-    ) -> tuple[torch.Tensor, int]:
-        """Provide the decoder used by torch-audiomentations in this test.
-
-        Returns:
-            A decoded waveform and its sample rate.
-        """
-        waveform, sample_rate = sf.read(file=path, dtype="float32", always_2d=True)
-        waveform_tensor = torch.from_numpy(waveform.T)
-        end = None if num_frames < 0 else frame_offset + num_frames
-        return waveform_tensor[:, frame_offset:end], sample_rate
-
-    monkeypatch.setattr(torchaudio, "load", load_audio)
-    created: list[AddBackgroundNoise] = []
-    original_add_background_noise = data.ta.AddBackgroundNoise
-
-    def create_background_noise(
-        *, background_paths: Path, p: float, sample_rate: int
-    ) -> AddBackgroundNoise:
-        """Make the probabilistic transform deterministic for this test.
-
-        Returns:
-            A background-noise transform configured to always run.
-        """
-        del p
-        transform = original_add_background_noise(
-            background_paths=background_paths, p=1.0, sample_rate=sample_rate
-        )
-        created.append(transform)
-        return transform
-
-    monkeypatch.setattr(data.ta, "AddBackgroundNoise", create_background_noise)
-    original_audio = torch.full((16_000,), 0.2)
-    example = {
-        "text": "Hello",
-        "audio": {"array": original_audio.tolist(), "sampling_rate": 16_000},
-    }
-
-    processed = process_example(
-        example=example,
-        characters_to_keep=None,
-        conversion_dict={},
-        text_column="text",
-        audio_column="audio",
-        lower_case=False,
-        convert_numerals=False,
-        processor=None,
-        normalise_audio=False,
-        augment_audio=True,
-    )
-
-    assert len(created) == 1
-    assert isinstance(created[0].audio, SoundfileAudio)
-    assert created[0].sample_rate == 16_000
-    assert processed["audio"]["array"].shape == (16_000,)
-    assert not torch.allclose(processed["audio"]["array"], original_audio)
-
-
 def test_process_example_skips_augmentation_when_disabled() -> None:
     """Disabling augmentation does not require background-noise files."""
     audio = torch.full((16_000,), 0.2)
@@ -452,14 +401,47 @@ def test_process_example_skips_augmentation_when_disabled() -> None:
     assert torch.equal(processed["audio"]["array"], audio)
 
 
-def test_soundfile_audio_reads_metadata_without_torchaudio_info(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_soundfile_audio_converts_offsets_and_downmixes_channels(
+    tmp_path: Path,
 ) -> None:
-    """Soundfile metadata supports torch-audiomentations on torchaudio 2.10."""
+    """Offsets use target-rate samples and decoded audio is channel-first mono."""
+    audio_path = tmp_path / "stereo.wav"
+    sf.write(file=audio_path, data=[(0.25, 0.75)] * 4, samplerate=8_000)
+    audio = SoundfileAudio(sample_rate=16_000, mono=True)
+
+    samples = audio(audio_path, sample_offset=2, num_samples=6)
+
+    assert samples.shape == (1, 6)
+
+    downmixed = SoundfileAudio(sample_rate=8_000, mono=True)(
+        audio_path, sample_offset=1, num_samples=2
+    )
+    torch.testing.assert_close(downmixed, torch.full((1, 2), 0.5), atol=1e-4, rtol=0)
+
+
+def test_soundfile_audio_preserves_in_memory_samples() -> None:
+    """In-memory input keeps torch-audiomentations' existing semantics."""
+    audio = SoundfileAudio(sample_rate=16_000, mono=True)
+    source = torch.tensor([[0.1, 0.2, 0.3]])
+
+    samples = audio({"samples": source, "sample_rate": 16_000}, num_samples=2)
+
+    torch.testing.assert_close(samples, torch.tensor([[0.1, 0.2]]))
+
+
+def test_soundfile_audio_reads_offset_and_pads_to_requested_length(
+    tmp_path: Path,
+) -> None:
+    """A request extending past EOF is padded at the target sample rate."""
     audio_path = tmp_path / "noise.wav"
-    sf.write(file=audio_path, data=[0.1] * 8_000, samplerate=8_000)
-    monkeypatch.delattr(torchaudio, "info", raising=False)
+    sf.write(file=audio_path, data=[0.25] * 4, samplerate=8_000)
+    audio = SoundfileAudio(sample_rate=8_000)
 
-    audio = SoundfileAudio(sample_rate=16_000)
+    samples = audio(audio_path, sample_offset=2, num_samples=5)
 
-    assert audio.get_num_samples(audio_path) == 16_000
+    assert samples.shape == (1, 5)
+    torch.testing.assert_close(samples, torch.tensor([[0.25, 0.25, 0.0, 0.0, 0.0]]))
+
+    at_end = audio(audio_path, sample_offset=4, num_samples=3)
+
+    torch.testing.assert_close(at_end, torch.zeros((1, 3)))
