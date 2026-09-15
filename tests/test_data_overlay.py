@@ -1,18 +1,36 @@
 """Focused tests for reusable metadata-only ASR overlays."""
 
 import concurrent.futures
+import functools
+import json
 import multiprocessing
 import pickle
+import struct
 import sys
 import typing as t
+import wave
+from pathlib import Path
 
 import pytest
-from datasets import Dataset, IterableDataset
+from datasets import (
+    Audio,
+    Dataset,
+    Features,
+    IterableDataset,
+    Value,
+    interleave_datasets,
+)
 from torch.utils.data import DataLoader
 from torch.utils.data import IterableDataset as TorchIterableDataset
 
 import hviske.data as data_module
-from hviske.data import apply_dataset_overlay
+from hviske.data import (
+    _filter_dataset_rows,
+    _standardise_training_dataset,
+    apply_dataset_overlay,
+    process_dataset,
+)
+from hviske.local_vtt import decode_vtt_audio, load_vtt_manifest
 
 
 def _consume_pickled_overlay(payload: bytes) -> list[str]:
@@ -23,6 +41,26 @@ def _consume_pickled_overlay(payload: bytes) -> list[str]:
     """
     dataset = pickle.loads(payload)
     return [row["text"] for row in dataset]
+
+
+def _first_spawn_batch(rows: list[dict[str, object]]) -> dict[str, object]:
+    """Keep nested audio dictionaries intact in the spawn probe's batch.
+
+    Returns:
+        The first row in the batch.
+    """
+    return rows[0]
+
+
+def _spawn_remote_rows() -> t.Iterator[dict[str, object]]:
+    """Yield typed, Hub-shaped rows for the Linux spawn graph test."""
+    for text in ("remote one", "remote two"):
+        yield {
+            "audio": {"array": [0.0] * 16_000, "sampling_rate": 16_000},
+            "text": text,
+            "language": "en",
+            "source": "remote",
+        }
 
 
 def test_keyed_overlay_rejects_duplicate_keys() -> None:
@@ -115,53 +153,6 @@ def test_keyed_overlay_rejects_missing_and_mismatched_keys() -> None:
     )
     with pytest.raises(ValueError, match="key type mismatch"):
         list(apply_dataset_overlay(base, mismatched_types, config))
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux worker runtime regression")
-def test_overlaid_iterable_feeds_spawn_dataloader() -> None:
-    """A joined and filtered overlay remains consumable by a spawned worker."""
-    base = Dataset.from_list(
-        [
-            {"id": 1, "source": "demo", "text": "one"},
-            {"id": 2, "source": "demo", "text": "two"},
-            {"id": 3, "source": "other", "text": "ignored"},
-        ]
-    )
-    overlay = Dataset.from_list(
-        [
-            {
-                "id": 1,
-                "source": "demo",
-                "reference_text": "one",
-                "new_text": None,
-                "action": "keep",
-            },
-            {
-                "id": 2,
-                "source": "demo",
-                "reference_text": "two",
-                "new_text": "deux",
-                "action": "relabel",
-            },
-        ]
-    )
-    overlaid = apply_dataset_overlay(
-        base_dataset=base,
-        overlay_dataset=overlay,
-        overlay_config=_config(
-            strategy="keyed", base_join_column="id", overlay_join_column="id"
-        ),
-    )
-
-    torch_dataset = t.cast(TorchIterableDataset[dict[str, object]], overlaid)
-    loader = DataLoader(
-        torch_dataset, batch_size=1, num_workers=1, multiprocessing_context="spawn"
-    )
-
-    assert [t.cast(dict[str, list[str]], batch)["text"][0] for batch in loader] == [
-        "one",
-        "deux",
-    ]
 
 
 def test_overlay_consumers_are_pickleable_and_isolated() -> None:
@@ -363,10 +354,14 @@ def test_positional_overlay_filters_and_uses_ordered_text_fallback() -> None:
         ]
     )
 
-    result = list(apply_dataset_overlay(base, overlay, _config()))
+    overlaid = apply_dataset_overlay(base, overlay, _config())
+    payload = pickle.dumps(overlaid)
+    result = list(overlaid)
+    restored = list(pickle.loads(payload))
 
     assert [row["text"] for row in result] == ["one", " revised "]
     assert [row["audio"] for row in result] == ["a", "b"]
+    assert [row["text"] for row in restored] == ["one", " revised "]
 
 
 def test_positional_overlay_infers_features_for_untyped_base() -> None:
@@ -438,3 +433,120 @@ def test_positional_overlay_rejects_length_and_equality_mismatches() -> None:
     )
     with pytest.raises(ValueError, match="equality mismatch"):
         list(apply_dataset_overlay(base, mismatched_overlay, _config()))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux worker runtime regression")
+def test_production_graph_feeds_spawn_dataloader(tmp_path: Path) -> None:
+    """A production-shaped local/remote graph remains pickleable under spawn."""
+    wav_path = tmp_path / "programme.wav"
+    _write_spawn_wav(wav_path)
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "source_wav_path": str(wav_path),
+                "start": 0.0,
+                "end": 1.0,
+                "duration": 1.0,
+                "text": "local",
+                "id": "local",
+                "language": "da",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    local = load_vtt_manifest(manifest_path, min_seconds=0.1, max_seconds=2.0)
+    local_features = local.features.copy()
+    local_features["audio"] = Audio(sampling_rate=16_000)
+    local = local.map(
+        function=functools.partial(decode_vtt_audio, sampling_rate=16_000),
+        features=local_features,
+    )
+    local = t.cast(
+        IterableDataset, _standardise_training_dataset(local, sampling_rate=16_000)
+    )
+
+    remote = IterableDataset.from_generator(
+        _spawn_remote_rows,
+        features=Features(
+            audio=Audio(sampling_rate=16_000),
+            text=Value("string"),
+            language=Value("string"),
+            source=Value("string"),
+        ),
+    )
+    remote = t.cast(
+        IterableDataset, _standardise_training_dataset(remote, sampling_rate=16_000)
+    )
+    remote = _filter_dataset_rows(dataset=remote, filters={"language": "en"})
+    remote = _filter_dataset_rows(dataset=remote, filters={"language": "en"})
+    overlay = Dataset.from_list(
+        [
+            {"reference_text": "remote one", "new_text": None, "action": "keep"},
+            {
+                "reference_text": "remote two",
+                "new_text": "remote revised",
+                "action": "relabel",
+            },
+        ]
+    )
+    remote = t.cast(
+        IterableDataset,
+        apply_dataset_overlay(
+            base_dataset=remote,
+            overlay_dataset=overlay,
+            overlay_config={
+                "strategy": "positional",
+                "action_column": "action",
+                "allowed_actions": ["keep", "relabel"],
+                "text_policy": {
+                    "candidates": [
+                        {"column": "new_text", "actions": ["relabel"]},
+                        {"column": "reference_text"},
+                    ]
+                },
+            },
+        ),
+    )
+    train = interleave_datasets(
+        datasets=[local, remote],
+        probabilities=[0.5, 0.5],
+        seed=4242,
+        stopping_strategy="all_exhausted",
+    )
+    train = process_dataset(
+        dataset=train,
+        lower_case=True,
+        characters_to_keep=None,
+        text_column="text",
+        remove_input_dataset_columns=False,
+        audio_column="audio",
+        convert_numerals=False,
+        normalise_audio=False,
+        augment_audio=False,
+        processor=None,
+        language_column="language",
+    )
+    pickle.dumps(train)
+    torch_dataset = t.cast(TorchIterableDataset[dict[str, object]], train)
+    loader = DataLoader(
+        torch_dataset,
+        batch_size=1,
+        num_workers=1,
+        multiprocessing_context="spawn",
+        collate_fn=_first_spawn_batch,
+    )
+
+    batches = list(loader)
+    assert len(batches) >= 1
+    assert all("audio" in batch and "text" in batch for batch in batches)
+
+
+def _write_spawn_wav(path: Path) -> None:
+    """Write a short mono WAV without requiring a fixture or network access."""
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(struct.pack("<16000h", *([0] * 16_000)))

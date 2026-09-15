@@ -1,5 +1,6 @@
 """Focused tests for bilingual and zero-copy data foundations."""
 
+import functools
 import json
 import multiprocessing
 import pickle
@@ -50,6 +51,15 @@ def _consume_pickled_join(payload: bytes) -> list[dict[str, object]]:
     """
     dataset = t.cast(IterableDataset, pickle.loads(payload))
     return list(dataset)
+
+
+def _production_hub_rows() -> Iterable[dict[str, object]]:
+    """Yield a typed Hub-shaped row for the production schema test."""
+    yield {
+        "recording_id": "hub",
+        "audio": {"array": np.zeros(16_000), "sampling_rate": 16_000},
+        "extra_metadata": "removed",
+    }
 
 
 def _streaming_join_audio_rows() -> Iterable[dict[str, str]]:
@@ -569,7 +579,7 @@ def test_production_sources_have_restartable_interleave_schema(tmp_path: Path) -
     local_features = local.features.copy()
     local_features["audio"] = Audio(sampling_rate=16_000)
     local = local.map(
-        function=lambda example: decode_vtt_audio(example, sampling_rate=16_000),
+        function=functools.partial(decode_vtt_audio, sampling_rate=16_000),
         features=local_features,
     )
     local = t.cast(
@@ -577,15 +587,7 @@ def test_production_sources_have_restartable_interleave_schema(tmp_path: Path) -
     )
 
     hub = IterableDataset.from_generator(
-        lambda: iter(
-            [
-                {
-                    "recording_id": "hub",
-                    "audio": {"array": np.zeros(16_000), "sampling_rate": 16_000},
-                    "extra_metadata": "removed",
-                }
-            ]
-        ),
+        _production_hub_rows,
         features=Features(
             recording_id=Value("string"),
             audio=Audio(sampling_rate=16_000),
@@ -604,7 +606,7 @@ def test_production_sources_have_restartable_interleave_schema(tmp_path: Path) -
     hub_features = hub.features.copy()
     hub_features["language"] = Value("string")
     hub = hub.map(
-        function=lambda example: _set_source_language(example, language="en"),
+        function=functools.partial(_set_source_language, language="en"),
         features=hub_features,
     )
     hub = t.cast(
@@ -618,9 +620,12 @@ def test_production_sources_have_restartable_interleave_schema(tmp_path: Path) -
         stopping_strategy="all_exhausted",
     )
     assert interleaved.features == local.features == hub.features
+    payload = pickle.dumps(interleaved)
     rows = list(interleaved)
     restarted_rows = list(interleaved)
+    restored_rows = list(pickle.loads(payload))
     assert [row["text"] for row in rows] == [row["text"] for row in restarted_rows]
+    assert [row["text"] for row in rows] == [row["text"] for row in restored_rows]
     assert set(row["text"] for row in rows) == {"local", "hub"}
     assert all(set(row) == {"audio", "text", "language"} for row in rows)
 
@@ -766,6 +771,8 @@ def test_vtt_manifest_does_not_open_audio_before_iteration(
     assert not opened
     assert next(iter(dataset))["text"] == "hello"
     assert not opened
+    payload = pickle.dumps(dataset)
+    assert next(iter(pickle.loads(payload)))["text"] == "hello"
 
 
 def test_vtt_manifest_slices_original_wav_without_copying(tmp_path: Path) -> None:
