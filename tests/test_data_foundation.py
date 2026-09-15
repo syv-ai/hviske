@@ -1,6 +1,7 @@
 """Focused tests for bilingual and zero-copy data foundations."""
 
 import json
+import multiprocessing
 import pickle
 import typing as t
 import wave
@@ -24,6 +25,7 @@ from datasets import config as datasets_config
 from hviske.data import (
     _dataset_cache_identity,
     _filter_dataset_rows,
+    _filter_streaming_dataset,
     _limit_validation_dataset,
     _set_source_language,
     _standardise_training_dataset,
@@ -38,6 +40,23 @@ from hviske.local_vtt import (
     load_vtt_manifest,
     parse_vtt,
 )
+
+
+def _consume_pickled_join(payload: bytes) -> list[dict[str, object]]:
+    """Consume a pickled joined stream in a spawn child.
+
+    Returns:
+        Rows emitted by the joined stream.
+    """
+    dataset = t.cast(IterableDataset, pickle.loads(payload))
+    return list(dataset)
+
+
+def _streaming_join_audio_rows() -> Iterable[dict[str, str]]:
+    """Yield small audio rows for the streaming join pickle test."""
+    yield {"partition": "train", "key": "one"}
+    yield {"partition": "other", "key": "two"}
+    yield {"partition": "train", "key": "three"}
 
 
 def test_build_vtt_manifest_is_atomic_on_fatal_failure(
@@ -280,6 +299,41 @@ def test_exact_row_filters_repeat_on_typed_streams_without_read_ahead() -> None:
     second_pass = [row["audio"]["path"] for row in filtered_twice.take(3)]
     assert second_pass == first_pass
     assert consumed <= 18
+
+
+def test_filtered_join_is_pickleable_and_spawn_restartable() -> None:
+    """A joined stream remains restartable after filtering and pickling."""
+    audio = IterableDataset.from_generator(
+        _streaming_join_audio_rows,
+        features=Features(partition=Value("string"), key=Value("string")),
+    )
+    filtered = _filter_dataset_rows(dataset=audio, filters={"partition": "train"})
+    transcripts = Dataset.from_list(
+        [
+            {"transcript_key": "one", "words": "Et"},
+            {"transcript_key": "three", "words": "Tre"},
+        ]
+    )
+    joined = join_audio_and_transcripts(
+        audio_dataset=filtered,
+        transcript_dataset=transcripts,
+        audio_join_column="key",
+        transcript_join_column="transcript_key",
+        transcript_text_column="words",
+    )
+    expected = [
+        {"partition": "train", "key": "one", "text": "Et"},
+        {"partition": "train", "key": "three", "text": "Tre"},
+    ]
+
+    payload = pickle.dumps(joined)
+    assert list(joined) == expected
+    assert list(joined) == expected
+    assert list(pickle.loads(payload)) == expected
+
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(1) as pool:
+        assert pool.apply(_consume_pickled_join, (payload,)) == expected
 
 
 def test_join_rejects_duplicate_transcript_keys() -> None:
@@ -614,6 +668,28 @@ def test_streaming_audio_is_joined_to_partial_transcript_index() -> None:
     )
 
     assert list(joined) == [{"key": "two", "text": "To"}]
+
+
+def test_streaming_filter_reraises_unrelated_type_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated filter TypeError is propagated without replacement."""
+    dataset = IterableDataset.from_generator(
+        lambda: iter([{"key": "one"}]), features=Features(key=Value("string"))
+    )
+    filtered_once = dataset.filter(function=lambda row: True)
+    error = TypeError("unrelated filter failure")
+
+    def fail_filter(self: IterableDataset, *, function: object) -> IterableDataset:
+        del self, function
+        raise error
+
+    monkeypatch.setattr(IterableDataset, "filter", fail_filter)
+
+    with pytest.raises(TypeError) as raised:
+        _filter_streaming_dataset(dataset=filtered_once, function=lambda row: True)
+
+    assert raised.value is error
 
 
 def test_validation_sample_cap_is_applied_before_materialisation() -> None:
