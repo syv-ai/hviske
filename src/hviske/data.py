@@ -186,6 +186,7 @@ def _standardise_training_dataset(
         ValueError:
             If a required training column is missing.
     """
+    dataset = _resolve_streaming_features(dataset=dataset)
     required_columns = {"audio", "text", "language"}
     available_columns = set(dataset.column_names or [])
     missing_columns = required_columns - available_columns
@@ -199,6 +200,44 @@ def _standardise_training_dataset(
         standardised = standardised.map(function=lambda example: example)
         standardised.info.features = features
     return standardised
+
+
+def _resolve_streaming_features(
+    dataset: Dataset | IterableDataset,
+) -> Dataset | IterableDataset:
+    """Infer features for an untyped streaming dataset without materialising it.
+
+    ``IterableDataset._resolve_features`` is private in the supported datasets
+    release, so all use of that compatibility API is kept in this helper.
+
+    Args:
+        dataset:
+            Dataset whose features may need to be inferred.
+
+    Returns:
+        The original dataset when features are already known, otherwise a new
+        restartable iterable dataset with inferred features.
+
+    Raises:
+        RuntimeError:
+            If the datasets version cannot infer features for an untyped stream.
+    """
+    if not isinstance(dataset, IterableDataset) or dataset.features is not None:
+        return dataset
+
+    resolve_features = getattr(dataset, "_resolve_features", None)
+    if not callable(resolve_features):
+        raise RuntimeError(
+            "Cannot infer features for an untyped streaming dataset: "
+            "datasets.IterableDataset._resolve_features is unavailable"
+        )
+    resolved = t.cast(Callable[[], IterableDataset], resolve_features)()
+    if resolved.features is None:
+        raise RuntimeError(
+            "datasets.IterableDataset._resolve_features did not infer streaming "
+            "dataset features"
+        )
+    return resolved
 
 
 def _standard_training_features(sampling_rate: int) -> Features:
@@ -295,6 +334,7 @@ def apply_dataset_overlay(
             or text policy is invalid.
     """
     config = overlay_config
+    base_dataset = _resolve_streaming_features(dataset=base_dataset)
     base_filters = config.get("base_filters")
     if base_filters is not None:
         if not isinstance(base_filters, Mapping):
@@ -876,6 +916,7 @@ def join_audio_and_transcripts(
             If a configured column is absent, transcript keys are duplicated, or no
             usable transcripts remain.
     """
+    audio_dataset = _resolve_streaming_features(dataset=audio_dataset)
     _require_columns(
         dataset=audio_dataset, columns=[audio_join_column], dataset_name="audio"
     )
@@ -1129,6 +1170,7 @@ def load_data_for_finetuning(
 
         if not isinstance(ds, Dataset | IterableDataset):
             raise ValueError(f"Unsupported dataset type: {type(ds)}")
+        ds = _resolve_streaming_features(dataset=ds)
 
         if not is_local_vtt:
             audio_column = str(dataset_config.audio_column)
@@ -1451,8 +1493,9 @@ def _filter_dataset_rows_from_split(
 
     Raises:
         ValueError:
-            If the dataset has no declared features or a filter column is missing.
+            If a filter column is missing.
     """
+    dataset = _resolve_streaming_features(dataset=dataset)
     if dataset.features is None:
         raise ValueError("Cannot apply row filters without declared dataset features")
     missing_columns = [column for column in filters if column not in dataset.features]
@@ -1509,6 +1552,19 @@ def filter_dataset(
         ValueError:
             If the filtered dataset type is unsupported.
     """
+    if isinstance(dataset, IterableDataset):
+        dataset = t.cast(Data, _resolve_streaming_features(dataset=dataset))
+    elif isinstance(dataset, IterableDatasetDict):
+        dataset = t.cast(
+            Data,
+            IterableDatasetDict(
+                {
+                    split_name: _resolve_streaming_features(dataset=split_dataset)
+                    for split_name, split_dataset in dataset.items()
+                }
+            ),
+        )
+
     num_samples_before = len(dataset) if isinstance(dataset, Sized) else 0
 
     filter_fn = partial(
@@ -1615,6 +1671,19 @@ def process_dataset(
         ValueError:
             If the dataset type is not supported.
     """
+    if isinstance(dataset, IterableDataset):
+        dataset = t.cast(Data, _resolve_streaming_features(dataset=dataset))
+    elif isinstance(dataset, IterableDatasetDict):
+        dataset = t.cast(
+            Data,
+            IterableDatasetDict(
+                {
+                    split_name: _resolve_streaming_features(dataset=split_dataset)
+                    for split_name, split_dataset in dataset.items()
+                }
+            ),
+        )
+
     if isinstance(dataset, Dataset) or isinstance(dataset, IterableDataset):
         column_names = t.cast(Dataset | IterableDataset, dataset).column_names
     elif isinstance(dataset, DatasetDict) or isinstance(dataset, IterableDatasetDict):
