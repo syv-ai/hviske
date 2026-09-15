@@ -268,11 +268,24 @@ def _grouped_source_candidate(
     overlay_filter = _matching_singleton_filter(overlay_config.get("filters"))
     if source_filter is None or base_filter is None or overlay_filter is None:
         return None
+    base_column, discriminator = source_filter
+    overlay_column, overlay_discriminator = overlay_filter
     if not (
-        source_filter[0] == base_filter[0] == overlay_filter[0]
-        and _same_filter_value(source_filter[1], base_filter[1])
-        and _same_filter_value(source_filter[1], overlay_filter[1])
+        base_column == base_filter[0]
+        and _same_filter_value(discriminator, base_filter[1])
+        and _same_filter_value(discriminator, overlay_discriminator)
     ):
+        return None
+    equality_checks = overlay_config.get(
+        "equality_checks", overlay_config.get("checks", {})
+    )
+    if not _has_exact_discriminator_check(
+        equality_checks=equality_checks,
+        base_column=base_column,
+        overlay_column=overlay_column,
+    ):
+        return None
+    if str(overlay_config.get("output_text_column", "text")) == base_column:
         return None
 
     source_without_filters = _without_config_keys(
@@ -284,8 +297,8 @@ def _grouped_source_candidate(
     return _GroupedSource(
         name=name,
         config=source_config,
-        filter_column=source_filter[0],
-        filter_value=source_filter[1],
+        filter_column=base_column,
+        filter_value=discriminator,
         base_signature=_normalise_config(source_without_filters),
         overlay_signature=_normalise_config(overlay_without_filters),
     )
@@ -307,25 +320,58 @@ def _effective_overlay_strategy(overlay_config: c.Mapping[str, object]) -> str:
     ).lower()
 
 
-def _matching_singleton_filter(value: object) -> tuple[str, object] | None:
-    """Return a conservative scalar singleton filter, if configured."""
+def _has_exact_discriminator_check(
+    equality_checks: object, base_column: str, overlay_column: str
+) -> bool:
+    """Check for one unambiguous discriminator equality mapping.
+
+    Returns:
+        Whether exactly one check maps the base discriminator to the overlay one.
+    """
+    pairs = _configured_equality_check_pairs(equality_checks=equality_checks)
+    if pairs is None:
+        return False
+    discriminator_checks = [overlay for base, overlay in pairs if base == base_column]
+    return discriminator_checks == [overlay_column]
+
+
+def _configured_equality_check_pairs(
+    equality_checks: object,
+) -> list[tuple[str, str]] | None:
+    """Normalise valid equality-check forms without raising during eligibility.
+
+    Returns:
+        Normalised base/overlay column pairs, or ``None`` for invalid forms.
+    """
+    if isinstance(equality_checks, c.Mapping):
+        return [(str(base), str(overlay)) for base, overlay in equality_checks.items()]
+    if isinstance(equality_checks, str) or not isinstance(equality_checks, c.Iterable):
+        return None
+
+    pairs: list[tuple[str, str]] = []
+    for check in equality_checks:
+        if not isinstance(check, c.Mapping):
+            return None
+        base = check.get("base_column", check.get("base"))
+        overlay = check.get("overlay_column", check.get("overlay"))
+        if base is None or overlay is None:
+            return None
+        pairs.append((str(base), str(overlay)))
+    return pairs
+
+
+def _matching_singleton_filter(value: object) -> tuple[str, str] | None:
+    """Return a singleton production-source filter, if configured."""
     if not isinstance(value, c.Mapping) or len(value) != 1:
         return None
     column, filter_value = next(iter(value.items()))
-    if not isinstance(column, str) or not _is_exact_filter_scalar(filter_value):
+    if (
+        not isinstance(column, str)
+        or not isinstance(filter_value, str)
+        or not filter_value
+    ):
         return None
     return column, filter_value
-
-
-def _is_exact_filter_scalar(value: object) -> bool:
-    """Whether a filter value has unambiguous equality semantics.
-
-    Returns:
-        Whether the value is a finite, scalar equality operand.
-    """
-    if value is None or isinstance(value, str | bool | int):
-        return True
-    return isinstance(value, float) and math.isfinite(value)
 
 
 def _normalise_config(value: object) -> object:
