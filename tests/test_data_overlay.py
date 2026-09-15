@@ -7,6 +7,7 @@ import pickle
 import pytest
 from datasets import Dataset, IterableDataset
 
+import hviske.data as data_module
 from hviske.data import apply_dataset_overlay
 
 
@@ -160,6 +161,37 @@ def test_overlay_consumers_are_pickleable_and_isolated() -> None:
     context = multiprocessing.get_context("spawn")
     with context.Pool(1) as pool:
         assert pool.apply(_consume_pickled_overlay, (payload,)) == ["one", "deux"]
+
+
+def test_overlay_projects_columns_before_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlay filters run after large unused columns are projected away."""
+    observed_columns: list[list[str]] = []
+    original_filter = data_module._filter_dataset_rows
+
+    def spy_filter(dataset: Dataset, filters: dict[str, object]) -> Dataset:
+        observed_columns.append(list(dataset.column_names or []))
+        return original_filter(dataset=dataset, filters=filters)
+
+    monkeypatch.setattr(data_module, "_filter_dataset_rows", spy_filter)
+    base = Dataset.from_list([{"source": "demo", "text": "one"}])
+    overlay = Dataset.from_list(
+        [
+            {
+                "source": "demo",
+                "reference_text": "one",
+                "new_text": None,
+                "action": "keep",
+                "unused_model_logits": [0.0] * 4096,
+            }
+        ]
+    )
+
+    result = list(apply_dataset_overlay(base, overlay, _config(base_filters=None)))
+
+    assert observed_columns == [["action", "new_text", "reference_text", "source"]]
+    assert result[0]["text"] == "one"
 
 
 def test_overlay_projects_unused_columns_before_indexing() -> None:

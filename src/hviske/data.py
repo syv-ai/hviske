@@ -346,13 +346,8 @@ def apply_dataset_overlay(
             dataset=base_dataset, filters=t.cast(Mapping[str, object], base_filters)
         )
     overlay_filters = config.get("filters", config.get("overlay_filters"))
-    if overlay_filters is not None:
-        if not isinstance(overlay_filters, Mapping):
-            raise ValueError("Overlay filters must be a mapping")
-        overlay_dataset = _filter_dataset_rows(
-            dataset=overlay_dataset,
-            filters=t.cast(Mapping[str, object], overlay_filters),
-        )
+    if overlay_filters is not None and not isinstance(overlay_filters, Mapping):
+        raise ValueError("Overlay filters must be a mapping")
 
     join_config = config.get("join", {})
     if not isinstance(join_config, Mapping):
@@ -411,11 +406,6 @@ def apply_dataset_overlay(
     required_overlay.update(column for _, column, _ in candidates)
     if isinstance(overlay_filters, Mapping):
         required_overlay.update(str(column) for column in overlay_filters)
-    _require_columns(
-        dataset=overlay_dataset,
-        columns=sorted(required_overlay),
-        dataset_name="overlay",
-    )
     required_base = {column for column, _ in equality_checks}
     if strategy == "keyed":
         base_join_column = config.get(
@@ -440,11 +430,21 @@ def apply_dataset_overlay(
         required_base.add(base_join_column)
         required_overlay.add(overlay_join_column)
     _require_columns(
+        dataset=overlay_dataset,
+        columns=sorted(required_overlay),
+        dataset_name="overlay",
+    )
+    _require_columns(
         dataset=base_dataset, columns=sorted(required_base), dataset_name="base"
     )
     # Store only metadata needed by the join. In particular, model logits and other
     # large overlay columns must never enter the SQLite record blobs.
     overlay_dataset = overlay_dataset.select_columns(sorted(required_overlay))
+    if isinstance(overlay_filters, Mapping):
+        overlay_dataset = _filter_dataset_rows(
+            dataset=overlay_dataset,
+            filters=t.cast(Mapping[str, object], overlay_filters),
+        )
     output_column = str(config.get("output_text_column", "text"))
     index_path = _build_overlay_index(
         overlay_dataset=overlay_dataset,
