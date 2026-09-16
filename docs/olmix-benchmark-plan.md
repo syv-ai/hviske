@@ -42,7 +42,7 @@ Optimise these six groups rather than 16 independent sources:
 | --- | --- | ---: |
 | DA read/prepared | CoRal read-aloud, Nota, NST | 0.06 |
 | DA broadcast/conversation | P1, DRTV, YouTube, CoRal conversation | 0.45 |
-| DA parliament | FTSpeech | 0.09 |
+| DA parliament | FTSpeech, VoxPopuli Danish | 0.09 |
 | EN mixed/conversation/meeting | People's Speech, AMI SDM, AMI IHM | 0.23 |
 | EN parliament | VoxPopuli English | 0.09 |
 | EN read | Three LibriSpeech splits | 0.08 |
@@ -127,7 +127,7 @@ Before any smoke:
 - pin the final private `syvai/p1-segments` revision;
 - verify the repository is private and accessible inside the Sparkie container;
 - stream, decode, filter, and collate at least one real P1 segment;
-- verify all 15 active source streams yield post-filter training examples;
+- verify all 16 source streams yield post-filter training examples;
 - record the exact Hviske commit and `uv.lock` digest;
 - check free disk, GPU memory, existing GPU processes, container health, and output
   permissions;
@@ -144,7 +144,7 @@ same container used for training.
 
 Run one two-step job for each proxy model. A smoke must exercise:
 
-- all 15 active source configurations, including segmented P1;
+- all 16 source configurations, including segmented P1;
 - weighted interleaving;
 - per-example Danish and English prompt construction;
 - variable-length feature padding;
@@ -262,7 +262,7 @@ held-out vector once with training seed `4242`; mixture-generation seeds remain
 separate metadata. Phase 5 defines the preliminary fit, variance estimate, deterministic
 seed-escalation decision, and final refit.
 
-Expand each group vector to the 15 active source probabilities with the fixed conditional
+Expand each group vector to the 16 source probabilities with the fixed conditional
 mapping. Validate non-negative values, sum-to-one tolerance, source order, language
 mass, and a positive post-filter sample from every source with non-zero weight.
 
@@ -435,7 +435,7 @@ candidates differ by less than `0.001` absolute WER, choose the larger `lambda`,
 stays closer to the natural prior. Held-out mixtures may validate the response model
 but may not choose `lambda`. If no candidate is eligible, stop without a mixture.
 
-Expand the selected group vector back to all 15 active sources and commit a named Hydra
+Expand the selected group vector back to all 16 sources and commit a named Hydra
 configuration. Keep full decimal precision in the manifest; round only the displayed
 report.
 
