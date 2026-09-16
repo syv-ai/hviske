@@ -656,6 +656,9 @@ class CohereSeq2SeqTrainer(Seq2SeqTrainer):
 
         # Unlike the generic trainer, never remove decoder_input_ids when their shape
         # happens to match labels: those IDs are the Cohere language/punctuation prompt.
+        generation_inputs = self._prepare_generation_inputs(
+            model=cohere_model, inputs=generation_inputs
+        )
         generate = t.cast(t.Callable[..., object], cohere_model.generate)
         generated_tokens = t.cast(
             torch.Tensor, generate(**generation_inputs, **gen_kwargs)
@@ -703,6 +706,63 @@ class CohereSeq2SeqTrainer(Seq2SeqTrainer):
                     labels, generation_config.max_new_tokens + 1
                 )
         return t.cast(float | None, loss), generated_tokens, labels
+
+    @classmethod
+    def _prepare_generation_inputs(
+        cls, model: torch.nn.Module, inputs: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Move generation inputs without changing discrete tensor semantics.
+
+        Returns:
+            Generation inputs with floating tensors matched to model inference.
+        """
+        parameter = cls._inference_parameter(model)
+        fallback = next(iter(inputs.values()), None)
+        device = parameter.device if parameter is not None else None
+        if device is None and fallback is not None:
+            device = fallback.device
+        if device is None:
+            return dict(inputs)
+
+        dtype = parameter.dtype if parameter is not None else None
+        if dtype is None or not parameter.is_floating_point():
+            floating_input = next(
+                (value for value in inputs.values() if value.is_floating_point()), None
+            )
+            dtype = floating_input.dtype if floating_input is not None else None
+
+        return {
+            key: (
+                value.to(device=device, dtype=dtype)
+                if value.is_floating_point() and dtype is not None
+                else value.to(device=device)
+            )
+            for key, value in inputs.items()
+        }
+
+    @staticmethod
+    def _inference_parameter(model: torch.nn.Module) -> torch.nn.Parameter | None:
+        """Return a parameter describing the model's inference device and dtype."""
+        encoder: object | None = None
+        get_encoder = getattr(model, "get_encoder", None)
+        if callable(get_encoder):
+            try:
+                encoder = get_encoder()
+            except (AttributeError, NotImplementedError, TypeError):
+                encoder = None
+        if not isinstance(encoder, torch.nn.Module):
+            encoder = getattr(model, "encoder", None)
+        if not isinstance(encoder, torch.nn.Module):
+            model_body = getattr(model, "model", None)
+            encoder = getattr(model_body, "encoder", None)
+
+        modules = (encoder, model) if isinstance(encoder, torch.nn.Module) else (model,)
+        for module in modules:
+            try:
+                return next(module.parameters())
+            except StopIteration:
+                continue
+        return None
 
 
 class CohereASRTranscriber:
