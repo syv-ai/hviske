@@ -58,6 +58,10 @@ def compute_error_rate_metrics(
     # Whisper decoding
     pred_ids: NDArray[np.int_]
     if predictions.ndim == 2:
+        # Trainer uses -100 when padding variable-length predictions during
+        # evaluation. Decode a copy so callers retain the aggregated IDs.
+        predictions = predictions.copy()
+        predictions[predictions == -100] = pad_token
         if isinstance(processor, Wav2Vec2ProcessorWithLM):
             predictions_str = processor.batch_decode(predictions)
         else:

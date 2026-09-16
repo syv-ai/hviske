@@ -34,6 +34,8 @@
 
 ### Fixed
 
+- Replaced Trainer padding sentinels in generated token IDs before ASR metric decoding
+  without mutating aggregated evaluation predictions.
 - Matched floating-point Cohere generation features to the model inference dtype while
   preserving decoder IDs, attention masks, labels, and training inputs, including when
   evaluation uses standard distributed model wrappers.
