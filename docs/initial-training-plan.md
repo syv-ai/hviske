@@ -270,7 +270,8 @@ and writes only embedded compressed audio bytes, final text, and source to check
 local Parquet shards. Training and preflight require the deterministic
 manifest and complete marker through `HVISKE_MATERIALISED_OVERLAYS_ROOT`; they fail
 closed rather than returning to remote positional joins. This safe local graph supports
-four spawned DataLoader workers while keeping dataset preprocessing serial. Avoid
+three spawned DataLoader workers while keeping dataset preprocessing serial and avoiding
+the sustained 85–86°C operation observed with four workers. Avoid
 loading the same source both directly and through the unified repository.
 
 Do not use the manifest's FLEURS rows. Common Voice rows may be used only when their

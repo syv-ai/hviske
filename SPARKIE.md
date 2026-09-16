@@ -143,8 +143,10 @@ in-process preprocessing (`num_proc=None`), not a one-worker child process. Vali
 filtering happens while Hub and `httpx` connections may already be open; forking
 preprocessing workers can inherit one of those sockets and deadlock in `CLOSE-WAIT`.
 Keep preprocessing serial for this streaming campaign. The local Parquet artefact has
-independent physical shards, so four spawned DataLoader workers can interleave shards
-without sharing a positional offset and can restart deterministically. Keep positional
+independent physical shards, so three spawned DataLoader workers can interleave shards
+without sharing a positional offset and can restart deterministically. Four workers drove
+the GB10 to sustained 85–86°C operation; three retain parallel loading with safer thermal
+headroom. Keep positional
 equality checks strict during materialisation and do not relax them: generic keyed and
 non-materialised positional overlays remain supported by the reusable loader.
 The per-source streaming shuffle is applied after the local materialised shards are

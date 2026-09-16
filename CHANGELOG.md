@@ -21,9 +21,10 @@
 
 ### Changed
 
-- Made the local positional-overlay artefact mandatory for Sparkie and enabled four
+- Made the local positional-overlay artefact mandatory for Sparkie and enabled three
   spawned DataLoader workers while retaining serial dataset preprocessing and generic
-  remote keyed/non-materialised overlay support.
+  remote keyed/non-materialised overlay support; four workers exceeded the production
+  thermal limit during a sustained GPU pilot.
 - Tuned the production Sparkie shuffle buffers after the wf2t12vq smoke: a one-row
   global buffer for already-sharded Hub sources, 128 rows for local DRTV and YouTube,
   and 16 rows for the five positional unified sources. The old global 128-row graph took
@@ -41,7 +42,7 @@
 ### Fixed
 
 - Partitioned local VTT manifests into configurable metadata-only shards so Sparkie's
-  four spawned DataLoader workers can consume DRTV and YouTube examples in parallel.
+  spawned DataLoader workers can consume DRTV and YouTube examples in parallel.
 - Replaced Trainer padding sentinels in generated token IDs before ASR metric decoding
   without mutating aggregated evaluation predictions.
 - Matched floating-point Cohere generation features to the model inference dtype while

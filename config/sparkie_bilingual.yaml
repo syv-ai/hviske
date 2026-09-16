@@ -75,8 +75,9 @@ max_seconds_per_example: 10.0
 # normalised to num_proc=None, avoiding forks while Hub HTTP connections are live.
 dataset_num_workers: 1
 # The required local materialisation splits positional overlays into independent,
-# restartable Parquet shards, so spawn workers can safely interleave them.
-dataloader_num_workers: 4
+# restartable Parquet shards. Three spawn workers keep the GB10 fed without the
+# sustained 85-86 C temperatures observed with four workers.
+dataloader_num_workers: 3
 streaming: true
 # Production must never fall back to remote positional joins. Build and validate this
 # immutable local artefact before preflight or training.

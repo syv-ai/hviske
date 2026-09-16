@@ -513,7 +513,7 @@ def test_sparkie_worker_counts_require_local_overlay_artifact(
     config = _preset(monkeypatch)
 
     assert config.dataset_num_workers == 1
-    assert config.dataloader_num_workers == 4
+    assert config.dataloader_num_workers == 3
     assert config.require_materialised_overlays is True
     assert config.materialised_overlay_root is None
     assert config.datasets.drtv_local.local_vtt_num_shards >= 4
