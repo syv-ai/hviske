@@ -411,6 +411,12 @@ defaults unless a pilot shows a concrete failure:
 - **Precision:** BF16 where supported.
 - **Memory:** gradient checkpointing; reduce per-device batch before changing the
   effective batch.
+- **Streaming shuffle:** use the global one-row buffer for already-sharded Hub sources,
+  128 rows for the one-shard local DRTV and YouTube manifests, and 16 rows for the six
+  positional unified sources. Shuffle joined metadata after the positional overlay and
+  before audio decoding; the source probabilities continue to interleave every stream.
+  The old global 128-row smoke took 127 minutes, read 90 GB, and reached 19 GB worker
+  RSS before its first batch.
 - **Effective batch:** 256 examples.
 - **Optimiser:** AdamW, betas 0.9 and 0.98, max gradient norm 1.0.
 - **Augmentation:** existing peak normalisation, gain, background/coloured noise, and

@@ -367,7 +367,7 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     assert config.private_only is True
     assert config.save_total_limit == 3
     assert config.max_validation_samples_per_dataset == 1000
-    assert config.shuffle_buffer_size == 128
+    assert config.shuffle_buffer_size == 1
     assert config.max_steps == 200_000
     assert config.stop_after_steps is None
     assert list(config.model_card_languages) == ["da", "en"]
@@ -448,6 +448,37 @@ def test_sparkie_publication_provenance_is_complete(
     assert p1_sources[0]["probability"] == TRAINING_PROBABILITIES[0]
     assert p1_sources[0]["revision"] == P1_SEGMENTS_SHA
     assert "joined_transcript" not in p1_sources[0]
+
+
+def test_sparkie_shuffle_buffers_are_source_specific(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production preset keeps exact effective shuffle values per source."""
+    config = _preset(monkeypatch)
+
+    expected_buffers = {
+        "p1": 1,
+        "drtv_local": 128,
+        "youtube_local": 128,
+        "coral_read_aloud": 16,
+        "coral_conversation": 16,
+        "ftspeech": 16,
+        "nota": 16,
+        "nst": 16,
+        "voxpopuli_da": 16,
+        "peoples_speech_clean": 1,
+        "ami_sdm": 1,
+        "ami_ihm": 1,
+        "voxpopuli_en": 1,
+        "librispeech_clean_train_100": 1,
+        "librispeech_clean_train_360": 1,
+        "librispeech_other_train_500": 1,
+    }
+    assert config.shuffle_buffer_size == 1
+    assert {
+        name: dataset.get("shuffle_buffer_size", config.shuffle_buffer_size)
+        for name, dataset in config.datasets.items()
+    } == expected_buffers
 
 
 def test_sparkie_training_order_and_probabilities(
