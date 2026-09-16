@@ -226,8 +226,9 @@ def test_cohere_trainer_generates_from_prompt_ids() -> None:
 
 
 class _Model(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, dtype: torch.dtype = torch.float32) -> None:
         super().__init__()
+        self.inference_parameter = torch.nn.Parameter(torch.zeros(1, dtype=dtype))
         self.generation_config = SimpleNamespace(max_length=None, max_new_tokens=None)
         self.generated_inputs: dict[str, torch.Tensor] | None = None
         self.forward_inputs: dict[str, torch.Tensor] | None = None
@@ -239,6 +240,63 @@ class _Model(torch.nn.Module):
     def generate(self, **kwargs: torch.Tensor) -> torch.Tensor:
         self.generated_inputs = kwargs
         return torch.tensor([[2, 3, 4]])
+
+
+def test_cohere_trainer_matches_generation_feature_dtype() -> None:
+    """Generation casts features while preserving masks, IDs and training inputs."""
+    trainer = object.__new__(CohereSeq2SeqTrainer)
+    # The test deliberately injects a minimal stand-in for Trainer arguments.
+    # ty: ignore[invalid-assignment]
+    trainer.args = t.cast(
+        object, SimpleNamespace(predict_with_generate=True, prediction_loss_only=False)
+    )
+    trainer.model = _Model(dtype=torch.bfloat16)
+    trainer._gen_kwargs = {}
+    trainer._prepare_inputs = lambda inputs: inputs  # ty: ignore[invalid-assignment]
+    # The test deliberately replaces this context-manager factory.
+    # ty: ignore[invalid-assignment]
+    trainer.compute_loss_context_manager = t.cast(object, contextlib.nullcontext)
+    input_features = torch.zeros(1, 2, 128)
+    attention_mask = torch.tensor([[True, True]])
+    decoder_input_ids = torch.tensor([[10, 11, 20, 21]])
+    labels = torch.tensor([[-100, 20, 21, 99]])
+    inputs = {
+        "input_features": input_features,
+        "attention_mask": attention_mask,
+        "decoder_input_ids": decoder_input_ids,
+        "decoder_attention_mask": torch.tensor([[1, 1, 1, 1]]),
+        "prompt_length": torch.tensor([2]),
+        "labels": labels,
+    }
+
+    trainer.prediction_step(
+        model=trainer.model, inputs=inputs, prediction_loss_only=False
+    )
+
+    assert trainer.model.generated_inputs is not None
+    generated_inputs = trainer.model.generated_inputs
+    assert generated_inputs["input_features"].dtype == torch.bfloat16
+    assert (
+        generated_inputs["input_features"].device
+        == trainer.model.inference_parameter.device
+    )
+    assert torch.equal(generated_inputs["attention_mask"], attention_mask[:, :2])
+    assert generated_inputs["attention_mask"].dtype == attention_mask.dtype
+    assert torch.equal(
+        generated_inputs["decoder_attention_mask"],
+        inputs["decoder_attention_mask"][:, :2],
+    )
+    assert (
+        generated_inputs["decoder_attention_mask"].dtype
+        == inputs["decoder_attention_mask"].dtype
+    )
+    assert torch.equal(generated_inputs["decoder_input_ids"], decoder_input_ids[:, :2])
+    assert generated_inputs["decoder_input_ids"].dtype == decoder_input_ids.dtype
+    assert torch.equal(inputs["input_features"], input_features)
+    assert inputs["input_features"].dtype == torch.float32
+    assert trainer.model.forward_inputs is not None
+    assert trainer.model.forward_inputs["input_features"].dtype == torch.float32
+    assert torch.equal(trainer.model.forward_inputs["labels"], labels)
 
 
 def test_language_validation_uses_checkpoint_vocabulary() -> None:

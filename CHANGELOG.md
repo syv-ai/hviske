@@ -34,6 +34,8 @@
 
 ### Fixed
 
+- Matched floating-point Cohere generation features to the model inference dtype while
+  preserving decoder IDs, attention masks, labels, and training inputs.
 - Removed the zero-yield Danish VoxPopuli stream from the active Sparkie mix and
   reassigned its 0.049091 probability to FTSpeech, preserving the 15-source 60/40
   Danish/English mixture; the reusable dataset configuration and unified provenance
