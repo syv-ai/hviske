@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added resumable, shard-bounded local materialisation for Sparkie's five positional
+  overlays, with durable compressed audio, strict join parity, atomic receipts,
+  checksummed provenance manifests, free-disk reserves, and shared preflight validation.
 - Added reproducible PyTorch 2.10 CUDA resolution for Sparkie, with a fail-fast check
   that prevents the production preset from starting without a usable CUDA device.
 - Added robust online W&B tracking for the production Sparkie v6.0 workflow, including
@@ -18,6 +21,9 @@
 
 ### Changed
 
+- Made the local positional-overlay artefact mandatory for Sparkie and enabled four
+  spawned DataLoader workers while retaining serial dataset preprocessing and generic
+  remote keyed/non-materialised overlay support.
 - Tuned the production Sparkie shuffle buffers after the wf2t12vq smoke: a one-row
   global buffer for already-sharded Hub sources, 128 rows for local DRTV and YouTube,
   and 16 rows for the five positional unified sources. The old global 128-row graph took

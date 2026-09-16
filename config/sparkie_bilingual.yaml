@@ -74,10 +74,14 @@ max_seconds_per_example: 10.0
 # Keep Hub-stream preprocessing in the parent process. The configured one worker is
 # normalised to num_proc=None, avoiding forks while Hub HTTP connections are live.
 dataset_num_workers: 1
-# Positional overlays use one global SQLite position stream; multi-shard bases cannot
-# be independently sharded across multiple DataLoader workers.
-dataloader_num_workers: 1
+# The required local materialisation splits positional overlays into independent,
+# restartable Parquet shards, so spawn workers can safely interleave them.
+dataloader_num_workers: 4
 streaming: true
+# Production must never fall back to remote positional joins. Build and validate this
+# immutable local artefact before preflight or training.
+materialised_overlay_root: ${oc.env:HVISKE_MATERIALISED_OVERLAYS_ROOT,null}
+require_materialised_overlays: true
 cache_dir: null
 # Keep already-sharded Hub sources cheap to start; sources can override this.
 shuffle_buffer_size: 1
