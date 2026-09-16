@@ -10,7 +10,6 @@ defaults:
     - ftspeech
     - nota
     - nst
-    - voxpopuli_da
     - peoples_speech_clean
     - ami_sdm
     - ami_ihm
@@ -84,17 +83,16 @@ cache_dir: null
 shuffle_buffer_size: 1
 padding: longest
 
-# The first nine entries are Danish (60%); the final seven are English (40%).
+# The first eight entries are Danish (60%); the final seven are English (40%).
 dataset_probabilities:
   - 0.102857 # p1
   - 0.128571 # drtv_local
   - 0.09 # youtube_local
   - 0.017143 # coral_read_aloud
   - 0.128572 # coral_conversation
-  - 0.040909 # ftspeech
+  - 0.09 # ftspeech
   - 0.021428 # nota
   - 0.021429 # nst
-  - 0.049091 # voxpopuli_da
   - 0.16 # peoples_speech_clean
   - 0.04 # ami_sdm
   - 0.03 # ami_ihm

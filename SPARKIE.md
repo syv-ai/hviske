@@ -54,7 +54,7 @@ still being finalised. Branches, short SHAs, and non-hex revisions are rejected.
 
 ## Fixed production mix
 
-Do not reorder or rebalance the preset. Its 16 streams are sampled as follows:
+Do not reorder or rebalance the preset. Its 15 active streams are sampled as follows:
 
 | Language | Source | Configuration and split | Probability |
 | --- | --- | --- | ---: |
@@ -63,10 +63,9 @@ Do not reorder or rebalance the preset. Its 16 streams are sampled as follows:
 | Danish | local YouTube manifest | `train` | 0.09 |
 | Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=coral_read_aloud` / `train` | 0.017143 |
 | Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=coral_conversation` / `train` | 0.128572 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=ftspeech` / `train` | 0.040909 |
+| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=ftspeech` / `train` | 0.09 |
 | Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nota` / `train` | 0.021428 |
 | Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=nst_da` / `train` | 0.021429 |
-| Danish | `syvai/danish-asr-unified` + v5-tiny overlay | `source=voxpopuli` / `train` | 0.049091 |
 | English | `MLCommons/peoples_speech` | `clean` / `train` | 0.16 |
 | English | `edinburghcstr/ami` | `sdm` / `train` | 0.04 |
 | English | `edinburghcstr/ami` | `ihm` / `train` | 0.03 |
@@ -78,14 +77,19 @@ Do not reorder or rebalance the preset. Its 16 streams are sampled as follows:
 These are source-sampling probabilities chosen for style and acoustic balance, not
 weights proportional to row count. Large formal or read-aloud corpora are deliberately
 capped. The Danish total is exactly 60% and the English total 40%. FLEURS `en_us` is
-evaluation-only. The unified Danish repository is filtered into six separately weighted
-streams and uses the `HVISKE_OVERLAY_REVISION` v5-tiny metadata overlay; its rows are not
-loaded directly from the obsolete source repositories. Each stream resolves only its
-inclusive source-contiguous shard range at both immutable revisions (`voxpopuli` 0--354,
+evaluation-only. The unified Danish repository is filtered into five separately weighted
+active streams and uses the `HVISKE_OVERLAY_REVISION` v5-tiny metadata overlay; its rows
+are not loaded directly from the obsolete source repositories. Each active stream resolves
+only its inclusive source-contiguous shard range at both immutable revisions:
 `nota` 354--367, `ftspeech` 367--563, `coral_read_aloud` 563--623,
-`coral_conversation` 623--653, and `nst_da` 653--689). Boundary shards deliberately
-appear in both adjacent ranges so filters retain complete source coverage. Empty shard
-numbers may be absent, but the resolved base and overlay basename order must match.
+`coral_conversation` 623--653, and `nst_da` 653--689. The reusable Danish VoxPopuli
+configuration remains available, but is not selected: at unified audio revision
+`5a3a49ee981baab6e1e37ddd2c45f9943c27d08f` and positional overlay shard range `0--354`,
+its first 100 joined clips are OGG mono 16 kHz (duration min 16.15, median 30, max 30),
+so none survive the strict `1 < duration < 10` filter. Keeping it active would scan
+1.745 million rows without yielding an example. Boundary shards deliberately appear in
+both adjacent ranges so filters retain complete source coverage. Empty shard numbers may
+be absent, but the resolved base and overlay basename order must match.
 Common Voice, GigaSpeech, SPGISpeech, older CoRal data, and CoRal TTS are not part of
 this run.
 
@@ -140,14 +144,14 @@ The per-source streaming shuffle is applied only after the positional overlay an
 strict equality checks, but before audio decoding and duration filtering. The global
 buffer is 1 for already-sharded Hub sources: their deterministic physical-shard
 shuffling remains intact, while the source probabilities still interleave all streams.
-The one-shard local DRTV and YouTube manifests override it with 128 rows, and the six
+The one-shard local DRTV and YouTube manifests override it with 128 rows, and the five
 positional unified sources use 16 rows because the overlay wrapper collapses their
 physical shards and needs local mixing. Every buffer therefore shuffles metadata rather
 than audio. The reviewed shard-bounded, decode-free graph with the old global 128-row
 value still took 127 minutes, read 90 GB, and reached 19 GB worker RSS before its first
 batch. This ordering is important: shuffling before a positional join would corrupt
 base/overlay alignment. The shard bounds avoid the previous full 273 GB scan in each of
-six source-filtered streams while keeping the source filters as runtime validation.
+five source-filtered streams while keeping the source filters as runtime validation.
 
 The finetuning entrypoint selects PyTorch's `spawn` start method before experiment
 tracking, Hub data loading, or Trainer/DataLoader construction, preventing workers from

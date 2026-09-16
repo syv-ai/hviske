@@ -232,7 +232,7 @@ Sparkie corpus.
 Treat `syvai/danish-asr-unified-hviske-v5-tiny` as a quality and relabelling manifest,
 not as an audio dataset. It has no audio column. The overlay main branch is moving, so
 v6.0 does not carry a stale overlay SHA. Set `HVISKE_OVERLAY_REVISION` to the completed,
-immutable 40-character overlay commit before preflight or training; the six unified
+immutable 40-character overlay commit before preflight or training; the five active unified
 Danish sources all resolve that same environment value. Keep the matching unified-audio
 revision (`5a3a49ee981baab6e1e37ddd2c45f9943c27d08f`) in the source configurations until
 the overlay completion is pinned.
@@ -250,15 +250,20 @@ After the job finishes:
 6. exclude `flag`, `quarantine`, and `drop` from this clean first run.
 
 At the current moving revision, the manifest contains 3,414,589 rows and marks about
-96.3% as clean by that rule. VoxPopuli is the main contaminant. Its known
-subtitle-credit hallucinations are a release-blocking regression category, not harmless
-label noise.
+96.3% as clean by that rule. VoxPopuli is not an active v6.0 source: at the pinned
+unified audio revision
+`5a3a49ee981baab6e1e37ddd2c45f9943c27d08f` and positional overlay shard range `0--354`,
+its first 100 joined clips are OGG mono 16 kHz (duration min 16.15, median 30, max 30),
+so none survive the strict `1 < duration < 10` filter. Keeping it active would scan
+1.745 million rows without yielding an example. Its known subtitle-credit hallucinations
+are therefore a release-blocking regression category, not harmless label noise.
 
-Use the quality manifest for all of its relevant Danish sources, not only VoxPopuli.
-Create source-filtered streams for CoRal read-aloud, CoRal conversation, FTSpeech, Nota,
-NST, and VoxPopuli so the existing per-source sampling weights remain explicit. Each
-stream uses the same source filter on the base and overlay, strict positional row
-matching, source and reference-text equality checks, and the ordered
+Use the quality manifest for the five active Danish unified sources. Create
+source-filtered streams for CoRal read-aloud, CoRal conversation, FTSpeech, Nota, and
+NST so the existing per-source sampling weights remain explicit. The unified repository
+and its overlay remain part of training provenance through those sources. Each stream
+uses the same source filter on the base and overlay, strict positional row matching,
+source and reference-text equality checks, and the ordered
 `new_text`-then-`reference_text` fallback for relabel/strip actions. The reusable
 loader indexes overlay metadata in disk-backed SQLite while audio remains streaming;
 preflight invokes the same overlay and consumes the metadata without decoding audio.
@@ -298,7 +303,7 @@ the broadcast/conversation domain, not prepared/read speech.
   0.021429.
 - **Danish broadcast/conversation, 0.45:** P1 0.102857, DRTV 0.128571, YouTube 0.09,
   and CoRal conversation 0.128572.
-- **Danish parliament, 0.09:** FTSpeech 0.040909 and cleaned VoxPopuli 0.049091.
+- **Danish parliament, 0.09:** FTSpeech 0.09.
 - **English mixed/conversation/meeting, 0.23:** People's Speech mixed 0.16, AMI SDM
   0.04, and AMI IHM 0.03.
 - **English parliament, 0.09:** VoxPopuli English.
@@ -412,7 +417,7 @@ defaults unless a pilot shows a concrete failure:
 - **Memory:** gradient checkpointing; reduce per-device batch before changing the
   effective batch.
 - **Streaming shuffle:** use the global one-row buffer for already-sharded Hub sources,
-  128 rows for the one-shard local DRTV and YouTube manifests, and 16 rows for the six
+  128 rows for the one-shard local DRTV and YouTube manifests, and 16 rows for the five
   positional unified sources. Shuffle joined metadata after the positional overlay and
   before audio decoding; the source probabilities continue to interleave every stream.
   The old global 128-row smoke took 127 minutes, read 90 GB, and reached 19 GB worker
@@ -486,7 +491,7 @@ that training will use:
 
 - verify Hub access without printing credentials;
 - verify every immutable revision and local manifest digest;
-- check all 16 streams produce accepted examples;
+- check all 15 active streams produce accepted examples;
 - decode and process multiple examples from every source, including every action type
   retained from v5-tiny;
 - collate one representative mixed batch;

@@ -20,7 +20,7 @@
 
 - Tuned the production Sparkie shuffle buffers after the wf2t12vq smoke: a one-row
   global buffer for already-sharded Hub sources, 128 rows for local DRTV and YouTube,
-  and 16 rows for the six positional unified sources. The old global 128-row graph took
+  and 16 rows for the five positional unified sources. The old global 128-row graph took
   127 minutes, read 90 GB, and reached 19 GB worker RSS before its first batch; the
   200,000-step training horizon remains unchanged.
 - Switched production Sparkie P1 training to direct `syvai/p1-segments` loading with a
@@ -34,6 +34,10 @@
 
 ### Fixed
 
+- Removed the zero-yield Danish VoxPopuli stream from the active Sparkie mix and
+  reassigned its 0.049091 probability to FTSpeech, preserving the 15-source 60/40
+  Danish/English mixture; the reusable dataset configuration and unified provenance
+  remain available for other sources.
 - Restricted mirrored base and overlay shard validation to effective positional joins,
   preserving independent keyed-overlay shard selection in training and preflight.
 - Hardened finetuning-data preflight transport logging before Hub access, preventing
