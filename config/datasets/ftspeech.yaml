@@ -8,6 +8,7 @@ ftspeech:
   filters:
     source: ftspeech
   language: da
+  shuffle_buffer_size: 16
   revision: 5a3a49ee981baab6e1e37ddd2c45f9943c27d08f
   trust_remote_code: false
   data_file_shards:

@@ -18,9 +18,11 @@
 
 ### Changed
 
-- Updated the production Sparkie campaign to use a 128-row metadata shuffle buffer and
-  a 200,000-step training horizon, based on measured startup memory and immutable P1
-  publication coverage.
+- Tuned the production Sparkie shuffle buffers after the wf2t12vq smoke: a one-row
+  global buffer for already-sharded Hub sources, 128 rows for local DRTV and YouTube,
+  and 16 rows for the six positional unified sources. The old global 128-row graph took
+  127 minutes, read 90 GB, and reached 19 GB worker RSS before its first batch; the
+  200,000-step training horizon remains unchanged.
 - Switched production Sparkie P1 training to direct `syvai/p1-segments` loading with a
   required immutable `P1_SEGMENTS_REVISION`; generic transcript joins remain supported.
 - Removed unsupported Parakeet TDT fine-tuning and the NeMo-only Danish RNNT preset.

@@ -137,14 +137,17 @@ is incompatible with this production graph. Keep positional equality checks stri
 do not relax them to hide worker-local offsets. This is not a generic restriction:
 keyed overlays and graphs without positional overlays retain their existing behaviour.
 The per-source streaming shuffle is applied only after the positional overlay and its
-strict equality checks, but before audio decoding and duration filtering. Its bounded
-128-row buffer therefore reads metadata rather than decoding 128 clips before the
-first training example. The reviewed production value replaces 1,000 after that
-shard-bounded, decode-free graph still took 50 minutes and reached 19.5 GiB worker RSS
-before its first batch. This ordering is important: shuffling before a positional join
-would corrupt base/overlay alignment. The shard bounds avoid the previous full 273 GB
-scan in each of six source-filtered streams while keeping the source filters as runtime
-validation.
+strict equality checks, but before audio decoding and duration filtering. The global
+buffer is 1 for already-sharded Hub sources: their deterministic physical-shard
+shuffling remains intact, while the source probabilities still interleave all streams.
+The one-shard local DRTV and YouTube manifests override it with 128 rows, and the six
+positional unified sources use 16 rows because the overlay wrapper collapses their
+physical shards and needs local mixing. Every buffer therefore shuffles metadata rather
+than audio. The reviewed shard-bounded, decode-free graph with the old global 128-row
+value still took 127 minutes, read 90 GB, and reached 19 GB worker RSS before its first
+batch. This ordering is important: shuffling before a positional join would corrupt
+base/overlay alignment. The shard bounds avoid the previous full 273 GB scan in each of
+six source-filtered streams while keeping the source filters as runtime validation.
 
 The finetuning entrypoint selects PyTorch's `spawn` start method before experiment
 tracking, Hub data loading, or Trainer/DataLoader construction, preventing workers from
