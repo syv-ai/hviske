@@ -27,6 +27,11 @@ from hviske.data import (
     join_audio_and_transcripts,
 )
 from hviske.experiment_tracking.wandb_setup import preflight_wandb_access
+from hviske.materialised_overlays import (
+    configured_materialised_overlay_root,
+    materialised_source_files,
+    validate_materialised_overlay_root,
+)
 from hviske.utils import (
     validate_immutable_source_revision,
     validate_overlay_revision,
@@ -811,6 +816,21 @@ def preflight_finetuning_data(
     """
     harden_p1_logging()
 
+    materialised_root = configured_materialised_overlay_root(config=config)
+    materialised_sources: set[str] = set()
+    if materialised_root is not None:
+        materialised_manifest = validate_materialised_overlay_root(
+            config=config, root=materialised_root
+        )
+        materialised_sources = set(
+            materialised_source_files(
+                manifest=materialised_manifest, root=materialised_root
+            )
+        )
+        logger.info(
+            "Validated %s local positional-overlay streams", len(materialised_sources)
+        )
+
     if config.get("enable_experiment_tracking", False):
         if config.experiment_tracking.type == "wandb":
             preflight_wandb_access(config=config)
@@ -838,8 +858,13 @@ def preflight_finetuning_data(
     )
     logger.info("Confirmed access to model %s", config.model.pretrained_model_id)
 
-    handled_sources = _preflight_grouped_hub_sources(
-        datasets=config.datasets,
+    remote_datasets = {
+        str(name): source_config
+        for name, source_config in config.datasets.items()
+        if str(name) not in materialised_sources
+    }
+    handled_sources = materialised_sources | _preflight_grouped_hub_sources(
+        datasets=remote_datasets,
         dataset_loader=dataset_loader,
         cache_dir=config.get("cache_dir"),
         token=token,

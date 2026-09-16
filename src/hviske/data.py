@@ -1290,12 +1290,31 @@ def load_data_for_finetuning(
             probabilities=probabilities, dataset_count=len(config.datasets)
         )
 
+    # Import locally because the materialiser deliberately reuses this module's strict
+    # overlay implementation.
+    from .materialised_overlays import (
+        configured_materialised_overlay_root,
+        materialised_source_files,
+        validate_materialised_overlay_root,
+    )
+
+    materialised_root = configured_materialised_overlay_root(config=config)
+    materialised_files: dict[str, list[str]] = {}
+    if materialised_root is not None:
+        materialised_manifest = validate_materialised_overlay_root(
+            config=config, root=materialised_root
+        )
+        materialised_files = materialised_source_files(
+            manifest=materialised_manifest, root=materialised_root
+        )
+
     all_datasets: list[Dataset | IterableDataset] = []
     for dataset_name, dataset_config in config.datasets.items():
         if is_main_process:
             logger.info(f"Loading dataset {dataset_name!r}")
 
         is_local_vtt = dataset_config.get("type") == "local_vtt"
+        is_materialised = dataset_name in materialised_files
         immutable_revision_env = dataset_config.get("immutable_revision_env")
         if immutable_revision_env is not None:
             validate_immutable_source_revision(
@@ -1316,7 +1335,11 @@ def load_data_for_finetuning(
             )
         base_data_files: list[str] | None = None
         overlay_data_files: list[str] | None = None
-        is_hub_dataset = not is_local_vtt and not Path(dataset_config.id).exists()
+        is_hub_dataset = (
+            not is_local_vtt
+            and not is_materialised
+            and not Path(dataset_config.id).exists()
+        )
         if is_hub_dataset:
             base_data_files = _resolve_hub_data_files(
                 dataset_id=str(dataset_config.id),
@@ -1344,7 +1367,16 @@ def load_data_for_finetuning(
                         base_files=base_data_files, overlay_files=overlay_data_files
                     )
 
-        if is_local_vtt:
+        if is_materialised:
+            with no_datasets_progress_bars():
+                ds = load_dataset(
+                    "parquet",
+                    data_files=materialised_files[dataset_name],
+                    split="train",
+                    streaming=True,
+                    cache_dir=config.cache_dir,
+                )
+        elif is_local_vtt:
             ds = load_vtt_manifest(
                 manifest_path=Path(dataset_config.manifest_path),
                 min_seconds=config.min_seconds_per_example,
@@ -1425,7 +1457,7 @@ def load_data_for_finetuning(
                 dataset=ds, filters=t.cast(Mapping[str, object], row_filters)
             )
 
-        if overlay_config is not None:
+        if overlay_config is not None and not is_materialised:
             overlay = _load_transcript_dataset(
                 dataset_id=str(overlay_config.id),
                 subset=overlay_config.get("subset"),

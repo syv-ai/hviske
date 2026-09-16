@@ -33,21 +33,20 @@ def test_sparkie_full_commands_match_training_plan_evaluation_cadence() -> None:
     )
 
 
-def test_sparkie_runbook_preserves_safe_stream_worker_counts() -> None:
-    """The runbook explains the production worker-count restrictions."""
+def test_sparkie_runbook_documents_materialised_worker_safety() -> None:
+    """The runbook explains the local artefact and worker-count contract."""
     runbook = RUNBOOK.read_text()
 
     assert "dataset_num_workers=1" in runbook
-    assert "dataloader_num_workers=1" in runbook
-    assert "dataloader_num_workers=4" not in runbook
+    assert "dataloader_num_workers=4" in runbook
+    assert "HVISKE_MATERIALISED_OVERLAYS_ROOT" in runbook
+    assert "materialise_finetuning_overlays.py" in runbook
     assert "CLOSE-WAIT" in runbook
     assert "not a one-worker child process" in runbook
-    assert "dataloader_num_workers > 1" in runbook
-    assert "is incompatible with this production graph" in runbook
-    assert "Keep positional equality checks strict" in runbook
+    assert "four spawned DataLoader workers" in runbook
+    assert "equality checks strict during materialisation" in runbook
     assert "do not relax them" in runbook
-    assert "worker-local offsets" in runbook
-    assert "Do not raise `dataset_num_workers` for Hub streams" in runbook
+    assert "fails closed" in runbook
 
 
 def test_sparkie_tmux_launches_scrub_inherited_wandb_identity() -> None:

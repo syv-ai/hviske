@@ -264,10 +264,14 @@ NST so the existing per-source sampling weights remain explicit. The unified rep
 and its overlay remain part of training provenance through those sources. Each stream
 uses the same source filter on the base and overlay, strict positional row matching,
 source and reference-text equality checks, and the ordered
-`new_text`-then-`reference_text` fallback for relabel/strip actions. The reusable
-loader indexes overlay metadata in disk-backed SQLite while audio remains streaming;
-preflight invokes the same overlay and consumes the metadata without decoding audio.
-Avoid loading the same source both directly and through the unified repository.
+`new_text`-then-`reference_text` fallback for relabel/strip actions. The preparation
+command applies the reusable strict overlay join one mirrored physical shard at a time
+and writes only embedded compressed audio bytes, final text, and source to checksummed
+local Parquet shards. Training and preflight require the deterministic
+manifest and complete marker through `HVISKE_MATERIALISED_OVERLAYS_ROOT`; they fail
+closed rather than returning to remote positional joins. This safe local graph supports
+four spawned DataLoader workers while keeping dataset preprocessing serial. Avoid
+loading the same source both directly and through the unified repository.
 
 Do not use the manifest's FLEURS rows. Common Voice rows may be used only when their
 split membership is proved and all leaderboard test rows are excluded; otherwise omit
@@ -479,12 +483,13 @@ Run in parallel with workstream A.
 
 ### Gate 1: data-only Sparkie preflight
 
-Set `P1_SEGMENTS_REVISION` and `HVISKE_OVERLAY_REVISION` before resolving the preset.
-Preflight rejects either missing, mutable, abbreviated, or non-hex value with an
-actionable error and fully consumes each
-overlay before training. This full integrity pass is required because positional training
-is lazy; it establishes the strict extra-row, missing-row, duplicate, and equality gates
-before any training iterator is created.
+Set `P1_SEGMENTS_REVISION`, `HVISKE_OVERLAY_REVISION`, and
+`HVISKE_MATERIALISED_OVERLAYS_ROOT` before resolving the preset. First run
+`src/scripts/materialise_finetuning_overlays.py` against the pinned revisions. It
+establishes strict extra-row, missing-row, action/text, source, and equality gates while
+writing one paired physical shard at a time. Preflight rejects mutable revisions and
+validates the same manifest, complete marker, source/file provenance, schemas, counts,
+receipts, and checksums before any local shard is opened.
 
 Keep the existing GPU service running during this gate. In the same container and mounts
 that training will use:
