@@ -299,6 +299,72 @@ def test_cohere_trainer_matches_generation_feature_dtype() -> None:
     assert torch.equal(trainer.model.forward_inputs["labels"], labels)
 
 
+@pytest.mark.parametrize("wrapper_kind", ["data_parallel", "distributed_data_parallel"])
+def test_cohere_trainer_unwraps_parallel_generation_model(
+    wrapper_kind: str, tmp_path: Path
+) -> None:
+    """Generation uses the underlying model while loss uses the parallel wrapper."""
+    process_group_initialised = False
+    try:
+        if wrapper_kind == "distributed_data_parallel":
+            torch.distributed.init_process_group(
+                backend="gloo",
+                init_method=f"file://{tmp_path / 'ddp-init'}",
+                rank=0,
+                world_size=1,
+            )
+            process_group_initialised = True
+
+        underlying_model = _Model(dtype=torch.bfloat16)
+        if wrapper_kind == "data_parallel":
+            wrapped_model: torch.nn.Module = torch.nn.DataParallel(underlying_model)
+        else:
+            wrapped_model = torch.nn.parallel.DistributedDataParallel(underlying_model)
+
+        trainer = object.__new__(CohereSeq2SeqTrainer)
+        # The test deliberately injects a minimal stand-in for Trainer arguments.
+        # ty: ignore[invalid-assignment]
+        trainer.args = t.cast(
+            object,
+            SimpleNamespace(predict_with_generate=True, prediction_loss_only=False),
+        )
+        trainer.model = wrapped_model
+        trainer._gen_kwargs = {}
+        trainer._prepare_inputs = lambda inputs: inputs  # ty: ignore[invalid-assignment]
+        # The test deliberately replaces this context-manager factory.
+        # ty: ignore[invalid-assignment]
+        trainer.compute_loss_context_manager = t.cast(object, contextlib.nullcontext)
+        inputs = {
+            "input_features": torch.zeros(1, 2, 128),
+            "decoder_input_ids": torch.tensor([[10, 11, 20, 21]]),
+            "decoder_attention_mask": torch.tensor([[1, 1, 1, 1]]),
+            "prompt_length": torch.tensor([2]),
+            "labels": torch.tensor([[-100, 20, 21, 99]]),
+        }
+
+        trainer.prediction_step(
+            model=wrapped_model, inputs=inputs, prediction_loss_only=False
+        )
+
+        assert underlying_model.generated_inputs is not None
+        assert underlying_model.forward_inputs is not None
+        assert (
+            underlying_model.generated_inputs["input_features"].dtype
+            == underlying_model.inference_parameter.dtype
+        )
+        assert torch.equal(
+            underlying_model.generated_inputs["decoder_input_ids"],
+            inputs["decoder_input_ids"][:, :2],
+        )
+        assert torch.equal(
+            underlying_model.forward_inputs["decoder_input_ids"],
+            inputs["decoder_input_ids"],
+        )
+    finally:
+        if process_group_initialised:
+            torch.distributed.destroy_process_group()
+
+
 def test_language_validation_uses_checkpoint_vocabulary() -> None:
     """A tokenizer-added language is accepted, while an unknown one is rejected."""
     processor = object.__new__(CohereAsrProcessor)

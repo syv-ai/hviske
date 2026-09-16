@@ -11,6 +11,7 @@ from typing import Type
 
 import numpy as np
 import torch
+from accelerate.utils import extract_model_from_parallel
 from omegaconf import DictConfig
 from torch.backends.mps import is_available as mps_is_available
 from transformers import (
@@ -598,6 +599,9 @@ class CohereSeq2SeqTrainer(Seq2SeqTrainer):
         has_labels = "labels" in inputs
         prepared_inputs = t.cast(dict[str, torch.Tensor], self._prepare_inputs(inputs))
         cohere_model = t.cast(CohereAsrForConditionalGeneration, model)
+        generation_model = t.cast(
+            CohereAsrForConditionalGeneration, extract_model_from_parallel(model)
+        )
         prompt_lengths = prepared_inputs.get("prompt_length")
         decoder_input_ids = prepared_inputs.get("decoder_input_ids")
         decoder_attention_mask = prepared_inputs.get("decoder_attention_mask")
@@ -657,14 +661,14 @@ class CohereSeq2SeqTrainer(Seq2SeqTrainer):
         # Unlike the generic trainer, never remove decoder_input_ids when their shape
         # happens to match labels: those IDs are the Cohere language/punctuation prompt.
         generation_inputs = self._prepare_generation_inputs(
-            model=cohere_model, inputs=generation_inputs
+            model=generation_model, inputs=generation_inputs
         )
-        generate = t.cast(t.Callable[..., object], cohere_model.generate)
+        generate = t.cast(t.Callable[..., object], generation_model.generate)
         generated_tokens = t.cast(
             torch.Tensor, generate(**generation_inputs, **gen_kwargs)
         )
 
-        generation_config = cohere_model.generation_config
+        generation_config = generation_model.generation_config
         if generation_config.max_length is not None:
             if generated_tokens.shape[-1] < generation_config.max_length:
                 generated_tokens = self._pad_tensors_to_max_len(
