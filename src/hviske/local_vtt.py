@@ -85,20 +85,18 @@ def _manifest_rows(
     ):
         raise ValueError("shards must contain indices in the range [0, num_shards)")
 
-    for shard_index in shards:
-        with manifest_path.open(encoding="utf-8") as manifest_file:
-            for line_number, line in enumerate(manifest_file, start=1):
-                row = json.loads(line)
-                duration = float(row["duration"])
-                if duration < 0:
-                    raise ValueError(
-                        f"Negative duration on manifest line {line_number}"
-                    )
-                if (
-                    min_seconds < duration < max_seconds
-                    and (line_number - 1) % num_shards == shard_index
-                ):
-                    yield row
+    selected_shards = set(shards)
+    with manifest_path.open(encoding="utf-8") as manifest_file:
+        for line_number, line in enumerate(manifest_file, start=1):
+            row = json.loads(line)
+            duration = float(row["duration"])
+            if duration < 0:
+                raise ValueError(f"Negative duration on manifest line {line_number}")
+            if (
+                min_seconds < duration < max_seconds
+                and (line_number - 1) % num_shards in selected_shards
+            ):
+                yield row
 
 
 def build_vtt_manifest(
