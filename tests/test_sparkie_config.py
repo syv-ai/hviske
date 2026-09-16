@@ -516,6 +516,8 @@ def test_sparkie_worker_counts_require_local_overlay_artifact(
     assert config.dataloader_num_workers == 4
     assert config.require_materialised_overlays is True
     assert config.materialised_overlay_root is None
+    assert config.datasets.drtv_local.local_vtt_num_shards >= 4
+    assert config.datasets.youtube_local.local_vtt_num_shards >= 4
 
 
 def test_youtube_local_manifest_is_danish() -> None:

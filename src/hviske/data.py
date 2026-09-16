@@ -1381,6 +1381,7 @@ def load_data_for_finetuning(
                 manifest_path=Path(dataset_config.manifest_path),
                 min_seconds=config.min_seconds_per_example,
                 max_seconds=config.max_seconds_per_example,
+                num_shards=dataset_config.get("local_vtt_num_shards", 1),
             )
         # Load from disk if the dataset ID is a path and it is stored as an arrow
         # dataset

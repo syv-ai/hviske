@@ -40,6 +40,8 @@
 
 ### Fixed
 
+- Partitioned local VTT manifests into configurable metadata-only shards so Sparkie's
+  four spawned DataLoader workers can consume DRTV and YouTube examples in parallel.
 - Replaced Trainer padding sentinels in generated token IDs before ASR metric decoding
   without mutating aggregated evaluation predictions.
 - Matched floating-point Cohere generation features to the model inference dtype while
