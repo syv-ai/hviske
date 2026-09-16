@@ -2,15 +2,15 @@
 
 ## Scope
 
-This inventory covers the 16 streams in `config/sparkie_bilingual.yaml`. Hours are for
-the configured training split where a split-level figure is available.
+This inventory covers the 15 active streams in `config/sparkie_bilingual.yaml`. The
+reusable Danish VoxPopuli configuration remains available but is not selected. Hours are
+for the configured training split where a split-level figure is available.
 
 The figures are not yet a uniform post-filter measurement:
 
 - DRTV and YouTube were measured directly from their Sparkie manifests.
 - P1 is the current reported estimate for the initial segmented release.
 - Most public-dataset figures come from dataset cards or existing model provenance.
-- Danish VoxPopuli is measured before applying the final v5-tiny quality manifest.
 - People's Speech clean/train is an estimate from its row count and partial duration
   statistics because its card publishes only the 30,000+ hour all-configuration total.
 
@@ -29,7 +29,6 @@ runtime filter remain a required pre-training artefact.
 | Nota                        | da    | Read/prepared          |          ~584 |
 | NST-da                      | da    | Read/prepared          |          ~250 |
 | FTSpeech                    | da    | Parliament             |      1,816.29 |
-| Unified VoxPopuli           | da    | Parliament             |       ~13,600 |
 | People's Speech clean       | en    | Mixed/heterogeneous    |        ~5,790 |
 | AMI SDM                     | en    | Conversation/meeting   |           ~80 |
 | AMI IHM                     | en    | Conversation/meeting   |           ~80 |
@@ -56,9 +55,12 @@ Only the local manifests currently have exact post-filter measurements:
   read/prepared even though an earlier model card called it broadcast media.
 - AMI SDM and IHM contain different microphone views of substantially the same meetings.
   They are separate training streams but not 160 unique meeting hours.
-- The Danish VoxPopuli figure comes from the Hviske v5 provenance table. Its final clean
-  hours cannot be known until v5-tiny actions are joined to audio and the duration
-  filter is applied.
+- Danish VoxPopuli is excluded from the active mix because, at unified audio revision
+  `5a3a49ee981baab6e1e37ddd2c45f9943c27d08f` and positional overlay shard range
+  `0--354`, its first 100 joined clips are OGG mono 16 kHz (duration min 16.15,
+  median 30, max 30); none survive the strict `1 < duration < 10` filter. Keeping it
+  active would scan 1.745 million rows without yielding an example. Its reusable dataset
+  YAML is retained for future use.
 - NST's approximately 250 hours come from the existing Hviske v5 provenance rather than
   a full-split duration scan.
 - People's Speech has 1,501,271 clean/train rows. The approximately 5,790-hour estimate
@@ -75,14 +77,13 @@ scale, not for freezing sampling probabilities.
 
 | Lang.     |       Read | Conversation |  Parliament |      Mixed |       Total |
 | --------- | ---------: | -----------: | ----------: | ---------: | ----------: |
-| Danish    |     ~1,355 |      ~16,193 |     ~15,416 |          0 |     ~32,965 |
+| Danish    |     ~1,355 |      ~16,193 |      ~1,816 |          0 |     ~19,364 |
 | English   |       ~960 |         ~160 |        ~543 |     ~5,790 |      ~7,453 |
-| **Total** | **~2,315** |  **~16,353** | **~15,959** | **~5,790** | **~40,418** |
+| **Total** | **~2,315** |  **~16,353** |  **~2,359** | **~5,790** | **~26,817** |
 
 The English conversation total counts both AMI microphone streams. Subtract roughly 80
-hours for a unique-meeting estimate. The matrix also includes uncleaned Danish VoxPopuli
-and estimated People's Speech hours, so its totals must not be presented as final usable
-hours.
+hours for a unique-meeting estimate. The matrix also includes estimated People's Speech
+hours, so its totals must not be presented as final usable hours.
 
 ## Sampling implications
 

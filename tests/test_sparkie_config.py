@@ -24,7 +24,6 @@ TRAINING_NAMES = [
     "ftspeech",
     "nota",
     "nst",
-    "voxpopuli_da",
     "peoples_speech_clean",
     "ami_sdm",
     "ami_ihm",
@@ -37,7 +36,6 @@ TRAINING_IDS = [
     "syvai/p1-segments",
     "local_vtt",
     "local_vtt",
-    "syvai/danish-asr-unified",
     "syvai/danish-asr-unified",
     "syvai/danish-asr-unified",
     "syvai/danish-asr-unified",
@@ -57,10 +55,9 @@ TRAINING_PROBABILITIES = [
     0.09,
     0.017143,
     0.128572,
-    0.040909,
+    0.09,
     0.021428,
     0.021429,
-    0.049091,
     0.16,
     0.04,
     0.03,
@@ -128,13 +125,6 @@ def test_sparkie_dataset_coordinates_and_revisions(
         "ftspeech": ("syvai/danish-asr-unified", "default", "train", "text", "audio"),
         "nota": ("syvai/danish-asr-unified", "default", "train", "text", "audio"),
         "nst": ("syvai/danish-asr-unified", "default", "train", "text", "audio"),
-        "voxpopuli_da": (
-            "syvai/danish-asr-unified",
-            "default",
-            "train",
-            "text",
-            "audio",
-        ),
         "peoples_speech_clean": (
             "MLCommons/peoples_speech",
             "clean",
@@ -191,7 +181,6 @@ def test_sparkie_dataset_coordinates_and_revisions(
         "ftspeech": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
         "nota": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
         "nst": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
-        "voxpopuli_da": "5a3a49ee981baab6e1e37ddd2c45f9943c27d08f",
         "peoples_speech_clean": "f10597c5d3d3a63f8b6827701297c3afdf178272",
         "ami_sdm": "46f28f2503e2ec48f8867a84eef356c70476beab",
         "ami_ihm": "46f28f2503e2ec48f8867a84eef356c70476beab",
@@ -218,7 +207,6 @@ def test_sparkie_dataset_coordinates_and_revisions(
             "ftspeech": "ftspeech",
             "nota": "nota",
             "nst": "nst_da",
-            "voxpopuli_da": "voxpopuli",
         }.items()
     )
     assert dict(datasets.nst.filters) == {"source": "nst_da"}
@@ -228,21 +216,13 @@ def test_sparkie_dataset_coordinates_and_revisions(
         name
         for name, dataset in datasets.items()
         if dataset.get("id") == "syvai/danish-asr-unified"
-    ] == [
-        "coral_read_aloud",
-        "coral_conversation",
-        "ftspeech",
-        "nota",
-        "nst",
-        "voxpopuli_da",
-    ]
+    ] == ["coral_read_aloud", "coral_conversation", "ftspeech", "nota", "nst"]
     assert all(
         dataset.overlay.revision == "9" * 40
         for dataset in datasets.values()
         if dataset.get("overlay") is not None
     )
     expected_shard_ranges = {
-        "voxpopuli_da": (0, 354),
         "nota": (354, 367),
         "ftspeech": (367, 563),
         "coral_read_aloud": (563, 623),
@@ -403,7 +383,7 @@ def test_sparkie_publication_provenance_is_complete(
         source_ids | joined_ids | overlay_ids
     )
     overlay_sources = [source for source in sources if "overlay" in source]
-    assert len(overlay_sources) == 6
+    assert len(overlay_sources) == 5
     assert all(
         t.cast(dict[str, object], source["overlay"])["revision"] == "9" * 40
         for source in overlay_sources
@@ -465,7 +445,6 @@ def test_sparkie_shuffle_buffers_are_source_specific(
         "ftspeech": 16,
         "nota": 16,
         "nst": 16,
-        "voxpopuli_da": 16,
         "peoples_speech_clean": 1,
         "ami_sdm": 1,
         "ami_ihm": 1,
@@ -487,14 +466,15 @@ def test_sparkie_training_order_and_probabilities(
     """The preset keeps source order aligned with the approved probabilities."""
     config = _preset(monkeypatch)
 
+    assert len(config.datasets) == 15
     assert list(config.datasets) == TRAINING_NAMES
     assert [
         dataset.get("id", dataset.get("type")) for dataset in config.datasets.values()
     ] == TRAINING_IDS
     assert list(config.dataset_probabilities) == TRAINING_PROBABILITIES
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
-    assert sum(config.dataset_probabilities[:9]) == pytest.approx(0.6)
-    assert sum(config.dataset_probabilities[9:]) == pytest.approx(0.4)
+    assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.6)
+    assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
     sources = training_sources_from_config(config=config)
     assert sum(
         float(t.cast(float, source["probability"])) for source in sources
