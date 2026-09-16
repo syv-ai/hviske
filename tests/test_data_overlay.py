@@ -156,6 +156,41 @@ def test_keyed_overlay_rejects_missing_and_mismatched_keys() -> None:
         list(apply_dataset_overlay(base, mismatched_types, config))
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux worker runtime regression")
+def test_local_manifest_feeds_four_spawn_dataloader(tmp_path: Path) -> None:
+    """Sharded local manifests retain all rows with four spawned workers."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    rows = [
+        {
+            "source_wav_path": str(tmp_path / "programme.wav"),
+            "start": float(index),
+            "end": float(index + 1),
+            "duration": 1.0,
+            "text": f"cue {index}",
+            "id": f"cue-{index}",
+            "language": "da",
+        }
+        for index in range(16)
+    ]
+    manifest_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    local = load_vtt_manifest(
+        manifest_path=manifest_path, min_seconds=0.1, max_seconds=2.0, num_shards=16
+    )
+    loader = DataLoader(
+        t.cast(TorchIterableDataset[dict[str, object]], local),
+        batch_size=1,
+        num_workers=4,
+        multiprocessing_context="spawn",
+        collate_fn=_first_spawn_batch,
+    )
+    expected_ids = {row["id"] for row in rows}
+    first_pass = [t.cast(str, batch["id"]) for batch in loader]
+    assert set(first_pass) == expected_ids
+    assert len(first_pass) == len(expected_ids)
+
+
 def test_overlay_consumers_are_pickleable_and_isolated() -> None:
     """Independent consumers can run concurrently without shared seen-key state."""
     base = Dataset.from_list(

@@ -36,6 +36,7 @@ from hviske.data import (
 )
 from hviske.local_vtt import (
     VTTParseStats,
+    _manifest_rows,
     build_vtt_manifest,
     decode_vtt_audio,
     load_vtt_manifest,
@@ -773,6 +774,65 @@ def test_vtt_manifest_does_not_open_audio_before_iteration(
     assert not opened
     payload = pickle.dumps(dataset)
     assert next(iter(pickle.loads(payload)))["text"] == "hello"
+
+
+def test_vtt_manifest_partitions_are_complete_and_restartable(tmp_path: Path) -> None:
+    """Manifest partitions form an exact, repeatable union of filtered rows."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    rows = [
+        {
+            "source_wav_path": str(tmp_path / "programme.wav"),
+            "start": float(index),
+            "end": float(index + 1),
+            "duration": 1.0 if index not in {2, 7} else 0.05,
+            "text": str(index),
+            "id": f"cue-{index}",
+            "language": "da",
+        }
+        for index in range(10)
+    ]
+    manifest_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    partitions = [
+        list(
+            _manifest_rows(
+                manifest_path=manifest_path,
+                min_seconds=0.1,
+                max_seconds=2.0,
+                shards=[shard_index],
+                num_shards=4,
+            )
+        )
+        for shard_index in range(4)
+    ]
+    partition_ids = [[row["id"] for row in partition] for partition in partitions]
+    expected_ids = [row["id"] for row in rows if 0.1 < row["duration"] < 2.0]
+    assert sorted(sum(partition_ids, [])) == sorted(expected_ids)
+    assert len(sum(partition_ids, [])) == len(set(sum(partition_ids, [])))
+
+    dataset = load_vtt_manifest(
+        manifest_path=manifest_path, min_seconds=0.1, max_seconds=2.0, num_shards=4
+    )
+    assert dataset.n_shards == 4
+    first_pass = [row["id"] for row in dataset]
+    assert [row["id"] for row in dataset] == first_pass
+    assert [row["id"] for row in pickle.loads(pickle.dumps(dataset))] == first_pass
+
+
+@pytest.mark.parametrize("num_shards", [0, -1, True, 1.5])
+def test_vtt_manifest_rejects_invalid_shard_counts(
+    tmp_path: Path, num_shards: int
+) -> None:
+    """Manifest sharding requires a positive integer count."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    with pytest.raises(ValueError, match="positive integer"):
+        load_vtt_manifest(
+            manifest_path=manifest_path,
+            min_seconds=0.1,
+            max_seconds=2.0,
+            num_shards=num_shards,
+        )
 
 
 def test_vtt_manifest_slices_original_wav_without_copying(tmp_path: Path) -> None:

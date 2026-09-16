@@ -9,7 +9,6 @@ import os
 import re
 import tempfile
 import typing as t
-from functools import partial
 from pathlib import Path
 
 import soundfile as sf
@@ -54,22 +53,52 @@ _MARKUP_PATTERN = re.compile(r"<[^>]*>")
 
 
 def _manifest_rows(
-    manifest_path: Path, min_seconds: float, max_seconds: float
+    manifest_path: Path,
+    min_seconds: float,
+    max_seconds: float,
+    shards: list[int],
+    num_shards: int,
 ) -> t.Iterator[dict[str, t.Any]]:
-    """Yield duration-filtered rows from a JSONL VTT manifest.
+    """Yield one deterministic, duration-filtered manifest partition.
+
+    Each partition scans the metadata-only manifest and keeps rows according to their
+    original line number. This avoids loading the manifest into memory while making
+    every row belong to exactly one dataset shard.
 
     Raises:
         ValueError:
-            If a manifest row has a negative duration.
+            If the shard configuration is invalid or a manifest row has a negative
+            duration.
     """
-    with manifest_path.open(encoding="utf-8") as manifest_file:
-        for line_number, line in enumerate(manifest_file, start=1):
-            row = json.loads(line)
-            duration = float(row["duration"])
-            if duration < 0:
-                raise ValueError(f"Negative duration on manifest line {line_number}")
-            if min_seconds < duration < max_seconds:
-                yield row
+    if (
+        not isinstance(num_shards, int)
+        or isinstance(num_shards, bool)
+        or num_shards <= 0
+        or not isinstance(shards, list)
+        or not shards
+        or any(
+            not isinstance(shard_index, int)
+            or isinstance(shard_index, bool)
+            or not 0 <= shard_index < num_shards
+            for shard_index in shards
+        )
+    ):
+        raise ValueError("shards must contain indices in the range [0, num_shards)")
+
+    for shard_index in shards:
+        with manifest_path.open(encoding="utf-8") as manifest_file:
+            for line_number, line in enumerate(manifest_file, start=1):
+                row = json.loads(line)
+                duration = float(row["duration"])
+                if duration < 0:
+                    raise ValueError(
+                        f"Negative duration on manifest line {line_number}"
+                    )
+                if (
+                    min_seconds < duration < max_seconds
+                    and (line_number - 1) % num_shards == shard_index
+                ):
+                    yield row
 
 
 def build_vtt_manifest(
@@ -318,12 +347,14 @@ def decode_vtt_audio(
 
 
 def load_vtt_manifest(
-    manifest_path: Path, min_seconds: float, max_seconds: float
+    manifest_path: Path, min_seconds: float, max_seconds: float, num_shards: int = 1
 ) -> IterableDataset:
     """Load manifest rows without decoding any audio.
 
     Duration filtering happens while the manifest is read, before a WAV is opened for
     sample data. The returned dataset retains source paths and offsets for lazy slicing.
+    The manifest is exposed as deterministic line-number partitions so PyTorch can
+    assign independent partitions to multiple DataLoader workers.
 
     Args:
         manifest_path:
@@ -332,17 +363,32 @@ def load_vtt_manifest(
             Exclusive lower duration bound.
         max_seconds:
             Exclusive upper duration bound.
+        num_shards (optional):
+            Number of manifest partitions to expose. Defaults to 1.
 
     Returns:
         An iterable dataset containing metadata only.
+
+    Raises:
+        ValueError:
+            If ``num_shards`` is not a positive integer.
     """
+    if (
+        not isinstance(num_shards, int)
+        or isinstance(num_shards, bool)
+        or num_shards <= 0
+    ):
+        raise ValueError("num_shards must be a positive integer")
+
     return IterableDataset.from_generator(
-        generator=partial(
-            _manifest_rows,
-            manifest_path=manifest_path,
-            min_seconds=min_seconds,
-            max_seconds=max_seconds,
-        ),
+        generator=_manifest_rows,
+        gen_kwargs={
+            "manifest_path": manifest_path,
+            "min_seconds": min_seconds,
+            "max_seconds": max_seconds,
+            "shards": list(range(num_shards)),
+            "num_shards": num_shards,
+        },
         features=Features(
             source_wav_path=Value("string"),
             start=Value("float64"),
