@@ -6,16 +6,20 @@ import gc
 import os
 import time
 import typing as t
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 import torch
+from omegaconf import OmegaConf
+from omegaconf.errors import MissingMandatoryValue
 from torch.utils.data import DataLoader, Dataset
 from transformers.trainer_callback import TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
 
+import hviske.finetune as finetune_module
 from hviske import dataloader_shutdown, hub_retries
 from hviske.dataloader_shutdown import (
     SHUTDOWN_SENTINEL_ENV,
@@ -88,6 +92,59 @@ class _SentinelDataset(Dataset[str]):
 
     def __len__(self) -> int:
         return 1
+
+
+@pytest.mark.parametrize(
+    ("tracking_value", "expected_error"),
+    [
+        pytest.param("???", MissingMandatoryValue, id="config-access"),
+        pytest.param(True, RuntimeError, id="tracking-load"),
+    ],
+)
+def test_setup_failures_restore_controller_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tracking_value: object,
+    expected_error: type[Exception],
+) -> None:
+    """Config and tracking setup failures restore all controller process state."""
+    previous_path = "/tmp/previous-hviske-sentinel"
+    previous_grace = dataloader_shutdown.data_utils.MP_STATUS_CHECK_INTERVAL
+    controller_directory = tmp_path / "controller"
+    config = OmegaConf.create(
+        {"dataloader_num_workers": 3, "enable_experiment_tracking": tracking_value}
+    )
+
+    def create_controller_directory(prefix: str) -> str:
+        assert prefix == "hviske-dataloader-"
+        controller_directory.mkdir()
+        return str(controller_directory)
+
+    def fail_tracking_setup(config: object) -> None:
+        del config
+        sentinel = Path(os.environ[SHUTDOWN_SENTINEL_ENV])
+        assert sentinel.parent == controller_directory
+        assert controller_directory.is_dir()
+        raise RuntimeError("tracking setup failed")
+
+    monkeypatch.setenv(SHUTDOWN_SENTINEL_ENV, previous_path)
+    monkeypatch.setattr(
+        dataloader_shutdown.tempfile, "mkdtemp", create_controller_directory
+    )
+    monkeypatch.setattr(
+        finetune_module, "_configure_dataloader_multiprocessing", lambda config: None
+    )
+    monkeypatch.setattr(
+        finetune_module, "validate_private_only_config", lambda config: None
+    )
+    monkeypatch.setattr(finetune_module, "load_extracking_setup", fail_tracking_setup)
+
+    with pytest.raises(expected_error):
+        finetune_module.finetune(config=config)
+
+    assert os.environ[SHUTDOWN_SENTINEL_ENV] == previous_path
+    assert dataloader_shutdown.data_utils.MP_STATUS_CHECK_INTERVAL == previous_grace
+    assert not controller_directory.exists()
 
 
 def test_shutdown_callback_requests_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,7 +231,11 @@ def test_three_workers_exit_from_long_backoff_without_termination(
         del iterator
         iterator = None
         gc.collect()
-        assert all(not worker.is_alive() for worker in workers)
+        for worker in workers:
+            worker.join(timeout=2.0)
+        assert [worker.exitcode for worker in workers] == [0, 0, 0], (
+            "workers must exit normally without terminate or SIGABRT"
+        )
     finally:
         del iterator
         controller.request_shutdown()
@@ -184,8 +245,11 @@ def test_three_workers_exit_from_long_backoff_without_termination(
 class _BackoffDataset(Dataset[int]):
     """Dataset whose workers wait in an interruptible transient retry."""
 
-    def __init__(self, ready_directory: Path) -> None:
+    def __init__(
+        self, ready_directory: Path, observed_directory: Path | None = None
+    ) -> None:
         self.ready_directory = ready_directory
+        self.observed_directory = observed_directory
 
     def __getitem__(self, index: int) -> int:
         self.ready_directory.joinpath(str(os.getpid())).touch()
@@ -194,8 +258,127 @@ class _BackoffDataset(Dataset[int]):
                 delay=30.0, error=RuntimeError("worker shutdown test")
             )
         except RuntimeError:
+            if self.observed_directory is not None:
+                self.observed_directory.joinpath(str(os.getpid())).touch()
             return index
         raise AssertionError("worker retry unexpectedly completed")
 
     def __len__(self) -> int:
         return 3
+
+
+def test_training_exception_releases_three_workers_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exception unwinding retains sentinel and join grace until workers exit."""
+    ready_directory = tmp_path / "ready"
+    observed_directory = tmp_path / "observed"
+    ready_directory.mkdir()
+    observed_directory.mkdir()
+    workers: list[torch.multiprocessing.Process] = []
+    reset_observations: list[tuple[float, list[int | None]]] = []
+    previous_grace = float(dataloader_shutdown.data_utils.MP_STATUS_CHECK_INTERVAL)
+    original_reset = DataLoaderShutdownController.reset
+
+    def recording_reset(controller: DataLoaderShutdownController) -> None:
+        current_grace = float(dataloader_shutdown.data_utils.MP_STATUS_CHECK_INTERVAL)
+        if workers and current_grace > previous_grace:
+            reset_observations.append(
+                (current_grace, [worker.exitcode for worker in workers])
+            )
+        original_reset(controller)
+
+    class Processor:
+        tokenizer = object()
+
+        def save_pretrained(self, save_directory: str) -> None:
+            del save_directory
+
+    class Model:
+        def save_pretrained(self, save_directory: str) -> None:
+            del save_directory
+
+    class FailingTrainer:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        def train(self, resume_from_checkpoint: object) -> None:
+            del resume_from_checkpoint
+            loader = DataLoader(
+                _BackoffDataset(ready_directory, observed_directory),
+                num_workers=3,
+                multiprocessing_context="spawn",
+            )
+            iterator = iter(loader)
+            workers.extend(iterator._workers)  # type: ignore[attr-defined]
+            deadline = time.monotonic() + 10.0
+            while len(list(ready_directory.iterdir())) < 3:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("workers did not enter retry backoff")
+                time.sleep(0.05)
+            raise RuntimeError("training failed")
+
+    class ModelSetup:
+        def load_compute_metrics(self) -> None:
+            return None
+
+        def load_data_collator(self) -> None:
+            return None
+
+        def load_model(self) -> Model:
+            return Model()
+
+        def load_processor(self) -> Processor:
+            return Processor()
+
+        def load_trainer_class(self) -> type[FailingTrainer]:
+            return FailingTrainer
+
+        def load_training_arguments(self) -> None:
+            return None
+
+    config = OmegaConf.create(
+        {
+            "dataloader_num_workers": 3,
+            "enable_experiment_tracking": False,
+            "model_dir": str(tmp_path / "model"),
+            "resume_from_checkpoint": False,
+            "early_stopping": False,
+            "push_to_hub": False,
+            "model": {"use_decoder": False},
+        }
+    )
+    monkeypatch.setattr(DataLoaderShutdownController, "reset", recording_reset)
+    monkeypatch.setattr(
+        finetune_module, "_configure_dataloader_multiprocessing", lambda config: None
+    )
+    monkeypatch.setattr(
+        finetune_module, "validate_private_only_config", lambda config: None
+    )
+    monkeypatch.setattr(finetune_module, "download_background_noises", lambda: None)
+    monkeypatch.setattr(
+        finetune_module, "load_model_setup", lambda config: ModelSetup()
+    )
+    monkeypatch.setattr(
+        finetune_module,
+        "load_data_for_finetuning",
+        lambda config, processor: {"train": object()},
+    )
+    monkeypatch.setattr(finetune_module, "block_terminal_output", lambda: None)
+    monkeypatch.setattr(finetune_module, "disable_tqdm", nullcontext)
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        finetune_module.finetune(config=config)
+
+    for worker in workers:
+        worker.join(timeout=2.0)
+    assert len(list(observed_directory.iterdir())) == 3
+    assert len(reset_observations) == 1
+    grace_at_reset, exitcodes_at_reset = reset_observations[0]
+    assert grace_at_reset > previous_grace
+    assert exitcodes_at_reset == [0, 0, 0], (
+        "workers must exit before sentinel and join grace are restored"
+    )
+    assert [worker.exitcode for worker in workers] == [0, 0, 0], (
+        "workers must exit normally without terminate or SIGABRT"
+    )
