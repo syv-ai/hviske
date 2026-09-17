@@ -44,8 +44,9 @@
 ### Fixed
 
 - Deferred bounded runs' terminal scheduled evaluation until training workers have shut
-  down, preventing spawned DataLoader worker aborts while preserving intermediate
-  evaluations, terminal checkpoints, W&B reporting, and step-tagged metrics.
+  down when early stopping is disabled, preventing spawned DataLoader worker aborts while
+  preserving intermediate evaluations, terminal checkpoints, W&B reporting, and
+  step-tagged metrics; early-stopping runs retain in-loop terminal evaluation.
 - Hardened evaluation transport logging so temporary signed Hugging Face dataset URLs
   are not emitted at INFO by HTTP, Hub, or filesystem transport loggers.
 - Made Parakeet transducer generation safe under distributed wrappers, enabled
