@@ -43,6 +43,8 @@
 
 ### Fixed
 
+- Hardened evaluation transport logging so temporary signed Hugging Face dataset URLs
+  are not emitted at INFO by HTTP, Hub, or filesystem transport loggers.
 - Made Parakeet transducer generation safe under distributed wrappers, enabled
   revision-pinned Hydra-composable TDT evaluation, and documented bounded checkpoint
   and metric persistence for isolated TDT smoke and pilot runs.
