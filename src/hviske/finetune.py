@@ -1,8 +1,10 @@
 """Finetuning ASR models."""
 
+import gc
 import json
 import logging
 import os
+import traceback
 from pathlib import Path
 
 import torch
@@ -47,147 +49,155 @@ def finetune(config: DictConfig) -> None:
     worker_shutdown = DataLoaderShutdownController(
         enabled=int(config.get("dataloader_num_workers") or 0) > 0
     )
-    worker_shutdown.start()
+    with worker_shutdown:
+        extracking_setup: ExTrackingSetup | None = None
+        try:
+            # Note whether this is the main process in a distributed setting.
+            is_main_process = os.getenv("RANK", "0") == "0"
+            if config.enable_experiment_tracking and is_main_process:
+                extracking_setup = load_extracking_setup(config=config)
 
-    # Note if we're on the main process, if we are running in a distributed setting
-    is_main_process = os.getenv("RANK", "0") == "0"
-    extracking_setup: ExTrackingSetup | None = None
-    if config.enable_experiment_tracking and is_main_process:
-        extracking_setup = load_extracking_setup(config=config)
+            if extracking_setup is not None:
+                extracking_setup.run_initialization()
 
-    try:
-        if extracking_setup is not None:
-            extracking_setup.run_initialization()
+            download_background_noises()
+            model_setup: ModelSetup = load_model_setup(config=config)
+            processor = model_setup.load_processor()
+            dataset = load_data_for_finetuning(config=config, processor=processor)
+            processor.save_pretrained(save_directory=config.model_dir)
+            model = model_setup.load_model()
 
-        download_background_noises()
-        model_setup: ModelSetup = load_model_setup(config=config)
-        processor = model_setup.load_processor()
-        dataset = load_data_for_finetuning(config=config, processor=processor)
-        processor.save_pretrained(save_directory=config.model_dir)
-        model = model_setup.load_model()
+            vals = {
+                split_name: split
+                for split_name, split in dataset.items()
+                if split_name.startswith("val")
+            }
+            match len(vals):
+                case 0:
+                    eval_dataset = None
+                case 1:
+                    eval_dataset = list(vals.values())[0]
+                case _:
+                    eval_dataset = vals
 
-        vals = {
-            split_name: split
-            for split_name, split in dataset.items()
-            if split_name.startswith("val")
-        }
-        match len(vals):
-            case 0:
-                eval_dataset = None
-            case 1:
-                eval_dataset = list(vals.values())[0]
-            case _:
-                eval_dataset = vals
+            if eval_dataset is None and is_main_process:
+                logger.info("No validation set found. Disabling early stopping.")
 
-        if eval_dataset is None and is_main_process:
-            logger.info("No validation set found. Disabling early stopping.")
-
-        callbacks: list[TrainerCallback] = []
-        evaluation_steps = [
-            int(step) for step in (config.get("evaluation_steps") or [])
-        ]
-        configured_stop = config.get("stop_after_steps")
-        stop_after_steps = int(configured_stop) if configured_stop is not None else None
-        # In-loop validation keeps spawned training workers alive until it finishes.
-        # Defer only when train() will not restore an earlier best model afterwards.
-        deferred_evaluation_step = (
-            stop_after_steps
-            if (
-                eval_dataset is not None
-                and not config.early_stopping
-                and stop_after_steps in evaluation_steps
+            callbacks: list[TrainerCallback] = []
+            evaluation_steps = [
+                int(step) for step in (config.get("evaluation_steps") or [])
+            ]
+            configured_stop = config.get("stop_after_steps")
+            stop_after_steps = (
+                int(configured_stop) if configured_stop is not None else None
             )
-            else None
-        )
-        if evaluation_steps:
-            callbacks.append(
-                EvaluationScheduleCallback(
-                    evaluation_steps=[
-                        step
-                        for step in evaluation_steps
-                        if step != deferred_evaluation_step
-                    ],
-                    metrics_path=config.get("evaluation_metrics_path"),
+            # In-loop validation keeps spawned training workers alive until it finishes.
+            # Defer only when train() will not restore an earlier best model afterwards.
+            deferred_evaluation_step = (
+                stop_after_steps
+                if (
+                    eval_dataset is not None
+                    and not config.early_stopping
+                    and stop_after_steps in evaluation_steps
                 )
+                else None
             )
-        if stop_after_steps is not None:
-            callbacks.append(StopAfterStepCallback(stop_after_steps=stop_after_steps))
-        if eval_dataset is not None and config.early_stopping:
-            callbacks.append(
-                EarlyStoppingCallback(
-                    early_stopping_patience=config.early_stopping_patience
-                )
-            )
-        callbacks.append(DataLoaderShutdownCallback(controller=worker_shutdown))
-
-        trainer = model_setup.load_trainer_class()(
-            model=model,
-            data_collator=model_setup.load_data_collator(),
-            args=model_setup.load_training_arguments(),
-            compute_metrics=model_setup.load_compute_metrics(),
-            train_dataset=dataset["train"],
-            eval_dataset=eval_dataset,
-            processing_class=getattr(processor, "tokenizer"),
-            callbacks=callbacks or None,
-        )
-
-        block_terminal_output()
-        with disable_tqdm():
-            try:
-                trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
-            finally:
-                # The callback normally signals from ``on_train_end`` while Trainer is
-                # unwinding. This also covers trainers that fail before that callback.
-                worker_shutdown.request_shutdown()
-                worker_shutdown.reset()
-            if (
-                deferred_evaluation_step is not None
-                and trainer.state.global_step == deferred_evaluation_step
-            ):
-                trainer.evaluate()
-
-        model.save_pretrained(save_directory=config.model_dir)
-
-        if hasattr(config.model, "use_decoder") and config.model.use_decoder:
-            train_and_store_ngram_model(config=config)
-
-        if config.push_to_hub:
-            push_model_to_hub(
-                trainer=trainer,
-                model_name=config.model_id,
-                finetuned_from=config.model.pretrained_model_id,
-                create_pr=config.create_pr,
-                private=config.private,
-                private_only=config.get("private_only", False),
-                model_card_languages=config.get("model_card_languages"),
-                training_dataset_ids=list(
-                    config.get("training_dataset_ids")
-                    or [
-                        str(dataset_config.id)
-                        for dataset_config in config.datasets.values()
-                    ]
-                ),
-                evaluation_status=(
-                    config.get("evaluation_status")
-                    or (
-                        "Evaluation ran during training."
-                        if eval_dataset is not None
-                        else "Not evaluated: no validation set was configured."
+            if evaluation_steps:
+                callbacks.append(
+                    EvaluationScheduleCallback(
+                        evaluation_steps=[
+                            step
+                            for step in evaluation_steps
+                            if step != deferred_evaluation_step
+                        ],
+                        metrics_path=config.get("evaluation_metrics_path"),
                     )
-                ),
-                finetuned_from_revision=config.model.get("revision"),
+                )
+            if stop_after_steps is not None:
+                callbacks.append(
+                    StopAfterStepCallback(stop_after_steps=stop_after_steps)
+                )
+            if eval_dataset is not None and config.early_stopping:
+                callbacks.append(
+                    EarlyStoppingCallback(
+                        early_stopping_patience=config.early_stopping_patience
+                    )
+                )
+            callbacks.append(DataLoaderShutdownCallback(controller=worker_shutdown))
+
+            trainer = model_setup.load_trainer_class()(
+                model=model,
+                data_collator=model_setup.load_data_collator(),
+                args=model_setup.load_training_arguments(),
+                compute_metrics=model_setup.load_compute_metrics(),
+                train_dataset=dataset["train"],
+                eval_dataset=eval_dataset,
+                processing_class=getattr(processor, "tokenizer"),
+                callbacks=callbacks or None,
             )
-    except BaseException:
-        worker_shutdown.request_shutdown()
-        worker_shutdown.reset()
-        if extracking_setup is not None:
-            _finalize_tracking_after_failure(extracking_setup)
-        raise
-    else:
-        if extracking_setup is not None:
-            extracking_setup.run_finalization(exit_code=0)
-    finally:
-        worker_shutdown.reset()
+
+            block_terminal_output()
+            with disable_tqdm():
+                try:
+                    trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
+                except BaseException as error:
+                    worker_shutdown.request_shutdown()
+                    # Trainer frames retain iterators while traceback references live.
+                    traceback.clear_frames(error.__traceback__)
+                    trainer = None
+                    gc.collect()
+                    worker_shutdown.reset()
+                    raise
+                else:
+                    # The callback normally signals while Trainer is unwinding. This
+                    # also covers trainers that omit that callback.
+                    worker_shutdown.request_shutdown()
+                    worker_shutdown.reset()
+                    completed_trainer = trainer
+                if (
+                    deferred_evaluation_step is not None
+                    and completed_trainer.state.global_step == deferred_evaluation_step
+                ):
+                    completed_trainer.evaluate()
+
+            model.save_pretrained(save_directory=config.model_dir)
+
+            if hasattr(config.model, "use_decoder") and config.model.use_decoder:
+                train_and_store_ngram_model(config=config)
+
+            if config.push_to_hub:
+                push_model_to_hub(
+                    trainer=completed_trainer,
+                    model_name=config.model_id,
+                    finetuned_from=config.model.pretrained_model_id,
+                    create_pr=config.create_pr,
+                    private=config.private,
+                    private_only=config.get("private_only", False),
+                    model_card_languages=config.get("model_card_languages"),
+                    training_dataset_ids=list(
+                        config.get("training_dataset_ids")
+                        or [
+                            str(dataset_config.id)
+                            for dataset_config in config.datasets.values()
+                        ]
+                    ),
+                    evaluation_status=(
+                        config.get("evaluation_status")
+                        or (
+                            "Evaluation ran during training."
+                            if eval_dataset is not None
+                            else "Not evaluated: no validation set was configured."
+                        )
+                    ),
+                    finetuned_from_revision=config.model.get("revision"),
+                )
+        except BaseException:
+            if extracking_setup is not None:
+                _finalize_tracking_after_failure(extracking_setup)
+            raise
+        else:
+            if extracking_setup is not None:
+                extracking_setup.run_finalization(exit_code=0)
 
 
 class DataLoaderShutdownCallback(TrainerCallback):
