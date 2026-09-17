@@ -14,10 +14,15 @@ import hviske.finetune as finetune_module
 from hviske.finetune import EvaluationScheduleCallback, StopAfterStepCallback
 
 
+@pytest.mark.parametrize(
+    "early_stopping",
+    [False, True],
+    ids=["without_early_stopping", "with_early_stopping"],
+)
 def test_bounded_terminal_evaluation_runs_after_training_workers_close(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, early_stopping: bool
 ) -> None:
-    """The terminal evaluation is deferred without duplicating scheduled metrics."""
+    """Defer terminal evaluation only when early stopping is disabled."""
     events: list[str] = []
     metrics_path = tmp_path / "metrics.jsonl"
 
@@ -34,6 +39,7 @@ def test_bounded_terminal_evaluation_runs_after_training_workers_close(
     class RecordingTrainer:
         def __init__(self, **kwargs: object) -> None:
             self.args = TrainingArguments(output_dir=str(tmp_path))
+            self.args.load_best_model_at_end = early_stopping
             self.callbacks = t.cast(list[TrainerCallback], kwargs["callbacks"])
             self.eval_dataset = t.cast(dict[str, object], kwargs["eval_dataset"])
             self.state = TrainerState(global_step=0)
@@ -99,7 +105,8 @@ def test_bounded_terminal_evaluation_runs_after_training_workers_close(
             "enable_experiment_tracking": False,
             "model_dir": str(tmp_path / "model"),
             "resume_from_checkpoint": False,
-            "early_stopping": False,
+            "early_stopping": early_stopping,
+            "early_stopping_patience": 2,
             "push_to_hub": False,
             "model": {"use_decoder": False},
             "evaluation_steps": [2, 4],
@@ -130,16 +137,21 @@ def test_bounded_terminal_evaluation_runs_after_training_workers_close(
 
     trainer = trainer_instances[0]
     assert trainer.state.global_step == 4
+    expected_source = "in-loop" if early_stopping else "deferred"
     assert trainer.evaluations == [
         ("in-loop", 2, ("val_danish", "val_english")),
-        ("deferred", 4, ("val_danish", "val_english")),
+        (expected_source, 4, ("val_danish", "val_english")),
     ]
-    assert events == [
-        "evaluate:in-loop:2",
-        "checkpoint:4",
-        "train-return",
-        "evaluate:deferred:4",
-    ]
+    assert events == (
+        ["evaluate:in-loop:2", "evaluate:in-loop:4", "checkpoint:4", "train-return"]
+        if early_stopping
+        else [
+            "evaluate:in-loop:2",
+            "checkpoint:4",
+            "train-return",
+            "evaluate:deferred:4",
+        ]
+    )
     metric_lines = metrics_path.read_text(encoding="utf-8").splitlines()
     records = [json.loads(line) for line in metric_lines]
     assert records == [

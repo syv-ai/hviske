@@ -84,10 +84,14 @@ def finetune(config: DictConfig) -> None:
         configured_stop = config.get("stop_after_steps")
         stop_after_steps = int(configured_stop) if configured_stop is not None else None
         # In-loop validation keeps spawned training workers alive until it finishes.
-        # Defer the bounded terminal evaluation until train() releases its iterator.
+        # Defer only when train() will not restore an earlier best model afterwards.
         deferred_evaluation_step = (
             stop_after_steps
-            if eval_dataset is not None and stop_after_steps in evaluation_steps
+            if (
+                eval_dataset is not None
+                and not config.early_stopping
+                and stop_after_steps in evaluation_steps
+            )
             else None
         )
         if evaluation_steps:
