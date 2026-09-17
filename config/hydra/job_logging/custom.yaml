@@ -14,9 +14,13 @@ handlers:
     formatter: simple
     filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
 loggers:
+  fsspec:
+    level: WARNING
   httpcore:
     level: WARNING
   httpx:
+    level: WARNING
+  huggingface_hub:
     level: WARNING
 root:
   handlers: [console, file]

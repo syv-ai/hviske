@@ -1,3 +1,7 @@
+defaults:
+  - override hydra/job_logging: custom
+  - _self_
+
 # Evaluation dataset parameters
 dataset: "CoRal-project/coral-v3::conversation"
 eval_split_name: test
