@@ -102,6 +102,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         """
         super().__init__(config=config)
         self.processor: Processor
+        self.model_config: PreTrainedConfig | None = None
 
     @staticmethod
     def _resize_rnnt_heads(model: PreTrainedModel, vocabulary_size: int) -> None:
@@ -233,6 +234,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
 
         if self.config.gradient_checkpointing and hasattr(model.config, "use_cache"):
             model.config.use_cache = False
+        self.model_config = model.config
         return model
 
     def _hub_kwargs(self, model_id: str | None = None) -> dict[str, str | bool]:
@@ -435,6 +437,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
 
         self.processor = processor
         self._resize_model_vocabulary(model=model, family=family)
+        self.model_config = model.config
         return PreTrainedModelData(
             processor=processor,
             model=model,
@@ -452,6 +455,7 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
             processor=self.processor,
             sample_rate=self.config.model.sampling_rate,
             padding=self.config.padding,
+            model_config=self.model_config,
         )
 
     def load_trainer_class(self) -> t.Type[Trainer]:

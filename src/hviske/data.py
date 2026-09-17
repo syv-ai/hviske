@@ -48,6 +48,7 @@ from .audio import SoundfileAudio
 from .dataloader_shutdown import start_worker_shutdown_watcher
 from .hub_retries import configure_hub_streaming_retries
 from .local_vtt import decode_vtt_audio, load_vtt_manifest
+from .parakeet_contract import validate_parakeet_transducer_inputs
 from .types import Data
 from .utils import (
     NUMERAL_REGEX,
@@ -2597,12 +2598,11 @@ def process_example(
         example["labels"] = _to_python(processed["labels"][0])
         labels = t.cast(Sized, example["labels"])
         if _is_parakeet_rnnt_processor(processor):
-            decoder_input_ids = t.cast(Sized, example["decoder_input_ids"])
-            if len(decoder_input_ids) != len(labels) + 1:
-                raise ValueError(
-                    "Parakeet transducer decoder_input_ids must contain exactly one "
-                    "more token than labels."
-                )
+            validate_parakeet_transducer_inputs(
+                decoder_input_ids=example["decoder_input_ids"],
+                labels=example["labels"],
+                processor=processor,
+            )
         example["input_length"] = len(labels)
         example["num_seconds"] = num_seconds
         return example

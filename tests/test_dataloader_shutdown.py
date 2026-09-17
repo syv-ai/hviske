@@ -16,15 +16,17 @@ import torch
 from omegaconf import OmegaConf
 from omegaconf.errors import MissingMandatoryValue
 from torch.utils.data import DataLoader, Dataset
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.trainer_callback import TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
 
 import hviske.finetune as finetune_module
 from hviske import dataloader_shutdown, hub_retries
+from hviske.data_collators import DataCollatorCTCWithPadding
+from hviske.data_models import Processor
 from hviske.dataloader_shutdown import (
     SHUTDOWN_SENTINEL_ENV,
     DataLoaderShutdownController,
-    start_worker_shutdown_watcher,
 )
 from hviske.finetune import DataLoaderShutdownCallback
 
@@ -244,7 +246,8 @@ def test_three_idle_workers_exit_from_watcher(tmp_path: Path) -> None:
     workers: list[torch.multiprocessing.Process] = []
     try:
         loader = DataLoader(
-            _WatchedPrefetchDataset(ready_directory),
+            _WatchedPrefetchDataset(),
+            collate_fn=_WatchedPrefetchCollator(ready_directory),
             num_workers=3,
             multiprocessing_context="spawn",
             prefetch_factor=1,
@@ -268,16 +271,62 @@ def test_three_idle_workers_exit_from_watcher(tmp_path: Path) -> None:
         controller.reset()
 
 
-class _WatchedPrefetchDataset(Dataset[int]):
-    """Dataset whose workers become idle after starting the shutdown watcher."""
+class _WatchedPrefetchCollator:
+    """Mark worker collation after the project CTC collator starts its watcher."""
 
     def __init__(self, ready_directory: Path) -> None:
         self.ready_directory = ready_directory
+        self.collator = DataCollatorCTCWithPadding(
+            processor=t.cast(Processor, _ShutdownTestProcessor()),
+            sample_rate=16_000,
+            max_seconds_per_example=1.0,
+            padding="longest",
+        )
 
-    def __getitem__(self, index: int) -> int:
-        start_worker_shutdown_watcher()
-        self.ready_directory.joinpath(f"watcher-{os.getpid()}").touch()
-        return index
+    def __call__(self, features: list[dict[str, object]]) -> BatchFeature:
+        batch = self.collator(features)
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            raise AssertionError("shutdown regression must collate in workers")
+        self.ready_directory.joinpath(f"watcher-{worker_info.id}").touch()
+        return batch
+
+
+class _ShutdownTestProcessor:
+    """Small picklable processor for exercising the real CTC collator."""
+
+    tokenizer = SimpleNamespace(model_max_length=512)
+
+    def pad(
+        self,
+        features: list[dict[str, object]] | None = None,
+        *,
+        labels: list[dict[str, object]] | None = None,
+        **kwargs: object,
+    ) -> BatchFeature:
+        del kwargs
+        rows = labels if labels is not None else features
+        if rows is None:
+            raise AssertionError("processor.pad requires features or labels")
+        key = "input_ids" if labels is not None else "input_values"
+        row_values = [t.cast(list[float | int], row[key]) for row in rows]
+        width = max(len(row) for row in row_values)
+        values = [row + [0] * (width - len(row)) for row in row_values]
+        return BatchFeature(
+            {
+                key: torch.tensor(values),
+                "attention_mask": torch.tensor(
+                    [[int(value != 0) for value in row] for row in values]
+                ),
+            }
+        )
+
+
+class _WatchedPrefetchDataset(Dataset[dict[str, object]]):
+    """Dataset whose workers become idle after their batch is collated."""
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return {"input_values": [float(index)], "labels": [index]}
 
     def __len__(self) -> int:
         return 3

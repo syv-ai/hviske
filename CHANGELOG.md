@@ -48,7 +48,7 @@
   retry code.
 - Filtered processor-backed training and validation examples whose cleaned text produces
   empty token labels, preventing zero-target Parakeet TDT loss division while preserving
-  lazy streaming, and rejected malformed transducer decoder/label lengths.
+  lazy streaming, and rejected malformed transducer decoder/label contracts.
 - Fixed cooperative shutdown for spawned DataLoader workers: terminal Transformers
   callbacks now signal the inherited per-run sentinel before the training iterator is
   destroyed, and terminal Hub retries exit disposable workers directly on Linux rather
