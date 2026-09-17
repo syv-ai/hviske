@@ -24,7 +24,12 @@ from huggingface_hub.hf_file_system import (
 )
 from huggingface_hub.utils import close_session, get_session
 
-from .dataloader_shutdown import interruptible_retry_delay, shutdown_requested
+from .dataloader_shutdown import (
+    exit_worker_if_shutdown_requested,
+    interruptible_retry_delay,
+    raise_or_exit_worker,
+    shutdown_requested,
+)
 
 Result = t.TypeVar("Result")
 
@@ -170,6 +175,7 @@ class RetryingHfFileSystemFile(HfFileSystemFile):
     """Range-reading Hub file using the configured retry policy."""
 
     def _fetch_range(self, start: int, end: int) -> bytes:
+        exit_worker_if_shutdown_requested()
         headers = {
             "range": f"bytes={start}-{end - 1}",
             **self.fs._api._build_hf_headers(),
@@ -207,6 +213,7 @@ def _run_with_retries(
     operation: Callable[[], Result], policy: HubRetryPolicy
 ) -> Result:
     for retry_number in range(policy.max_retries + 1):
+        exit_worker_if_shutdown_requested()
         caught_error: BaseException | None = None
         try:
             return operation()
@@ -217,14 +224,14 @@ def _run_with_retries(
                 raise
             caught_error = error
             if shutdown_requested():
-                raise caught_error
+                raise_or_exit_worker(error=caught_error)
             if "client has been closed" in str(error).lower():
                 close_session()
-        if caught_error is None or retry_number == policy.max_retries:
-            assert caught_error is not None
-            raise caught_error
-        assert caught_error is not None
+        if caught_error is None:
+            raise AssertionError("retry loop did not capture its transient error")
         if shutdown_requested():
+            raise_or_exit_worker(error=caught_error)
+        if retry_number == policy.max_retries:
             raise caught_error
         delay = policy.delay(retry_number)
         logger.warning(
@@ -234,6 +241,8 @@ def _run_with_retries(
             policy.max_retries,
         )
         interruptible_retry_delay(delay=delay, error=caught_error, sleep=time.sleep)
+        if shutdown_requested():
+            raise_or_exit_worker(error=caught_error)
     raise AssertionError("retry loop did not return or raise")
 
 
@@ -271,6 +280,7 @@ class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
             AssertionError:
                 If the bounded retry loop reaches an unreachable state.
         """
+        exit_worker_if_shutdown_requested()
         if self.response is None:
             self._open_connection()
 
@@ -286,9 +296,9 @@ class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
                     raise
                 if self.response is not None:
                     self.response.close()
-                if retry_number == self.fs._retry_policy.max_retries:
-                    raise
                 if shutdown_requested():
+                    raise_or_exit_worker(error=error)
+                if retry_number == self.fs._retry_policy.max_retries:
                     raise
                 if "client has been closed" in str(error).lower():
                     close_session()
@@ -301,6 +311,8 @@ class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
                     self.fs._retry_policy.max_retries,
                 )
                 interruptible_retry_delay(delay=delay, error=error, sleep=time.sleep)
+                if shutdown_requested():
+                    raise_or_exit_worker(error=error)
                 self._open_connection()
         raise AssertionError("stream retry loop did not return or raise")
 

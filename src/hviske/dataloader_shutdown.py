@@ -1,4 +1,8 @@
-"""Cooperative shutdown for spawned training DataLoader workers."""
+"""Cooperative shutdown for spawned training DataLoader workers.
+
+Workers exit directly after a terminal retry signal so Linux does not run Python or
+native finalisation while the DataLoader is tearing down.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from pathlib import Path
 
 import torch.utils.data._utils as data_utils
 from huggingface_hub import constants
+from torch.utils.data import get_worker_info
 
 SHUTDOWN_SENTINEL_ENV = "HVISKE_DATALOADER_SHUTDOWN_SENTINEL"
 _FINALISATION_MARGIN_SECONDS = 5.0
@@ -115,6 +120,18 @@ class DataLoaderShutdownController:
         self.reset()
 
 
+def exit_worker_if_shutdown_requested() -> None:
+    """Exit a DataLoader worker before starting another read after shutdown."""
+    if shutdown_requested() and get_worker_info() is not None:
+        os._exit(0)
+
+
+def shutdown_requested() -> bool:
+    """Return whether the inherited worker sentinel has been created."""
+    sentinel = os.getenv(SHUTDOWN_SENTINEL_ENV)
+    return bool(sentinel) and Path(sentinel).is_file()
+
+
 def interruptible_retry_delay(
     delay: float, error: BaseException, sleep: Callable[[float], None] | None = None
 ) -> None:
@@ -133,19 +150,27 @@ def interruptible_retry_delay(
     sleeper = sleep or time.sleep
     if not os.getenv(SHUTDOWN_SENTINEL_ENV):
         sleeper(delay)
+        if shutdown_requested():
+            _raise_or_exit_worker(error=error)
         return
 
     deadline = time.monotonic() + delay
     while True:
         if shutdown_requested():
-            raise error
+            _raise_or_exit_worker(error=error)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
         sleeper(min(0.1, remaining))
 
 
-def shutdown_requested() -> bool:
-    """Return whether the inherited worker sentinel has been created."""
-    sentinel = os.getenv(SHUTDOWN_SENTINEL_ENV)
-    return bool(sentinel) and Path(sentinel).is_file()
+def _raise_or_exit_worker(error: BaseException) -> None:
+    """Exit a disposable DataLoader worker after a terminal shutdown signal."""
+    if shutdown_requested() and get_worker_info() is not None:
+        os._exit(0)
+    raise error
+
+
+def raise_or_exit_worker(error: BaseException) -> None:
+    """Re-raise a transient error, or exit a worker after terminal shutdown."""
+    _raise_or_exit_worker(error=error)
