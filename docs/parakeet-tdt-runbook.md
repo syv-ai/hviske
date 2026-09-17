@@ -73,6 +73,14 @@ uv run python src/scripts/finetune_asr_model.py --config-name asr_finetuning \
   enable_experiment_tracking=false
 ```
 
+When `evaluation_steps` contains the bounded `stop_after_steps`, the final validation
+runs at that same global step immediately after `trainer.train()` returns. This ordering
+lets spawned training DataLoader workers shut down before validation opens its own Hub
+streams, avoiding a misleading worker `SIGABRT` during interpreter finalisation. The
+terminal metrics still cover every configured validation dataset, use the same W&B run,
+and are appended to `evaluation_metrics_path`; any earlier scheduled validations remain
+in the training loop, and the terminal checkpoint is saved there as usual.
+
 **Gate:** forward loss is finite, the saved processor reloads with `decoder_type=tdt`,
 clean reload uses local files without the Hub base revision, and the resumed trainer
 reports global step 4 (or a later explicitly requested step).
@@ -94,6 +102,10 @@ for lr in 5e-6 1e-5; do
     enable_experiment_tracking=false
  done
 ```
+
+Steps 250, 500, and 1000 evaluate in-loop. Step 2000 uses the post-training ordering
+described above and must appear exactly once in the metrics JSONL after the training
+workers have closed.
 
 **Gate:** each pilot has independent checkpoints and metrics, reaches the requested
 bounded stop without changing `config/model/cohere.yaml` or

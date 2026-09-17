@@ -78,19 +78,31 @@ def finetune(config: DictConfig) -> None:
             logger.info("No validation set found. Disabling early stopping.")
 
         callbacks: list[TrainerCallback] = []
-        evaluation_steps = config.get("evaluation_steps")
+        evaluation_steps = [
+            int(step) for step in (config.get("evaluation_steps") or [])
+        ]
+        configured_stop = config.get("stop_after_steps")
+        stop_after_steps = int(configured_stop) if configured_stop is not None else None
+        # In-loop validation keeps spawned training workers alive until it finishes.
+        # Defer the bounded terminal evaluation until train() releases its iterator.
+        deferred_evaluation_step = (
+            stop_after_steps
+            if eval_dataset is not None and stop_after_steps in evaluation_steps
+            else None
+        )
         if evaluation_steps:
             callbacks.append(
                 EvaluationScheduleCallback(
-                    evaluation_steps=[int(step) for step in evaluation_steps],
+                    evaluation_steps=[
+                        step
+                        for step in evaluation_steps
+                        if step != deferred_evaluation_step
+                    ],
                     metrics_path=config.get("evaluation_metrics_path"),
                 )
             )
-        stop_after_steps = config.get("stop_after_steps")
         if stop_after_steps is not None:
-            callbacks.append(
-                StopAfterStepCallback(stop_after_steps=int(stop_after_steps))
-            )
+            callbacks.append(StopAfterStepCallback(stop_after_steps=stop_after_steps))
         if eval_dataset is not None and config.early_stopping:
             callbacks.append(
                 EarlyStoppingCallback(
@@ -112,6 +124,11 @@ def finetune(config: DictConfig) -> None:
         block_terminal_output()
         with disable_tqdm():
             trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
+            if (
+                deferred_evaluation_step is not None
+                and trainer.state.global_step == deferred_evaluation_step
+            ):
+                trainer.evaluate()
 
         model.save_pretrained(save_directory=config.model_dir)
 
