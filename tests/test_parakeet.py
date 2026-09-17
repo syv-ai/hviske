@@ -21,7 +21,9 @@ from transformers.models.parakeet import (
     ParakeetEncoderConfig,
     ParakeetForCTC,
     ParakeetForRNNT,
+    ParakeetForTDT,
     ParakeetRNNTConfig,
+    ParakeetTDTConfig,
 )
 from transformers.models.parakeet.feature_extraction_parakeet import (
     ParakeetFeatureExtractor,
@@ -30,7 +32,7 @@ from transformers.pipelines.automatic_speech_recognition import (
     AutomaticSpeechRecognitionPipeline,
 )
 
-from hviske.cohere import get_asr_call_kwargs
+from hviske.cohere import get_asr_call_kwargs, load_asr_transcriber
 from hviske.compute_metrics import compute_error_rate_metrics
 from hviske.data import process_example
 from hviske.data_collators import DataCollatorParakeetWithPadding
@@ -236,6 +238,33 @@ def test_parakeet_danish_tokens_resize_rnnt_and_keep_blank() -> None:
     assert torch.isfinite(outputs.loss)
 
 
+def test_parakeet_danish_tokens_resize_tdt_preserves_duration_head() -> None:
+    """TDT vocabulary growth preserves duration rows and the blank start ID."""
+    setup = _tiny_parakeet_setup()
+    processor = setup._adapt_processor(processor=_tiny_parakeet_processor())
+    model = ParakeetForTDT(
+        ParakeetTDTConfig(
+            encoder_config=_tiny_parakeet_encoder_config(),
+            vocab_size=6,
+            decoder_hidden_size=4,
+            num_decoder_layers=1,
+            pad_token_id=0,
+            blank_token_id=5,
+            durations=(0, 1, 2),
+        )
+    )
+    old_head = model.joint.head.weight.detach().clone()
+    old_duration_head = old_head[-3:].clone()
+    setup.processor = processor
+    setup._resize_model_vocabulary(model=model, family="tdt")
+
+    assert model.decoder.embedding.num_embeddings == 9
+    assert model.joint.head.out_features == 12
+    assert torch.equal(model.joint.head.weight[-3:], old_duration_head)
+    assert model.config.blank_token_id == 5
+    assert model.generation_config.decoder_start_token_id == 5
+
+
 def test_parakeet_dispatch() -> None:
     """The model factory selects the Parakeet setup."""
     config = OmegaConf.create({"model": {"type": "parakeet"}})
@@ -248,10 +277,9 @@ def test_parakeet_family_rejects_collection_checkpoint() -> None:
         parakeet_family(SimpleNamespace(model_type="nemo"))
 
 
-def test_parakeet_family_rejects_tdt_architecture() -> None:
-    """TDT directs users to NeMo instead of attempting native fine-tuning."""
-    with pytest.raises(ValueError, match="Use NVIDIA NeMo"):
-        parakeet_family(SimpleNamespace(model_type="parakeet_tdt"))
+def test_parakeet_family_supports_tdt_architecture() -> None:
+    """TDT checkpoints use the native Transformers family."""
+    assert parakeet_family(SimpleNamespace(model_type="parakeet_tdt")) == "tdt"
 
 
 def test_parakeet_family_uses_checkpoint_architecture() -> None:
@@ -348,6 +376,43 @@ def test_parakeet_load_model_selects_native_auto_class(
     assert setup.load_model() is ctc_model
     ctc_loader.assert_called_once()
     general_loader.assert_not_called()
+
+
+def test_parakeet_load_model_selects_native_tdt_auto_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TDT uses AutoModelForTDT rather than the generic auto model."""
+    config = OmegaConf.create(
+        {
+            "model": {
+                "type": "parakeet",
+                "pretrained_model_id": "checkpoint",
+                "freeze_feature_encoder": False,
+            },
+            "gradient_checkpointing": False,
+        }
+    )
+    setup = ParakeetModelSetup(config=config)
+    tdt_model = SimpleNamespace(config=SimpleNamespace())
+    tdt_loader = MagicMock(return_value=tdt_model)
+    monkeypatch.setattr(
+        "hviske.parakeet.AutoConfig.from_pretrained",
+        MagicMock(return_value=SimpleNamespace(model_type="parakeet_tdt")),
+    )
+    monkeypatch.setattr("hviske.parakeet.AutoModelForTDT.from_pretrained", tdt_loader)
+
+    assert setup.load_model() is tdt_model
+    tdt_loader.assert_called_once()
+
+
+def test_parakeet_local_paths_omit_base_revision(tmp_path: Path) -> None:
+    """Saved checkpoints are not resolved against the pinned base revision."""
+    setup = _tiny_parakeet_setup()
+    setup.config.model.revision = "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+    assert setup._hub_kwargs(model_id=str(tmp_path)) == {}
+    assert setup._hub_kwargs(model_id="nvidia/parakeet-tdt-0.6b-v3")["revision"] == (
+        "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+    )
 
 
 def test_parakeet_metric_decodes_generated_sequences() -> None:
@@ -493,8 +558,66 @@ def test_parakeet_rnnt_forward_computes_native_loss() -> None:
     assert torch.isfinite(outputs.loss)
 
 
-def test_parakeet_rnnt_metrics_keep_repeated_reference_tokens() -> None:
-    """RNNT metrics retain consecutive identical tokens in reference labels."""
+def test_parakeet_tdt_forward_has_finite_loss_and_gradients() -> None:
+    """A native tiny TDT model computes a trainable finite loss."""
+    model = ParakeetForTDT(
+        ParakeetTDTConfig(
+            encoder_config=_tiny_parakeet_encoder_config(),
+            vocab_size=6,
+            decoder_hidden_size=4,
+            num_decoder_layers=1,
+            pad_token_id=0,
+            blank_token_id=5,
+            durations=(0, 1, 2),
+        )
+    )
+    outputs = model(
+        input_features=torch.randn(2, 64, 16),
+        attention_mask=torch.ones(2, 64),
+        decoder_input_ids=torch.tensor([[5, 1, 2], [5, 1, 0]]),
+        labels=torch.tensor([[1, 2], [1, 0]]),
+    )
+    assert outputs.loss is not None
+    assert torch.isfinite(outputs.loss)
+    outputs.loss.backward()
+    gradients = [parameter.grad for parameter in model.parameters()]
+    assert gradients
+    assert all(
+        gradient is not None and torch.isfinite(gradient).all()
+        for gradient in gradients
+    )
+
+
+def test_parakeet_tdt_save_and_clean_reload(tmp_path: Path) -> None:
+    """A tiny TDT model and processor reload from local files."""
+    processor = _tiny_parakeet_processor()
+    processor.decoder_type = "tdt"
+    model = ParakeetForTDT(
+        ParakeetTDTConfig(
+            encoder_config=_tiny_parakeet_encoder_config(),
+            vocab_size=6,
+            decoder_hidden_size=4,
+            num_decoder_layers=1,
+            pad_token_id=0,
+            blank_token_id=5,
+            durations=(0, 1, 2),
+        )
+    )
+    processor.save_pretrained(tmp_path)
+    model.save_pretrained(tmp_path)
+
+    reloaded_processor = ParakeetProcessor.from_pretrained(tmp_path)
+    reloaded_model = ParakeetForTDT.from_pretrained(tmp_path)
+    assert reloaded_processor.decoder_type == "tdt"
+    assert reloaded_model.config.blank_token_id == 5
+    assert reloaded_model.joint.head.out_features == 9
+
+
+@pytest.mark.parametrize("decoder_type", ["rnnt", "tdt"])
+def test_parakeet_transducer_metrics_keep_repeated_reference_tokens(
+    decoder_type: str,
+) -> None:
+    """Transducer metrics retain consecutive identical reference tokens."""
     tokenizer = ParakeetTokenizer(
         vocab={"<pad>": 0, "a": 1, "<blank>": 2, "<unk>": 3},
         pad_token="<pad>",
@@ -505,7 +628,7 @@ def test_parakeet_rnnt_metrics_keep_repeated_reference_tokens() -> None:
         feature_extractor=ParakeetFeatureExtractor(feature_size=1),
         tokenizer=tokenizer,
         blank_token="<blank>",
-        decoder_type="rnnt",
+        decoder_type=decoder_type,
     )
     setup = ParakeetModelSetup(
         config=OmegaConf.create(
@@ -519,3 +642,26 @@ def test_parakeet_rnnt_metrics_keep_repeated_reference_tokens() -> None:
     )
 
     assert metrics == {"cer": 0.0, "wer": 0.0}
+
+
+def test_parakeet_zero_shot_pipeline_uses_pinned_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic Parakeet evaluation passes its immutable Hub revision to pipeline."""
+    pipeline = MagicMock(return_value=object())
+    monkeypatch.setattr("hviske.cohere.pipeline", pipeline)
+    monkeypatch.setattr(
+        "hviske.cohere.AutoConfig.from_pretrained",
+        MagicMock(return_value=SimpleNamespace(model_type="parakeet_tdt")),
+    )
+
+    load_asr_transcriber(
+        model_id="nvidia/parakeet-tdt-0.6b-v3",
+        no_lm=False,
+        device=torch.device("cpu"),
+        revision="541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+    )
+
+    assert pipeline.call_args.kwargs["revision"] == (
+        "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+    )

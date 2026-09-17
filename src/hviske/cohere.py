@@ -968,10 +968,9 @@ def load_asr_transcriber(
         max_new_tokens (optional):
             Maximum number of tokens generated per audio input. Defaults to ``256``.
         revision (optional):
-            Immutable Hub revision for a native Cohere checkpoint. Defaults to the
-            pinned official Cohere checkpoint revision when ``model_id`` is that base
-            checkpoint. Other Hub models are loaded without a revision unless one is
-            explicitly supplied.
+            Immutable Hub checkpoint revision. Defaults to the pinned official Cohere
+            checkpoint revision when ``model_id`` is that base checkpoint. Other Hub
+            models are loaded without a revision unless one is explicitly supplied.
 
     Returns:
         A native Cohere adapter or a standard Transformers ASR pipeline.
@@ -1027,4 +1026,11 @@ def load_asr_transcriber(
             feature_extractor=feature_extractor,
             device=device,
         )
-    return pipeline(task="automatic-speech-recognition", model=model_id, device=device)
+    pipeline_kwargs: dict[str, object] = {
+        "task": "automatic-speech-recognition",
+        "model": model_id,
+        "device": device,
+    }
+    if revision is not None:
+        pipeline_kwargs["revision"] = revision
+    return pipeline(**pipeline_kwargs)

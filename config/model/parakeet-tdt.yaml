@@ -1,0 +1,9 @@
+name: parakeet-tdt
+type: parakeet
+pretrained_model_id: nvidia/parakeet-tdt-0.6b-v3
+revision: 541d1f99c6b0c3cd0b11a95167540bb8edefd82b
+freeze_feature_encoder: false
+lower_case: true
+characters_to_keep: 'abcdefghijklmnopqrstuvwxyzæøå0123456789éü'
+sampling_rate: 16_000
+learning_rate: 1e-4
