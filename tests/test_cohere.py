@@ -321,6 +321,7 @@ def test_cohere_trainer_unwraps_parallel_generation_model(
             # Exercise the real wrapper type without coupling this CPU stand-in to
             # whichever CUDA devices happen to be visible on the host.
             data_parallel_model.device_ids = []
+            data_parallel_model.module.to(device="cpu")
             wrapped_model: torch.nn.Module = data_parallel_model
         else:
             wrapped_model = torch.nn.parallel.DistributedDataParallel(underlying_model)
