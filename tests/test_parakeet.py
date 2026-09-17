@@ -681,14 +681,14 @@ def test_parakeet_tdt_runbook_overrides_compose() -> None:
             "stop_after_steps=2",
             "max_steps=2",
             "save_steps=2",
-            "save_total_limit=1",
+            "save_total_limit=2",
             "evaluation_steps=[2]",
             "evaluation_metrics_path=/tmp/parakeet-tdt-smoke/metrics.jsonl",
             "enable_experiment_tracking=false",
         ],
     )
     assert smoke.save_steps == 2
-    assert smoke.save_total_limit == 1
+    assert smoke.save_total_limit == 2
     assert smoke.evaluation_steps == [2]
     assert smoke.evaluation_metrics_path.endswith("metrics.jsonl")
     assert smoke.enable_experiment_tracking is False
@@ -719,15 +719,20 @@ def test_parakeet_tdt_runbook_saves_requested_checkpoints_and_metrics() -> None:
     ).read_text(encoding="utf-8")
 
     smoke = runbook[runbook.index("smoke_dir=") : runbook.index("After it exits")]
-    assert "save_steps=2 save_total_limit=1" in smoke
+    assert "save_steps=2 save_total_limit=2" in smoke
+    assert "save_total_limit=1" not in smoke
     assert 'evaluation_metrics_path="$smoke_dir/evaluation-metrics.jsonl"' in smoke
     assert "enable_experiment_tracking=false" in smoke
 
     resume_start = runbook.index("resume_from_checkpoint")
     resume = runbook[resume_start : runbook.index("**Gate:", resume_start)]
     assert "checkpoint-2" in resume
-    assert "save_steps=2 save_total_limit=1" in resume
+    assert "save_steps=2 save_total_limit=2" in resume
+    assert "save_total_limit=1" not in resume
     assert 'evaluation_metrics_path="$smoke_dir/evaluation-metrics.jsonl"' in resume
+
+    assert "best_model_checkpoint" in runbook
+    assert "both the best/source checkpoint and newest resume checkpoint" in runbook
 
     pilots = runbook[runbook.index("for lr") :]
     assert "evaluation_steps='[250,500,1000,2000]'" in pilots
