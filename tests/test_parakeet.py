@@ -324,13 +324,11 @@ def test_parakeet_generation_trainer_unwraps_parallel_model(
 
         underlying_model = _TinyGenerationModel()
         if wrapper_kind == "data_parallel":
-            if torch.cuda.is_available():
-                underlying_model = underlying_model.to(device="cuda:0")
-                wrapped_model: torch.nn.Module = torch.nn.DataParallel(
-                    underlying_model, device_ids=[0]
-                )
-            else:
-                wrapped_model = torch.nn.DataParallel(underlying_model)
+            data_parallel_model = torch.nn.DataParallel(underlying_model)
+            # Exercise the real wrapper type without coupling this CPU Trainer test to
+            # whichever CUDA devices happen to be visible on the host.
+            data_parallel_model.device_ids = []
+            wrapped_model: torch.nn.Module = data_parallel_model
         else:
             wrapped_model = torch.nn.parallel.DistributedDataParallel(underlying_model)
         trainer = ParakeetGenerationTrainer(
