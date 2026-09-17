@@ -1,8 +1,12 @@
 """Regression tests for project-owned Hub streaming retries."""
 
+import contextlib
+import multiprocessing as mp
 import typing as t
+from multiprocessing.connection import Connection
 from types import SimpleNamespace
 
+import fsspec
 import httpx
 import pytest
 
@@ -13,6 +17,61 @@ from hviske.hub_retries import (
     _request_range,
     configure_hub_streaming_retries,
 )
+
+
+def _read_spawned_policy(connection: Connection) -> None:
+    filesystem = fsspec.filesystem("hf")
+    connection.send(filesystem._retry_policy.max_retries)
+    connection.close()
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 404])
+def test_auth_and_not_found_failures_are_not_retried(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    """Authentication and missing-file responses fail deterministically."""
+    client = _FakeClient([_response(status_code)])
+    sleeps: list[float] = []
+    monkeypatch.setattr(hub_retries, "get_session", lambda: client)
+    monkeypatch.setattr(hub_retries.time, "sleep", sleeps.append)
+
+    remote_file = object.__new__(RetryingHfFileSystemFile)
+    object.__setattr__(
+        remote_file,
+        "fs",
+        SimpleNamespace(
+            _api=SimpleNamespace(_build_hf_headers=lambda: {}),
+            _retry_policy=HubRetryPolicy(max_retries=5),
+        ),
+    )
+    object.__setattr__(remote_file, "url", lambda: "https://huggingface.co/file")
+
+    with pytest.raises(httpx.HTTPError):
+        remote_file._fetch_range(start=0, end=1)
+
+    assert client.calls == 1
+    assert sleeps == []
+
+
+class _FakeClient:
+    def __init__(self, outcomes: list[object]) -> None:
+        self.outcomes = outcomes
+        self.calls = 0
+
+    def request(self, **_: object) -> httpx.Response:
+        outcome = self.outcomes[self.calls]
+        self.calls += 1
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return t.cast(httpx.Response, outcome)
+
+
+def _response(status_code: int, content: bytes = b"") -> httpx.Response:
+    return httpx.Response(
+        status_code=status_code,
+        content=content,
+        request=httpx.Request("GET", "https://huggingface.co/dataset/file"),
+    )
 
 
 def test_deterministic_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -71,28 +130,103 @@ def test_range_read_retries_closed_client_and_5xx(
     assert client.calls == 3
     assert len(closed_clients) == 1
     assert sleeps == [1.0, 2.0]
+    assert caplog.text.count("Transient Hugging Face Hub read failed; retrying in") == 2
     assert "X-Amz-Signature=secret" not in caplog.text
 
 
-class _FakeClient:
-    def __init__(self, outcomes: list[object]) -> None:
-        self.outcomes = outcomes
-        self.calls = 0
+def test_resumed_stream_416_is_eof(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 416 while resuming a stream means the file is already exhausted."""
+    client = _FakeStreamingClient(_response(416))
+    monkeypatch.setattr(hub_retries, "get_session", lambda: client)
 
-    def request(self, **_: object) -> httpx.Response:
-        outcome = self.outcomes[self.calls]
-        self.calls += 1
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return t.cast(httpx.Response, outcome)
-
-
-def _response(status_code: int, content: bytes = b"") -> httpx.Response:
-    return httpx.Response(
-        status_code=status_code,
-        content=content,
-        request=httpx.Request("GET", "https://huggingface.co/dataset/file"),
+    stream_file = object.__new__(hub_retries.RetryingHfFileSystemStreamFile)
+    object.__setattr__(
+        stream_file,
+        "fs",
+        SimpleNamespace(
+            _api=SimpleNamespace(_build_hf_headers=lambda: {}),
+            _retry_policy=HubRetryPolicy(max_retries=2),
+        ),
     )
+    object.__setattr__(stream_file, "url", lambda: "https://huggingface.co/file")
+    object.__setattr__(stream_file, "loc", 17)
+    object.__setattr__(stream_file, "response", None)
+    object.__setattr__(stream_file, "_stream_iterator", None)
+    object.__setattr__(stream_file, "_stream_buffer", bytearray())
+    object.__setattr__(stream_file, "_exit_stack", contextlib.ExitStack())
+
+    assert stream_file.read() == b""
+
+    assert stream_file.response is None
+    assert stream_file._stream_iterator is None
+    assert client.headers == {"Range": "bytes=17-"}
+    assert client.context.closed
+
+
+class _FakeStreamContext:
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        self.closed = False
+
+    def __enter__(self) -> httpx.Response:
+        return self.response
+
+    def __exit__(self, *_: object) -> None:
+        self.closed = True
+
+
+class _FakeStreamingClient:
+    def __init__(self, response: httpx.Response) -> None:
+        self.context = _FakeStreamContext(response)
+        self.headers: dict[str, str] | None = None
+
+    def stream(self, **kwargs: object) -> _FakeStreamContext:
+        self.headers = t.cast(dict[str, str], kwargs["headers"])
+        return self.context
+
+
+def test_retry_exhaustion_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A persistent server error stops after the configured number of retries."""
+    client = _FakeClient([_response(503), _response(503), _response(503)])
+    sleeps: list[float] = []
+    monkeypatch.setattr(hub_retries, "get_session", lambda: client)
+    monkeypatch.setattr(hub_retries.time, "sleep", sleeps.append)
+    monkeypatch.setattr(hub_retries.random, "uniform", lambda *_: 0.0)
+
+    with pytest.raises(hub_retries._RetryableStatus) as error:
+        hub_retries._run_with_retries(
+            lambda: _request_range(url="https://huggingface.co/file", headers={}),
+            HubRetryPolicy(max_retries=2),
+        )
+
+    assert error.value.status_code == 503
+    assert client.calls == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_retry_policy_is_available_in_a_spawned_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A focused spawned process picks up the policy without starting a DataLoader."""
+    monkeypatch.delenv(hub_retries._POLICY_ENV, raising=False)
+    policy = configure_hub_streaming_retries({"max_retries": 3})
+    context = mp.get_context("spawn")
+    parent_connection, child_connection = context.Pipe()
+    process = context.Process(target=_read_spawned_policy, args=(child_connection,))
+    process.start()
+    child_connection.close()
+
+    try:
+        assert parent_connection.poll(10)
+        assert parent_connection.recv() == policy.max_retries
+    finally:
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        parent_connection.close()
+
+    assert process.exitcode == 0
 
 
 def test_retry_policy_is_used_by_spawnable_filesystem(
@@ -112,6 +246,22 @@ def test_retry_policy_is_used_by_spawnable_filesystem(
     filesystem = hub_retries.RetryingHfFileSystem()
 
     assert filesystem._retry_policy == policy
+
+
+def test_retry_policy_reconfiguration_invalidates_cached_filesystems(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated configuration changes the policy returned by fsspec."""
+    monkeypatch.delenv(hub_retries._POLICY_ENV, raising=False)
+    first_policy = configure_hub_streaming_retries({"max_retries": 1})
+    first_filesystem = fsspec.filesystem("hf")
+
+    second_policy = configure_hub_streaming_retries({"max_retries": 4})
+    second_filesystem = fsspec.filesystem("hf")
+
+    assert first_filesystem is not second_filesystem
+    assert first_filesystem._retry_policy == first_policy
+    assert second_filesystem._retry_policy == second_policy
 
 
 @pytest.mark.parametrize(
