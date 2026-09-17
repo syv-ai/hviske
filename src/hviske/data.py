@@ -45,6 +45,7 @@ from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
 from .audio import SoundfileAudio
+from .hub_retries import configure_hub_streaming_retries
 from .local_vtt import decode_vtt_audio, load_vtt_manifest
 from .types import Data
 from .utils import (
@@ -1281,6 +1282,12 @@ def load_data_for_finetuning(
         ValueError:
             If the dataset is not supported.
     """
+    configure_hub_streaming_retries(
+        retry_config=t.cast(
+            Mapping[str, object] | None, config.get("hub_streaming_retries")
+        )
+    )
+
     # Note if we're on the main process, if we are running in a distributed setting
     is_main_process = os.getenv("RANK", "0") == "0"
 

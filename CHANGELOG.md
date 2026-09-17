@@ -41,6 +41,10 @@
 
 ### Fixed
 
+- Added bounded, jittered retries for transient Hugging Face Hub streaming reads,
+  including process-local client recreation for closed-client failures; preserved
+  upstream 416-as-EOF handling and policy reconfiguration; local and materialised
+  file reads remain unchanged.
 - Partitioned local VTT manifests into configurable metadata-only shards so Sparkie's
   spawned DataLoader workers can consume DRTV and YouTube examples in parallel.
 - Replaced Trainer padding sentinels in generated token IDs before ASR metric decoding
