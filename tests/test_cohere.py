@@ -235,7 +235,7 @@ class _Model(torch.nn.Module):
 
     def forward(self, **kwargs: torch.Tensor) -> SimpleNamespace:
         self.forward_inputs = kwargs
-        return SimpleNamespace(loss=torch.tensor(0.5))
+        return SimpleNamespace(loss=self.inference_parameter.new_tensor(0.5))
 
     def generate(self, **kwargs: torch.Tensor) -> torch.Tensor:
         self.generated_inputs = kwargs
@@ -317,7 +317,13 @@ def test_cohere_trainer_unwraps_parallel_generation_model(
 
         underlying_model = _Model(dtype=torch.bfloat16)
         if wrapper_kind == "data_parallel":
-            wrapped_model: torch.nn.Module = torch.nn.DataParallel(underlying_model)
+            if torch.cuda.is_available():
+                underlying_model = underlying_model.to(device="cuda:0")
+                wrapped_model: torch.nn.Module = torch.nn.DataParallel(
+                    underlying_model, device_ids=[0]
+                )
+            else:
+                wrapped_model = torch.nn.DataParallel(underlying_model)
         else:
             wrapped_model = torch.nn.parallel.DistributedDataParallel(underlying_model)
 
