@@ -43,6 +43,10 @@
 
 ### Fixed
 
+- Made Parakeet transducer generation safe under distributed wrappers, enabled
+  revision-pinned Hydra-composable TDT evaluation, and documented bounded checkpoint
+  and metric persistence for isolated TDT smoke and pilot runs.
+- Added a tiny Parakeet TDT checkpoint resume lifecycle regression test.
 - Added bounded, jittered retries for transient Hugging Face Hub streaming reads,
   including process-local client recreation for closed-client failures; preserved
   upstream 416-as-EOF handling and policy reconfiguration; local and materialised

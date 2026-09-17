@@ -49,7 +49,8 @@ The smoke must save at step 2; do not reuse a prior output directory:
 smoke_dir="$PWD/runs/parakeet-tdt-smoke"
 uv run python src/scripts/finetune_asr_model.py --config-name asr_finetuning \
   model=parakeet-tdt model_dir="$smoke_dir" stop_after_steps=2 \
-  max_steps=2 save_steps=2 evaluation_steps='[2]' \
+  max_steps=2 save_steps=2 save_total_limit=1 evaluation_steps='[2]' \
+  evaluation_metrics_path="$smoke_dir/evaluation-metrics.jsonl" \
   enable_experiment_tracking=false
 ```
 
@@ -63,7 +64,9 @@ uv run python src/scripts/evaluate_model.py \
 uv run python src/scripts/finetune_asr_model.py --config-name asr_finetuning \
   model=parakeet-tdt model_dir="$smoke_dir" \
   resume_from_checkpoint="$smoke_dir/checkpoint-2" stop_after_steps=4 \
-  max_steps=4 save_steps=2 enable_experiment_tracking=false
+  max_steps=4 save_steps=2 save_total_limit=1 evaluation_steps='[4]' \
+  evaluation_metrics_path="$smoke_dir/evaluation-metrics.jsonl" \
+  enable_experiment_tracking=false
 ```
 
 **Gate:** forward loss is finite, the saved processor reloads with `decoder_type=tdt`,
@@ -82,7 +85,9 @@ for lr in 5e-6 1e-5; do
   uv run python src/scripts/finetune_asr_model.py --config-name asr_finetuning \
     model=parakeet-tdt model.learning_rate="$lr" model_dir="$run_dir" \
     evaluation_steps='[250,500,1000,2000]' stop_after_steps=2000 \
-    max_steps=100000 save_steps=500 enable_experiment_tracking=false
+    max_steps=100000 save_steps=250 save_total_limit=8 \
+    evaluation_metrics_path="$run_dir/evaluation-metrics.jsonl" \
+    enable_experiment_tracking=false
  done
 ```
 

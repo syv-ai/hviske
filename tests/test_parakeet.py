@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+from hydra import compose
 from omegaconf import OmegaConf
 from transformers import (
     EvalPrediction,
@@ -271,6 +272,19 @@ def test_parakeet_dispatch() -> None:
     assert isinstance(load_model_setup(config), ParakeetModelSetup)
 
 
+def test_parakeet_evaluation_revision_is_hydra_composable() -> None:
+    """The documented zero-shot revision is accepted by the evaluation config."""
+    config = compose(
+        config_name="evaluation",
+        overrides=[
+            "model_id=nvidia/parakeet-tdt-0.6b-v3",
+            "model_revision=541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+        ],
+    )
+
+    assert config.model_revision == "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+
+
 def test_parakeet_family_rejects_collection_checkpoint() -> None:
     """NeMo collection configs fail before an auto model is selected."""
     with pytest.raises(ValueError, match="Unsupported Parakeet checkpoint"):
@@ -292,34 +306,80 @@ def test_parakeet_family_uses_checkpoint_architecture() -> None:
     )
 
 
-def test_parakeet_generation_trainer_unwraps_transducer_output(tmp_path: Path) -> None:
-    """Trainer metrics receive sequences, not the RNNT generation wrapper."""
+@pytest.mark.parametrize("wrapper_kind", ["data_parallel", "distributed_data_parallel"])
+def test_parakeet_generation_trainer_unwraps_parallel_model(
+    wrapper_kind: str, tmp_path: Path
+) -> None:
+    """Generation uses the underlying model for parallel wrappers."""
+    process_group_initialised = False
+    try:
+        if wrapper_kind == "distributed_data_parallel":
+            torch.distributed.init_process_group(
+                backend="gloo",
+                init_method=f"file://{tmp_path / 'ddp-init'}",
+                rank=0,
+                world_size=1,
+            )
+            process_group_initialised = True
 
-    class TinyModel(torch.nn.Module):
-        config = SimpleNamespace(
-            model_type="parakeet_rnnt", keys_to_ignore_at_inference=[]
+        underlying_model = _TinyGenerationModel()
+        if wrapper_kind == "data_parallel":
+            wrapped_model: torch.nn.Module = torch.nn.DataParallel(underlying_model)
+        else:
+            wrapped_model = torch.nn.parallel.DistributedDataParallel(underlying_model)
+        trainer = ParakeetGenerationTrainer(
+            model=underlying_model,
+            args=TrainingArguments(
+                output_dir=str(tmp_path), use_cpu=True, report_to=[]
+            ),
         )
 
-        def forward(
-            self,
-            input_features: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            labels: torch.Tensor | None = None,
-        ) -> CausalLMOutput:
-            return CausalLMOutput(
-                loss=t.cast(torch.FloatTensor, torch.tensor(0.5)),
-                logits=t.cast(torch.FloatTensor, input_features),
-            )
+        loss, predictions, labels = trainer.prediction_step(
+            model=wrapped_model,
+            inputs={
+                "input_features": torch.zeros(1, 2, 3),
+                "attention_mask": torch.ones(1, 2),
+                "labels": torch.tensor([[1, 2]]),
+            },
+            prediction_loss_only=False,
+        )
 
-        def generate(
-            self,
-            input_features: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-        ) -> SimpleNamespace:
-            return SimpleNamespace(sequences=torch.tensor([[1, 2]]))
+        assert loss is not None
+        assert torch.equal(t.cast(torch.Tensor, predictions), torch.tensor([[1, 2]]))
+        assert torch.equal(t.cast(torch.Tensor, labels), torch.tensor([[1, 2]]))
+    finally:
+        if process_group_initialised:
+            torch.distributed.destroy_process_group()
 
+
+class _TinyGenerationModel(torch.nn.Module):
+    config = SimpleNamespace(model_type="parakeet_rnnt", keys_to_ignore_at_inference=[])
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+    ) -> CausalLMOutput:
+        return CausalLMOutput(
+            loss=t.cast(torch.FloatTensor, self.scale * 0.5),
+            logits=t.cast(torch.FloatTensor, input_features),
+        )
+
+    def generate(
+        self, input_features: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> SimpleNamespace:
+        return SimpleNamespace(sequences=torch.tensor([[1, 2]]))
+
+
+def test_parakeet_generation_trainer_unwraps_transducer_output(tmp_path: Path) -> None:
+    """Trainer metrics receive sequences, not the RNNT generation wrapper."""
     trainer = ParakeetGenerationTrainer(
-        model=TinyModel(),
+        model=_TinyGenerationModel(),
         args=TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to=[]),
     )
     loss, predictions, labels = trainer.prediction_step(
@@ -413,6 +473,24 @@ def test_parakeet_local_paths_omit_base_revision(tmp_path: Path) -> None:
     assert setup._hub_kwargs(model_id="nvidia/parakeet-tdt-0.6b-v3")["revision"] == (
         "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
     )
+
+
+def test_parakeet_local_pipeline_omits_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Local evaluation paths are not given a Hub-only revision argument."""
+    pipeline = MagicMock(return_value=object())
+    monkeypatch.setattr("hviske.cohere.pipeline", pipeline)
+    monkeypatch.setattr(
+        "hviske.cohere.AutoConfig.from_pretrained",
+        MagicMock(return_value=SimpleNamespace(model_type="wav2vec2")),
+    )
+
+    load_asr_transcriber(
+        model_id=str(tmp_path), no_lm=False, device=torch.device("cpu")
+    )
+
+    assert "revision" not in pipeline.call_args.kwargs
 
 
 def test_parakeet_metric_decodes_generated_sequences() -> None:
@@ -588,6 +666,70 @@ def test_parakeet_tdt_forward_has_finite_loss_and_gradients() -> None:
     )
 
 
+def test_parakeet_tdt_runbook_overrides_compose() -> None:
+    """Runbook checkpoint and metric overrides compose in the training config."""
+    smoke = compose(
+        config_name="asr_finetuning",
+        overrides=[
+            "model=parakeet-tdt",
+            "model_dir=/tmp/parakeet-tdt-smoke",
+            "stop_after_steps=2",
+            "max_steps=2",
+            "save_steps=2",
+            "save_total_limit=1",
+            "evaluation_steps=[2]",
+            "evaluation_metrics_path=/tmp/parakeet-tdt-smoke/metrics.jsonl",
+            "enable_experiment_tracking=false",
+        ],
+    )
+    assert smoke.save_steps == 2
+    assert smoke.save_total_limit == 1
+    assert smoke.evaluation_steps == [2]
+    assert smoke.evaluation_metrics_path.endswith("metrics.jsonl")
+    assert smoke.enable_experiment_tracking is False
+
+    pilot = compose(
+        config_name="asr_finetuning",
+        overrides=[
+            "model=parakeet-tdt",
+            "save_steps=250",
+            "save_total_limit=8",
+            "evaluation_steps=[250,500,1000,2000]",
+            "stop_after_steps=2000",
+            "max_steps=100000",
+            "enable_experiment_tracking=false",
+        ],
+    )
+    assert pilot.save_steps == 250
+    assert pilot.save_total_limit == 8
+    assert pilot.evaluation_steps == [250, 500, 1000, 2000]
+    assert pilot.stop_after_steps == 2000
+    assert pilot.max_steps == 100000
+
+
+def test_parakeet_tdt_runbook_saves_requested_checkpoints_and_metrics() -> None:
+    """Runbook commands retain every requested checkpoint and metric record."""
+    runbook = (
+        Path(__file__).parents[1] / "docs" / "parakeet-tdt-runbook.md"
+    ).read_text(encoding="utf-8")
+
+    smoke = runbook[runbook.index("smoke_dir=") : runbook.index("After it exits")]
+    assert "save_steps=2 save_total_limit=1" in smoke
+    assert 'evaluation_metrics_path="$smoke_dir/evaluation-metrics.jsonl"' in smoke
+    assert "enable_experiment_tracking=false" in smoke
+
+    resume_start = runbook.index("resume_from_checkpoint")
+    resume = runbook[resume_start : runbook.index("**Gate:", resume_start)]
+    assert "checkpoint-2" in resume
+    assert "save_steps=2 save_total_limit=1" in resume
+    assert 'evaluation_metrics_path="$smoke_dir/evaluation-metrics.jsonl"' in resume
+
+    pilots = runbook[runbook.index("for lr") :]
+    assert "evaluation_steps='[250,500,1000,2000]'" in pilots
+    assert "save_steps=250 save_total_limit=8" in pilots
+    assert 'evaluation_metrics_path="$run_dir/evaluation-metrics.jsonl"' in pilots
+
+
 def test_parakeet_tdt_save_and_clean_reload(tmp_path: Path) -> None:
     """A tiny TDT model and processor reload from local files."""
     processor = _tiny_parakeet_processor()
@@ -611,6 +753,94 @@ def test_parakeet_tdt_save_and_clean_reload(tmp_path: Path) -> None:
     assert reloaded_processor.decoder_type == "tdt"
     assert reloaded_model.config.blank_token_id == 5
     assert reloaded_model.joint.head.out_features == 9
+
+
+def test_parakeet_tdt_trainer_resumes_saved_checkpoint(tmp_path: Path) -> None:
+    """A tiny TDT trainer writes step 2 and resumes it through step 4."""
+    processor = _tiny_parakeet_processor()
+    processor.decoder_type = "tdt"
+    model = ParakeetForTDT(
+        ParakeetTDTConfig(
+            encoder_config=_tiny_parakeet_encoder_config(),
+            vocab_size=6,
+            decoder_hidden_size=4,
+            num_decoder_layers=1,
+            pad_token_id=0,
+            blank_token_id=5,
+            durations=(0, 1, 2),
+        )
+    )
+    processor.save_pretrained(tmp_path)
+    examples = [
+        {
+            "input_features": torch.zeros(64, 16),
+            "attention_mask": torch.ones(64, dtype=torch.long),
+            "decoder_input_ids": [5, 1, 2],
+            "labels": [1, 2],
+        }
+        for _ in range(4)
+    ]
+    data_collator = DataCollatorParakeetWithPadding(
+        processor=processor, sample_rate=16_000, padding="longest"
+    )
+
+    def training_arguments(max_steps: int) -> TrainingArguments:
+        return TrainingArguments(
+            output_dir=str(tmp_path),
+            max_steps=max_steps,
+            save_strategy="steps",
+            save_steps=2,
+            save_total_limit=2,
+            logging_steps=2,
+            report_to=[],
+            use_cpu=True,
+            per_device_train_batch_size=2,
+            remove_unused_columns=False,
+        )
+
+    train_dataset = t.cast(torch.utils.data.Dataset[object], examples)
+    trainer = ParakeetGenerationTrainer(
+        model=model,
+        args=training_arguments(max_steps=2),
+        data_collator=data_collator,
+        train_dataset=train_dataset,
+        processing_class=processor.tokenizer,
+    )
+    trainer.train()
+
+    checkpoint = tmp_path / "checkpoint-2"
+    assert trainer.state.global_step == 2
+    assert checkpoint.is_dir()
+    model.save_pretrained(tmp_path)
+
+    setup = ParakeetModelSetup(
+        config=OmegaConf.create(
+            {
+                "model": {
+                    "type": "parakeet",
+                    "characters_to_keep": None,
+                    "pretrained_model_id": "unused",
+                    "sampling_rate": 16_000,
+                },
+                "model_dir": str(tmp_path),
+                "model_id": "unused",
+                "hub_organisation": "unused",
+                "padding": "longest",
+            }
+        )
+    )
+    saved = setup.load_saved()
+    resumed = ParakeetGenerationTrainer(
+        model=saved.model,
+        args=training_arguments(max_steps=4),
+        data_collator=saved.data_collator,
+        train_dataset=train_dataset,
+        processing_class=saved.processor.tokenizer,
+    )
+    resumed.train(resume_from_checkpoint=str(checkpoint))
+
+    assert resumed.state.global_step == 4
+    assert (tmp_path / "checkpoint-4").is_dir()
 
 
 @pytest.mark.parametrize("decoder_type", ["rnnt", "tdt"])
