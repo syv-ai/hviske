@@ -278,7 +278,10 @@ class _BackoffDataset(Dataset[int]):
         self.ready_directory = ready_directory
 
     def __getitem__(self, index: int) -> int:
-        self.ready_directory.joinpath(str(os.getpid())).touch()
+        def mark_backoff_and_sleep(delay: float) -> None:
+            self.ready_directory.joinpath(f"backoff-{os.getpid()}").touch()
+            time.sleep(delay)
+
         hub_retries._run_with_retries(
             operation=lambda: (_ for _ in ()).throw(
                 httpx.ReadTimeout("worker shutdown test")
@@ -289,6 +292,7 @@ class _BackoffDataset(Dataset[int]):
                 max_delay_seconds=30.0,
                 jitter_seconds=0.0,
             ),
+            sleep=mark_backoff_and_sleep,
         )
         raise AssertionError("worker retry unexpectedly completed")
 
