@@ -10,6 +10,8 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.tokenization_utils_base import BatchEncoding
 
 from .data_models import Processor
+from .dataloader_shutdown import start_worker_shutdown_watcher
+from .parakeet_contract import validate_parakeet_transducer_inputs
 
 logger = logging.getLogger(__package__)
 
@@ -60,6 +62,7 @@ class DataCollatorCTCWithPadding(DataCollatorMixin):
             ValueError:
                 If the features do not contain either 'input_features' or 'audio' key.
         """
+        start_worker_shutdown_watcher()
         if "input_values" in features[0]:
             audio_features = [dict(input_values=f["input_values"]) for f in features]
         elif "audio" in features[0]:
@@ -124,6 +127,7 @@ class DataCollatorCohereWithPadding(DataCollatorMixin):
             ValueError:
                 If features do not contain the Cohere inputs.
         """
+        start_worker_shutdown_watcher()
         if "input_features" not in features[0]:
             raise ValueError("Cohere features must contain 'input_features'.")
         if any("decoder_input_ids" not in feature for feature in features):
@@ -255,14 +259,16 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
     Parakeet receives log-mel features shaped ``(frames, feature_size)``.  The
     feature extractor knows the feature size and frame padding value, so this
     collator intentionally delegates padding rather than assuming a mel width.
-    Native RNNT and TDT labels and decoder inputs remain padded with the
-    tokenizer's blank/pad ID.
+    Native RNNT and TDT decoder inputs are validated against the model's blank ID
+    before padding; tokenizer padding semantics are otherwise preserved.
     """
 
     processor: Processor
     sample_rate: int
     padding: bool | str
     return_tensors: str = "pt"
+    model_config: object | None = None
+    blank_token_id: int | None = None
 
     def __post_init__(self) -> None:
         """Reject frame padding without an explicit Parakeet frame length.
@@ -294,6 +300,22 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
             ValueError:
                 If examples do not contain preprocessed features or raw audio.
         """
+        start_worker_shutdown_watcher()
+        has_decoder_inputs = "decoder_input_ids" in features[0]
+        if has_decoder_inputs:
+            if any("decoder_input_ids" not in feature for feature in features):
+                raise ValueError(
+                    "Every Parakeet transducer feature must contain decoder_input_ids."
+                )
+            for feature in features:
+                validate_parakeet_transducer_inputs(
+                    decoder_input_ids=feature["decoder_input_ids"],
+                    labels=feature["labels"],
+                    processor=self.processor,
+                    model_config=self.model_config,
+                    blank_token_id=self.blank_token_id,
+                )
+
         if "input_features" in features[0]:
             audio_features = [
                 {
@@ -331,11 +353,7 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
         )
         batch["labels"] = labels_batch["input_ids"]
 
-        if "decoder_input_ids" in features[0]:
-            if any("decoder_input_ids" not in feature for feature in features):
-                raise ValueError(
-                    "Every Parakeet transducer feature must contain decoder_input_ids."
-                )
+        if has_decoder_inputs:
             decoder_features = [
                 {"input_ids": feature["decoder_input_ids"]} for feature in features
             ]
@@ -395,6 +413,7 @@ class DataCollatorSpeechSeq2SeqWithPadding(DataCollatorMixin):
             ValueError:
                 If the features do not contain either 'input_features' or 'audio' key.
         """
+        start_worker_shutdown_watcher()
         if "input_features" in features[0]:
             audio_features = [
                 dict(input_features=f["input_features"]) for f in features

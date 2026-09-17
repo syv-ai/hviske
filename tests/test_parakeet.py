@@ -83,6 +83,7 @@ def test_parakeet_collator_pads_rnnt_decoder_inputs() -> None:
     processor = SimpleNamespace(
         feature_extractor=ParakeetFeatureExtractor(feature_size=3),
         tokenizer=MagicMock(),
+        blank_token_id=0,
     )
     processor.tokenizer.pad.side_effect = [
         {"input_ids": torch.tensor([[1, 2], [3, 0]])},
@@ -111,6 +112,48 @@ def test_parakeet_collator_pads_rnnt_decoder_inputs() -> None:
 
     assert batch["labels"].tolist() == [[1, 2], [3, 0]]
     assert batch["decoder_input_ids"].tolist() == [[0, 1, 2], [0, 3, 0]]
+
+
+def test_parakeet_collator_uses_blank_distinct_from_pad() -> None:
+    """TDT/RNNT decoder padding retains the processor's separate blank ID."""
+    processor = _tiny_parakeet_processor()
+    collator = DataCollatorParakeetWithPadding(
+        processor=processor, sample_rate=16_000, padding="longest"
+    )
+
+    batch = collator(
+        [
+            {
+                "input_features": torch.zeros(2, 1),
+                "labels": [1],
+                "decoder_input_ids": [5, 1],
+            },
+            {
+                "input_features": torch.zeros(2, 1),
+                "labels": [1, 2],
+                "decoder_input_ids": [5, 1, 2],
+            },
+        ]
+    )
+
+    assert batch["decoder_input_ids"].tolist() == [[5, 1, 0], [5, 1, 2]]
+
+
+def _tiny_parakeet_processor() -> ParakeetProcessor:
+    tokenizer = ParakeetTokenizer(
+        vocab={"<pad>": 0, "a": 1, "<unk>": 2, "<s>": 3, "</s>": 4, "<blank>": 5},
+        pad_token="<pad>",
+        unk_token="<unk>",
+        bos_token="<s>",
+        eos_token="</s>",
+        blank_token="<blank>",
+    )
+    return ParakeetProcessor(
+        feature_extractor=ParakeetFeatureExtractor(feature_size=1),
+        tokenizer=tokenizer,
+        blank_token="<blank>",
+        decoder_type="rnnt",
+    )
 
 
 def test_parakeet_danish_tokens_resize_ctc_and_save_processor(tmp_path: Path) -> None:
@@ -166,23 +209,6 @@ def _tiny_parakeet_encoder_config() -> ParakeetEncoderConfig:
         layerdrop=0.0,
         activation_dropout=0.0,
         attention_dropout=0.0,
-    )
-
-
-def _tiny_parakeet_processor() -> ParakeetProcessor:
-    tokenizer = ParakeetTokenizer(
-        vocab={"<pad>": 0, "a": 1, "<unk>": 2, "<s>": 3, "</s>": 4, "<blank>": 5},
-        pad_token="<pad>",
-        unk_token="<unk>",
-        bos_token="<s>",
-        eos_token="</s>",
-        blank_token="<blank>",
-    )
-    return ParakeetProcessor(
-        feature_extractor=ParakeetFeatureExtractor(feature_size=1),
-        tokenizer=tokenizer,
-        blank_token="<blank>",
-        decoder_type="rnnt",
     )
 
 
@@ -553,6 +579,7 @@ def test_parakeet_processing_keeps_joint_decoder_inputs(
 
     class FakeParakeetProcessor:
         blank_token = "<blank>"
+        blank_token_id = 4
         decoder_type = "rnnt"
 
         def __call__(self, audio: object, text: str, sampling_rate: int) -> dict:
@@ -589,11 +616,19 @@ def test_parakeet_processing_keeps_joint_decoder_inputs(
     assert processed["num_seconds"] == 2.0
 
 
-def test_parakeet_processing_rejects_transducer_length_mismatch() -> None:
+@pytest.mark.parametrize(
+    ("decoder_input_ids", "labels"),
+    [([5, 7], [7]), ([4, 8], [7]), ([4], [7])],
+    ids=["wrong blank", "wrong label", "wrong length"],
+)
+def test_parakeet_processing_rejects_invalid_transducer_contract(
+    decoder_input_ids: list[int], labels: list[int]
+) -> None:
     """Transducer decoder inputs must be the blank-prefixed label sequence."""
 
     class MismatchedParakeetProcessor:
         blank_token = "<blank>"
+        blank_token_id = 4
         decoder_type = "tdt"
 
         def __call__(self, audio: object, text: str, sampling_rate: int) -> dict:
@@ -601,8 +636,8 @@ def test_parakeet_processing_rejects_transducer_length_mismatch() -> None:
             return {
                 "input_features": [[[0.0]]],
                 "attention_mask": [[1]],
-                "decoder_input_ids": [[4]],
-                "labels": [[7]],
+                "decoder_input_ids": [decoder_input_ids],
+                "labels": [labels],
             }
 
     with pytest.raises(ValueError, match="exactly one more token"):
