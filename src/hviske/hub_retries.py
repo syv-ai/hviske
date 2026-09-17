@@ -16,6 +16,7 @@ from collections.abc import Callable, Generator, Mapping
 import fsspec
 import httpx
 from huggingface_hub import HfFileSystem, constants
+from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.hf_file_system import (
     HfFileSystemFile,
     HfFileSystemStreamFile,
@@ -297,10 +298,17 @@ class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
         headers = self.fs._api._build_hf_headers()
         if self.loc > 0:
             headers["Range"] = f"bytes={self.loc}-"
-        context = _stream_with_retries(
-            url=self.url(), headers=headers, policy=self.fs._retry_policy
-        )
-        self.response = self._exit_stack.enter_context(context)
+        try:
+            context = _stream_with_retries(
+                url=self.url(), headers=headers, policy=self.fs._retry_policy
+            )
+            self.response = self._exit_stack.enter_context(context)
+        except HfHubHTTPError as error:
+            if self.loc > 0 and error.response.status_code == 416:
+                # Match HfFileSystemStreamFile: an exhausted resumed range is EOF.
+                self.response = None
+                return
+            raise
         self._stream_iterator = self.response.iter_bytes()
 
 
@@ -394,6 +402,7 @@ def configure_hub_streaming_retries(
     """
     policy = _policy_from_config(retry_config)
     os.environ[_POLICY_ENV] = json.dumps(dataclasses.asdict(policy), sort_keys=True)
+    RetryingHfFileSystem.clear_instance_cache()
     fsspec.register_implementation("hf", RetryingHfFileSystem, clobber=True)
     return policy
 
