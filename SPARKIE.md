@@ -141,7 +141,7 @@ remote sources without logging signed URLs. Sparkie fails closed when
 remote positional join.
 
 The preset deliberately uses `dataset_num_workers=1` and
-`dataloader_num_workers=4`. For regular datasets, `dataset_num_workers=1` maps to
+`dataloader_num_workers=3`. For regular datasets, `dataset_num_workers=1` maps to
 in-process preprocessing (`num_proc=None`), not a one-worker child process. Validation
 filtering happens while Hub and `httpx` connections may already be open; forking
 preprocessing workers can inherit one of those sockets and deadlock in `CLOSE-WAIT`.
@@ -167,10 +167,12 @@ validation.
 
 The finetuning entrypoint selects PyTorch's `spawn` start method before experiment
 tracking, Hub data loading, or Trainer/DataLoader construction, preventing workers from
-inheriting Hub HTTP clients and sockets. An already-selected `spawn` method is reused; a
-conflicting method fails clearly instead of silently falling back to `fork`.
-Do not raise `dataset_num_workers` for Hub streams. Every smoke, pilot, full-run, and
-interruption-recovery command below inherits these values from
+inheriting Hub HTTP clients and sockets. At terminal training teardown it publishes a
+per-run local shutdown sentinel inherited by those workers, interrupts transient Hub
+backoff, and gives the parent a bounded join grace. An already-selected `spawn` method
+is reused; a conflicting method fails clearly instead of silently falling back to
+`fork`. Do not raise `dataset_num_workers` for Hub streams. Every smoke, pilot,
+full-run, and interruption-recovery command below inherits these values from
 `config/sparkie_bilingual.yaml`; do not add a preprocessing-worker override.
 
 Remote `hf://` reads use the project-owned retry policy in

@@ -24,6 +24,8 @@ from huggingface_hub.hf_file_system import (
 )
 from huggingface_hub.utils import close_session, get_session
 
+from .dataloader_shutdown import interruptible_retry_delay, shutdown_requested
+
 Result = t.TypeVar("Result")
 
 logger = logging.getLogger(__name__)
@@ -214,10 +216,15 @@ def _run_with_retries(
             if not _is_retryable_error(error):
                 raise
             caught_error = error
+            if shutdown_requested():
+                raise caught_error
             if "client has been closed" in str(error).lower():
                 close_session()
         if caught_error is None or retry_number == policy.max_retries:
             assert caught_error is not None
+            raise caught_error
+        assert caught_error is not None
+        if shutdown_requested():
             raise caught_error
         delay = policy.delay(retry_number)
         logger.warning(
@@ -226,7 +233,7 @@ def _run_with_retries(
             retry_number + 1,
             policy.max_retries,
         )
-        time.sleep(delay)
+        interruptible_retry_delay(delay=delay, error=caught_error, sleep=time.sleep)
     raise AssertionError("retry loop did not return or raise")
 
 
@@ -281,6 +288,8 @@ class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
                     self.response.close()
                 if retry_number == self.fs._retry_policy.max_retries:
                     raise
+                if shutdown_requested():
+                    raise
                 if "client has been closed" in str(error).lower():
                     close_session()
                 delay = self.fs._retry_policy.delay(retry_number)
@@ -291,7 +300,7 @@ class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
                     retry_number + 1,
                     self.fs._retry_policy.max_retries,
                 )
-                time.sleep(delay)
+                interruptible_retry_delay(delay=delay, error=error, sleep=time.sleep)
                 self._open_connection()
         raise AssertionError("stream retry loop did not return or raise")
 
