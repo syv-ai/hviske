@@ -45,6 +45,7 @@ from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
 from .audio import SoundfileAudio
+from .dataloader_shutdown import start_worker_shutdown_watcher
 from .hub_retries import configure_hub_streaming_retries
 from .local_vtt import decode_vtt_audio, load_vtt_manifest
 from .types import Data
@@ -1202,6 +1203,40 @@ def _add_transcript(
     return example
 
 
+def _filter_empty_token_label_batch(
+    batch: dict[str, list[object]],
+) -> dict[str, list[object]]:
+    """Retain only rows with non-empty labels from one streaming batch.
+
+    Returns:
+        Batch restricted to examples with non-empty token labels.
+    """
+    labels = batch.get("labels", [])
+    input_lengths = batch.get("input_length", [])
+    retained_indices = [
+        index
+        for index, (label, input_length) in enumerate(zip(labels, input_lengths))
+        if _has_non_empty_token_labels({"labels": label, "input_length": input_length})
+    ]
+    return {
+        column: [values[index] for index in retained_indices]
+        for column, values in batch.items()
+    }
+
+
+def _has_non_empty_token_labels(example: dict[str, object]) -> bool:
+    """Return whether processed labels and their declared length are non-empty."""
+    labels = example.get("labels")
+    input_length = example.get("input_length")
+    return (
+        isinstance(labels, Sized)
+        and len(labels) > 0
+        and isinstance(input_length, Number)
+        and not isinstance(input_length, bool)
+        and input_length > 0
+    )
+
+
 def _has_transcript(
     example: dict[str, Any],
     audio_join_column: str,
@@ -2050,7 +2085,8 @@ def process_dataset(
 ) -> Data:
     """Process the dataset.
 
-    Note that this does not remove any samples from the dataset.
+    When a processor emits token labels, examples with empty labels are removed after
+    processing so training and validation losses always have a non-zero target length.
 
     Args:
         dataset:
@@ -2163,7 +2199,54 @@ def process_dataset(
             }
         )
 
+    if processor is not None:
+        mapped = _filter_empty_token_labels(dataset=mapped, num_proc=num_proc)
+
     return t.cast(Data, mapped)
+
+
+def _filter_empty_token_labels(dataset: Data, num_proc: int | None) -> Data:
+    """Lazily remove processed examples without a usable token target.
+
+    Returns:
+        Dataset containing only examples with non-empty token labels.
+    """
+    filter_num_proc = None if num_proc == 1 else num_proc
+    if isinstance(dataset, Dataset | DatasetDict):
+        return t.cast(
+            Data,
+            dataset.filter(
+                function=_has_non_empty_token_labels,
+                num_proc=filter_num_proc,
+                desc="Removing examples with empty token labels",
+            ),
+        )
+    if isinstance(dataset, IterableDataset):
+        return t.cast(Data, _filter_empty_streaming_labels(dataset=dataset))
+    iterable_dataset_dict = t.cast(IterableDatasetDict, dataset)
+    return t.cast(
+        Data,
+        IterableDatasetDict(
+            {
+                split: _filter_empty_streaming_labels(dataset=split_dataset)
+                for split, split_dataset in iterable_dataset_dict.items()
+            }
+        ),
+    )
+
+
+def _filter_empty_streaming_labels(dataset: IterableDataset) -> IterableDataset:
+    """Remove empty targets lazily without triggering datasets' typed-filter bug.
+
+    Returns:
+        Lazy dataset containing only examples with non-empty token labels.
+    """
+    return dataset.map(
+        function=_filter_empty_token_label_batch,
+        batched=True,
+        batch_size=1000,
+        features=dataset.features,
+    )
 
 
 def _processing_features(
@@ -2379,6 +2462,7 @@ def process_example(
         ValueError:
             If Whisper processing has no language for the example.
     """
+    start_worker_shutdown_watcher()
     doc = example[text_column]
 
     if convert_numerals and re.search(pattern=NUMERAL_REGEX, string=doc):
@@ -2512,6 +2596,13 @@ def process_example(
         example["decoder_input_ids"] = _to_python(processed["decoder_input_ids"][0])
         example["labels"] = _to_python(processed["labels"][0])
         labels = t.cast(Sized, example["labels"])
+        if _is_parakeet_rnnt_processor(processor):
+            decoder_input_ids = t.cast(Sized, example["decoder_input_ids"])
+            if len(decoder_input_ids) != len(labels) + 1:
+                raise ValueError(
+                    "Parakeet transducer decoder_input_ids must contain exactly one "
+                    "more token than labels."
+                )
         example["input_length"] = len(labels)
         example["num_seconds"] = num_seconds
         return example

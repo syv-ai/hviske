@@ -24,6 +24,7 @@ from hviske import dataloader_shutdown, hub_retries
 from hviske.dataloader_shutdown import (
     SHUTDOWN_SENTINEL_ENV,
     DataLoaderShutdownController,
+    start_worker_shutdown_watcher,
 )
 from hviske.finetune import DataLoaderShutdownCallback
 
@@ -226,6 +227,60 @@ def test_shutdown_interrupts_range_and_stream_retries(
         )
     assert stream_error.value is error
     assert calls == 1
+
+
+def test_three_idle_workers_exit_from_watcher(tmp_path: Path) -> None:
+    """Idle prefetched workers observe terminal shutdown without retry backoff.
+
+    Raises:
+        AssertionError:
+            If all workers do not start their watcher within the startup timeout.
+    """
+    ready_directory = tmp_path / "ready-watcher"
+    ready_directory.mkdir()
+    controller = DataLoaderShutdownController(enabled=True)
+    controller.start()
+    iterator = None
+    workers: list[torch.multiprocessing.Process] = []
+    try:
+        loader = DataLoader(
+            _WatchedPrefetchDataset(ready_directory),
+            num_workers=3,
+            multiprocessing_context="spawn",
+            prefetch_factor=1,
+        )
+        iterator = iter(loader)
+        workers = list(iterator._workers)  # type: ignore[attr-defined]
+        deadline = time.monotonic() + 10.0
+        while len(list(ready_directory.iterdir())) < 3:
+            if time.monotonic() >= deadline:
+                raise AssertionError("workers did not start their shutdown watchers")
+            time.sleep(0.05)
+        assert all(worker.is_alive() for worker in workers)
+
+        controller.request_shutdown()
+        for worker in workers:
+            worker.join(timeout=2.0)
+        assert [worker.exitcode for worker in workers] == [0, 0, 0]
+    finally:
+        del iterator
+        controller.request_shutdown()
+        controller.reset()
+
+
+class _WatchedPrefetchDataset(Dataset[int]):
+    """Dataset whose workers become idle after starting the shutdown watcher."""
+
+    def __init__(self, ready_directory: Path) -> None:
+        self.ready_directory = ready_directory
+
+    def __getitem__(self, index: int) -> int:
+        start_worker_shutdown_watcher()
+        self.ready_directory.joinpath(f"watcher-{os.getpid()}").touch()
+        return index
+
+    def __len__(self) -> int:
+        return 3
 
 
 def test_three_workers_exit_from_long_backoff_without_termination(

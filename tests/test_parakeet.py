@@ -589,6 +589,43 @@ def test_parakeet_processing_keeps_joint_decoder_inputs(
     assert processed["num_seconds"] == 2.0
 
 
+def test_parakeet_processing_rejects_transducer_length_mismatch() -> None:
+    """Transducer decoder inputs must be the blank-prefixed label sequence."""
+
+    class MismatchedParakeetProcessor:
+        blank_token = "<blank>"
+        decoder_type = "tdt"
+
+        def __call__(self, audio: object, text: str, sampling_rate: int) -> dict:
+            del audio, text, sampling_rate
+            return {
+                "input_features": [[[0.0]]],
+                "attention_mask": [[1]],
+                "decoder_input_ids": [[4]],
+                "labels": [[7]],
+            }
+
+    with pytest.raises(ValueError, match="exactly one more token"):
+        process_example(
+            example={
+                "text": "hej",
+                "audio": {
+                    "array": np.zeros(16_000, dtype=np.float32),
+                    "sampling_rate": 16_000,
+                },
+            },
+            characters_to_keep=None,
+            conversion_dict={},
+            text_column="text",
+            audio_column="audio",
+            lower_case=False,
+            convert_numerals=False,
+            processor=t.cast(t.Callable, MismatchedParakeetProcessor()),
+            normalise_audio=False,
+            augment_audio=False,
+        )
+
+
 def test_parakeet_rejects_max_length_padding() -> None:
     """Frame max length cannot be inferred from the shared training config."""
     processor = SimpleNamespace(

@@ -81,6 +81,11 @@ terminal metrics still cover every configured validation dataset, use the same W
 and are appended to `evaluation_metrics_path`; any earlier scheduled validations remain
 in the training loop, and the terminal checkpoint is saved there as usual.
 
+**Numerical gate:** processed training and validation examples must have non-empty
+`labels` and positive `input_length`, and every observed forward loss must be finite.
+Stop on any NaN or infinity and investigate the source example; do not mask the failure
+with `nan_to_num` or continue the run.
+
 **Gate:** forward loss is finite, the saved processor reloads with `decoder_type=tdt`,
 clean reload uses local files without the Hub base revision, and the resumed trainer
 reports global step 4 (or a later explicitly requested step).
@@ -107,7 +112,8 @@ Steps 250, 500, and 1000 evaluate in-loop. Step 2000 uses the post-training orde
 described above and must appear exactly once in the metrics JSONL after the training
 workers have closed.
 
-**Gate:** each pilot has independent checkpoints and metrics, reaches the requested
-bounded stop without changing `config/model/cohere.yaml` or
+**Gate:** each pilot has finite training and validation losses at every reviewed step,
+has independent checkpoints and metrics, reaches the requested bounded stop without
+changing `config/model/cohere.yaml` or
 `config/sparkie_bilingual.yaml`, and has a clean reload/resume record. Do not start a
 longer run, publish a model, or alter Sparkie until the pilot comparison is reviewed.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -19,6 +20,9 @@ from torch.utils.data import get_worker_info
 
 SHUTDOWN_SENTINEL_ENV = "HVISKE_DATALOADER_SHUTDOWN_SENTINEL"
 _FINALISATION_MARGIN_SECONDS = 5.0
+_WORKER_POLL_INTERVAL_SECONDS = 0.1
+_worker_watcher: threading.Thread | None = None
+_worker_watcher_lock = threading.Lock()
 
 
 class DataLoaderShutdownController:
@@ -120,6 +124,13 @@ class DataLoaderShutdownController:
         self.reset()
 
 
+def _watch_for_worker_shutdown(sentinel: Path) -> None:
+    """Exit this disposable worker after the parent publishes terminal shutdown."""
+    while not sentinel.is_file():
+        time.sleep(_WORKER_POLL_INTERVAL_SECONDS)
+    os._exit(0)
+
+
 def exit_worker_if_shutdown_requested() -> None:
     """Exit a DataLoader worker before starting another read after shutdown."""
     if shutdown_requested() and get_worker_info() is not None:
@@ -174,3 +185,28 @@ def _raise_or_exit_worker(error: BaseException) -> None:
 def raise_or_exit_worker(error: BaseException) -> None:
     """Re-raise a transient error, or exit a worker after terminal shutdown."""
     _raise_or_exit_worker(error=error)
+
+
+def start_worker_shutdown_watcher() -> None:
+    """Start one sentinel watcher in a spawned DataLoader worker.
+
+    The parent process and processes without this run's inherited sentinel are left
+    untouched. The daemon remains dormant until terminal shutdown is published.
+    """
+    if get_worker_info() is None:
+        return
+    sentinel_value = os.getenv(SHUTDOWN_SENTINEL_ENV)
+    if not sentinel_value:
+        return
+
+    global _worker_watcher
+    with _worker_watcher_lock:
+        if _worker_watcher is not None and _worker_watcher.is_alive():
+            return
+        _worker_watcher = threading.Thread(
+            target=_watch_for_worker_shutdown,
+            kwargs={"sentinel": Path(sentinel_value)},
+            name="hviske-dataloader-shutdown",
+            daemon=True,
+        )
+        _worker_watcher.start()

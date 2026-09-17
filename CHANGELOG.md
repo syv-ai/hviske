@@ -43,6 +43,12 @@
 
 ### Fixed
 
+- Ensured a process-local shutdown watcher lets spawned DataLoader workers that are idle
+  or prefetched exit cleanly after the terminal sentinel without needing to enter Hub
+  retry code.
+- Filtered processor-backed training and validation examples whose cleaned text produces
+  empty token labels, preventing zero-target Parakeet TDT loss division while preserving
+  lazy streaming, and rejected malformed transducer decoder/label lengths.
 - Fixed cooperative shutdown for spawned DataLoader workers: terminal Transformers
   callbacks now signal the inherited per-run sentinel before the training iterator is
   destroyed, and terminal Hub retries exit disposable workers directly on Linux rather
