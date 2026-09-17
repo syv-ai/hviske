@@ -5,6 +5,7 @@ import re
 import typing as t
 from collections.abc import Generator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import soundfile as sf
@@ -59,6 +60,60 @@ class TestLoadDataForFinetuning:
 
 class TestProcessDataset:
     """Unit tests for the `process_dataset` function."""
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_empty_token_labels_are_filtered_after_processing(
+        self, streaming: bool
+    ) -> None:
+        """Cleaning may empty raw text, so filtering follows tokenisation."""
+
+        class Tokenizer:
+            def __call__(self, text: str, truncation: bool) -> SimpleNamespace:
+                assert truncation
+                return SimpleNamespace(input_ids=list(range(len(text))))
+
+        class Processor:
+            model_input_names = ["input_values"]
+            tokenizer = Tokenizer()
+
+            def __call__(
+                self, audio: object, sampling_rate: int
+            ) -> dict[str, list[list[float]]]:
+                del audio
+                assert sampling_rate == 16_000
+                return {"input_values": [[0.0]]}
+
+        raw = Dataset.from_dict(
+            {
+                "text": ["ehh", "###", "hej"],
+                "audio": [
+                    {"array": [0.0], "sampling_rate": 16_000},
+                    {"array": [0.0], "sampling_rate": 16_000},
+                    {"array": [0.0], "sampling_rate": 16_000},
+                ],
+            }
+        )
+        dataset = raw.to_iterable_dataset() if streaming else raw
+        assert len(raw) == 3
+        assert all(raw["text"])
+
+        processed = process_dataset(
+            dataset=dataset,
+            characters_to_keep=set("abcdefghijklmnopqrstuvwxyz "),
+            text_column="text",
+            audio_column="audio",
+            convert_numerals=False,
+            remove_input_dataset_columns=True,
+            lower_case=True,
+            normalise_audio=False,
+            augment_audio=False,
+            processor=Processor(),
+        )
+
+        examples = list(processed)
+        assert len(examples) == 1
+        assert examples[0]["labels"] == [0, 1, 2]
+        assert examples[0]["input_length"] == 3
 
     def test_process_dataset(
         self, dataset: Dataset | IterableDataset | DatasetDict | IterableDatasetDict
