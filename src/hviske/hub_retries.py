@@ -210,8 +210,11 @@ def _is_retryable_status(status_code: int) -> bool:
 
 
 def _run_with_retries(
-    operation: Callable[[], Result], policy: HubRetryPolicy
+    operation: Callable[[], Result],
+    policy: HubRetryPolicy,
+    sleep: Callable[[float], None] | None = None,
 ) -> Result:
+    sleeper = time.sleep if sleep is None else sleep
     for retry_number in range(policy.max_retries + 1):
         exit_worker_if_shutdown_requested()
         caught_error: BaseException | None = None
@@ -240,7 +243,7 @@ def _run_with_retries(
             retry_number + 1,
             policy.max_retries,
         )
-        interruptible_retry_delay(delay=delay, error=caught_error, sleep=time.sleep)
+        interruptible_retry_delay(delay=delay, error=caught_error, sleep=sleeper)
         if shutdown_requested():
             raise_or_exit_worker(error=caught_error)
     raise AssertionError("retry loop did not return or raise")
