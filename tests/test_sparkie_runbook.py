@@ -38,7 +38,7 @@ def test_sparkie_runbook_documents_materialised_worker_safety() -> None:
     runbook = RUNBOOK.read_text()
 
     assert "dataset_num_workers=1" in runbook
-    assert "dataloader_num_workers=4" in runbook
+    assert "dataloader_num_workers=3" in runbook
     assert "HVISKE_MATERIALISED_OVERLAYS_ROOT" in runbook
     assert "materialise_finetuning_overlays.py" in runbook
     assert "CLOSE-WAIT" in runbook

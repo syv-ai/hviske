@@ -43,6 +43,10 @@
 
 ### Fixed
 
+- Added cooperative shutdown for spawned DataLoader workers: terminal Transformers
+  callbacks signal an inherited per-run sentinel, interrupt transient Hub retry backoff,
+  and allow the parent a bounded join grace before restoring process state; Sparkie
+  remains at three workers and local/materialised reads are unchanged.
 - Deferred bounded runs' terminal scheduled evaluation until training workers have shut
   down when early stopping is disabled, preventing spawned DataLoader worker aborts while
   preserving intermediate evaluations, terminal checkpoints, W&B reporting, and

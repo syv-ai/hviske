@@ -20,6 +20,7 @@ from hviske.data import download_background_noises
 
 from .data import load_data_for_finetuning
 from .data_models import ModelSetup
+from .dataloader_shutdown import DataLoaderShutdownController
 from .experiment_tracking import ExTrackingSetup, load_extracking_setup
 from .model_setup import load_model_setup
 from .ngram import train_and_store_ngram_model
@@ -43,6 +44,10 @@ def finetune(config: DictConfig) -> None:
     check_cuda_requirement(config=config)
     _configure_dataloader_multiprocessing(config=config)
     validate_private_only_config(config=config)
+    worker_shutdown = DataLoaderShutdownController(
+        enabled=int(config.get("dataloader_num_workers") or 0) > 0
+    )
+    worker_shutdown.start()
 
     # Note if we're on the main process, if we are running in a distributed setting
     is_main_process = os.getenv("RANK", "0") == "0"
@@ -113,6 +118,7 @@ def finetune(config: DictConfig) -> None:
                     early_stopping_patience=config.early_stopping_patience
                 )
             )
+        callbacks.append(DataLoaderShutdownCallback(controller=worker_shutdown))
 
         trainer = model_setup.load_trainer_class()(
             model=model,
@@ -127,7 +133,13 @@ def finetune(config: DictConfig) -> None:
 
         block_terminal_output()
         with disable_tqdm():
-            trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
+            try:
+                trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
+            finally:
+                # The callback normally signals from ``on_train_end`` while Trainer is
+                # unwinding. This also covers trainers that fail before that callback.
+                worker_shutdown.request_shutdown()
+                worker_shutdown.reset()
             if (
                 deferred_evaluation_step is not None
                 and trainer.state.global_step == deferred_evaluation_step
@@ -166,12 +178,40 @@ def finetune(config: DictConfig) -> None:
                 finetuned_from_revision=config.model.get("revision"),
             )
     except BaseException:
+        worker_shutdown.request_shutdown()
+        worker_shutdown.reset()
         if extracking_setup is not None:
             _finalize_tracking_after_failure(extracking_setup)
         raise
     else:
         if extracking_setup is not None:
             extracking_setup.run_finalization(exit_code=0)
+    finally:
+        worker_shutdown.reset()
+
+
+class DataLoaderShutdownCallback(TrainerCallback):
+    """Signal DataLoader workers during Transformers terminal callbacks."""
+
+    def __init__(self, controller: DataLoaderShutdownController) -> None:
+        """Initialise the callback with the current run's controller.
+
+        Args:
+            controller:
+                Controller publishing the inherited worker sentinel.
+        """
+        self.controller = controller
+
+    def on_train_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: object,
+    ) -> None:
+        """Request cooperative worker shutdown before Trainer returns."""
+        del args, state, control, kwargs
+        self.controller.request_shutdown()
 
 
 class EvaluationScheduleCallback(TrainerCallback):
