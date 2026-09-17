@@ -35,19 +35,18 @@ def test_auth_and_not_found_failures_are_not_retried(
     monkeypatch.setattr(hub_retries, "get_session", lambda: client)
     monkeypatch.setattr(hub_retries.time, "sleep", sleeps.append)
 
-    remote_file = object.__new__(RetryingHfFileSystemFile)
-    object.__setattr__(
-        remote_file,
-        "fs",
-        SimpleNamespace(
+    remote_file = SimpleNamespace(
+        fs=SimpleNamespace(
             _api=SimpleNamespace(_build_hf_headers=lambda: {}),
             _retry_policy=HubRetryPolicy(max_retries=5),
         ),
+        url=lambda: "https://huggingface.co/file",
     )
-    object.__setattr__(remote_file, "url", lambda: "https://huggingface.co/file")
 
     with pytest.raises(httpx.HTTPError):
-        remote_file._fetch_range(start=0, end=1)
+        RetryingHfFileSystemFile._fetch_range(
+            t.cast(RetryingHfFileSystemFile, remote_file), start=0, end=1
+        )
 
     assert client.calls == 1
     assert sleeps == []
@@ -74,18 +73,24 @@ def _response(status_code: int, content: bytes = b"") -> httpx.Response:
     )
 
 
-def test_deterministic_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Schema and other deterministic failures pass through immediately."""
+@pytest.mark.parametrize(
+    "failure",
+    [ValueError("invalid parquet schema"), httpx.LocalProtocolError("invalid request")],
+)
+def test_deterministic_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    """Schema and local protocol failures pass through immediately."""
     calls = 0
 
     def fail() -> None:
         nonlocal calls
         calls += 1
-        raise ValueError("invalid parquet schema")
+        raise failure
 
     monkeypatch.setattr(hub_retries.time, "sleep", pytest.fail)
 
-    with pytest.raises(ValueError, match="invalid parquet schema"):
+    with pytest.raises(type(failure), match=str(failure)):
         hub_retries._run_with_retries(fail, HubRetryPolicy(max_retries=5))
 
     assert calls == 1
@@ -111,22 +116,20 @@ def test_range_read_retries_closed_client_and_5xx(
     monkeypatch.setattr(hub_retries.time, "sleep", sleeps.append)
     monkeypatch.setattr(hub_retries.random, "uniform", lambda *_: 0.0)
 
-    remote_file = object.__new__(RetryingHfFileSystemFile)
-    object.__setattr__(
-        remote_file,
-        "fs",
-        SimpleNamespace(
+    remote_file = SimpleNamespace(
+        fs=SimpleNamespace(
             _api=SimpleNamespace(_build_hf_headers=lambda: {}),
             _retry_policy=HubRetryPolicy(max_retries=3),
         ),
-    )
-    object.__setattr__(
-        remote_file,
-        "url",
-        lambda: "https://huggingface.co/dataset/file?X-Amz-Signature=secret",
+        url=lambda: "https://huggingface.co/dataset/file?X-Amz-Signature=secret",
     )
 
-    assert remote_file._fetch_range(start=0, end=13) == b"parquet bytes"
+    assert (
+        RetryingHfFileSystemFile._fetch_range(
+            t.cast(RetryingHfFileSystemFile, remote_file), start=0, end=13
+        )
+        == b"parquet bytes"
+    )
     assert client.calls == 3
     assert len(closed_clients) == 1
     assert sleeps == [1.0, 2.0]
@@ -139,23 +142,30 @@ def test_resumed_stream_416_is_eof(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _FakeStreamingClient(_response(416))
     monkeypatch.setattr(hub_retries, "get_session", lambda: client)
 
-    stream_file = object.__new__(hub_retries.RetryingHfFileSystemStreamFile)
-    object.__setattr__(
-        stream_file,
-        "fs",
-        SimpleNamespace(
+    stream_file = SimpleNamespace(
+        fs=SimpleNamespace(
             _api=SimpleNamespace(_build_hf_headers=lambda: {}),
             _retry_policy=HubRetryPolicy(max_retries=2),
         ),
+        url=lambda: "https://huggingface.co/file",
+        loc=17,
+        response=None,
+        _stream_iterator=None,
+        _stream_buffer=bytearray(),
+        _exit_stack=contextlib.ExitStack(),
     )
-    object.__setattr__(stream_file, "url", lambda: "https://huggingface.co/file")
-    object.__setattr__(stream_file, "loc", 17)
-    object.__setattr__(stream_file, "response", None)
-    object.__setattr__(stream_file, "_stream_iterator", None)
-    object.__setattr__(stream_file, "_stream_buffer", bytearray())
-    object.__setattr__(stream_file, "_exit_stack", contextlib.ExitStack())
+    stream_file._open_connection = lambda: (
+        hub_retries.RetryingHfFileSystemStreamFile._open_connection(
+            t.cast(hub_retries.RetryingHfFileSystemStreamFile, stream_file)
+        )
+    )
 
-    assert stream_file.read() == b""
+    assert (
+        hub_retries.RetryingHfFileSystemStreamFile.read(
+            t.cast(hub_retries.RetryingHfFileSystemStreamFile, stream_file)
+        )
+        == b""
+    )
 
     assert stream_file.response is None
     assert stream_file._stream_iterator is None
@@ -265,7 +275,12 @@ def test_retry_policy_reconfiguration_invalidates_cached_filesystems(
 
 
 @pytest.mark.parametrize(
-    "failure", [httpx.ReadTimeout("timed out"), ConnectionResetError("reset")]
+    "failure",
+    [
+        httpx.ReadTimeout("timed out"),
+        httpx.RemoteProtocolError("peer closed the connection"),
+        ConnectionResetError("reset"),
+    ],
 )
 def test_transport_failures_are_retried(
     monkeypatch: pytest.MonkeyPatch, failure: BaseException
