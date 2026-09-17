@@ -43,13 +43,17 @@ any checkpoint is created.
 ## Gate 2: two-step smoke and lifecycle check
 
 Use a fresh local directory and a separate W&B identity only if tracking is enabled.
-The smoke must save at step 2; do not reuse a prior output directory:
+The smoke must save at step 2; do not reuse a prior output directory. Keep two
+checkpoints: Transformers can retain the tracked `best_model_checkpoint` while
+rotating out the newest checkpoint when `save_total_limit=1`, which makes the
+resume source or the newly completed step disappear. A limit of 2 guarantees that
+both the best/source checkpoint and newest resume checkpoint survive:
 
 ```bash
 smoke_dir="$PWD/runs/parakeet-tdt-smoke"
 uv run python src/scripts/finetune_asr_model.py --config-name asr_finetuning \
   model=parakeet-tdt model_dir="$smoke_dir" stop_after_steps=2 \
-  max_steps=2 save_steps=2 save_total_limit=1 evaluation_steps='[2]' \
+  max_steps=2 save_steps=2 save_total_limit=2 evaluation_steps='[2]' \
   evaluation_metrics_path="$smoke_dir/evaluation-metrics.jsonl" \
   enable_experiment_tracking=false
 ```
@@ -64,7 +68,7 @@ uv run python src/scripts/evaluate_model.py \
 uv run python src/scripts/finetune_asr_model.py --config-name asr_finetuning \
   model=parakeet-tdt model_dir="$smoke_dir" \
   resume_from_checkpoint="$smoke_dir/checkpoint-2" stop_after_steps=4 \
-  max_steps=4 save_steps=2 save_total_limit=1 evaluation_steps='[4]' \
+  max_steps=4 save_steps=2 save_total_limit=2 evaluation_steps='[4]' \
   evaluation_metrics_path="$smoke_dir/evaluation-metrics.jsonl" \
   enable_experiment_tracking=false
 ```

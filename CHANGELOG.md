@@ -49,6 +49,8 @@
   revision-pinned Hydra-composable TDT evaluation, and documented bounded checkpoint
   and metric persistence for isolated TDT smoke and pilot runs.
 - Added a tiny Parakeet TDT checkpoint resume lifecycle regression test.
+- Fixed the Parakeet TDT runbook smoke and resume retention limit so both the tracked
+  best/source checkpoint and newest resume checkpoint survive rotation.
 - Added bounded, jittered retries for transient Hugging Face Hub streaming reads,
   including process-local client recreation for closed-client failures; preserved
   upstream 416-as-EOF handling and policy reconfiguration; local and materialised
