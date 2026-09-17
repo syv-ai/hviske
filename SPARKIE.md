@@ -170,6 +170,15 @@ Do not raise `dataset_num_workers` for Hub streams. Every smoke, pilot, full-run
 interruption-recovery command below inherits these values from
 `config/sparkie_bilingual.yaml`; do not add a preprocessing-worker override.
 
+Remote `hf://` reads use the project-owned retry policy in
+`config/sparkie_bilingual.yaml`: six retries after the initial request, exponential
+backoff from 1 second capped at 30 seconds, and up to 0.5 seconds of jitter. It retries
+only transport failures, HTTP 429, and HTTP 5xx responses. A closed Hub HTTP client is
+reset in that worker before retrying. Authentication, not-found, schema, and data errors
+remain fatal, and local/materialised Parquet reads do not use this policy. Keep these
+bounds conservative for multi-week runs; repeated exhaustion is an operational failure
+to investigate rather than an invitation to increase the retry budget.
+
 Do not proceed if any preflight check fails. Fix access, schema, revision, or local-file
 errors and rerun the complete preflight. If a run hangs during validation materialisation,
 stop that tmux session, leave `dataset_num_workers` at 1 (in-process preprocessing), and

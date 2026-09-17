@@ -39,6 +39,12 @@ streaming: true
 cache_dir: null
 # Streaming examples are shuffled before audio decoding with this bounded buffer.
 shuffle_buffer_size: 1000
+# Bounded retries apply only to hf:// streaming reads; local files are unchanged.
+hub_streaming_retries:
+  max_retries: 6
+  base_delay_seconds: 1.0
+  max_delay_seconds: 30.0
+  jitter_seconds: 0.5
 
 # Can be `longest`, `max_length` or `do_not_pad`
 # NOTE: This is automatically set to `max_length` in a multi-gpu setting
