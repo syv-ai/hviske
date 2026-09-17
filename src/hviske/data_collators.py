@@ -255,8 +255,8 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
     Parakeet receives log-mel features shaped ``(frames, feature_size)``.  The
     feature extractor knows the feature size and frame padding value, so this
     collator intentionally delegates padding rather than assuming a mel width.
-    Native RNNT labels and decoder inputs remain padded with the tokenizer's
-    blank/pad ID.
+    Native RNNT and TDT labels and decoder inputs remain padded with the
+    tokenizer's blank/pad ID.
     """
 
     processor: Processor
@@ -284,7 +284,7 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
         Args:
             features:
                 Examples containing ``input_features`` and optionally an
-                ``attention_mask``, plus token ID ``labels``. RNNT examples
+                ``attention_mask``, plus token ID ``labels``. Transducer examples
                 also contain ``decoder_input_ids``.
 
         Returns:
@@ -334,7 +334,7 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
         if "decoder_input_ids" in features[0]:
             if any("decoder_input_ids" not in feature for feature in features):
                 raise ValueError(
-                    "Every Parakeet RNNT feature must contain decoder_input_ids."
+                    "Every Parakeet transducer feature must contain decoder_input_ids."
                 )
             decoder_features = [
                 {"input_ids": feature["decoder_input_ids"]} for feature in features

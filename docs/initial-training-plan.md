@@ -125,9 +125,9 @@ for systematic mixture experiments instead.
 
 Parakeet is the strongest later speed/serving candidate, not the fastest route to this
 accuracy release. The current open `svale-600M` result is 12.64% mean WER. The strongest
-multilingual Parakeet uses FastConformer-TDT, while Hviske currently supports
-Transformers-native Parakeet CTC and RNNT but not TDT. Using TDT would therefore add a
-new NeMo or Transformers TDT training path before the first model can run.
+multilingual Parakeet uses FastConformer-TDT. Hviske now supports the
+Transformers-native Parakeet CTC, RNNT, and TDT paths; the revision-pinned TDT preset
+should still be evaluated separately from the active Cohere campaign.
 
 ## Freeze the benchmark first
 

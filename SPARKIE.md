@@ -1,7 +1,10 @@
 # Sparkie bilingual runbook
 
 This runbook is for the private `syvai/hviske-v6.0` Cohere run. Training and
-publication are deliberately separate.
+publication are deliberately separate. Native Parakeet TDT validation is also
+separate; use [`docs/parakeet-tdt-runbook.md`](docs/parakeet-tdt-runbook.md) for its
+pinned zero-shot, smoke, reload/resume, and bounded pilot gates. Do not change the
+active Cohere campaign while running those isolated checks.
 
 ## Prerequisites and authentication
 

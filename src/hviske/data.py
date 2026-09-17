@@ -2222,11 +2222,11 @@ def _processing_features(
 
 
 def _is_parakeet_rnnt_processor(processor: Callable | None) -> bool:
-    """Return whether a processor follows the Parakeet RNNT contract."""
+    """Return whether a processor follows the Parakeet transducer contract."""
     return (
         processor is not None
         and hasattr(processor, "blank_token")
-        and str(getattr(processor, "decoder_type", "")).lower() == "rnnt"
+        and str(getattr(processor, "decoder_type", "")).lower() in {"rnnt", "tdt"}
     )
 
 

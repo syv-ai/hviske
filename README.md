@@ -44,18 +44,20 @@ Here are some of the more important available keys:
   - `cohere`
   - `parakeet-ctc`
   - `parakeet-rnnt`
+  - `parakeet-tdt`
 
-  The `parakeet-*` configs use the Transformers-native NVIDIA Parakeet CTC and
-  RNNT implementations. Parakeet TDT fine-tuning is not supported on the
-  Transformers stack because its native loss is broken; use NVIDIA NeMo instead.
+  The `parakeet-*` configs use the Transformers-native NVIDIA Parakeet CTC, RNNT,
+  and TDT implementations. The TDT preset is pinned to a tested Hub revision.
   The Danish `parakeet-rnnt-da-dk` repository is NeMo-only and is not supported.
-  Parakeet RNNT evaluation uses native generation and does not pass Whisper
+  Parakeet RNNT and TDT evaluation use native generation and do not pass Whisper
   language or task generation arguments. The Parakeet configs extend the native
   tokenizer with retained Danish characters (such as `æ`, `ø`, and `å`) when
   they would otherwise become unknown tokens; existing vocabulary and blank
   token IDs are preserved.
 
-  The `cohere` config fine-tunes `CohereLabs/cohere-transcribe-03-2026` with a
+  The isolated TDT validation gates and bounded pilot commands are documented in
+  [`docs/parakeet-tdt-runbook.md`](docs/parakeet-tdt-runbook.md). The `cohere` config
+  fine-tunes `CohereLabs/cohere-transcribe-03-2026` with a
   Danish language and punctuation prompt at 16 kHz. The official Cohere checkpoint
   is gated on Hugging Face and requires accepted access and authentication. Native
   Transformers 5.5 loading is used without remote code; Danish fine-tuned
