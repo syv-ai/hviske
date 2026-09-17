@@ -232,6 +232,9 @@ def _run_with_retries(
 
 def _is_retryable_error(error: BaseException) -> bool:
     """Return whether an exception represents a transient transport failure."""
+    if isinstance(error, httpx.RemoteProtocolError):
+        # A peer closing an HTTP stream is transient, unlike local protocol errors.
+        return True
     if isinstance(
         error,
         (
