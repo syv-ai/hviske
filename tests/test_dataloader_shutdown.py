@@ -24,7 +24,6 @@ from hviske import dataloader_shutdown, hub_retries
 from hviske.dataloader_shutdown import (
     SHUTDOWN_SENTINEL_ENV,
     DataLoaderShutdownController,
-    interruptible_retry_delay,
 )
 from hviske.finetune import DataLoaderShutdownCallback
 
@@ -163,6 +162,36 @@ def test_shutdown_callback_requests_shutdown(monkeypatch: pytest.MonkeyPatch) ->
     assert calls == ["shutdown"]
 
 
+def test_shutdown_callback_waits_for_terminal_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal step shutdown waits until any in-loop evaluation completes."""
+    calls: list[str] = []
+    controller = DataLoaderShutdownController(enabled=False)
+    monkeypatch.setattr(
+        controller, "request_shutdown", lambda: calls.append("shutdown")
+    )
+    callback = DataLoaderShutdownCallback(controller=controller)
+    args = TrainingArguments(output_dir="/tmp/hviske-test")
+    state = TrainerState(global_step=4)
+
+    pending_evaluation = TrainerControl(should_training_stop=True, should_evaluate=True)
+    callback.on_step_end(args=args, state=state, control=pending_evaluation)
+    assert calls == []
+    callback.on_evaluate(args=args, state=state, control=pending_evaluation)
+    assert calls == ["shutdown"]
+
+    calls.clear()
+    intermediate_evaluation = TrainerControl(should_evaluate=True)
+    callback.on_step_end(args=args, state=state, control=intermediate_evaluation)
+    callback.on_evaluate(args=args, state=state, control=intermediate_evaluation)
+    assert calls == []
+
+    terminal_epoch = TrainerControl(should_training_stop=True)
+    callback.on_epoch_end(args=args, state=state, control=terminal_epoch)
+    assert calls == ["shutdown"]
+
+
 def test_shutdown_interrupts_range_and_stream_retries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -245,22 +274,22 @@ def test_three_workers_exit_from_long_backoff_without_termination(
 class _BackoffDataset(Dataset[int]):
     """Dataset whose workers wait in an interruptible transient retry."""
 
-    def __init__(
-        self, ready_directory: Path, observed_directory: Path | None = None
-    ) -> None:
+    def __init__(self, ready_directory: Path) -> None:
         self.ready_directory = ready_directory
-        self.observed_directory = observed_directory
 
     def __getitem__(self, index: int) -> int:
         self.ready_directory.joinpath(str(os.getpid())).touch()
-        try:
-            interruptible_retry_delay(
-                delay=30.0, error=RuntimeError("worker shutdown test")
-            )
-        except RuntimeError:
-            if self.observed_directory is not None:
-                self.observed_directory.joinpath(str(os.getpid())).touch()
-            return index
+        hub_retries._run_with_retries(
+            operation=lambda: (_ for _ in ()).throw(
+                httpx.ReadTimeout("worker shutdown test")
+            ),
+            policy=hub_retries.HubRetryPolicy(
+                max_retries=3,
+                base_delay_seconds=30.0,
+                max_delay_seconds=30.0,
+                jitter_seconds=0.0,
+            ),
+        )
         raise AssertionError("worker retry unexpectedly completed")
 
     def __len__(self) -> int:
@@ -272,9 +301,7 @@ def test_training_exception_releases_three_workers_before_cleanup(
 ) -> None:
     """Exception unwinding retains sentinel and join grace until workers exit."""
     ready_directory = tmp_path / "ready"
-    observed_directory = tmp_path / "observed"
     ready_directory.mkdir()
-    observed_directory.mkdir()
     workers: list[torch.multiprocessing.Process] = []
     reset_observations: list[tuple[float, list[int | None]]] = []
     previous_grace = float(dataloader_shutdown.data_utils.MP_STATUS_CHECK_INTERVAL)
@@ -305,7 +332,7 @@ def test_training_exception_releases_three_workers_before_cleanup(
         def train(self, resume_from_checkpoint: object) -> None:
             del resume_from_checkpoint
             loader = DataLoader(
-                _BackoffDataset(ready_directory, observed_directory),
+                _BackoffDataset(ready_directory),
                 num_workers=3,
                 multiprocessing_context="spawn",
             )
@@ -372,7 +399,7 @@ def test_training_exception_releases_three_workers_before_cleanup(
 
     for worker in workers:
         worker.join(timeout=2.0)
-    assert len(list(observed_directory.iterdir())) == 3
+    assert len(list(ready_directory.iterdir())) == 3
     assert len(reset_observations) == 1
     grace_at_reset, exitcodes_at_reset = reset_observations[0]
     assert grace_at_reset > previous_grace

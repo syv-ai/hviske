@@ -201,7 +201,7 @@ def finetune(config: DictConfig) -> None:
 
 
 class DataLoaderShutdownCallback(TrainerCallback):
-    """Signal DataLoader workers during Transformers terminal callbacks."""
+    """Signal DataLoader workers once Transformers reaches a terminal state."""
 
     def __init__(self, controller: DataLoaderShutdownController) -> None:
         """Initialise the callback with the current run's controller.
@@ -212,6 +212,57 @@ class DataLoaderShutdownCallback(TrainerCallback):
         """
         self.controller = controller
 
+    def on_epoch_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: object,
+    ) -> TrainerControl:
+        """Signal natural epoch completion when no evaluation remains in-loop.
+
+        Returns:
+            The unchanged trainer control object.
+        """
+        del args, state, kwargs
+        if control.should_training_stop and not control.should_evaluate:
+            self.controller.request_shutdown()
+        return control
+
+    def on_evaluate(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: object,
+    ) -> TrainerControl:
+        """Signal after terminal evaluation callbacks have completed.
+
+        Returns:
+            The unchanged trainer control object.
+        """
+        del args, state, kwargs
+        if control.should_training_stop:
+            self.controller.request_shutdown()
+        return control
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: object,
+    ) -> TrainerControl:
+        """Signal after terminal step callbacks, unless evaluation is pending.
+
+        Returns:
+            The unchanged trainer control object.
+        """
+        del args, state, kwargs
+        if control.should_training_stop and not control.should_evaluate:
+            self.controller.request_shutdown()
+        return control
+
     def on_train_end(
         self,
         args: TrainingArguments,
@@ -219,7 +270,7 @@ class DataLoaderShutdownCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs: object,
     ) -> None:
-        """Request cooperative worker shutdown before Trainer returns."""
+        """Request cooperative worker shutdown as a final compatibility fallback."""
         del args, state, control, kwargs
         self.controller.request_shutdown()
 
