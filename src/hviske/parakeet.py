@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from accelerate.utils import extract_model_from_parallel
 from omegaconf import DictConfig
 from torch import nn
 from transformers import (
@@ -78,7 +79,8 @@ class ParakeetGenerationTrainer(Trainer):
             for key, value in prepared_inputs.items()
             if key in {"input_features", "attention_mask"}
         }
-        generate = t.cast(t.Callable[..., object], model.generate)
+        generation_model = extract_model_from_parallel(model)
+        generate = t.cast(t.Callable[..., object], generation_model.generate)
         generated = generate(**generation_inputs)
         sequences = t.cast(torch.Tensor, getattr(generated, "sequences", generated))
         return loss, sequences.detach(), t.cast(torch.Tensor | None, labels)

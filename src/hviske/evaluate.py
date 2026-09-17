@@ -210,7 +210,7 @@ def load_asr_pipeline(
         max_new_tokens (optional):
             Maximum number of tokens generated per audio input. Defaults to ``256``.
         revision (optional):
-            Immutable Hub revision for a native Cohere checkpoint.
+            Immutable Hub revision for a Hub checkpoint. Local paths omit it.
 
     Returns:
         The ASR pipeline or native Cohere transcriber.
