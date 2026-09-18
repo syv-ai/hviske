@@ -1,7 +1,7 @@
 # Sparkie bilingual runbook
 
-This runbook covers the private Parakeet TDT campaign. Training and publication are
-separate operations. The production preset uses the pinned TDT base, 1--8-second
+This runbook covers the private Parakeet TDT campaign, including integrated Hub
+publication. The production preset uses the pinned TDT base, 1--8-second
 audio, per-device batch 6, effective batch 60, and two DataLoader workers.
 
 ## Prerequisites
@@ -90,13 +90,13 @@ missing data, failed checkpoint reload, unsafe temperature or insufficient disk 
 
 ## Private publication
 
-After reviewing the final package and evaluation, publish it separately:
+Set the integrated publication options before the final run:
 
 ```bash
-uv run python src/scripts/publish_model.py \
-  runs/hviske-v6.0 syvai/hviske-v6.0 --private \
-  --evaluation-status 'Full-run evaluation reviewed before publication.'
+uv run python src/scripts/finetune_asr_model.py --config-name bilingual \
+  push_to_hub=true private=true private_only=true
 ```
 
-The command verifies private Hub visibility. Never upload raw audio, credentials,
-training outputs, caches, or experiment-tracking artefacts.
+The training command generates the model card and verifies private Hub visibility.
+Never upload raw audio, credentials, training outputs, caches, or experiment-tracking
+artefacts.

@@ -11,7 +11,7 @@ from transformers.trainer_callback import TrainerCallback, TrainerControl, Train
 from transformers.training_args import TrainingArguments
 
 import hviske.finetune as finetune_module
-from hviske.finetune import EvaluationScheduleCallback, StopAfterStepCallback
+from hviske.callbacks import EvaluationScheduleCallback, StopAfterStepCallback
 
 
 @pytest.mark.parametrize(

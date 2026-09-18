@@ -36,16 +36,14 @@ from transformers.pipelines.automatic_speech_recognition import (
 from hviske.cohere import get_asr_call_kwargs, load_asr_transcriber
 from hviske.compute_metrics import compute_error_rate_metrics
 from hviske.data import process_example
-from hviske.data_collators import DataCollatorParakeetWithPadding
 from hviske.data_models import Processor
 from hviske.model_setup import load_model_setup
 from hviske.parakeet import (
+    DataCollatorParakeetWithPadding,
     ParakeetGenerationTrainer,
     ParakeetModelSetup,
-    parakeet_family,
-)
-from hviske.parakeet_contract import (
     get_parakeet_blank_token_id,
+    parakeet_family,
     validate_parakeet_transducer_inputs,
 )
 
@@ -635,7 +633,7 @@ def test_parakeet_processing_keeps_joint_decoder_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """RNNT processing retains decoder IDs returned by the real processor contract."""
-    monkeypatch.setattr("hviske.data.download_background_noises", lambda: None)
+    monkeypatch.setattr("hviske.audio.download_background_noises", lambda: None)
 
     class FakeParakeetProcessor:
         blank_token = "<blank>"

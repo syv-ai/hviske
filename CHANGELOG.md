@@ -36,9 +36,9 @@
   existing vocabulary, blank-token IDs, and TDT duration heads while resizing
   vocabulary-dependent CTC and transducer heads.
 - Added Parakeet CTC, RNNT, and revision-pinned TDT model presets.
-- Added a publication-only command with strict Cohere and Parakeet TDT package
-  validation, including package-family/provenance matching and an explicit preserved
-  Cohere publication preset, while keeping reviewed uploads separate from training.
+- Added integrated private Hub publication for fine-tuning runs, with strict Cohere
+  and Parakeet TDT package validation, package-family matching, generated model cards,
+  and private-repository checks.
 
 ### Changed
 

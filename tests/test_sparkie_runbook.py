@@ -23,8 +23,8 @@ def test_sparkie_runbook_documents_p1_gate_and_publication() -> None:
     assert "archives/hviske-p1-pipeline/f3dcf16/" in runbook
     assert "44284e5849b6b1d96b874891c579654a644e0e2f" in runbook
     assert "manually gated" in runbook
-    assert "src/scripts/publish_model.py" in runbook
-    assert "runs/hviske-v6.0 syvai/hviske-v6.0 --private" in runbook
+    assert "push_to_hub=true" in runbook
+    assert "private=true private_only=true" in runbook
 
 
 def test_sparkie_tmux_launches_scrub_inherited_wandb_identity() -> None:

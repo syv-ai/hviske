@@ -20,7 +20,6 @@ The supported entry points are:
 
 - `src/scripts/finetune_asr_model.py`: Hydra training entry point.
 - `src/scripts/evaluate_model.py`: Hydra model evaluation entry point.
-- `src/scripts/publish_model.py`: publication-only validation and Hub upload.
 - `src/scripts/fix_dot_env_file.py`: Makefile environment-file setup helper.
 
 The project deliberately does not ship dataset downloaders, plotting utilities, P1
@@ -57,9 +56,9 @@ P1_SEGMENTS_REVISION=<full-40-hex-commit-sha> \
   uv run python src/scripts/finetune_asr_model.py --config-name bilingual --cfg job
 ```
 
-See [`SPARKIE.md`](SPARKIE.md) for the GPU runbook and checkpoint publication
-procedure. See [`docs/parakeet-tdt-runbook.md`](docs/parakeet-tdt-runbook.md) for
-focused Parakeet TDT validation.
+See [`SPARKIE.md`](SPARKIE.md) for the GPU runbook and integrated checkpoint
+publication procedure. See [`docs/parakeet-tdt-runbook.md`](docs/parakeet-tdt-runbook.md)
+for focused Parakeet TDT validation.
 
 ### Evaluation
 
@@ -72,16 +71,10 @@ and audio-column settings are defined in `config/evaluation.yaml`.
 
 ### Publication
 
-Review a saved model package, then publish it privately with:
-
-```bash
-uv run python src/scripts/publish_model.py \
-  runs/model syvai/model --private \
-  --evaluation-status 'Evaluation reviewed before publication.'
-```
-
-Publication validates model-family provenance and rejects local data artefacts,
-credentials, and unsupported package contents.
+Set `push_to_hub=true` in the fine-tuning configuration to publish the completed
+model directly to the Hub. Set `private=true` and `private_only=true` for a private
+repository. Publication generates the model card, validates the model package, and
+rejects local data artefacts, credentials, and unsupported package contents.
 
 ## Development
 
