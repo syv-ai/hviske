@@ -531,6 +531,26 @@ class HfApiAdapter:
             token=self._token,
         )
 
+    def list_repo_commits(
+        self, repo_id: str, *, repo_type: str, revision: str
+    ) -> c.Iterable[object]:
+        """List commit metadata for bounded ancestry checks.
+
+        Only the Hub API response is returned; transport details are neither logged
+        nor included in adapter diagnostics. The finaliser consumes immutable commit
+        identifiers from these objects.
+
+        Returns:
+            Commits reachable from ``revision``, newest first.
+        """
+        return self._api.list_repo_commits(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            revision=revision,
+            token=self._token,
+            formatted=False,
+        )
+
     def list_repo_files(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
     ) -> c.Iterable[str]:

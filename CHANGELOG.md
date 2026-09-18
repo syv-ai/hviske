@@ -52,6 +52,8 @@
 
 ### Fixed
 
+- Enabled private P1 finalisation to verify non-empty batch ancestry through the
+  production Hub adapter and to CAS-update the actual three-section dataset card.
 - Retried Hugging Face HTTP 499 client-closed responses during remote streaming,
   preventing transient proxy cancellations from terminating long training runs.
 - Ensured a process-local shutdown watcher lets spawned DataLoader workers that are idle

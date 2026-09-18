@@ -609,6 +609,33 @@ def test_failed_verification_resumes_without_reupload_or_early_purge(
         assert not manifest_path.exists()
 
 
+def test_hf_adapter_lists_commits_without_returning_transport_details() -> None:
+    """Ancestry forwarding passes only bounded, non-formatted API options."""
+    adapter = object.__new__(HfApiAdapter)
+    adapter._token = "private-token"
+    commits = (SimpleNamespace(commit_id="a" * 40),)
+    calls: dict[str, object] = {}
+
+    class Api:
+        def list_repo_commits(self, **kwargs: object) -> tuple[object, ...]:
+            calls.update(kwargs)
+            return commits
+
+    adapter._api = t.cast(HfApi, Api())
+    result = adapter.list_repo_commits(
+        "org/private", repo_type="dataset", revision="a" * 40
+    )
+
+    assert tuple(result) == commits
+    assert calls == {
+        "repo_id": "org/private",
+        "repo_type": "dataset",
+        "revision": "a" * 40,
+        "token": "private-token",
+        "formatted": False,
+    }
+
+
 def test_hf_adapter_tags_opaque_create_failure_without_leaking(tmp_path: Path) -> None:
     """Adapter phase hints are bounded even when transport details are private."""
     path = tmp_path / "private-source-id.parquet"
