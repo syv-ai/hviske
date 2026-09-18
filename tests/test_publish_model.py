@@ -16,7 +16,6 @@ def test_cohere_publication_preset_has_matching_package_family(
 ) -> None:
     """The preserved Cohere baseline has an explicit publication provenance path."""
     monkeypatch.setenv("P1_SEGMENTS_REVISION", "1" * 40)
-    monkeypatch.setenv("HVISKE_OVERLAY_REVISION", "2" * 40)
 
     config = compose(config_name="cohere_publication")
 

@@ -15,29 +15,3 @@ nst:
     template: data/train-{shard:05d}.parquet
     start: 653
     end: 689
-  overlay:
-    id: syvai/danish-asr-unified-hviske-v5-tiny
-    subset: default
-    split: train
-    revision: ${oc.env:HVISKE_OVERLAY_REVISION,""}
-    data_file_shards:
-      template: data/train-{shard:05d}.parquet
-      start: 653
-      end: 689
-    strategy: positional
-    base_filters:
-      source: nst_da
-    filters:
-      source: nst_da
-    equality_checks:
-      source: source
-      text: reference_text
-    action_column: action
-    allowed_actions: [keep, relabel, strip]
-    recognised_actions: [keep, relabel, strip, drop, flag, quarantine, review]
-    text_policy:
-      candidates:
-        - column: new_text
-          actions: [relabel, strip]
-        - column: reference_text
-    trust_remote_code: false

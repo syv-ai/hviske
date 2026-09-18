@@ -1,6 +1,5 @@
 """Functions related to the data loading and processing."""
 
-import atexit
 import copy
 import hashlib
 import io
@@ -8,11 +7,8 @@ import json
 import logging
 import math
 import os
-import pickle
 import re
 import shutil
-import sqlite3
-import tempfile
 import typing as t
 from collections.abc import Callable, Iterable, Mapping, Sized
 from functools import partial
@@ -47,7 +43,6 @@ from tqdm.auto import tqdm
 from .audio import SoundfileAudio
 from .dataloader_shutdown import start_worker_shutdown_watcher
 from .hub_retries import configure_hub_streaming_retries
-from .local_vtt import decode_vtt_audio, load_vtt_manifest
 from .parakeet_contract import validate_parakeet_transducer_inputs
 from .types import Data
 from .utils import (
@@ -57,7 +52,6 @@ from .utils import (
     interpret_dataset_name,
     no_datasets_progress_bars,
     validate_immutable_source_revision,
-    validate_overlay_revision,
     validate_transcript_revision,
 )
 
@@ -435,622 +429,6 @@ def _validate_dataset_probabilities(
     return validated
 
 
-def _validate_positional_shard_parity(
-    base_files: list[str] | None, overlay_files: list[str] | None
-) -> None:
-    """Require selected positional base and overlay shards to mirror each other.
-
-    Raises:
-        ValueError:
-            If only one side is selected or their basename order differs.
-    """
-    if base_files is None and overlay_files is None:
-        return
-    if base_files is None or overlay_files is None:
-        raise ValueError(
-            "Positional shard selection must be configured for both base and overlay"
-        )
-    base_names = [Path(path).name for path in base_files]
-    overlay_names = [Path(path).name for path in overlay_files]
-    if base_names != overlay_names:
-        raise ValueError(
-            "Positional base and overlay shard basenames/orders do not match"
-        )
-
-
-def apply_dataset_overlay(
-    base_dataset: Dataset | IterableDataset,
-    overlay_dataset: Dataset,
-    overlay_config: Mapping[str, object],
-) -> Dataset | IterableDataset:
-    """Apply a validated, metadata-only transcript overlay to an audio stream.
-
-    The overlay is indexed in a temporary SQLite database.  Consequently the audio
-    side remains lazy and the amount of Python memory used by a multi-million-row
-    overlay does not grow with its size.  ``strategy`` may be ``keyed`` or
-    ``positional``; positional joins validate row order and length while the stream
-    is consumed.
-
-    Args:
-        base_dataset:
-            The filtered audio/metadata dataset.  It is never materialised.
-        overlay_dataset:
-            The finite, non-streaming overlay dataset.
-        overlay_config:
-            Nested overlay settings. Supported keys include ``strategy``,
-            ``base_join_column``, ``overlay_join_column``, ``equality_checks``,
-            ``action_column``, ``recognised_actions``, ``allowed_actions``,
-            ``text_policy``, and ``base_filters``.
-
-    Returns:
-        A lazy dataset containing only rows with an allowed action and usable text.
-
-    Raises:
-        ValueError:
-            If the overlay schema, immutable configuration, join, equality checks,
-            or text policy is invalid.
-    """
-    config = overlay_config
-    base_dataset = _resolve_streaming_features(dataset=base_dataset)
-    base_filters = config.get("base_filters")
-    if base_filters is not None:
-        if not isinstance(base_filters, Mapping):
-            raise ValueError("Overlay base_filters must be a mapping")
-        base_dataset = _filter_dataset_rows(
-            dataset=base_dataset, filters=t.cast(Mapping[str, object], base_filters)
-        )
-    overlay_filters = config.get("filters", config.get("overlay_filters"))
-    if overlay_filters is not None and not isinstance(overlay_filters, Mapping):
-        raise ValueError("Overlay filters must be a mapping")
-
-    join_config = config.get("join", {})
-    if not isinstance(join_config, Mapping):
-        raise ValueError("Overlay join must be a mapping")
-    strategy = _effective_overlay_strategy(overlay_config=config)
-    if strategy not in {"keyed", "positional"}:
-        raise ValueError(
-            f"Unsupported overlay join strategy {strategy!r}; use keyed or positional"
-        )
-    equality_checks = _overlay_equality_checks(
-        config.get("equality_checks", config.get("checks", {}))
-    )
-    action_column = str(config.get("action_column", "action"))
-    recognised_actions = config.get(
-        "recognised_actions",
-        config.get(
-            "recognized_actions",
-            ["keep", "relabel", "strip", "drop", "flag", "quarantine"],
-        ),
-    )
-    if isinstance(recognised_actions, str) or not isinstance(
-        recognised_actions, Iterable
-    ):
-        raise ValueError("Overlay recognised_actions must be a non-empty list")
-    recognised = {str(action) for action in recognised_actions}
-    if not recognised:
-        raise ValueError("Overlay recognised_actions must not be empty")
-    allowed_actions = config.get("allowed_actions", ["keep", "relabel", "strip"])
-    if isinstance(allowed_actions, str) or not isinstance(allowed_actions, Iterable):
-        raise ValueError("Overlay allowed_actions must be a non-empty list")
-    allowed = {str(action) for action in allowed_actions}
-    if not allowed:
-        raise ValueError("Overlay allowed_actions must not be empty")
-    unknown_allowed = allowed - recognised
-    if unknown_allowed:
-        raise ValueError(
-            "Overlay allowed_actions contains actions outside recognised_actions: "
-            + ", ".join(sorted(unknown_allowed))
-        )
-    text_policy = config.get(
-        "text_policy", {"candidates": config.get("text_candidates")}
-    )
-    if isinstance(text_policy, list):
-        text_policy = {"candidates": text_policy}
-    if not isinstance(text_policy, Mapping):
-        raise ValueError("Overlay text_policy must be a mapping")
-    candidates = _overlay_text_candidates(text_policy=t.cast(Mapping, text_policy))
-
-    required_overlay = {action_column}
-    required_overlay.update(column for _, column in equality_checks)
-    required_overlay.update(column for _, column, _ in candidates)
-    if isinstance(overlay_filters, Mapping):
-        required_overlay.update(str(column) for column in overlay_filters)
-    required_base = {column for column, _ in equality_checks}
-    if strategy == "keyed":
-        base_join_column = config.get(
-            "base_join_column",
-            config.get(
-                "base_column", join_config.get("base_column", config.get("join_column"))
-            ),
-        )
-        overlay_join_column = config.get(
-            "overlay_join_column",
-            config.get(
-                "overlay_column",
-                join_config.get("overlay_column", config.get("join_column")),
-            ),
-        )
-        if base_join_column is None or overlay_join_column is None:
-            raise ValueError(
-                "Keyed overlays require base_join_column and overlay_join_column"
-            )
-        base_join_column = str(base_join_column)
-        overlay_join_column = str(overlay_join_column)
-        required_base.add(base_join_column)
-        required_overlay.add(overlay_join_column)
-    _require_columns(
-        dataset=overlay_dataset,
-        columns=sorted(required_overlay),
-        dataset_name="overlay",
-    )
-    _require_columns(
-        dataset=base_dataset, columns=sorted(required_base), dataset_name="base"
-    )
-    # Store only metadata needed by the join. In particular, model logits and other
-    # large overlay columns must never enter the SQLite record blobs.
-    overlay_dataset = overlay_dataset.select_columns(sorted(required_overlay))
-    if isinstance(overlay_filters, Mapping):
-        overlay_dataset = _filter_dataset_rows(
-            dataset=overlay_dataset,
-            filters=t.cast(Mapping[str, object], overlay_filters),
-        )
-    output_column = str(config.get("output_text_column", "text"))
-    index_path = _build_overlay_index(
-        overlay_dataset=overlay_dataset,
-        strategy=strategy,
-        overlay_join_column=(
-            str(
-                config.get(
-                    "overlay_join_column",
-                    config.get(
-                        "overlay_column",
-                        join_config.get("overlay_column", config.get("join_column")),
-                    ),
-                )
-            )
-            if strategy == "keyed"
-            else None
-        ),
-        action_column=action_column,
-        allowed_actions=allowed,
-        recognised_actions=recognised,
-        candidates=candidates,
-    )
-    features = (
-        base_dataset.features.copy() if base_dataset.features is not None else None
-    )
-    if features is None:
-        raise ValueError("Base dataset must declare features for an overlay")
-    features[output_column] = Value("string")
-
-    generator = _OverlayRows(
-        base_dataset=base_dataset,
-        index_path=index_path,
-        strategy=strategy,
-        base_join_column=base_join_column if strategy == "keyed" else None,
-        action_column=action_column,
-        allowed_actions=allowed,
-        candidates=candidates,
-        equality_checks=equality_checks,
-        output_column=output_column,
-    )
-    atexit.register(Path(index_path).unlink, missing_ok=True)
-    return IterableDataset.from_generator(generator=generator, features=features)
-
-
-class _OverlayRows:
-    """Pickleable per-consumer reader for an overlay index."""
-
-    def __init__(
-        self,
-        base_dataset: Dataset | IterableDataset,
-        index_path: str,
-        strategy: str,
-        base_join_column: str | None,
-        action_column: str,
-        allowed_actions: set[str],
-        candidates: list[tuple[frozenset[str] | None, str, str | None]],
-        equality_checks: list[tuple[str, str]],
-        output_column: str,
-    ) -> None:
-        self.base_dataset = base_dataset
-        self.index_path = index_path
-        self.strategy = strategy
-        self.base_join_column = base_join_column
-        self.action_column = action_column
-        self.allowed_actions = allowed_actions
-        self.candidates = candidates
-        self.equality_checks = equality_checks
-        self.output_column = output_column
-
-    def __call__(self) -> Iterable[dict[str, Any]]:
-        """Yield joined rows using a connection-local duplicate-key table.
-
-        Raises:
-            ValueError:
-                If a base row cannot be matched or fails an overlay check.
-        """
-        connection = sqlite3.connect(self.index_path)
-        connection.execute(
-            "CREATE TEMP TABLE seen_base_keys (key_blob BLOB PRIMARY KEY)"
-        )
-        position = 0
-        try:
-            for raw_row in self.base_dataset:
-                row = t.cast(dict[str, Any], raw_row)
-                if self.strategy == "positional":
-                    record = connection.execute(
-                        "SELECT row_blob FROM overlay_rows WHERE position = ?",
-                        (position,),
-                    ).fetchone()
-                    if record is None:
-                        raise ValueError(
-                            "Overlay positional join length mismatch: base has more "
-                            f"rows than the filtered overlay at position {position}"
-                        )
-                    overlay_row = t.cast(dict[str, Any], pickle.loads(record[0]))
-                else:
-                    base_join_column = self.base_join_column
-                    if base_join_column is None:
-                        raise ValueError(
-                            "Keyed overlay is missing its base join column"
-                        )
-                    key = row[base_join_column]
-                    _validate_join_key(key=key, expected_type=None, side="base")
-                    if key is None:
-                        raise ValueError("Overlay base join key must not be null")
-                    key_blob = sqlite3.Binary(pickle.dumps(key, protocol=5))
-                    try:
-                        connection.execute(
-                            "INSERT INTO seen_base_keys VALUES (?)", (key_blob,)
-                        )
-                    except sqlite3.IntegrityError as error:
-                        raise ValueError(f"Duplicate base join key: {key!r}") from error
-                    record = connection.execute(
-                        "SELECT position, key_type, row_blob FROM overlay_rows "
-                        "WHERE key_blob = ?",
-                        (key_blob,),
-                    ).fetchone()
-                    if record is None:
-                        overlay_types = {
-                            str(value[0])
-                            for value in connection.execute(
-                                "SELECT DISTINCT key_type FROM overlay_rows"
-                            )
-                        }
-                        if (
-                            len(overlay_types) == 1
-                            and type(key).__name__ not in overlay_types
-                        ):
-                            raise ValueError(
-                                "Overlay keyed join key type mismatch: base keys are "
-                                f"{type(key).__name__}, overlay keys are "
-                                f"{next(iter(overlay_types))}"
-                            )
-                        raise ValueError(
-                            f"Overlay keyed join is missing base key {key!r}"
-                        )
-                    overlay_row = t.cast(dict[str, Any], pickle.loads(record[2]))
-                    overlay_key_type = str(record[1])
-                    if type(key).__name__ != overlay_key_type:
-                        raise ValueError(
-                            "Overlay keyed join key type mismatch for "
-                            f"{key!r}: base is {type(key).__name__}, overlay is "
-                            f"{overlay_key_type}"
-                        )
-                _check_overlay_equalities(
-                    base_row=row,
-                    overlay_row=overlay_row,
-                    checks=self.equality_checks,
-                    position=position,
-                )
-                text = _select_overlay_text(
-                    row=overlay_row,
-                    action=overlay_row[self.action_column],
-                    allowed_actions=self.allowed_actions,
-                    candidates=self.candidates,
-                )
-                position += 1
-                if text is None:
-                    continue
-                row = dict(row)
-                row[self.output_column] = text
-                yield row
-            total = int(
-                connection.execute("SELECT count(*) FROM overlay_rows").fetchone()[0]
-            )
-            if position != total:
-                join_name = "positional" if self.strategy == "positional" else "keyed"
-                raise ValueError(
-                    f"Overlay {join_name} join length mismatch: base has "
-                    f"{position} rows but filtered overlay has {total}"
-                )
-        finally:
-            connection.close()
-
-
-def _check_overlay_equalities(
-    base_row: dict[str, Any],
-    overlay_row: dict[str, Any],
-    checks: list[tuple[str, str]],
-    position: int,
-) -> None:
-    """Check configured metadata equality without touching the audio field.
-
-    Raises:
-        ValueError:
-            If a configured value differs or has a different type.
-    """
-    for base_column, overlay_column in checks:
-        base_value = base_row[base_column]
-        overlay_value = overlay_row[overlay_column]
-        if type(base_value) is not type(overlay_value):
-            raise ValueError(
-                f"Overlay equality type mismatch at row {position}: base "
-                f"{base_column} is {type(base_value).__name__}, overlay "
-                f"{overlay_column} is {type(overlay_value).__name__}"
-            )
-        if base_value != overlay_value:
-            raise ValueError(
-                f"Overlay equality mismatch at row {position}: base "
-                f"{base_column}={base_value!r}, overlay {overlay_column}="
-                f"{overlay_value!r}"
-            )
-
-
-def _select_overlay_text(
-    row: dict[str, Any],
-    action: object,
-    allowed_actions: set[str],
-    candidates: list[tuple[frozenset[str] | None, str, str | None]],
-) -> str | None:
-    """Select the first non-blank candidate permitted for an overlay action.
-
-    Returns:
-        The selected transcript, or ``None`` for a disallowed/empty action.
-    """
-    action_name = str(action) if action is not None else ""
-    if action_name not in allowed_actions:
-        return None
-    for actions, column, _ in candidates:
-        if actions is not None and action_name not in actions:
-            continue
-        value = row.get(column)
-        if isinstance(value, str) and value.strip():
-            return value
-    return None
-
-
-def _validate_join_key(
-    key: object, expected_type: type[object] | None, side: str
-) -> None:
-    """Validate that a join key can be indexed and has the expected type.
-
-    Raises:
-        ValueError:
-            If the key is unhashable or has an incompatible type.
-    """
-    try:
-        hash(key)
-    except TypeError as error:
-        raise ValueError(f"The {side} join key must be hashable: {key!r}") from error
-    if expected_type is not None and type(key) is not expected_type:
-        raise ValueError(
-            f"The {side} join key has type {type(key).__name__}, expected "
-            f"{expected_type.__name__}"
-        )
-
-
-def _build_overlay_index(
-    overlay_dataset: Dataset,
-    strategy: str,
-    overlay_join_column: str | None,
-    action_column: str,
-    allowed_actions: set[str],
-    recognised_actions: set[str],
-    candidates: list[tuple[frozenset[str] | None, str, str | None]],
-) -> str:
-    """Create the bounded-memory SQLite index used by ``apply_dataset_overlay``.
-
-    Returns:
-        Temporary SQLite database path.
-
-    Raises:
-        ValueError:
-            If a key is invalid, duplicated, or no usable rows remain.
-    """
-    descriptor, index_path = tempfile.mkstemp(
-        prefix="hviske-overlay-", suffix=".sqlite"
-    )
-    os.close(descriptor)
-    connection = sqlite3.connect(index_path)
-    connection.execute(
-        "CREATE TABLE overlay_rows (position INTEGER PRIMARY KEY, key_blob BLOB, "
-        "key_type TEXT, row_blob BLOB)"
-    )
-    connection.execute("CREATE UNIQUE INDEX overlay_key ON overlay_rows(key_blob)")
-    usable = 0
-    expected_key_type: str | None = None
-    try:
-        for position, raw_row in enumerate(overlay_dataset):
-            row = t.cast(dict[str, Any], raw_row)
-            key_blob = None
-            key_type = None
-            if strategy == "keyed":
-                key = row[overlay_join_column or ""]
-                _validate_join_key(key=key, expected_type=None, side="overlay")
-                if key is None:
-                    raise ValueError("Overlay join key must not be null")
-                key_blob = sqlite3.Binary(pickle.dumps(key, protocol=5))
-                key_type = type(key).__name__
-                if expected_key_type is None:
-                    expected_key_type = key_type
-                elif key_type != expected_key_type:
-                    raise ValueError(
-                        "Overlay keyed join key type mismatch: row "
-                        f"{position} is {key_type}, expected {expected_key_type}"
-                    )
-            try:
-                connection.execute(
-                    "INSERT INTO overlay_rows VALUES (?, ?, ?, ?)",
-                    (position, key_blob, key_type, pickle.dumps(row, protocol=5)),
-                )
-            except sqlite3.IntegrityError as error:
-                raise ValueError(
-                    f"Duplicate overlay join key at filtered overlay row {position}"
-                ) from error
-            action = _validate_overlay_action(
-                action=row[action_column],
-                recognised_actions=recognised_actions,
-                position=position,
-            )
-            if action not in allowed_actions:
-                continue
-            if (
-                _select_overlay_text(
-                    row=row,
-                    action=action,
-                    allowed_actions=allowed_actions,
-                    candidates=candidates,
-                )
-                is None
-            ):
-                raise ValueError(
-                    f"Overlay retained action {action!r} at row {position} has no "
-                    "usable text candidate (no usable rows remain for this row)"
-                )
-            usable += 1
-        if usable == 0:
-            raise ValueError(
-                "Overlay contains no usable rows after allowed actions and text "
-                "fallbacks"
-            )
-        connection.commit()
-    except Exception:
-        connection.close()
-        Path(index_path).unlink(missing_ok=True)
-        raise
-    connection.close()
-    return index_path
-
-
-def _validate_overlay_action(
-    action: object, recognised_actions: set[str], position: int
-) -> str:
-    """Validate one overlay action against the configured action domain.
-
-    Returns:
-        The validated action name.
-
-    Raises:
-        ValueError:
-            If the action is null or outside the recognised action domain.
-    """
-    if not isinstance(action, str) or action not in recognised_actions:
-        value = "null" if action is None else repr(action)
-        raise ValueError(
-            f"Overlay row {position} has action {value}; expected one of "
-            + ", ".join(sorted(recognised_actions))
-        )
-    return action
-
-
-def _effective_overlay_strategy(overlay_config: Mapping[str, object]) -> str:
-    """Resolve the overlay strategy using the overlay implementation's precedence.
-
-    Returns:
-        The normalised configured strategy.
-    """
-    nested_join = overlay_config.get("join")
-    join_config = nested_join if isinstance(nested_join, Mapping) else {}
-    return str(
-        overlay_config.get(
-            "strategy",
-            overlay_config.get("join_strategy", join_config.get("strategy", "keyed")),
-        )
-    ).lower()
-
-
-def _overlay_equality_checks(value: object) -> list[tuple[str, str]]:
-    """Normalise equality-check mappings and list forms.
-
-    Returns:
-        Pairs of base and overlay column names.
-
-    Raises:
-        ValueError:
-            If the configured checks are not mappings with both columns.
-    """
-    if isinstance(value, Mapping):
-        return [(str(base), str(overlay)) for base, overlay in value.items()]
-    if isinstance(value, str) or not isinstance(value, Iterable):
-        raise ValueError("Overlay equality_checks must be a mapping or list")
-    checks: list[tuple[str, str]] = []
-    for check in value:
-        if not isinstance(check, Mapping):
-            raise ValueError("Each overlay equality check must be a mapping")
-        base = check.get("base_column", check.get("base"))
-        overlay = check.get("overlay_column", check.get("overlay"))
-        if base is None or overlay is None:
-            raise ValueError("Overlay equality checks need base and overlay columns")
-        checks.append((str(base), str(overlay)))
-    return checks
-
-
-def _overlay_text_candidates(
-    text_policy: Mapping[str, object],
-) -> list[tuple[frozenset[str] | None, str, str | None]]:
-    """Normalise ordered conditional text candidates.
-
-    Returns:
-        Conditional candidates in their configured order.
-
-    Raises:
-        ValueError:
-            If candidates are missing, empty, or malformed.
-    """
-    raw_candidates = text_policy.get("candidates", text_policy.get("text_candidates"))
-    if raw_candidates is None:
-        raw_candidates = [
-            {"column": "new_text", "actions": ["relabel", "strip"]},
-            {"column": "reference_text"},
-        ]
-    if isinstance(raw_candidates, str) or not isinstance(raw_candidates, Iterable):
-        raise ValueError("Overlay text candidates must be an ordered list")
-    candidates: list[tuple[frozenset[str] | None, str, str | None]] = []
-    for candidate in raw_candidates:
-        if isinstance(candidate, str):
-            candidates.append((None, candidate, None))
-            continue
-        if not isinstance(candidate, Mapping) or candidate.get("column") is None:
-            raise ValueError("Each overlay text candidate needs a column")
-        actions = candidate.get("actions")
-        if actions is None and candidate.get("action") is not None:
-            actions = [candidate["action"]]
-        when = candidate.get("when")
-        if actions is None and isinstance(when, Mapping):
-            actions = when.get("actions", when.get("action"))
-        if isinstance(actions, str):
-            action_set = frozenset({actions})
-        elif actions is None:
-            action_set = None
-        else:
-            action_set = frozenset(str(action) for action in actions)
-        candidates.append((action_set, str(candidate["column"]), None))
-    if not candidates:
-        raise ValueError("Overlay text candidates must not be empty")
-    return candidates
-
-
-def _require_columns(
-    dataset: Dataset | IterableDataset, columns: list[str], dataset_name: str
-) -> None:
-    available = set(dataset.column_names or [])
-    missing = sorted(set(columns) - available)
-    if missing:
-        raise ValueError(f"Missing {dataset_name} dataset columns: {missing}")
-
-
 def join_audio_and_transcripts(
     audio_dataset: Dataset | IterableDataset,
     transcript_dataset: Dataset,
@@ -1138,6 +516,35 @@ def join_audio_and_transcripts(
         Dataset | IterableDataset,
         filtered_audio.map(add_transcript, features=joined_features),
     )
+
+
+def _require_columns(
+    dataset: Dataset | IterableDataset, columns: list[str], dataset_name: str
+) -> None:
+    available = set(dataset.column_names or [])
+    missing = sorted(set(columns) - available)
+    if missing:
+        raise ValueError(f"Missing {dataset_name} dataset columns: {missing}")
+
+
+def _validate_join_key(
+    key: object, expected_type: type[object] | None, side: str
+) -> None:
+    """Validate that a transcript join key is hashable and type-consistent.
+
+    Raises:
+        ValueError:
+            If the key is unhashable or has an incompatible type.
+    """
+    try:
+        hash(key)
+    except TypeError as error:
+        raise ValueError(f"The {side} join key must be hashable: {key!r}") from error
+    if expected_type is not None and type(key) is not expected_type:
+        raise ValueError(
+            f"The {side} join key has type {type(key).__name__}, expected "
+            f"{expected_type.__name__}"
+        )
 
 
 # Dictionary that contains characters to be converted (from the key to the value). Some
@@ -1333,31 +740,11 @@ def load_data_for_finetuning(
             probabilities=probabilities, dataset_count=len(config.datasets)
         )
 
-    # Import locally because the materialiser deliberately reuses this module's strict
-    # overlay implementation.
-    from .materialised_overlays import (
-        configured_materialised_overlay_root,
-        materialised_source_files,
-        validate_materialised_overlay_root,
-    )
-
-    materialised_root = configured_materialised_overlay_root(config=config)
-    materialised_files: dict[str, list[str]] = {}
-    if materialised_root is not None:
-        materialised_manifest = validate_materialised_overlay_root(
-            config=config, root=materialised_root
-        )
-        materialised_files = materialised_source_files(
-            manifest=materialised_manifest, root=materialised_root
-        )
-
     all_datasets: list[Dataset | IterableDataset] = []
     for dataset_name, dataset_config in config.datasets.items():
         if is_main_process:
             logger.info(f"Loading dataset {dataset_name!r}")
 
-        is_local_vtt = dataset_config.get("type") == "local_vtt"
-        is_materialised = dataset_name in materialised_files
         immutable_revision_env = dataset_config.get("immutable_revision_env")
         if immutable_revision_env is not None:
             validate_immutable_source_revision(
@@ -1370,19 +757,8 @@ def load_data_for_finetuning(
             transcript_revision = validate_transcript_revision(
                 str(dataset_config.transcript_revision)
             )
-        overlay_config = dataset_config.get("overlay")
-        overlay_revision = None
-        if overlay_config is not None:
-            overlay_revision = validate_overlay_revision(
-                str(overlay_config.get("revision") or "")
-            )
         base_data_files: list[str] | None = None
-        overlay_data_files: list[str] | None = None
-        is_hub_dataset = (
-            not is_local_vtt
-            and not is_materialised
-            and not Path(dataset_config.id).exists()
-        )
+        is_hub_dataset = not Path(dataset_config.id).exists()
         if is_hub_dataset:
             base_data_files = _resolve_hub_data_files(
                 dataset_id=str(dataset_config.id),
@@ -1391,44 +767,10 @@ def load_data_for_finetuning(
                     Mapping[str, object] | None, dataset_config.get("data_file_shards")
                 ),
             )
-            if overlay_config is not None:
-                overlay_data_files = _resolve_hub_data_files(
-                    dataset_id=str(overlay_config.id),
-                    revision=overlay_revision,
-                    selection=t.cast(
-                        Mapping[str, object] | None,
-                        overlay_config.get("data_file_shards"),
-                    ),
-                )
-                if (
-                    _effective_overlay_strategy(
-                        overlay_config=t.cast(Mapping[str, object], overlay_config)
-                    )
-                    == "positional"
-                ):
-                    _validate_positional_shard_parity(
-                        base_files=base_data_files, overlay_files=overlay_data_files
-                    )
 
-        if is_materialised:
-            with no_datasets_progress_bars():
-                ds = load_dataset(
-                    "parquet",
-                    data_files=materialised_files[dataset_name],
-                    split="train",
-                    streaming=True,
-                    cache_dir=config.cache_dir,
-                )
-        elif is_local_vtt:
-            ds = load_vtt_manifest(
-                manifest_path=Path(dataset_config.manifest_path),
-                min_seconds=config.min_seconds_per_example,
-                max_seconds=config.max_seconds_per_example,
-                num_shards=dataset_config.get("local_vtt_num_shards", 1),
-            )
         # Load from disk if the dataset ID is a path and it is stored as an arrow
         # dataset
-        elif Path(dataset_config.id).exists():
+        if Path(dataset_config.id).exists():
             train_path = Path(dataset_config.id) / dataset_config.train_name
             data_files = list(map(str, train_path.glob("data-*.arrow")))
             if len(data_files) == 0:
@@ -1490,10 +832,9 @@ def load_data_for_finetuning(
             raise ValueError(f"Unsupported dataset type: {type(ds)}")
         ds = _resolve_streaming_features(dataset=ds)
 
-        if not is_local_vtt:
-            audio_column = str(dataset_config.audio_column)
-            if audio_column in (ds.column_names or []):
-                ds = ds.cast_column(column=audio_column, feature=Audio(decode=False))
+        audio_column = str(dataset_config.audio_column)
+        if audio_column in (ds.column_names or []):
+            ds = ds.cast_column(column=audio_column, feature=Audio(decode=False))
 
         row_filters = dataset_config.get("filters")
         if row_filters is not None:
@@ -1501,25 +842,9 @@ def load_data_for_finetuning(
                 dataset=ds, filters=t.cast(Mapping[str, object], row_filters)
             )
 
-        if overlay_config is not None and not is_materialised:
-            overlay = _load_transcript_dataset(
-                dataset_id=str(overlay_config.id),
-                subset=overlay_config.get("subset"),
-                split=str(overlay_config.get("split", "train")),
-                revision=overlay_revision,
-                cache_dir=config.cache_dir,
-                trust_remote_code=overlay_config.get("trust_remote_code", False),
-                data_files=overlay_data_files,
-            )
-            ds = apply_dataset_overlay(
-                base_dataset=ds,
-                overlay_dataset=overlay,
-                overlay_config=t.cast(Mapping[str, object], overlay_config),
-            )
-
-        if not is_local_vtt and dataset_config.text_column != "text":
+        if dataset_config.text_column != "text":
             ds = ds.rename_column(dataset_config.text_column, "text")
-        if not is_local_vtt and dataset_config.audio_column != "audio":
+        if dataset_config.audio_column != "audio":
             ds = ds.rename_column(dataset_config.audio_column, "audio")
 
         if transcript_dataset_id is not None:
@@ -1555,35 +880,23 @@ def load_data_for_finetuning(
         else:
             ds = ds.shuffle(seed=config.seed)
 
-        if not is_local_vtt:
-            ds = ds.cast_column(
-                column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
-            )
-            if ds.features is None:
-                raise ValueError("Hub datasets must declare features")
-            language_features = ds.features.copy()
-            language_features["language"] = Value("string")
-            ds = ds.map(
-                function=partial(
-                    _set_source_language,
-                    language=dataset_config.get("language")
-                    or getattr(config.model, "language", None),
-                ),
-                features=language_features,
-            )
+        ds = ds.cast_column(
+            column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
+        )
+        if ds.features is None:
+            raise ValueError("Hub datasets must declare features")
+        language_features = ds.features.copy()
+        language_features["language"] = Value("string")
+        ds = ds.map(
+            function=partial(
+                _set_source_language,
+                language=dataset_config.get("language")
+                or getattr(config.model, "language", None),
+            ),
+            features=language_features,
+        )
 
-        if is_local_vtt:
-            if ds.features is None:
-                raise ValueError("Local VTT datasets must declare manifest features")
-            local_features = ds.features.copy()
-            local_features["audio"] = Audio(sampling_rate=config.model.sampling_rate)
-            ds = ds.map(
-                function=partial(
-                    decode_vtt_audio, sampling_rate=config.model.sampling_rate
-                ),
-                features=local_features,
-            )
-        elif dataset_config.filter_dataset:
+        if dataset_config.filter_dataset:
             ds = _standardise_training_dataset(
                 dataset=ds, sampling_rate=config.model.sampling_rate
             )

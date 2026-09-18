@@ -939,11 +939,6 @@ def _validate_training_sources(
             dataset_id = joined_transcript.get("dataset_id")
             if dataset_id is not None:
                 ids.add(str(dataset_id))
-        overlay = source.get("overlay")
-        if isinstance(overlay, dict):
-            dataset_id = overlay.get("dataset_id")
-            if dataset_id is not None:
-                ids.add(str(dataset_id))
     missing = sorted(set(training_dataset_ids) - ids)
     if missing:
         raise ValueError("Model-card provenance misses datasets: " + ", ".join(missing))
@@ -1204,14 +1199,14 @@ class transformers_output_ignored:
         hf_logging.set_verbosity_info()
 
 
-def validate_overlay_revision(revision: str) -> str:
-    """Validate the immutable overlay revision supplied for the v6 data sources.
+def validate_transcript_revision(revision: str) -> str:
+    """Validate an immutable revision for a generic transcript join.
 
     Returns:
         The unchanged, validated revision.
     """
     return validate_immutable_source_revision(
-        revision, revision_label="HVISKE_OVERLAY_REVISION"
+        revision, revision_label="Transcript dataset revision"
     )
 
 
@@ -1242,14 +1237,3 @@ def validate_immutable_source_revision(revision: str, *, revision_label: str) ->
             "mutable branches and abbreviated or non-hex revisions are forbidden."
         )
     return revision
-
-
-def validate_transcript_revision(revision: str) -> str:
-    """Validate an immutable revision for a generic transcript join.
-
-    Returns:
-        The unchanged, validated revision.
-    """
-    return validate_immutable_source_revision(
-        revision, revision_label="Transcript dataset revision"
-    )

@@ -280,9 +280,7 @@ def test_wandb_payload_redacts_resolved_paths_without_redacting_hyperparameters(
                 "tokenizer_token": "benign-value",
                 "wandb_api_key": "secret-value",
                 "resume_from_checkpoint": "/private/checkpoints/checkpoint-2000",
-                "datasets": {
-                    "drtv_local": {"manifest_path": "/private/audio/drtv.jsonl"}
-                },
+                "datasets": {"p1": {"data_path": "/private/audio/p1.parquet"}},
             }
         ),
     )
@@ -292,8 +290,8 @@ def test_wandb_payload_redacts_resolved_paths_without_redacting_hyperparameters(
     assert payload["model_dir"] == "[REDACTED]"
     assert payload["cache_dir"] == "[REDACTED]"
     datasets = t.cast(dict[str, object], payload["datasets"])
-    drtv = t.cast(dict[str, object], datasets["drtv_local"])
-    assert drtv["manifest_path"] == "[REDACTED]"
+    p1 = t.cast(dict[str, object], datasets["p1"])
+    assert p1["data_path"] == "[REDACTED]"
     assert payload["tokenizer_token"] == "benign-value"
     assert payload["wandb_api_key"] == "[REDACTED]"
     assert payload["resume_from_checkpoint"] == "[REDACTED]"
