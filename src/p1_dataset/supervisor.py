@@ -22,8 +22,10 @@ import typing as t
 from dataclasses import dataclass
 from pathlib import Path
 
+from huggingface_hub.errors import HfHubHTTPError
 from omegaconf import DictConfig, OmegaConf
 
+from .hub_diagnostics import classify_hub_error
 from .pipeline import (
     PipelineSettings,
     _safe_exception_category,
@@ -52,6 +54,10 @@ class StatusPayload(t.TypedDict):
     outcome: str
     category: str
     exception_class: str
+    http_status_code: int | None
+    hub_phase: str
+    hub_reason: str
+    hub_retryable: bool | None
     status: str
     started_at: str
     finished_at: str
@@ -155,6 +161,7 @@ def _child_entry(
         outcome="STARTED",
         category="none",
         exception_class="none",
+        hub_error=None,
         status="running",
         started_at=started_at,
         finished_at=started_at,
@@ -172,6 +179,7 @@ def _child_entry(
             outcome="FAILED",
             category=_safe_category(error),
             exception_class=_safe_class(error),
+            hub_error=error,
             status="failed",
             started_at=started_at,
             finished_at=_timestamp(),
@@ -184,6 +192,7 @@ def _child_entry(
         outcome="DONE",
         category="none",
         exception_class="none",
+        hub_error=None,
         status="done",
         started_at=started_at,
         finished_at=_timestamp(),
@@ -198,16 +207,24 @@ def _send_status(
     outcome: str,
     category: str,
     exception_class: str,
+    hub_error: BaseException | None,
     status: str,
     started_at: str,
     finished_at: str,
 ) -> None:
+    diagnostic = classify_hub_error(hub_error or RuntimeError())
     payload: StatusPayload = {
         "partition_index": partition_index,
         "attempt": attempt,
         "outcome": outcome,
         "category": _safe_name(category),
         "exception_class": _safe_name(exception_class),
+        "http_status_code": diagnostic.status_code,
+        "hub_phase": diagnostic.phase,
+        "hub_reason": diagnostic.reason,
+        "hub_retryable": (
+            diagnostic.retryable if isinstance(hub_error, HfHubHTTPError) else None
+        ),
         "status": _safe_name(status),
         "started_at": started_at,
         "finished_at": finished_at,
@@ -430,10 +447,20 @@ def _sanitise_status(value: object) -> StatusPayload | None:
     attempt = t.cast(int, value["attempt"])
     if partition_index < 0 or attempt < 1:
         return None
+    http_status = value.get("http_status_code")
+    if http_status is not None and not isinstance(http_status, int):
+        return None
+    if "hub_retryable" not in value:
+        return None
+    hub_retryable = value.get("hub_retryable")
+    if hub_retryable is not None and not isinstance(hub_retryable, bool):
+        return None
     strings = (
         "outcome",
         "category",
         "exception_class",
+        "hub_phase",
+        "hub_reason",
         "status",
         "started_at",
         "finished_at",
@@ -446,6 +473,10 @@ def _sanitise_status(value: object) -> StatusPayload | None:
         "outcome": _safe_name(t.cast(str, value["outcome"])),
         "category": _safe_name(t.cast(str, value["category"])),
         "exception_class": _safe_name(t.cast(str, value["exception_class"])),
+        "http_status_code": t.cast(int | None, http_status),
+        "hub_phase": _safe_name(t.cast(str, value["hub_phase"])),
+        "hub_reason": _safe_name(t.cast(str, value["hub_reason"])),
+        "hub_retryable": t.cast(bool | None, hub_retryable),
         "status": _safe_name(t.cast(str, value["status"])),
         "started_at": t.cast(str, value["started_at"])[:40],
         "finished_at": t.cast(str, value["finished_at"])[:40],
@@ -503,7 +534,8 @@ def _reap_partitions(
             state.done = True
             completed.add(partition_index)
             continue
-        if stop_requested or state.attempt >= max_attempts:
+        non_retryable_hub = status is not None and status["hub_retryable"] is False
+        if stop_requested or non_retryable_hub or state.attempt >= max_attempts:
             state.failed = True
             failed.add(partition_index)
             continue
@@ -539,6 +571,10 @@ def _crash_status(*, partition_index: int, attempt: int) -> StatusPayload:
         "outcome": "FAILED",
         "category": "child_crash",
         "exception_class": "ProcessExit",
+        "http_status_code": None,
+        "hub_phase": "unknown",
+        "hub_reason": "unknown",
+        "hub_retryable": None,
         "status": "crashed",
         "started_at": timestamp,
         "finished_at": timestamp,

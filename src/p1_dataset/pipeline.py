@@ -51,7 +51,9 @@ from .contracts import (
     pipeline_config_sha256,
     validate_p1_runtime_contract,
 )
+from .hub_diagnostics import classify_hub_error
 from .ledger import Ledger
+from .publication_layout import PublicationLayout, new_shard_path
 from .segments import (
     CTCBackend,
     TimestampAlignmentBackend,
@@ -109,6 +111,7 @@ class PipelineSettings:
     resume: bool
     device: str
     target_private_repo: str
+    publication_layout: PublicationLayout
     source_audio_repository: str
     source_audio_revision: str
     source_transcript_repository: str
@@ -198,6 +201,14 @@ class PipelineSettings:
         anomaly_raw = t.cast(dict[str, object], future_alignment["anomaly_model"])
         output_raw = t.cast(dict[str, object], root["output"])
         dataset_license_raw = t.cast(dict[str, object], root["dataset_license"])
+        layout_raw = root.get("publication_layout", {})
+        if not isinstance(layout_raw, dict):
+            raise ValueError("publication_layout must be a mapping")
+        publication_layout = PublicationLayout(
+            version=str(layout_raw.get("version", "p1-publication-layout-2")),
+            shard_root=str(layout_raw.get("shard_root", "data-shards/train")),
+            bucket_width=_as_int(layout_raw.get("bucket_width", 2)),
+        )
         manifest = CanonicalIdentityManifest(
             schema_version=str(root["schema_version"]),
             pipeline_version=str(root["pipeline_version"]),
@@ -348,6 +359,7 @@ class PipelineSettings:
             resume=bool(root.get("resume", True)),
             device=str(runtime.get("device", "cuda:0")),
             target_private_repo=str(runtime["target_private_repo"]),
+            publication_layout=publication_layout,
             source_audio_repository=str(audio["repository"]),
             source_audio_revision=str(audio["revision"]),
             source_transcript_repository=str(transcripts["repository"]),
@@ -1914,7 +1926,7 @@ def _process_native_programmes(
             allocations = tuple(
                 ShardAllocation(
                     local_path=item.path,
-                    remote_path=f"data/train/{programme_id}-{ordinal:05d}.parquet",
+                    remote_path=new_shard_path(programme_id, ordinal),
                     sha256=item.evidence.sha256,
                     byte_size=item.evidence.byte_size,
                     row_count=item.evidence.row_count,
@@ -2165,7 +2177,7 @@ def publish_pending(
 
     Raises:
         HfHubHTTPError:
-            If all bounded Hub publication attempts fail.
+            If a deterministic Hub request fails or bounded transient attempts fail.
         AssertionError:
             If the bounded retry loop exits without returning or raising.
     """
@@ -2183,36 +2195,33 @@ def publish_pending(
                     audit_reservoir=audit_reservoir,
                 )
         except HfHubHTTPError as error:
+            diagnostic = classify_hub_error(error)
+            will_retry = (
+                diagnostic.retryable and attempt < _PUBLICATION_RETRY_MAX_ATTEMPTS
+            )
             delay = (
                 _publication_retry_delay(settings=settings, attempt=attempt)
-                if attempt < _PUBLICATION_RETRY_MAX_ATTEMPTS
+                if will_retry
                 else 0.0
             )
             logger.warning(
                 "P1 Hub publication attempt=%d/%d partition=%d "
-                "exception_class=%s status_code=%s delay_seconds=%.1f",
+                "exception_class=%s status_code=%s hub_phase=%s "
+                "hub_reason=%s retryable=%s delay_seconds=%.1f",
                 attempt,
                 _PUBLICATION_RETRY_MAX_ATTEMPTS,
                 settings.partition_index,
                 type(error).__name__,
-                _hub_status_code(error),
+                diagnostic.status_code,
+                diagnostic.phase,
+                diagnostic.reason,
+                diagnostic.retryable,
                 delay,
             )
-            if attempt == _PUBLICATION_RETRY_MAX_ATTEMPTS:
+            if not will_retry:
                 raise
             time.sleep(delay)
     raise AssertionError("publication retry loop must return or raise")
-
-
-def _hub_status_code(error: HfHubHTTPError) -> int | None:
-    """Extract only the numeric HTTP status from a Hub transport error.
-
-    Returns:
-        Numeric HTTP status when the Hub response exposes one.
-    """
-    response = getattr(error, "response", None)
-    status_code = getattr(response, "status_code", None)
-    return status_code if isinstance(status_code, int) else None
 
 
 @contextlib.contextmanager

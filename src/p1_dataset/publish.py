@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 import soundfile as sf
 from datasets import Audio, Features, Sequence, Value, load_dataset
 from huggingface_hub import CommitOperationAdd, HfApi, HfFileSystem, hf_hub_url
+from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 from pyarrow import parquet as pq
 
@@ -29,6 +30,8 @@ from .contracts import (
     RejectionCategory,
     ShardEvidence,
 )
+from .hub_diagnostics import annotate_hub_error
+from .publication_layout import is_allowed_shard_path
 
 if t.TYPE_CHECKING:
     from .ledger import Ledger
@@ -384,7 +387,11 @@ def build_dataset_card(
         "from datasets import load_dataset\n\n"
         "dataset = load_dataset(\n"
         '    "syvai/p1-segments",\n'
-        '    data_files="data/train/*.parquet",\n'
+        '    # Legacy-only readers used data_files="data/train/*.parquet".\n'
+        "    data_files=[\n"
+        '        "data/train/**/*.parquet",\n'
+        '        "data-shards/train/**/*.parquet",\n'
+        "    ],\n"
         '    revision="<immutable-commit-sha>",\n'
         "    streaming=True,\n"
         ")\n"
@@ -471,6 +478,10 @@ class HfApiAdapter:
 
         Returns:
             The Hub commit response.
+
+        Raises:
+            HfHubHTTPError:
+                If the Hub rejects preupload, object transfer, or commit creation.
         """
         hub_operations = [
             CommitOperationAdd(
@@ -478,14 +489,19 @@ class HfApiAdapter:
             )
             for operation in operations
         ]
-        return self._api.create_commit(
-            repo_id=repo_id,
-            operations=hub_operations,
-            repo_type=repo_type,
-            commit_message=commit_message,
-            parent_commit=parent_commit,
-            token=self._token,
-        )
+        try:
+            return self._api.create_commit(
+                repo_id=repo_id,
+                operations=hub_operations,
+                repo_type=repo_type,
+                commit_message=commit_message,
+                parent_commit=parent_commit,
+                num_threads=1,
+                token=self._token,
+            )
+        except HfHubHTTPError as error:
+            annotate_hub_error(error, phase="create_commit")
+            raise
 
     def create_repo(
         self, repo_id: str, *, repo_type: str, private: bool, exist_ok: bool
@@ -550,6 +566,24 @@ class HfApiAdapter:
             token=self._token,
         )
         return dataset.cast_column("audio", Audio(sampling_rate=16000, decode=False))
+
+    def open_file(
+        self, repo_id: str, path: str, *, repo_type: str, revision: str
+    ) -> object:
+        """Open one immutable Hub file for bounded random-access reads.
+
+        Returns:
+            A seekable remote file handle.
+
+        Raises:
+            ValueError:
+                If a non-dataset repository is requested.
+        """
+        if repo_type != "dataset":
+            raise ValueError("P1 publication only supports dataset repositories")
+        return self._filesystem.open(
+            f"datasets/{repo_id}/{path}", mode="rb", revision=revision
+        )
 
     def repo_info(
         self, repo_id: str, *, repo_type: str, revision: str | None = None
@@ -899,13 +933,27 @@ def _mutate_commit(
     commit_recorded: c.Callable[[str], None] | None = None,
 ) -> object:
     _assert_private(api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id)
-    result = api.create_commit(
-        repo_id,
-        operations,
-        repo_type="dataset",
-        commit_message=message,
-        parent_commit=parent_commit,
-    )
+    try:
+        result = api.create_commit(
+            repo_id,
+            operations,
+            repo_type="dataset",
+            commit_message=message,
+            parent_commit=parent_commit,
+        )
+    except HfHubHTTPError as error:
+        # Some Hub stale-parent responses are opaque 400s. Confirming that HEAD
+        # advanced turns only that deterministic race into a bounded safe retry.
+        if parent_commit is not None and _http_status_code(error) == 400:
+            try:
+                current_head = _target_head(
+                    api.repo_info(repo_id=repo_id, repo_type="dataset"), repo_id
+                )
+            except Exception:
+                current_head = parent_commit
+            if current_head != parent_commit:
+                annotate_hub_error(error, phase="commit", reason="stale_parent")
+        raise
     commit_id = _commit_sha(result)
     if commit_recorded is not None:
         commit_recorded(commit_id)
@@ -1321,6 +1369,17 @@ def verify_batch(
     return result
 
 
+def validate_p1_publication_path(path: str) -> None:
+    """Reject P1 shard paths outside the immutable legacy and active roots.
+
+    Raises:
+        AllowListError:
+            If ``path`` is not an approved canonical shard path.
+    """
+    if not is_allowed_shard_path(path):
+        raise AllowListError("P1 publication path is outside the approved roots")
+
+
 recover_batch = verify_batch
 
 
@@ -1328,6 +1387,9 @@ def _assert_unique_paths(shards: tuple[ShardEvidence, ...]) -> None:
     paths = [shard.path for shard in shards]
     if len(paths) != len(set(paths)):
         raise AllowListError("a batch contains duplicate repository paths")
+    for path in paths:
+        if path.startswith(("data/train/", "data-shards/train/")):
+            validate_p1_publication_path(path)
 
 
 class AllowListError(PublicationError):
@@ -1347,6 +1409,12 @@ def _has_parquet_footer(path: Path) -> bool:
         stream.seek(-4, os.SEEK_END)
         footer = stream.read(4)
     return header == b"PAR1" and footer == b"PAR1"
+
+
+def _http_status_code(error: HfHubHTTPError) -> int | None:
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
 
 
 def _local_evidence(
@@ -1440,13 +1508,16 @@ def validate_local_shard(
         batch = next(batches, None)
         if batch is None or batch.num_rows == 0:
             raise VerificationError(f"empty local shard: {path}")
-        _validate_row(
-            batch.to_pylist()[0],
-            str(path),
-            expected_pipeline_version=expected_pipeline_version,
-            expected_pipeline_config_sha256=expected_pipeline_config_sha256,
-        )
+        scanned_rows = batch.num_rows
+        for row in batch.to_pylist():
+            _validate_row(
+                row,
+                str(path),
+                expected_pipeline_version=expected_pipeline_version,
+                expected_pipeline_config_sha256=expected_pipeline_config_sha256,
+            )
         for batch in batches:
+            scanned_rows += batch.num_rows
             for row in batch.to_pylist():
                 _validate_row(
                     row,
@@ -1454,6 +1525,8 @@ def validate_local_shard(
                     expected_pipeline_version=expected_pipeline_version,
                     expected_pipeline_config_sha256=expected_pipeline_config_sha256,
                 )
+        if expected_row_count is not None and scanned_rows != expected_row_count:
+            raise VerificationError(f"scanned row count mismatch for {path}")
     except VerificationError:
         raise
     except Exception as error:
@@ -1543,6 +1616,11 @@ def _validate_row(
         or source_end > source_duration
     ):
         raise VerificationError(f"source duration is inconsistent: {shard_path}")
+    if (
+        expected_pipeline_version == "p1-segmentation-8"
+        and not 1000 <= duration < 10000
+    ):
+        raise VerificationError(f"v8 duration is outside active bounds: {shard_path}")
     if decoded.shape[0] != duration * 16:
         raise VerificationError(f"decoded duration is inconsistent: {shard_path}")
     if row.get("pipeline_version") == "p1-segmentation-7":
@@ -1620,21 +1698,32 @@ def _refuse_remote_collisions(
         AllowListError:
             If a requested path already exists in the repository.
     """
-    try:
-        existing = set(
-            api.list_repo_files(repo_id, repo_type="dataset", revision=revision)
-        )
-    except RevisionNotFoundError as error:
-        if revision is not None:
+    for item in expected:
+        if item.path.startswith(("data/train/", "data-shards/train/")):
+            validate_p1_publication_path(item.path)
+    if revision is None:
+        existing: set[str] = set()
+    else:
+        requested = [item.path for item in expected]
+        try:
+            info = api.get_paths_info(
+                repo_id, requested, repo_type="dataset", revision=revision
+            )
+            existing = {
+                path for item in info if (path := _remote_info_path(item)) is not None
+            }
+        except RevisionNotFoundError as error:
             raise AllowListError("could not establish remote path safety") from error
-        existing = set()
-    except Exception as error:
-        raise AllowListError("could not establish remote path safety") from error
+        except Exception as error:
+            raise AllowListError("could not establish remote path safety") from error
     collisions = existing.intersection(item.path for item in expected)
     if collisions:
-        raise AllowListError(
-            "remote publication path collision: " + ", ".join(sorted(collisions))
-        )
+        raise AllowListError("remote publication path collision")
+
+
+def _remote_info_path(info: object) -> str | None:
+    value = info.get("path") if isinstance(info, dict) else getattr(info, "path", None)
+    return value if isinstance(value, str) else None
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -1772,10 +1861,17 @@ def _verify_remote(
 
 
 def _remote_digest(info: object) -> str | None:
+    """Return only a content SHA-256 exposed by remote file metadata.
+
+    ``blob_id`` is a Git SHA-1 and is deliberately not accepted as a content
+    digest. Git-backed files therefore fall through to bounded streaming in
+    ``_verify_remote``.
+    """
     lfs = _value(info, "lfs")
-    digest = _value(info, "sha256", "digest") or _value(lfs, "sha256")
-    if isinstance(digest, str) and _SHA256.fullmatch(digest):
-        return digest
+    candidates = (_value(lfs, "sha256"), _value(info, "sha256"))
+    for digest in candidates:
+        if isinstance(digest, str) and _SHA256.fullmatch(digest):
+            return digest
     return None
 
 

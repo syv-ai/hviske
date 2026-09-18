@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added privacy-safe private P1 Hub diagnostics and bounded transient retries, deterministic
+  bucketed shard publication with crash-safe ledger migration, and completed-corpus
+  finalisation with metadata-only scanning and optional card CAS updates.
 - Added resumable, shard-bounded local materialisation for Sparkie's five positional
   overlays, with durable compressed audio, strict join parity, atomic receipts,
   checksummed provenance manifests, free-disk reserves, and shared preflight validation.

@@ -108,6 +108,11 @@ dataset_license:
   target_path: LICENSE
   target_sha256: 02f6d0056a6f19f59b57c6a20c49bf7edd90530fa2664bb7e4a286522c981c6e
 
+# Publication layout is runtime metadata, not canonical row identity.
+publication_layout:
+  version: p1-publication-layout-2
+  shard_root: data-shards/train
+  bucket_width: 2
 output:
   audio_format: ogg-opus
   sampling_rate: 16000
