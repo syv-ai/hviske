@@ -182,7 +182,6 @@ addopts = [
     '--color=yes',
     '--doctest-modules',
     '--cov=src/hviske',
-    '--cov=src/p1_dataset',
     '-vvv',
 ]
 xfail_strict = true
@@ -199,11 +198,10 @@ log_cli_level = "info"
 testpaths = [
     "tests",
     "src/hviske",
-    "src/p1_dataset",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/hviske", "src/p1_dataset"]
+packages = ["src/hviske"]
 
 [build-system]
 requires = ["hatchling"]

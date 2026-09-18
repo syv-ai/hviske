@@ -6,7 +6,6 @@ import subprocess
 import sys
 
 import hviske
-import p1_dataset
 
 
 def test_coral_namespace_is_absent() -> None:
@@ -49,9 +48,3 @@ assert root.handlers == before_handlers
         [sys.executable, "-c", check], capture_output=True, text=True, check=False
     )
     assert imported.returncode == 0, imported.stderr
-
-
-def test_p1_dataset_namespace_is_available() -> None:
-    """P1 dataset creation is available outside the ASR namespace."""
-    assert p1_dataset.__name__ == "p1_dataset"
-    assert importlib.util.find_spec("p1_dataset") is not None
