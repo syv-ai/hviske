@@ -117,6 +117,77 @@ def test_finaliser_help_has_no_import_warning_or_absolute_path() -> None:
     assert str(_PROJECT_ROOT) not in output
 
 
+def test_finaliser_progresses_with_adapter_commit_history(tmp_path: Path) -> None:
+    """The CLI supplies its production adapter for non-empty batch evidence."""
+    _write_sitecustomize(
+        tmp_path,
+        f"""
+import warnings
+from types import SimpleNamespace
+
+warnings.filterwarnings("ignore", message=r'^Field name "schema"')
+
+import p1_dataset.finalisation as finalisation
+from p1_dataset.publish import HfApiAdapter
+
+
+class Api:
+    def list_repo_commits(self, **kwargs):
+        assert kwargs == {{
+            "repo_id": "syvai/p1-segments",
+            "repo_type": "dataset",
+            "revision": "{_REVISION}",
+            "token": True,
+            "formatted": False,
+        }}
+        return [
+            SimpleNamespace(commit_id="{_REVISION}"),
+            SimpleNamespace(commit_id="{{batch}}".format(batch="c" * 40)),
+        ]
+
+
+def initialise(self, token=None):
+    self._token = True if token is None else token
+    self._api = Api()
+    self._filesystem = None
+
+
+HfApiAdapter.__init__ = initialise
+
+
+def progress(**kwargs):
+    batch = finalisation._Batch(
+        "batch-001", "c" * 40, 1, 1, {{}},
+        (finalisation._Shard("data/train/part-00000.parquet", 1, 1, "d" * 64),),
+    )
+    finalisation._check_batch_ancestry(
+        kwargs["hub"], kwargs["repository"], kwargs["revision"], (batch,)
+    )
+    return {{"pass": True}}
+
+
+finalisation.finalise_p1_corpus = progress
+""",
+    )
+
+    result = _run_cli(
+        _FINALISER,
+        "--revision",
+        _REVISION,
+        "--run-root",
+        str(tmp_path / "run"),
+        "--pipeline-config-sha256",
+        _DIGEST,
+        "--report",
+        str(tmp_path / "report.json"),
+        extra_python_path=tmp_path,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "P1 finalisation passed\n"
+    assert result.stderr == ""
+
+
 def test_finaliser_success_emits_only_status(tmp_path: Path) -> None:
     """A successful finaliser emits no report data or diagnostics."""
     _write_sitecustomize(

@@ -334,12 +334,20 @@ def _add_card_statistics(card: str, report: dict[str, object]) -> str:
 
 
 def _four_sections(card: bytes) -> bool:
+    """Check the private card's required structural sections.
+
+    The private card deliberately has no licence heading: licensing provenance is
+    kept out of the metadata-only card contract.
+
+    Returns:
+        Whether the card contains exactly the required sections.
+    """
     try:
         text = card.decode("utf-8")
     except UnicodeDecodeError:
         return False
     headings = re.findall(r"(?m)^## ([^\r\n]+?)\s*$", text)
-    return headings == ["Dataset", "Source", "Access", "Licence"]
+    return headings == ["Dataset", "Source", "Access"]
 
 
 def _object_value(value: object, name: str) -> object | None:

@@ -13,7 +13,7 @@ import pytest
 
 import p1_dataset.finalisation as finalisation
 from p1_dataset.finalisation import FinalisationError, finalise_p1_corpus
-from p1_dataset.publish import UploadOperation
+from p1_dataset.publish import UploadOperation, build_dataset_card
 from p1_dataset.validation import PinnedHubClipRetriever
 
 _REVISION = "a" * 40
@@ -56,7 +56,16 @@ def test_card_update_uses_cas_and_preserves_licence_and_inventory() -> None:
     """Card mode commits only README bytes against the pinned parent."""
     old_head = _REVISION
     new_head = "d" * 40
-    readme = b"## Dataset\n\n## Source\n\n## Access\n\n## Licence\n"
+    readme = build_dataset_card(
+        source_provenance="Pinned source programmes",
+        permitted_use="Internal ASR research",
+        private_access_terms="Access is limited to the project organisation",
+        alignment_method=f"pipeline_config_sha256: {_DIGEST}",
+        field_schema="audio, text and deterministic metadata",
+        known_limitations="Danish speech only",
+        rejection_policy="Reject undecodable or poorly aligned material",
+        source_revisions="{}",
+    ).encode("utf-8")
     licence = b"unchanged licence"
 
     class CardHub(_Hub):
