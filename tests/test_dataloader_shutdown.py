@@ -22,13 +22,13 @@ from transformers.training_args import TrainingArguments
 
 import hviske.finetune as finetune_module
 from hviske import dataloader_shutdown, hub_retries
+from hviske.callbacks import DataLoaderShutdownCallback
 from hviske.data_collators import DataCollatorCTCWithPadding
 from hviske.data_models import Processor
 from hviske.dataloader_shutdown import (
     SHUTDOWN_SENTINEL_ENV,
     DataLoaderShutdownController,
 )
-from hviske.finetune import DataLoaderShutdownCallback
 
 
 def _read_worker_sentinel(_: list[int]) -> str:

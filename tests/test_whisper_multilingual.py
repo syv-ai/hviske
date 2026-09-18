@@ -13,7 +13,7 @@ def test_real_whisper_processor_uses_each_example_language(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Danish and English examples receive their own Whisper language token."""
-    monkeypatch.setattr("hviske.data.download_background_noises", lambda: None)
+    monkeypatch.setattr("hviske.audio.download_background_noises", lambda: None)
     processor = WhisperProcessor.from_pretrained(
         "openai/whisper-tiny", revision=WHISPER_REVISION
     )

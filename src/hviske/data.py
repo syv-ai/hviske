@@ -2,13 +2,11 @@
 
 import copy
 import hashlib
-import io
 import json
 import logging
 import math
 import os
 import re
-import shutil
 import typing as t
 from collections.abc import Callable, Iterable, Mapping, Sized
 from functools import partial
@@ -16,10 +14,8 @@ from numbers import Number
 from pathlib import Path
 from typing import Any
 from unicodedata import normalize
-from zipfile import ZipFile
 
 import datasets
-import httpx
 import torch
 import torch_audiomentations as ta
 from datasets import (
@@ -38,13 +34,12 @@ from datasets import (
 from datasets import iterable_dataset as datasets_iterable
 from huggingface_hub import HfApi
 from omegaconf import DictConfig
-from tqdm.auto import tqdm
 
+from . import audio as audio_module
 from .audio import SoundfileAudio
 from .dataloader_shutdown import start_worker_shutdown_watcher
 from .hub_retries import configure_hub_streaming_retries
-from .parakeet_contract import validate_parakeet_transducer_inputs
-from .types import Data
+from .parakeet import validate_parakeet_transducer_inputs
 from .utils import (
     NUMERAL_REGEX,
     convert_iterable_dataset_to_dataset,
@@ -58,6 +53,10 @@ from .utils import (
 logger = logging.getLogger(__package__)
 
 _MAX_HUB_SHARD_CANDIDATES = 100_000
+
+Data = t.TypeVar(
+    "Data", bound=Dataset | IterableDataset | DatasetDict | IterableDatasetDict
+)
 
 
 class _HubFileLister(t.Protocol):
@@ -1831,7 +1830,7 @@ def process_example(
     # Normalise and augment audio
     normalise = ta.PeakNormalization(p=1.0) if normalise_audio else ta.Identity()
     if augment_audio:
-        download_background_noises()
+        audio_module.download_background_noises()
         background_noise = ta.AddBackgroundNoise(
             background_paths=Path("background-noises"), p=0.7, sample_rate=sampling_rate
         )
@@ -1956,49 +1955,3 @@ def _to_python(value: object) -> object:
         return value
     to_list = t.cast(Callable[[], object], getattr(value, "tolist"))
     return to_list()
-
-
-def download_background_noises() -> None:
-    """Download background noises for audio augmentation.
-
-    This function downloads the background noises to the `background-noises` directory,
-    and will do nothing if the directory already exists.
-    """
-    background_noises_path = Path("background-noises")
-    if background_noises_path.exists():
-        return
-
-    logger.info("Downloading background noises from the ESC-50 dataset...")
-
-    # Download the ESC-50 dataset zip file as a stream
-    zip_url = "https://github.com/karolpiczak/ESC-50/archive/master.zip"
-    chunks = []
-    with httpx.stream(method="GET", url=zip_url, follow_redirects=True) as response:
-        for chunk in tqdm(
-            response.iter_bytes(),
-            desc="Downloading ESC-50 dataset",
-            unit="B",
-            unit_scale=True,
-            total=int(response.headers.get("Content-Length", 0)),
-        ):
-            chunks.append(chunk)
-    content = b"".join(chunks)
-
-    # Unzip only the audio files from the ESC-50 dataset
-    with ZipFile(file=io.BytesIO(content)) as zip_file:
-        audio_files = [
-            file_info
-            for file_info in zip_file.infolist()
-            if file_info.filename.startswith("ESC-50-master/audio/")
-        ]
-        zip_file.extractall(members=audio_files, path=background_noises_path)
-
-    # Move audio files to the root of the background-noises directory
-    extracted_audio_path = background_noises_path / "ESC-50-master" / "audio"
-    for audio_file in extracted_audio_path.iterdir():
-        audio_file.rename(background_noises_path / audio_file.name)
-
-    # Remove the extracted directories
-    shutil.rmtree(background_noises_path / "ESC-50-master")
-
-    logger.info("Background noises downloaded successfully.")

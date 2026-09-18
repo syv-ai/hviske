@@ -1,11 +1,19 @@
 """Audio loading helpers."""
 
+import io
+import logging
+import shutil
 import typing as t
 from pathlib import Path
+from zipfile import ZipFile
 
+import httpx
 import soundfile as sf
 import torch
 from torch_audiomentations.utils.io import Audio, AudioFile
+from tqdm.auto import tqdm
+
+logger = logging.getLogger(__package__)
 
 
 class SoundfileAudio(Audio):
@@ -99,3 +107,49 @@ class SoundfileAudio(Audio):
         """Return the number of frames and sample rate for an audio file."""
         info = sf.info(file_path)
         return info.frames, info.samplerate
+
+
+def download_background_noises() -> None:
+    """Download background noises for audio augmentation.
+
+    This function downloads the background noises to the `background-noises` directory,
+    and will do nothing if the directory already exists.
+    """
+    background_noises_path = Path("background-noises")
+    if background_noises_path.exists():
+        return
+
+    logger.info("Downloading background noises from the ESC-50 dataset...")
+
+    # Download the ESC-50 dataset zip file as a stream
+    zip_url = "https://github.com/karolpiczak/ESC-50/archive/master.zip"
+    chunks = []
+    with httpx.stream(method="GET", url=zip_url, follow_redirects=True) as response:
+        for chunk in tqdm(
+            response.iter_bytes(),
+            desc="Downloading ESC-50 dataset",
+            unit="B",
+            unit_scale=True,
+            total=int(response.headers.get("Content-Length", 0)),
+        ):
+            chunks.append(chunk)
+    content = b"".join(chunks)
+
+    # Unzip only the audio files from the ESC-50 dataset
+    with ZipFile(file=io.BytesIO(content)) as zip_file:
+        audio_files = [
+            file_info
+            for file_info in zip_file.infolist()
+            if file_info.filename.startswith("ESC-50-master/audio/")
+        ]
+        zip_file.extractall(members=audio_files, path=background_noises_path)
+
+    # Move audio files to the root of the background-noises directory
+    extracted_audio_path = background_noises_path / "ESC-50-master" / "audio"
+    for audio_file in extracted_audio_path.iterdir():
+        audio_file.rename(background_noises_path / audio_file.name)
+
+    # Remove the extracted directories
+    shutil.rmtree(background_noises_path / "ESC-50-master")
+
+    logger.info("Background noises downloaded successfully.")

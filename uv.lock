@@ -1081,7 +1081,6 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
-    { name = "click" },
     { name = "datasets" },
     { name = "deepspeed" },
     { name = "hydra-core" },
@@ -1112,7 +1111,6 @@ kenlm = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "click" },
     { name = "coverage" },
     { name = "lxml" },
     { name = "nbstripout" },
@@ -1133,7 +1131,6 @@ quality = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=1.9.0" },
-    { name = "click", specifier = ">=8.2.1" },
     { name = "datasets", specifier = ">=3.6.0,<4.0.0" },
     { name = "deepspeed", specifier = ">=0.17.4" },
     { name = "hydra-core", specifier = ">=1.1.1" },
@@ -1160,7 +1157,6 @@ provides-extras = ["kenlm"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "click", specifier = ">=8.1.7" },
     { name = "coverage", specifier = ">=5.5" },
     { name = "lxml", specifier = ">=6.1.0" },
     { name = "nbstripout", specifier = ">=0.7.1" },

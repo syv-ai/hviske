@@ -92,9 +92,10 @@ checkpoints with non-finite loss, severe Danish regression, repeated output, or
 unresolved data and privacy issues.
 
 After checkpoint selection, freeze the model, code, lockfile, revisions, development
-report, and decoding settings. Publish first to a private Hub repository with
-`src/scripts/publish_model.py`; verify that no local data, credentials, caches, or
-training artefacts are uploaded.
+report, and decoding settings. Run the final fine-tuning job with
+`push_to_hub=true private=true private_only=true` to publish to a private Hub
+repository; verify that no local data, credentials, caches, or training artefacts are
+uploaded.
 
 ## Non-goals
 

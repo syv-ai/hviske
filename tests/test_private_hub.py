@@ -25,7 +25,7 @@ from transformers import (
 )
 from transformers.trainer import Trainer
 
-import hviske.utils as utils
+import hviske.model_publication as publication
 
 
 class FakeRepositoryNotFoundError(Exception):
@@ -35,15 +35,13 @@ class FakeRepositoryNotFoundError(Exception):
 def test_generated_tdt_model_card_is_family_neutral(tmp_path: Path) -> None:
     """Generated TDT provenance never labels the package as Cohere."""
     destination = tmp_path / "README.md"
-    utils._stage_model_card(
+    publication._stage_model_card(
         destination=destination,
         finetuned_from="nvidia/parakeet-tdt-0.6b-v3",
         finetuned_from_revision="541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
         model_card_languages=["da", "en"],
         training_dataset_ids=["org/dataset"],
-        training_sources=[_source("org/dataset")],
         evaluation_status="Reviewed.",
-        reviewed_model_card=None,
     )
 
     card = destination.read_text(encoding="utf-8")
@@ -52,85 +50,15 @@ def test_generated_tdt_model_card_is_family_neutral(tmp_path: Path) -> None:
     assert "base_model: nvidia/parakeet-tdt-0.6b-v3" in card
 
 
-def _source(dataset_id: str) -> dict[str, object]:
-    """Return complete provenance metadata for publication tests."""
-    return {
-        "id": dataset_id,
-        "source": dataset_id,
-        "subset": "none",
-        "split": "train",
-        "revision": "sha256-test",
-        "probability": 1.0,
-        "language": "da",
-    }
-
-
-def test_model_card_frontmatter_accepts_exact_top_level_metadata() -> None:
-    """Valid frontmatter returns the exact required top-level strings."""
-    card = (
-        "---\n"
-        "license: openrail\n"
-        "base_model: org/base-model\n"
-        "base_model_revision: base-revision\n"
-        "---\n\n"
-        "# Private internal checkpoint\n"
-    )
-
-    assert utils._read_model_card_frontmatter(card) == {
-        "base_model": "org/base-model",
-        "base_model_revision": "base-revision",
-    }
-
-
-def test_model_card_frontmatter_rejects_multiple_blocks() -> None:
-    """A reviewed card must contain only one frontmatter block."""
-    card = (
-        "---\n"
-        "base_model: org/base-model\n"
-        "base_model_revision: base-revision\n"
-        "---\n\n"
-        "---\n"
-        "base_model: org/base-model\n"
-        "base_model_revision: base-revision\n"
-        "---\n"
-    )
-
-    assert utils._read_model_card_frontmatter(card) == {}
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    (
-        "metadata:\n  base_model: org/base-model\n"
-        "  base_model_revision: base-revision\n",
-        "base_model: [org/base-model]\nbase_model_revision: base-revision\n",
-        "base_model: org/base-model\nbase_model_revision: {value: base-revision}\n",
-        "base_model: null\nbase_model_revision: base-revision\n",
-        "base_model: [org/base-model\nbase_model_revision: base-revision\n",
-        'base_model: !!python/object/apply:os.system ["echo unsafe"]\n'
-        "base_model_revision: base-revision\n",
-        "base_model: org/base-model\nbase_model_revision: base-revision\n"
-        "base_model: duplicate\n",
-    ),
-)
-def test_model_card_frontmatter_rejects_unsafe_metadata(metadata: str) -> None:
-    """Frontmatter requires unique top-level scalar metadata."""
-    card = f"---\n{metadata}---\n\n# Body\n"
-
-    assert utils._read_model_card_frontmatter(card) == {}
-
-
 def test_model_card_requires_pinned_base_metadata(tmp_path: Path) -> None:
     """Generated cards cannot omit the exact base model revision."""
     with pytest.raises(ValueError, match="pinned base model revision"):
-        utils._stage_model_card(
+        publication._stage_model_card(
             destination=tmp_path / "README.md",
             finetuned_from="org/base-model",
             model_card_languages=["da", "en"],
             training_dataset_ids=["org/dataset"],
-            training_sources=[_source("org/dataset")],
             evaluation_status="Not evaluated.",
-            reviewed_model_card=None,
             finetuned_from_revision=None,
         )
 
@@ -140,10 +68,12 @@ def test_private_only_creates_missing_repository_as_private(
 ) -> None:
     """A missing destination is created privately and checked immediately."""
     api = FakeHubApi(private=None)
-    monkeypatch.setattr(utils, "HfApi", lambda **_: api)
-    monkeypatch.setattr(utils, "RepositoryNotFoundError", FakeRepositoryNotFoundError)
+    monkeypatch.setattr(publication, "HfApi", lambda **_: api)
+    monkeypatch.setattr(
+        publication, "RepositoryNotFoundError", FakeRepositoryNotFoundError
+    )
 
-    utils.ensure_private_hub_repository(repo_id="syvai/hviske-v6", token="token")
+    publication.ensure_private_hub_repository(repo_id="syvai/hviske-v6", token="token")
 
     assert api.create_calls[0]["private"] is True
     assert api.info_calls == 2
@@ -182,10 +112,12 @@ def test_private_only_refuses_existing_public_repository(
 ) -> None:
     """An existing public destination is never changed or uploaded to."""
     api = FakeHubApi(private=False)
-    monkeypatch.setattr(utils, "HfApi", lambda **_: api)
+    monkeypatch.setattr(publication, "HfApi", lambda **_: api)
 
     with pytest.raises(PermissionError, match="public repository"):
-        utils.ensure_private_hub_repository(repo_id="syvai/hviske-v6", token="token")
+        publication.ensure_private_hub_repository(
+            repo_id="syvai/hviske-v6", token="token"
+        )
 
     assert api.create_calls == []
 
@@ -193,13 +125,15 @@ def test_private_only_refuses_existing_public_repository(
 def test_private_only_refuses_private_false() -> None:
     """A private-only run cannot be configured as public."""
     with pytest.raises(ValueError, match="private=true"):
-        utils.validate_private_only_config({"private_only": True, "private": False})
+        publication.validate_private_only_config(
+            {"private_only": True, "private": False}
+        )
 
 
 def test_publication_accepts_native_cohere_save_and_reload(tmp_path: Path) -> None:
     """A native Transformers save passes validation and local reload."""
     _minimal_cohere_package(tmp_path)
-    assert utils._validate_model_package(tmp_path) == "cohere_asr"
+    assert publication._validate_model_package(tmp_path) == "cohere_asr"
 
     processor = CohereAsrProcessor.from_pretrained(tmp_path, local_files_only=True)
     model = CohereAsrForConditionalGeneration.from_pretrained(
@@ -266,7 +200,7 @@ def test_publication_accepts_native_parakeet_tdt_save(tmp_path: Path) -> None:
     """A saved TDT package follows the pinned Transformers artefact contract."""
     _minimal_tdt_package(tmp_path)
 
-    assert utils._validate_model_package(tmp_path) == "parakeet_tdt"
+    assert publication._validate_model_package(tmp_path) == "parakeet_tdt"
 
 
 def _minimal_tdt_package(folder: Path) -> None:
@@ -310,14 +244,14 @@ def test_publication_rejects_corrupt_weights(tmp_path: Path) -> None:
     _minimal_cohere_package(tmp_path, weights=False)
     (tmp_path / "model.safetensors").write_bytes(b"not safetensors")
     with pytest.raises(ValueError, match="Invalid safetensors"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_empty_or_card_only_package(tmp_path: Path) -> None:
     """A README or empty output cannot be uploaded as a model."""
     (tmp_path / "README.md").write_text("card", encoding="utf-8")
     with pytest.raises(ValueError, match="Cohere package is missing"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_expected_tensor_duplicated_into_another_shard(
@@ -342,7 +276,7 @@ def test_publication_rejects_expected_tensor_duplicated_into_another_shard(
         tmp_path / "model-00002-of-00002.safetensors",
     )
     with pytest.raises(ValueError, match="tensor set does not match"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_malformed_sharded_index(tmp_path: Path) -> None:
@@ -350,7 +284,7 @@ def test_publication_rejects_malformed_sharded_index(tmp_path: Path) -> None:
     _minimal_cohere_package(tmp_path, weights=False)
     (tmp_path / "model.safetensors.index.json").write_text("[]", encoding="utf-8")
     with pytest.raises(ValueError, match="Malformed sharded"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_malformed_tdt_processor(tmp_path: Path) -> None:
@@ -365,14 +299,14 @@ def test_publication_rejects_malformed_tdt_processor(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="wrong decoder_type"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_missing_processor(tmp_path: Path) -> None:
     """A weight file without Cohere processor essentials is incomplete."""
     _minimal_cohere_package(tmp_path, processor=False)
     with pytest.raises(ValueError, match="processor_config"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_missing_shard(tmp_path: Path) -> None:
@@ -388,14 +322,14 @@ def test_publication_rejects_missing_shard(tmp_path: Path) -> None:
         tmp_path / "model-00001-of-00002.safetensors",
     )
     with pytest.raises(ValueError, match="Incomplete sharded"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_missing_weights(tmp_path: Path) -> None:
     """Processor metadata alone is not a reloadable model."""
     _minimal_cohere_package(tmp_path, weights=False)
     with pytest.raises(ValueError, match="needs model"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_package_family_provenance_mismatch(tmp_path: Path) -> None:
@@ -407,7 +341,7 @@ def test_publication_rejects_package_family_provenance_mismatch(tmp_path: Path) 
     _minimal_cohere_package(source)
 
     with pytest.raises(ValueError, match="does not match publication provenance"):
-        utils._copy_model_artefacts(
+        publication._copy_model_artefacts(
             source=source, destination=destination, expected_model_type="parakeet_tdt"
         )
 
@@ -429,7 +363,7 @@ def test_publication_rejects_per_shard_tensor_set_mismatch(tmp_path: Path) -> No
         tmp_path / "model-00002-of-00002.safetensors",
     )
     with pytest.raises(ValueError, match="shard without that tensor"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_tensor_in_wrong_shard(tmp_path: Path) -> None:
@@ -448,7 +382,7 @@ def test_publication_rejects_tensor_in_wrong_shard(tmp_path: Path) -> None:
             {"decoder.weight": np.ones((1, 1), dtype=np.float32)}, tmp_path / name
         )
     with pytest.raises(ValueError, match="shard without that tensor"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_unindexed_shard_tensor(tmp_path: Path) -> None:
@@ -466,7 +400,7 @@ def test_publication_rejects_unindexed_shard_tensor(tmp_path: Path) -> None:
         tmp_path / "model-00001-of-00001.safetensors",
     )
     with pytest.raises(ValueError, match="unindexed tensors"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_wrong_model_type(tmp_path: Path) -> None:
@@ -474,7 +408,7 @@ def test_publication_rejects_wrong_model_type(tmp_path: Path) -> None:
     _minimal_cohere_package(tmp_path)
     (tmp_path / "config.json").write_text('{"model_type": "whisper"}', encoding="utf-8")
     with pytest.raises(ValueError, match="wrong model_type"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
 def test_publication_rejects_wrong_parakeet_family(tmp_path: Path) -> None:
@@ -489,33 +423,54 @@ def test_publication_rejects_wrong_parakeet_family(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="Unsupported model family"):
-        utils._validate_model_package(tmp_path)
+        publication._validate_model_package(tmp_path)
 
 
-def test_publish_fails_if_visibility_changes_after_upload(
+def test_push_stages_once_and_disables_trainer_push(
     monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The final visibility check rejects a repository made public mid-upload."""
+    """Trainer publication also uses the filtered staging directory once."""
     api = FakeHubApi(private=True)
-    monkeypatch.setattr(utils, "HfApi", lambda **_: api)
+    _populate_model_output(tmp_path)
+    trainer = t.cast(
+        Trainer,
+        SimpleNamespace(
+            hub_model_id="syvai/hviske-v6",
+            args=SimpleNamespace(
+                hub_model_id="syvai/hviske-v6",
+                output_dir=str(tmp_path),
+                push_to_hub=True,
+            ),
+            is_world_process_zero=lambda: True,
+            _finish_current_push=lambda: None,
+        ),
+    )
+    uploads: list[set[str]] = []
+    monkeypatch.setattr(publication, "HfApi", lambda **_: api)
 
-    def upload(**_: object) -> SimpleNamespace:
-        api.private = False
+    def upload(**kwargs: object) -> SimpleNamespace:
+        staging = Path(str(kwargs["folder_path"]))
+        uploads.append({item.name for item in staging.iterdir()})
         return SimpleNamespace()
 
-    monkeypatch.setattr(utils, "upload_folder", upload)
-    _populate_model_output(tmp_path)
-    with pytest.raises(PermissionError, match="public repository"):
-        utils.publish_model_folder(
-            folder_path=tmp_path,
-            repo_id="syvai/hviske-v6",
-            finetuned_from="org/base-model",
-            finetuned_from_revision="base-revision",
-            private=True,
-            model_card_languages=["da", "en"],
-            training_dataset_ids=["org/dataset"],
-            training_sources=[_source("org/dataset")],
-        )
+    monkeypatch.setattr(publication, "upload_folder", upload)
+
+    publication.push_model_to_hub(
+        trainer=trainer,
+        model_name="hviske-v6",
+        finetuned_from="org/base-model",
+        create_pr=False,
+        private=True,
+        private_only=True,
+        training_dataset_ids=["org/private-dataset"],
+        finetuned_from_revision="base-revision",
+    )
+
+    assert len(uploads) == 1
+    assert "README.md" in uploads[0]
+    assert "recording.wav" not in uploads[0]
+    assert trainer.args.push_to_hub is False
+    assert api.info_calls == 3
 
 
 def _populate_model_output(folder: Path) -> None:
@@ -541,149 +496,3 @@ def _populate_model_output(folder: Path) -> None:
     (folder / "nested").mkdir()
     (folder / "nested" / "config.json").write_text("forbidden", encoding="utf-8")
     (folder / "symlink.safetensors").symlink_to(folder / "model.safetensors")
-
-
-def test_publish_stages_exact_top_level_allowlist(
-    monkeypatch: MonkeyPatch, tmp_path: Path
-) -> None:
-    """Only regular top-level model artefacts and the generated card are staged."""
-    api = FakeHubApi(private=True)
-    staged_contents: list[set[str]] = []
-    staged_card: list[str] = []
-    upload_calls = 0
-    _populate_model_output(tmp_path)
-    monkeypatch.setattr(utils, "HfApi", lambda **_: api)
-
-    def upload(**kwargs: object) -> SimpleNamespace:
-        nonlocal upload_calls
-        upload_calls += 1
-        staging = Path(str(kwargs["folder_path"]))
-        staged_contents.append({item.name for item in staging.iterdir()})
-        staged_card.append((staging / "README.md").read_text(encoding="utf-8"))
-        return SimpleNamespace()
-
-    monkeypatch.setattr(utils, "upload_folder", upload)
-    monkeypatch.setenv("HUGGINGFACE_HUB_TOKEN", "token")
-
-    utils.publish_model_folder(
-        folder_path=tmp_path,
-        repo_id="syvai/hviske-v6",
-        finetuned_from="CohereLabs/cohere-transcribe-03-2026",
-        finetuned_from_revision="b1eacc2686a3d08ceaae5f24a88b1d519620bc09",
-        private=True,
-        model_card_languages=["da", "en"],
-        training_dataset_ids=["CoRal-project/coral-v3"],
-        training_sources=[_source("CoRal-project/coral-v3")],
-        evaluation_status="Evaluation ran during training.",
-    )
-
-    assert upload_calls == 1
-    assert staged_contents == [
-        {
-            "README.md",
-            "config.json",
-            "generation_config.json",
-            "model.safetensors",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "vocab.json",
-            "merges.txt",
-            "processor_config.json",
-            "chat_template.jinja",
-        }
-    ]
-    assert "license: openrail" in staged_card[0]
-    assert "CoRal-project/coral-v3" in staged_card[0]
-    assert "Private internal Danish-English ASR checkpoint" in staged_card[0]
-    assert str(tmp_path) not in staged_card[0]
-    assert api.info_calls == 3
-
-
-def test_push_stages_once_and_disables_trainer_push(
-    monkeypatch: MonkeyPatch, tmp_path: Path
-) -> None:
-    """Trainer publication also uses the filtered staging directory once."""
-    api = FakeHubApi(private=True)
-    _populate_model_output(tmp_path)
-    trainer = t.cast(
-        Trainer,
-        SimpleNamespace(
-            hub_model_id="syvai/hviske-v6",
-            args=SimpleNamespace(
-                hub_model_id="syvai/hviske-v6",
-                output_dir=str(tmp_path),
-                push_to_hub=True,
-            ),
-            is_world_process_zero=lambda: True,
-            _finish_current_push=lambda: None,
-        ),
-    )
-    uploads: list[set[str]] = []
-    monkeypatch.setattr(utils, "HfApi", lambda **_: api)
-
-    def upload(**kwargs: object) -> SimpleNamespace:
-        staging = Path(str(kwargs["folder_path"]))
-        uploads.append({item.name for item in staging.iterdir()})
-        return SimpleNamespace()
-
-    monkeypatch.setattr(utils, "upload_folder", upload)
-
-    utils.push_model_to_hub(
-        trainer=trainer,
-        model_name="hviske-v6",
-        finetuned_from="org/base-model",
-        create_pr=False,
-        private=True,
-        private_only=True,
-        training_dataset_ids=["org/private-dataset"],
-        finetuned_from_revision="base-revision",
-    )
-
-    assert len(uploads) == 1
-    assert "README.md" in uploads[0]
-    assert "recording.wav" not in uploads[0]
-    assert trainer.args.push_to_hub is False
-    assert api.info_calls == 3
-
-
-def test_reviewed_model_card_requires_exact_base_metadata(tmp_path: Path) -> None:
-    """Reviewed cards must carry matching base model and revision frontmatter."""
-    for name, metadata in (
-        ("missing", "base_model: org/base-model\n"),
-        ("wrong", "base_model: org/other-model\nbase_model_revision: base-revision\n"),
-        ("correct", "base_model: org/base-model\nbase_model_revision: base-revision\n"),
-    ):
-        card = tmp_path / f"{name}.md"
-        card.write_text(
-            f"---\nlicense: openrail\n{metadata}---\n\n"
-            "# Private internal checkpoint\n\n"
-            "org/dataset none train sha256-test 1.0 da\n",
-            encoding="utf-8",
-        )
-        destination = tmp_path / f"staged-{name}.md"
-        if name == "correct":
-            utils._stage_model_card(
-                destination=destination,
-                finetuned_from="org/base-model",
-                model_card_languages=["da", "en"],
-                training_dataset_ids=["org/dataset"],
-                training_sources=[_source("org/dataset")],
-                evaluation_status="Not evaluated.",
-                reviewed_model_card=card,
-                finetuned_from_revision="base-revision",
-            )
-            assert destination.read_text(encoding="utf-8") == card.read_text(
-                encoding="utf-8"
-            )
-        else:
-            with pytest.raises(ValueError, match="safe complete provenance"):
-                utils._stage_model_card(
-                    destination=destination,
-                    finetuned_from="org/base-model",
-                    model_card_languages=["da", "en"],
-                    training_dataset_ids=["org/dataset"],
-                    training_sources=[_source("org/dataset")],
-                    evaluation_status="Not evaluated.",
-                    reviewed_model_card=card,
-                    finetuned_from_revision="base-revision",
-                )

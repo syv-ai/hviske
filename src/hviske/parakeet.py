@@ -1,9 +1,12 @@
 """Model setup for Transformers-native NVIDIA Parakeet models."""
 
+import collections.abc as c
 import logging
 import os
 import typing as t
+from dataclasses import dataclass
 from functools import partial
+from numbers import Integral
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +24,8 @@ from transformers import (
     PreTrainedModel,
     Trainer,
 )
+from transformers.data.data_collator import DataCollatorMixin
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.parakeet.modeling_parakeet import (
     ParakeetRNNTDecoder,
     ParakeetRNNTJointNetwork,
@@ -28,8 +33,8 @@ from transformers.models.parakeet.modeling_parakeet import (
 from transformers.trainer_utils import EvalPrediction
 
 from .compute_metrics import compute_error_rate_metrics
-from .data_collators import DataCollatorParakeetWithPadding
 from .data_models import PreTrainedModelData, Processor
+from .dataloader_shutdown import start_worker_shutdown_watcher
 from .wav2vec2 import Wav2Vec2ModelSetup
 
 logger = logging.getLogger(__package__)
@@ -84,6 +89,118 @@ class ParakeetGenerationTrainer(Trainer):
         generated = generate(**generation_inputs)
         sequences = t.cast(torch.Tensor, getattr(generated, "sequences", generated))
         return loss, sequences.detach(), t.cast(torch.Tensor | None, labels)
+
+
+@dataclass
+class DataCollatorParakeetWithPadding(DataCollatorMixin):
+    """Pad Parakeet frame features, decoder inputs, and labels.
+
+    Parakeet receives log-mel features shaped ``(frames, feature_size)``.  The
+    feature extractor knows the feature size and frame padding value, so this
+    collator intentionally delegates padding rather than assuming a mel width.
+    Native RNNT and TDT decoder inputs are validated against the model's blank ID
+    before padding; tokenizer padding semantics are otherwise preserved.
+    """
+
+    processor: Processor
+    sample_rate: int
+    padding: bool | str
+    return_tensors: str = "pt"
+    model_config: object | None = None
+
+    def __post_init__(self) -> None:
+        """Reject frame padding without an explicit Parakeet frame length.
+
+        Raises:
+            ValueError:
+                If ``padding`` is ``"max_length"``.
+        """
+        if self.padding == "max_length":
+            raise ValueError(
+                "Parakeet does not support padding='max_length': a frame max_length "
+                "is required, but this configuration does not provide one. Use "
+                "padding='longest' instead."
+            )
+
+    def torch_call(self, features: list[dict]) -> BatchFeature:
+        """Collate preprocessed Parakeet features and padded labels.
+
+        Args:
+            features:
+                Examples containing ``input_features`` and optionally an
+                ``attention_mask``, plus token ID ``labels``. Transducer examples
+                also contain ``decoder_input_ids``.
+
+        Returns:
+            A batch suitable for a native Parakeet model.
+
+        Raises:
+            ValueError:
+                If examples do not contain preprocessed features or raw audio.
+        """
+        start_worker_shutdown_watcher()
+        has_decoder_inputs = any("decoder_input_ids" in feature for feature in features)
+        if has_decoder_inputs:
+            if any("decoder_input_ids" not in feature for feature in features):
+                raise ValueError(
+                    "Every Parakeet transducer feature must contain decoder_input_ids."
+                )
+            for feature in features:
+                validate_parakeet_transducer_inputs(
+                    decoder_input_ids=feature["decoder_input_ids"],
+                    labels=feature["labels"],
+                    processor=self.processor,
+                    model_config=self.model_config,
+                )
+
+        if "input_features" in features[0]:
+            audio_features = [
+                {
+                    key: feature[key]
+                    for key in ("input_features", "attention_mask")
+                    if key in feature
+                }
+                for feature in features
+            ]
+            batch = self.processor.feature_extractor.pad(
+                audio_features,
+                padding=self.padding,
+                return_attention_mask=True,
+                return_tensors=self.return_tensors,
+            )
+        elif "audio" in features[0]:
+            batch = self.processor.feature_extractor(
+                [feature["audio"]["array"] for feature in features],
+                sampling_rate=self.sample_rate,
+                padding=self.padding,
+                return_attention_mask=True,
+                return_tensors=self.return_tensors,
+            )
+        else:
+            raise ValueError(
+                "Parakeet features must contain either 'input_features' or 'audio'."
+            )
+
+        if "attention_mask" in batch:
+            batch["attention_mask"] = batch["attention_mask"].long()
+
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        labels_batch = self.processor.tokenizer.pad(
+            label_features, padding=self.padding, return_tensors=self.return_tensors
+        )
+        batch["labels"] = labels_batch["input_ids"]
+
+        if has_decoder_inputs:
+            decoder_features = [
+                {"input_ids": feature["decoder_input_ids"]} for feature in features
+            ]
+            decoder_batch = self.processor.tokenizer.pad(
+                decoder_features,
+                padding=self.padding,
+                return_tensors=self.return_tensors,
+            )
+            batch["decoder_input_ids"] = decoder_batch["input_ids"]
+        return batch
 
 
 class ParakeetModelSetup(Wav2Vec2ModelSetup):
@@ -462,6 +579,94 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         """Return Trainer or the generation-compatible RNNT Trainer."""
         family = self._load_family(model_id=str(self.config.model.pretrained_model_id))
         return Trainer if family == "ctc" else ParakeetGenerationTrainer
+
+
+def validate_parakeet_transducer_inputs(
+    decoder_input_ids: object,
+    labels: object,
+    processor: object,
+    model_config: object | None = None,
+) -> None:
+    """Require decoder IDs to be the unpadded blank-prefixed labels.
+
+    Raises:
+        ValueError:
+            If the IDs do not equal ``[blank_token_id, *labels]``.
+    """
+    resolved_blank_token_id = get_parakeet_blank_token_id(
+        processor=processor, model_config=model_config
+    )
+    actual_ids = _as_int_list(decoder_input_ids)
+    label_ids = _as_int_list(labels)
+    if actual_ids != [resolved_blank_token_id, *label_ids]:
+        raise ValueError(
+            "Parakeet transducer decoder_input_ids must contain exactly one more "
+            "token and equal [blank_token_id, *labels] before padding."
+        )
+
+
+def _as_int_list(values: object) -> list[int]:
+    """Convert tensor-like or iterable token IDs to a Python list.
+
+    Returns:
+        The token IDs as integers.
+
+    Raises:
+        TypeError:
+            If ``values`` is neither an integer nor an iterable.
+    """
+    if hasattr(values, "tolist"):
+        tolist = getattr(values, "tolist")
+        if callable(tolist):
+            values = tolist()
+    if isinstance(values, Integral):
+        return [int(values)]
+    if not isinstance(values, c.Iterable):
+        raise TypeError("Expected an integer or iterable of integers")
+    return [int(value) for value in t.cast(c.Iterable[int], values)]
+
+
+def get_parakeet_blank_token_id(
+    processor: object, model_config: object | None = None
+) -> int:
+    """Resolve a Parakeet blank ID without falling back to the pad ID.
+
+    Returns:
+        The configured blank token ID.
+
+    Raises:
+        ValueError:
+            If no usable blank token ID is exposed by the processor or configuration.
+    """
+    for source in (model_config, processor, getattr(processor, "tokenizer", None)):
+        blank_token_id = _configured_int(source, "blank_token_id")
+        if blank_token_id is not None:
+            return blank_token_id
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    blank_token = getattr(processor, "blank_token", None)
+    if blank_token is None:
+        blank_token = getattr(tokenizer, "blank_token", None)
+    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if blank_token is not None and callable(convert_tokens_to_ids):
+        converted_id = convert_tokens_to_ids(blank_token)
+        if isinstance(converted_id, Integral):
+            return int(converted_id)
+
+    raise ValueError(
+        "Parakeet transducer processor does not expose a usable blank_token_id."
+    )
+
+
+def _configured_int(source: object | None, name: str) -> int | None:
+    """Return an integer configuration value from an object or mapping."""
+    if source is None:
+        return None
+    if isinstance(source, c.Mapping):
+        value = source.get(name)
+    else:
+        value = getattr(source, name, None)
+    return int(value) if isinstance(value, Integral) else None
 
 
 def parakeet_family(config: PreTrainedConfig) -> ParakeetFamily:

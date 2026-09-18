@@ -11,7 +11,6 @@ from transformers.tokenization_utils_base import BatchEncoding
 
 from .data_models import Processor
 from .dataloader_shutdown import start_worker_shutdown_watcher
-from .parakeet_contract import validate_parakeet_transducer_inputs
 
 logger = logging.getLogger(__package__)
 
@@ -250,118 +249,6 @@ def _pad_length_backed_features(
         lengths.append(int(feature["length"]))
     batch = BatchFeature({"input_features": padded, "length": torch.tensor(lengths)})
     return batch.convert_to_tensors(return_tensors)
-
-
-@dataclass
-class DataCollatorParakeetWithPadding(DataCollatorMixin):
-    """Pad Parakeet frame features, decoder inputs, and labels.
-
-    Parakeet receives log-mel features shaped ``(frames, feature_size)``.  The
-    feature extractor knows the feature size and frame padding value, so this
-    collator intentionally delegates padding rather than assuming a mel width.
-    Native RNNT and TDT decoder inputs are validated against the model's blank ID
-    before padding; tokenizer padding semantics are otherwise preserved.
-    """
-
-    processor: Processor
-    sample_rate: int
-    padding: bool | str
-    return_tensors: str = "pt"
-    model_config: object | None = None
-
-    def __post_init__(self) -> None:
-        """Reject frame padding without an explicit Parakeet frame length.
-
-        Raises:
-            ValueError:
-                If ``padding`` is ``"max_length"``.
-        """
-        if self.padding == "max_length":
-            raise ValueError(
-                "Parakeet does not support padding='max_length': a frame max_length "
-                "is required, but this configuration does not provide one. Use "
-                "padding='longest' instead."
-            )
-
-    def torch_call(self, features: list[dict]) -> BatchFeature:
-        """Collate preprocessed Parakeet features and padded labels.
-
-        Args:
-            features:
-                Examples containing ``input_features`` and optionally an
-                ``attention_mask``, plus token ID ``labels``. Transducer examples
-                also contain ``decoder_input_ids``.
-
-        Returns:
-            A batch suitable for a native Parakeet model.
-
-        Raises:
-            ValueError:
-                If examples do not contain preprocessed features or raw audio.
-        """
-        start_worker_shutdown_watcher()
-        has_decoder_inputs = any("decoder_input_ids" in feature for feature in features)
-        if has_decoder_inputs:
-            if any("decoder_input_ids" not in feature for feature in features):
-                raise ValueError(
-                    "Every Parakeet transducer feature must contain decoder_input_ids."
-                )
-            for feature in features:
-                validate_parakeet_transducer_inputs(
-                    decoder_input_ids=feature["decoder_input_ids"],
-                    labels=feature["labels"],
-                    processor=self.processor,
-                    model_config=self.model_config,
-                )
-
-        if "input_features" in features[0]:
-            audio_features = [
-                {
-                    key: feature[key]
-                    for key in ("input_features", "attention_mask")
-                    if key in feature
-                }
-                for feature in features
-            ]
-            batch = self.processor.feature_extractor.pad(
-                audio_features,
-                padding=self.padding,
-                return_attention_mask=True,
-                return_tensors=self.return_tensors,
-            )
-        elif "audio" in features[0]:
-            batch = self.processor.feature_extractor(
-                [feature["audio"]["array"] for feature in features],
-                sampling_rate=self.sample_rate,
-                padding=self.padding,
-                return_attention_mask=True,
-                return_tensors=self.return_tensors,
-            )
-        else:
-            raise ValueError(
-                "Parakeet features must contain either 'input_features' or 'audio'."
-            )
-
-        if "attention_mask" in batch:
-            batch["attention_mask"] = batch["attention_mask"].long()
-
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-        labels_batch = self.processor.tokenizer.pad(
-            label_features, padding=self.padding, return_tensors=self.return_tensors
-        )
-        batch["labels"] = labels_batch["input_ids"]
-
-        if has_decoder_inputs:
-            decoder_features = [
-                {"input_ids": feature["decoder_input_ids"]} for feature in features
-            ]
-            decoder_batch = self.processor.tokenizer.pad(
-                decoder_features,
-                padding=self.padding,
-                return_tensors=self.return_tensors,
-            )
-            batch["decoder_input_ids"] = decoder_batch["input_ids"]
-        return batch
 
 
 @dataclass
