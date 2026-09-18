@@ -112,7 +112,7 @@ dataset_probabilities:
   - 0.025 # librispeech_clean_train_360
   - 0.045 # librispeech_other_train_500
 
-# Exact source metadata for the separate private publication step.
+# Exact source metadata included when the finetuning entry point publishes privately.
 training_dataset_ids:
   - syvai/p1-segments
   - syvai/danish-asr-unified

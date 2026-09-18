@@ -9,8 +9,6 @@ from hydra import compose
 from omegaconf import DictConfig, OmegaConf
 
 import hviske.experiment_tracking.wandb_setup as wandb_module
-import hviske.utils as utils
-from scripts.publish_private_model import training_sources_from_config
 
 P1_SEGMENTS_SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -297,34 +295,6 @@ def test_sparkie_evaluation_and_exclusions(monkeypatch: pytest.MonkeyPatch) -> N
     assert not Path("config/datasets/fleurs_en_us.yaml").exists()
 
 
-def test_sparkie_model_card_contains_safe_complete_provenance(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The generated card contains all source metadata but no local paths."""
-    config = _preset(monkeypatch)
-    sources = training_sources_from_config(config=config)
-    card_path = tmp_path / "README.md"
-    utils._stage_model_card(
-        destination=card_path,
-        finetuned_from=str(config.model.pretrained_model_id),
-        model_card_languages=list(config.model_card_languages),
-        training_dataset_ids=list(config.training_dataset_ids),
-        training_sources=sources,
-        evaluation_status="Pilot reviewed.",
-        reviewed_model_card=None,
-        finetuned_from_revision=str(config.model.revision),
-    )
-    card = card_path.read_text(encoding="utf-8")
-    for source in sources:
-        assert all(str(source[key]) in card for key in source)
-    assert str(tmp_path) not in card
-    assert str(config.datasets.drtv_local.manifest_path) not in card
-    assert "license: openrail" in card
-    assert "base_model: CohereLabs/cohere-transcribe-03-2026" in card
-    assert "base_model_revision: b1eacc2686a3d08ceaae5f24a88b1d519620bc09" in card
-    assert "Pilot reviewed." in card
-
-
 def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     """Training stays local and publication metadata names every Hub source."""
     config = _preset(monkeypatch)
@@ -360,74 +330,6 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
         "facebook/voxpopuli",
         "openslr/librispeech_asr",
     ]
-
-
-def test_sparkie_publication_provenance_is_complete(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Publication provenance covers Hub and local sources without paths."""
-    config = _preset(monkeypatch)
-    sources = training_sources_from_config(config=config)
-    source_ids = {str(source["id"]) for source in sources}
-    joined_ids = {
-        str(t.cast(dict[str, object], source["joined_transcript"])["dataset_id"])
-        for source in sources
-        if "joined_transcript" in source
-    }
-    overlay_ids = {
-        str(t.cast(dict[str, object], source["overlay"])["dataset_id"])
-        for source in sources
-        if "overlay" in source
-    }
-    assert set(config.training_dataset_ids).issubset(
-        source_ids | joined_ids | overlay_ids
-    )
-    overlay_sources = [source for source in sources if "overlay" in source]
-    assert len(overlay_sources) == 5
-    assert all(
-        t.cast(dict[str, object], source["overlay"])["revision"] == "9" * 40
-        for source in overlay_sources
-    )
-    for source in overlay_sources:
-        overlay = t.cast(dict[str, object], source["overlay"])
-        assert overlay["allowed_actions"] == ["keep", "relabel", "strip"]
-        assert overlay["recognised_actions"] == [
-            "keep",
-            "relabel",
-            "strip",
-            "drop",
-            "flag",
-            "quarantine",
-            "review",
-        ]
-    first_overlay = t.cast(dict[str, object], overlay_sources[0]["overlay"])
-    assert first_overlay["strategy"] == "positional"
-    assert first_overlay["filters"] == {"source": "coral_read_aloud"}
-    assert first_overlay["base_filters"] == {"source": "coral_read_aloud"}
-    assert first_overlay["equality_checks"] == {
-        "source": "source",
-        "text": "reference_text",
-    }
-    assert "text_policy" in first_overlay
-    assert all("path" not in str(source).lower() for source in overlay_sources)
-    assert {"local_vtt:drtv_local", "local_vtt:youtube_local"}.issubset(source_ids)
-    assert all(
-        all(
-            key in source
-            for key in ("subset", "split", "revision", "probability", "language")
-        )
-        for source in sources
-    )
-    assert all(
-        "/" not in str(source["revision"])
-        for source in sources
-        if source["id"].startswith("local_vtt:")
-    )
-    p1_sources = [source for source in sources if source["id"] == "syvai/p1-segments"]
-    assert len(p1_sources) == 1
-    assert p1_sources[0]["probability"] == TRAINING_PROBABILITIES[0]
-    assert p1_sources[0]["revision"] == P1_SEGMENTS_SHA
-    assert "joined_transcript" not in p1_sources[0]
 
 
 def test_sparkie_shuffle_buffers_are_source_specific(
@@ -475,20 +377,6 @@ def test_sparkie_training_order_and_probabilities(
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
     assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.6)
     assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
-    sources = training_sources_from_config(config=config)
-    assert sum(
-        float(t.cast(float, source["probability"])) for source in sources
-    ) == pytest.approx(1.0)
-    assert sum(
-        float(t.cast(float, source["probability"]))
-        for source in sources
-        if source["language"] == "da"
-    ) == pytest.approx(0.6)
-    assert sum(
-        float(t.cast(float, source["probability"]))
-        for source in sources
-        if source["language"] == "en"
-    ) == pytest.approx(0.4)
 
 
 def test_sparkie_wandb_payload_redacts_local_paths(

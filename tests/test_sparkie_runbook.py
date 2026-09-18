@@ -40,12 +40,12 @@ def test_sparkie_runbook_documents_materialised_worker_safety() -> None:
     assert "dataset_num_workers=1" in runbook
     assert "dataloader_num_workers=3" in runbook
     assert "HVISKE_MATERIALISED_OVERLAYS_ROOT" in runbook
-    assert "materialise_finetuning_overlays.py" in runbook
+    assert "package-level materialised-overlay implementation" in runbook
     assert "CLOSE-WAIT" in runbook
     assert "not a one-worker child process" in runbook
     assert "three spawned DataLoader workers" in runbook
     assert "85–86°C" in runbook
-    assert "equality checks strict during materialisation" in runbook
+    assert "positional equality checks strict" in runbook
     assert "do not relax them" in runbook
     assert "fails closed" in runbook
 

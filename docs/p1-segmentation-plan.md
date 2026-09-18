@@ -515,10 +515,10 @@ Update `config/datasets/p1.yaml` to read `syvai/p1-segments`, `train`, `audio`, 
 `text` at the final immutable revision. Remove all runtime transcript-join environment
 variables from the P1 path.
 
-Strengthen `src/scripts/preflight_finetuning_data.py` so P1 preflight retrieves and
-processes at least one genuine post-filter segment. It must decode the audio, verify
-text, duration, language, and required metadata, and prove that
-`load_data_for_finetuning` yields a training example.
+Ensure the general finetuning entry point retrieves and processes at least one
+genuine post-filter P1 segment. It must decode the audio, verify text, duration,
+language, and required metadata, and prove that `load_data_for_finetuning` yields a
+training example.
 
 Update `SPARKIE.md` and tests with the pinned derived revision.
 

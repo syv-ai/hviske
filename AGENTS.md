@@ -52,7 +52,7 @@ Hydra entry points accept `key=value` overrides. Common examples are:
 uv run python src/scripts/finetune_asr_model.py model=wav2vec2-small
 uv run python src/scripts/evaluate_model.py model_id=ORG/MODEL
 uv run python src/scripts/run_asr_demo.py
-uv run python src/scripts/train_ngram_decoder.py model=wav2vec2-small
+uv run python src/scripts/finetune_asr_model.py model=wav2vec2-small
 ```
 
 Hydra `config_path` values such as `../../config` are relative to the declaring

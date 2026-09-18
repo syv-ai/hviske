@@ -96,7 +96,7 @@ be absent, but the resolved base and overlay basename order must match.
 Common Voice, GigaSpeech, SPGISpeech, older CoRal data, and CoRal TTS are not part of
 this run.
 
-## Local manifests and bounded preflight
+## Local manifests and bounded validation
 
 Build compact manifests from the existing WAV/VTT directories. This records paths and
 cue offsets without copying audio:
@@ -112,33 +112,22 @@ uv run python src/scripts/build_vtt_manifest.py \
   --language da
 ```
 
-Materialise the five positional overlays before preflight. The command resolves the
-pinned mirrored base and overlay files, applies the same strict action, text, equality,
-and row-count semantics one physical shard at a time, and stores only embedded
-compressed audio bytes, final text, and source. It is bounded by one shard, retains a
-10 GiB free-disk reserve by default, resumes validated shard receipts, and publishes a
-deterministic manifest plus `COMPLETE` marker only after every checksum and schema
-passes. Never point training at an incomplete directory.
+The production preset requires an already prepared materialised-overlay artefact.
+Set `HVISKE_MATERIALISED_OVERLAYS_ROOT` to that artefact before resolving the preset;
+Sparkie fails closed when the variable is absent or invalid and never falls back to a
+remote positional join. Use the general finetuning entry point for configuration checks
+and training:
 
 ```bash
 export HVISKE_MATERIALISED_OVERLAYS_ROOT="$HOME/hviske-v6-overlays"
-uv run python src/scripts/materialise_finetuning_overlays.py \
-  --config-name sparkie_bilingual \
-  --output-root "$HVISKE_MATERIALISED_OVERLAYS_ROOT"
 uv run python src/scripts/finetune_asr_model.py \
   --config-name sparkie_bilingual --cfg job
-uv run python src/scripts/preflight_finetuning_data.py \
-  --config-name sparkie_bilingual
-uv run pytest tests/test_materialised_overlays.py tests/test_sparkie_config.py \
-  tests/test_wandb_setup.py tests/test_preflight_finetuning_data.py -q
 ```
 
-The preflight validates the same complete marker, manifest, immutable revisions,
-source/file provenance, Parquet schemas, counts, receipts, and checksums before any
-materialised stream is opened. It also checks Hub authentication and the remaining
-remote sources without logging signed URLs. Sparkie fails closed when
-`HVISKE_MATERIALISED_OVERLAYS_ROOT` is absent or invalid; it never falls back to the
-remote positional join.
+The package-level materialised-overlay implementation validates immutable revisions,
+source/file provenance, Parquet schemas, counts, receipts, and checksums before a
+materialised stream is opened. Keep positional equality checks strict and never point
+training at an incomplete directory.
 
 The preset deliberately uses `dataset_num_workers=1` and
 `dataloader_num_workers=3`. For regular datasets, `dataset_num_workers=1` maps to
@@ -184,8 +173,8 @@ remain fatal, and local/materialised Parquet reads do not use this policy. Keep 
 bounds conservative for multi-week runs; repeated exhaustion is an operational failure
 to investigate rather than an invitation to increase the retry budget.
 
-Do not proceed if any preflight check fails. Fix access, schema, revision, or local-file
-errors and rerun the complete preflight. If a run hangs during validation materialisation,
+Do not proceed if any validation check fails. Fix access, schema, revision, or local-file
+errors before retrying. If a run hangs during validation materialisation,
 stop that tmux session, leave `dataset_num_workers` at 1 (in-process preprocessing), and
 restart the same command (or the resume command below after a checkpoint exists); do not
 retry by increasing preprocessing workers.
@@ -317,23 +306,9 @@ The preset retains at most three checkpoints. Stop the run if free disk space, G
 memory, temperatures, or repeated streaming failures become unsafe. Preserve enough
 free space for the next checkpoint and final model save.
 
-## Explicit private publication
+## Private publication
 
-Publish only after reviewing the selected pilot or full-run checkpoint. The separate
-command requires `--private`, refuses a public destination, verifies private visibility
-immediately before and after the single staged upload, and stages only a complete
-reloadable Cohere package plus a strict model card. Trainer-side publication remains
-disabled. It resolves the preset automatically, including both local Danish manifest
-sources (without their paths), every Hub source, revisions, splits, languages,
-probabilities, licence, base model, and evaluation status. A reviewed card may be
-supplied only after it has been checked against that metadata; local audio and manifests
-must never be uploaded.
-
-```bash
-uv run python src/scripts/publish_private_model.py \
-  models/hviske-v6.0 syvai/hviske-v6.0 --private \
-  --evaluation-status 'Pilot and full-run evaluation reviewed before publication.'
-```
-
-Never use a public destination or upload raw audio, local manifests, Hydra output,
+The Sparkie preset keeps automatic publication disabled. Publish only after reviewing
+the selected pilot or full-run checkpoint, and verify that the Hub destination is
+private before and after upload. Never upload raw audio, local manifests, Hydra output,
 checkpoints, caches, or experiment-tracking artefacts.

@@ -4,8 +4,9 @@
 
 The production consumer now loads `syvai/p1-segments` directly as a normal Hub dataset
 with `audio` and `text`. Training remains gated until the manually gated dataset's final
-immutable revision is supplied as `P1_SEGMENTS_REVISION` and the complete data preflight
-passes; the revision must not be replaced with a moving branch or a provisional snapshot.
+immutable revision is supplied as `P1_SEGMENTS_REVISION` and the complete data
+validation passes; the revision must not be replaced with a moving branch or a
+provisional snapshot.
 
 ## Decision summary
 
@@ -232,7 +233,7 @@ Sparkie corpus.
 Treat `syvai/danish-asr-unified-hviske-v5-tiny` as a quality and relabelling manifest,
 not as an audio dataset. It has no audio column. The overlay main branch is moving, so
 v6.0 does not carry a stale overlay SHA. Set `HVISKE_OVERLAY_REVISION` to the completed,
-immutable 40-character overlay commit before preflight or training; the five active unified
+immutable 40-character overlay commit before validation or training; the five active unified
 Danish sources all resolve that same environment value. Keep the matching unified-audio
 revision (`5a3a49ee981baab6e1e37ddd2c45f9943c27d08f`) in the source configurations until
 the overlay completion is pinned.
@@ -264,10 +265,10 @@ NST so the existing per-source sampling weights remain explicit. The unified rep
 and its overlay remain part of training provenance through those sources. Each stream
 uses the same source filter on the base and overlay, strict positional row matching,
 source and reference-text equality checks, and the ordered
-`new_text`-then-`reference_text` fallback for relabel/strip actions. The preparation
-command applies the reusable strict overlay join one mirrored physical shard at a time
-and writes only embedded compressed audio bytes, final text, and source to checksummed
-local Parquet shards. Training and preflight require the deterministic
+`new_text`-then-`reference_text` fallback for relabel/strip actions. The package-level
+implementation applies the reusable strict overlay join one mirrored physical shard at a
+time and writes only embedded compressed audio bytes, final text, and source to
+checksummed local Parquet shards. Training and validation require the deterministic
 manifest and complete marker through `HVISKE_MATERIALISED_OVERLAYS_ROOT`; they fail
 closed rather than returning to remote positional joins. This safe local graph supports
 three spawned DataLoader workers while keeping dataset preprocessing serial and avoiding
@@ -464,7 +465,7 @@ This can start before the final datasets are available.
 - Add a source-filtered join from the compact v5-tiny manifest to the pinned unified
   audio repository.
 - Update P1 configuration to consume `syvai/p1-segments` directly.
-- Strengthen preflight so every source reaches a real processed training batch.
+- Strengthen validation so every source reaches a real processed training batch.
 - Add manifest statistics, benchmark exclusion, and cross-source deduplication.
 - Update the Sparkie preset and tests to the predeclared v6.0 group-mass matrix.
 
@@ -482,15 +483,15 @@ Run in parallel with workstream A.
 - Draft the model card with placeholders for final revisions, counts, hours, and scores.
 - Define the Hub repository as private by default.
 
-### Gate 1: data-only Sparkie preflight
+### Gate 1: data-only Sparkie validation
 
 Set `P1_SEGMENTS_REVISION`, `HVISKE_OVERLAY_REVISION`, and
-`HVISKE_MATERIALISED_OVERLAYS_ROOT` before resolving the preset. First run
-`src/scripts/materialise_finetuning_overlays.py` against the pinned revisions. It
-establishes strict extra-row, missing-row, action/text, source, and equality gates while
-writing one paired physical shard at a time. Preflight rejects mutable revisions and
-validates the same manifest, complete marker, source/file provenance, schemas, counts,
-receipts, and checksums before any local shard is opened.
+`HVISKE_MATERIALISED_OVERLAYS_ROOT` before resolving the preset. The package-level
+materialised-overlay implementation establishes strict extra-row, missing-row,
+action/text, source, and equality gates while writing one paired physical shard at a
+time. The finetuning entry point rejects mutable revisions and validates the same
+manifest, complete marker, source/file provenance, schemas, counts, receipts, and
+checksums before any local shard is opened.
 
 Keep the existing GPU service running during this gate. In the same container and mounts
 that training will use:
@@ -635,11 +636,11 @@ leaderboard maintainers independently reproduce and publish the result.
 - pin it and the matching unified audio revision;
 - materialise the compact clean manifest;
 - reconcile all action and source counts; and
-- run the complete data-only Sparkie preflight.
+- run the complete data-only Sparkie validation.
 
 ### First free GPU window
 
-- stop the conflicting GPU service only after preflight;
+- stop the conflicting GPU service only after validation;
 - run the two-step smoke; and
 - launch the direct full run at the 200,000-step horizon.
 

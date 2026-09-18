@@ -97,12 +97,9 @@ Here are some of the more important available keys:
   to the Hugging Face Hub, and if so, which organisation to push it to. If `private` is
   set to `True`, the model will be private. The default is not to push the model to the
   Hub. `private_only` hard-fails public destinations and verifies Hub visibility before
-  and after upload. The production Sparkie preset keeps publication off during training;
-  use its separate `publish_private_model.py` command after review. Publication stages
-  only a complete reloadable Cohere package and a strict provenance model card. The
-  command resolves the preset automatically, including Hub revisions and source
-  probabilities; local manifest paths are never included. Trainer automatic pushes
-  remain disabled.
+  and after upload. The production Sparkie preset keeps publication off during training.
+  Enable publication through the general finetuning entry point only after confirming
+  the destination and privacy settings; local manifest paths must never be included.
 - `enable_experiment_tracking`: Whether training monitoring during training should be
   enabled. Defaults to false. You can also set `experiment_tracking` to either `wandb`
   or `mlflow` to specify which experiment tracking tool to use (`wandb` is used by
@@ -151,13 +148,11 @@ is consumed; the manifest stores paths, offsets, text, IDs, durations, and langu
 
 The reproducible Sparkie bilingual preset is `config/sparkie_bilingual.yaml`. Export
 `P1_SEGMENTS_REVISION` and `HVISKE_OVERLAY_REVISION` with their immutable
-40-character commits, resolve the preset with the existing fixed Hydra entry point using
-`--config-name sparkie_bilingual`, then run the bounded data preflight before stopping
-other Sparkie services:
+40-character commits, then resolve the preset with the general finetuning entry point:
 
 ```bash
-uv run python src/scripts/preflight_finetuning_data.py \
-  --config-name sparkie_bilingual
+uv run python src/scripts/finetune_asr_model.py \
+  --config-name sparkie_bilingual --cfg job
 ```
 
 The production preset caps validation materialisation at 1,000 examples per dataset.
@@ -165,7 +160,7 @@ Use `max_validation_samples_per_dataset=32` for a two-step smoke, `=256` for a p
 and `=1000` for the long run; the smoke must never materialise full validation.
 
 The complete operational procedure, including smoke, pilot, full tmux run, monitoring,
-checkpoint retention, and the separate private publication command, is in
+and checkpoint retention, is in
 [`SPARKIE.md`](SPARKIE.md).
 
 See all the finetuning options in the `config/asr_finetuning.yaml` file.

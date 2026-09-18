@@ -137,8 +137,8 @@ Before any smoke:
 Use Hugging Face's stored authentication. Never print tokens, `.env`, request headers,
 or credential-bearing URLs.
 
-**Gate:** the strengthened preflight and all 33 benchmark-focused tests pass inside the
-same container used for training.
+**Gate:** the strengthened data validation and all 33 benchmark-focused tests pass
+inside the same container used for training.
 
 ## Phase 1: serial two-step smokes
 
