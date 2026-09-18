@@ -43,6 +43,8 @@
 
 ### Fixed
 
+- Retried Hugging Face HTTP 499 client-closed responses during remote streaming,
+  preventing transient proxy cancellations from terminating long training runs.
 - Ensured a process-local shutdown watcher lets spawned DataLoader workers that are idle
   or prefetched exit cleanly after the terminal sentinel without needing to enter Hub
   retry code.

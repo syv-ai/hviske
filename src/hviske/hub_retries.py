@@ -36,7 +36,7 @@ Result = t.TypeVar("Result")
 logger = logging.getLogger(__name__)
 
 _POLICY_ENV = "HVISKE_HUB_STREAMING_RETRY_POLICY"
-_RETRYABLE_STATUS_CODES = frozenset({429})
+_RETRYABLE_STATUS_CODES = frozenset({429, 499})
 
 
 @dataclasses.dataclass(frozen=True)

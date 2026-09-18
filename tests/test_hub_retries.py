@@ -96,13 +96,14 @@ def test_deterministic_error_is_not_retried(
     assert calls == 1
 
 
-def test_range_read_retries_closed_client_and_5xx(
+def test_range_read_retries_closed_client_and_remote_failures(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A closed client and a server outage are retried without exposing the URL."""
+    """Transient remote failures are retried without exposing the URL."""
     client = _FakeClient(
         [
             RuntimeError("Cannot send a request, as the client has been closed."),
+            _response(499),
             _response(503),
             _response(200, b"parquet bytes"),
         ]
@@ -119,7 +120,7 @@ def test_range_read_retries_closed_client_and_5xx(
     remote_file = SimpleNamespace(
         fs=SimpleNamespace(
             _api=SimpleNamespace(_build_hf_headers=lambda: {}),
-            _retry_policy=HubRetryPolicy(max_retries=3),
+            _retry_policy=HubRetryPolicy(max_retries=4),
         ),
         url=lambda: "https://huggingface.co/dataset/file?X-Amz-Signature=secret",
     )
@@ -130,10 +131,10 @@ def test_range_read_retries_closed_client_and_5xx(
         )
         == b"parquet bytes"
     )
-    assert client.calls == 3
+    assert client.calls == 4
     assert len(closed_clients) == 1
-    assert sleeps == [1.0, 2.0]
-    assert caplog.text.count("Transient Hugging Face Hub read failed; retrying in") == 2
+    assert sleeps == [1.0, 2.0, 4.0]
+    assert caplog.text.count("Transient Hugging Face Hub read failed; retrying in") == 3
     assert "X-Amz-Signature=secret" not in caplog.text
 
 
