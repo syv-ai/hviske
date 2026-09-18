@@ -1,6 +1,0 @@
-drtv_local:
-  type: local_vtt
-  manifest_path: ${oc.env:HOME}/drtv-asr-dataset/data/drtv/drtv-manifest.jsonl
-  language: da
-  local_vtt_num_shards: 16
-  shuffle_buffer_size: 128

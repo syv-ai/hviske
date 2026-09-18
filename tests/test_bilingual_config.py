@@ -15,8 +15,6 @@ P1_SEGMENTS_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 TRAINING_NAMES = [
     "p1",
-    "drtv_local",
-    "youtube_local",
     "coral_read_aloud",
     "coral_conversation",
     "ftspeech",
@@ -32,8 +30,6 @@ TRAINING_NAMES = [
 ]
 TRAINING_IDS = [
     "syvai/p1-segments",
-    "local_vtt",
-    "local_vtt",
     "syvai/danish-asr-unified",
     "syvai/danish-asr-unified",
     "syvai/danish-asr-unified",
@@ -48,21 +44,19 @@ TRAINING_IDS = [
     "openslr/librispeech_asr",
 ]
 TRAINING_PROBABILITIES = [
-    0.102857,
-    0.128571,
-    0.09,
-    0.017143,
-    0.128572,
-    0.09,
-    0.021428,
-    0.021429,
-    0.16,
-    0.04,
-    0.03,
-    0.09,
-    0.01,
-    0.025,
-    0.045,
+    0.131626801667,
+    0.021938013562,
+    0.164534461864,
+    0.115173611422,
+    0.027421557173,
+    0.027422836880,
+    0.204753086973,
+    0.051188271743,
+    0.038391203807,
+    0.115173611422,
+    0.012797067936,
+    0.031992669839,
+    0.057586805712,
 ]
 
 
@@ -177,18 +171,11 @@ def test_bilingual_dataset_coordinates_and_revisions(
         }.items()
     )
     assert dict(datasets.nst.filters) == {"source": "nst_da"}
-    assert dict(datasets.nst.overlay.base_filters) == {"source": "nst_da"}
-    assert dict(datasets.nst.overlay.filters) == {"source": "nst_da"}
     assert [
         name
         for name, dataset in datasets.items()
         if dataset.get("id") == "syvai/danish-asr-unified"
     ] == ["coral_read_aloud", "coral_conversation", "ftspeech", "nota", "nst"]
-    assert all(
-        dataset.overlay.revision == "9" * 40
-        for dataset in datasets.values()
-        if dataset.get("overlay") is not None
-    )
     expected_shard_ranges = {
         "nota": (354, 367),
         "ftspeech": (367, 563),
@@ -204,14 +191,6 @@ def test_bilingual_dataset_coordinates_and_revisions(
     for name, bounds in expected_shard_ranges.items():
         dataset = datasets[name]
         assert dataset.data_file_shards.template == "data/train-{shard:05d}.parquet"
-        assert (
-            dataset.overlay.data_file_shards.start,
-            dataset.overlay.data_file_shards.end,
-        ) == bounds
-        assert (
-            dataset.overlay.data_file_shards.template
-            == dataset.data_file_shards.template
-        )
 
 
 def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
@@ -221,7 +200,6 @@ def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
         The resolved Sparkie preset.
     """
     monkeypatch.setenv("P1_SEGMENTS_REVISION", P1_SEGMENTS_SHA)
-    monkeypatch.setenv("HVISKE_OVERLAY_REVISION", "9" * 40)
     return compose(config_name="bilingual")
 
 
@@ -309,7 +287,6 @@ def test_bilingual_private_publication_metadata(
     assert list(config.training_dataset_ids) == [
         "syvai/p1-segments",
         "syvai/danish-asr-unified",
-        "syvai/danish-asr-unified-hviske-v5-tiny",
         "MLCommons/peoples_speech",
         "edinburghcstr/ami",
         "facebook/voxpopuli",
@@ -325,8 +302,6 @@ def test_bilingual_shuffle_buffers_are_source_specific(
 
     expected_buffers = {
         "p1": 1,
-        "drtv_local": 128,
-        "youtube_local": 128,
         "coral_read_aloud": 16,
         "coral_conversation": 16,
         "ftspeech": 16,
@@ -353,44 +328,30 @@ def test_bilingual_training_order_and_probabilities(
     """The preset keeps source order aligned with the approved probabilities."""
     config = _preset(monkeypatch)
 
-    assert len(config.datasets) == 15
+    assert len(config.datasets) == 13
     assert list(config.datasets) == TRAINING_NAMES
     assert [
         dataset.get("id", dataset.get("type")) for dataset in config.datasets.values()
     ] == TRAINING_IDS
     assert list(config.dataset_probabilities) == TRAINING_PROBABILITIES
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
-    assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.6)
-    assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
 
 
-def test_bilingual_wandb_payload_redacts_local_paths(
+def test_bilingual_wandb_payload_has_no_overlay_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The resolved production payload contains no local filesystem locations."""
+    """The resolved production payload contains only base dataset sources."""
     payload = wandb_module._resolved_config_payload(config=_preset(monkeypatch))
 
     assert payload["model_dir"] == "[REDACTED]"
     assert payload["cache_dir"] is None
     datasets = t.cast(dict[str, object], payload["datasets"])
-    drtv = t.cast(dict[str, object], datasets["drtv_local"])
-    youtube = t.cast(dict[str, object], datasets["youtube_local"])
-    assert drtv["manifest_path"] == "[REDACTED]"
-    assert youtube["manifest_path"] == "[REDACTED]"
-
-
-def test_bilingual_worker_counts_require_local_overlay_artifact(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Local shards enable workers while Hub preprocessing remains serial."""
-    config = _preset(monkeypatch)
-
-    assert config.dataset_num_workers == 1
-    assert config.dataloader_num_workers == 2
-    assert config.require_materialised_overlays is True
-    assert config.materialised_overlay_root is None
-    assert config.datasets.drtv_local.local_vtt_num_shards >= 4
-    assert config.datasets.youtube_local.local_vtt_num_shards >= 4
+    assert "drtv_local" not in datasets
+    assert "youtube_local" not in datasets
+    assert all(
+        isinstance(dataset, dict) and "overlay" not in dataset
+        for dataset in datasets.values()
+    )
 
 
 def test_p1_segments_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -422,11 +383,3 @@ def test_p1_segments_revision_rejects_mutable_or_invalid_values(
         validate_immutable_source_revision(
             str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
         )
-
-
-def test_youtube_local_manifest_is_danish() -> None:
-    """The Sparkie YouTube manifest uses Danish VTT transcripts."""
-    contents = Path("config/datasets/youtube_local.yaml").read_text()
-
-    assert "language: da" in contents
-    assert "language: en" not in contents
