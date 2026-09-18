@@ -18,6 +18,8 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCTC,
+    # Transformers 5.17 provides the native Parakeet RNNT mapping.
+    AutoModelForRNNT,
     AutoModelForTDT,
     AutoProcessor,
     PreTrainedConfig,
@@ -31,11 +33,12 @@ from transformers.models.parakeet.modeling_parakeet import (
     ParakeetRNNTJointNetwork,
 )
 from transformers.trainer_utils import EvalPrediction
+from transformers.training_args import TrainingArguments
 
+from .base_model_setup import BaseModelSetup
 from .compute_metrics import compute_error_rate_metrics
 from .data_models import PreTrainedModelData, Processor
 from .dataloader_shutdown import start_worker_shutdown_watcher
-from .wav2vec2 import Wav2Vec2ModelSetup
 
 logger = logging.getLogger(__package__)
 
@@ -44,6 +47,35 @@ ParakeetFamily: t.TypeAlias = t.Literal["ctc", "rnnt", "tdt"]
 
 
 _TRANSDUCER_FAMILIES = frozenset(("rnnt", "tdt"))
+# Keep the old import available for callers that patched the generic auto loader.
+_LEGACY_AUTO_MODEL = AutoModel
+
+
+class ParakeetDecoderStrategy:
+    """Contract for one native Parakeet decoder family."""
+
+    family: ParakeetFamily
+
+    def label_padding_id(self, processor: object, model_config: object | None) -> int:
+        """Return the sentinel used for padded transcript labels."""
+        pad_token_id = getattr(getattr(processor, "tokenizer", None), "pad_token_id", 0)
+        return int(pad_token_id)
+
+    def load_model(
+        self, model_id: str, kwargs: dict[str, str | bool]
+    ) -> PreTrainedModel:
+        """Load a checkpoint with this decoder's native auto class."""
+        raise NotImplementedError
+
+    def resize_model_vocabulary(
+        self, model: PreTrainedModel, vocabulary_size: int
+    ) -> None:
+        """Resize this decoder's vocabulary-dependent output modules."""
+        raise NotImplementedError
+
+    def trainer_class(self) -> type[Trainer]:
+        """Return the trainer required by this decoder's output contract."""
+        return Trainer
 
 
 class ParakeetGenerationTrainer(Trainer):
@@ -107,6 +139,7 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
     padding: bool | str
     return_tensors: str = "pt"
     model_config: object | None = None
+    decoder_strategy: ParakeetDecoderStrategy | None = None
 
     def __post_init__(self) -> None:
         """Reject frame padding without an explicit Parakeet frame length.
@@ -121,6 +154,12 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
                 "is required, but this configuration does not provide one. Use "
                 "padding='longest' instead."
             )
+        if self.decoder_strategy is None:
+            decoder_type = str(getattr(self.processor, "decoder_type", "")).lower()
+            if decoder_type in {"ctc", "rnnt", "tdt"}:
+                self.decoder_strategy = parakeet_decoder_strategy(decoder_type)
+            else:
+                self.decoder_strategy = parakeet_decoder_strategy("ctc")
 
     def torch_call(self, features: list[dict]) -> BatchFeature:
         """Collate preprocessed Parakeet features and padded labels.
@@ -189,6 +228,13 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
             label_features, padding=self.padding, return_tensors=self.return_tensors
         )
         batch["labels"] = labels_batch["input_ids"]
+        if self.decoder_strategy is not None and self.decoder_strategy.family == "rnnt":
+            blank_token_id = self.decoder_strategy.label_padding_id(
+                processor=self.processor, model_config=self.model_config
+            )
+            for index, feature in enumerate(features):
+                label_length = len(_as_int_list(feature["labels"]))
+                batch["labels"][index, label_length:] = blank_token_id
 
         if has_decoder_inputs:
             decoder_features = [
@@ -203,11 +249,11 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
         return batch
 
 
-class ParakeetModelSetup(Wav2Vec2ModelSetup):
+class ParakeetModelSetup(BaseModelSetup):
     """Model setup for Transformers-native NVIDIA Parakeet checkpoints.
 
-    CTC checkpoints are loaded through ``AutoModelForCTC``.  RNNT and TDT use
-    their native Transformers auto classes and share the transducer data path.
+    CTC, RNNT, and TDT checkpoints use their native Transformers auto classes;
+    transducers share only their common data path.
     """
 
     def __init__(self, config: DictConfig) -> None:
@@ -220,6 +266,43 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         super().__init__(config=config)
         self.processor: Processor
         self.model_config: PreTrainedConfig | None = None
+        self.decoder_strategy: ParakeetDecoderStrategy | None = None
+
+    @staticmethod
+    def _resize_ctc_head(model: PreTrainedModel, vocabulary_size: int) -> None:
+        """Resize a CTC head while retaining its pretrained rows.
+
+        Raises:
+            ValueError:
+                If the model does not expose a CTC head or the target vocabulary
+                would discard existing output rows.
+        """
+        head = getattr(model, "ctc_head", None)
+        if not isinstance(head, nn.Conv1d):
+            raise ValueError("Native Parakeet CTC model does not provide ctc_head.")
+        if head.out_channels > vocabulary_size:
+            raise ValueError("The adapted tokenizer is smaller than the CTC head.")
+        if head.out_channels < vocabulary_size:
+            new_head = type(head)(
+                in_channels=head.in_channels,
+                out_channels=vocabulary_size,
+                kernel_size=head.kernel_size,
+                stride=head.stride,
+                padding=head.padding,
+                dilation=head.dilation,
+                groups=head.groups,
+                bias=head.bias is not None,
+                padding_mode=head.padding_mode,
+                device=head.weight.device,
+                dtype=head.weight.dtype,
+            )
+            model._init_weights(new_head)
+            with torch.no_grad():
+                new_head.weight[: head.out_channels].copy_(head.weight)
+                if head.bias is not None and new_head.bias is not None:
+                    new_head.bias[: head.out_channels].copy_(head.bias)
+            model.ctc_head = new_head
+        model.config.vocab_size = vocabulary_size
 
     @staticmethod
     def _resize_rnnt_heads(model: PreTrainedModel, vocabulary_size: int) -> None:
@@ -325,34 +408,67 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         if generation_config is not None and blank_token_id is not None:
             generation_config.decoder_start_token_id = blank_token_id
 
-    def load_model(self) -> PreTrainedModel:
-        """Load the model class selected from the Transformers checkpoint config.
+    def load_processor(self) -> Processor:
+        """Load the Transformers-native Parakeet processor.
 
         Returns:
-            A Parakeet CTC or RNNT model.
+            The Parakeet processor.
 
+        Raises:
+            ValueError:
+                If the checkpoint is not packaged for Transformers.
         """
         model_id = str(self.config.model.pretrained_model_id)
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_id, **self._hub_kwargs(model_id=model_id)
+            )
+        except (OSError, ValueError, KeyError) as error:
+            raise ValueError(
+                f"Parakeet checkpoint {model_id!r} is not a Transformers-native "
+                "checkpoint. NeMo collection .nemo files are unsupported; use a "
+                "checkpoint with config.json and processor files."
+            ) from error
+        if not hasattr(processor, "feature_extractor") or not hasattr(
+            processor, "tokenizer"
+        ):
+            raise ValueError(
+                f"Parakeet checkpoint {model_id!r} does not provide a "
+                "Transformers feature extractor and tokenizer."
+            )
         family = self._load_family(model_id=model_id)
-        kwargs = self._hub_kwargs()
-        if family == "ctc":
-            model = AutoModelForCTC.from_pretrained(model_id, **kwargs)
-        elif family == "tdt":
-            model = AutoModelForTDT.from_pretrained(model_id, **kwargs)
-        else:
-            model = AutoModel.from_pretrained(model_id, **kwargs)
-        self._resize_model_vocabulary(model=model, family=family)
+        if family in _TRANSDUCER_FAMILIES:
+            setattr(processor, "decoder_type", family)
+        self.processor = self._adapt_processor(processor=processor)
+        self.decoder_strategy = parakeet_decoder_strategy(family)
+        return self.processor
 
-        if self.config.model.get("freeze_feature_encoder", False):
-            encoder = getattr(model, "encoder", None)
-            if encoder is not None:
-                for parameter in encoder.parameters():
-                    parameter.requires_grad = False
+    def _adapt_processor(self, processor: Processor) -> Processor:
+        """Add retained characters that the native tokenizer cannot encode.
 
-        if self.config.gradient_checkpointing and hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
-        self.model_config = model.config
-        return model
+        Added tokens are deliberately ordinary tokens.  This leaves the native BPE
+        vocabulary and every existing special-token ID untouched.
+
+        Returns:
+            The processor with the adapted tokenizer.
+        """
+        characters_to_keep = self.config.model.get("characters_to_keep")
+        if characters_to_keep is None:
+            return processor
+
+        tokenizer = processor.tokenizer
+        unknown_token_id = tokenizer.unk_token_id
+        if unknown_token_id is None:
+            return processor
+
+        for character in dict.fromkeys(str(char) for char in characters_to_keep):
+            token_ids = tokenizer(character, add_special_tokens=False)["input_ids"]
+            if (
+                tokenizer.convert_tokens_to_ids(character) == unknown_token_id
+                or unknown_token_id in token_ids
+            ):
+                tokenizer.add_tokens(character)
+        return processor
 
     def _hub_kwargs(self, model_id: str | None = None) -> dict[str, str | bool]:
         """Return Hub arguments without applying a base revision to local paths.
@@ -390,120 +506,6 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
             ) from error
         return parakeet_family(config=config)
 
-    def _resize_model_vocabulary(
-        self, model: PreTrainedModel, family: ParakeetFamily
-    ) -> None:
-        """Resize Parakeet vocabulary-dependent modules after processor adaptation."""
-        processor = getattr(self, "processor", None)
-        tokenizer = getattr(processor, "tokenizer", None)
-        if tokenizer is None:
-            return
-
-        vocabulary_size = len(tokenizer)
-        if family == "ctc":
-            self._resize_ctc_head(model=model, vocabulary_size=vocabulary_size)
-        else:
-            self._resize_transducer_heads(
-                model=model, vocabulary_size=vocabulary_size, family=family
-            )
-
-    @staticmethod
-    def _resize_ctc_head(model: PreTrainedModel, vocabulary_size: int) -> None:
-        """Resize a CTC head while retaining its pretrained rows.
-
-        Raises:
-            ValueError:
-                If the model does not expose a CTC head or the target vocabulary
-                would discard existing output rows.
-        """
-        head = getattr(model, "ctc_head", None)
-        if not isinstance(head, nn.Conv1d):
-            raise ValueError("Native Parakeet CTC model does not provide ctc_head.")
-        if head.out_channels > vocabulary_size:
-            raise ValueError("The adapted tokenizer is smaller than the CTC head.")
-        if head.out_channels < vocabulary_size:
-            new_head = type(head)(
-                in_channels=head.in_channels,
-                out_channels=vocabulary_size,
-                kernel_size=head.kernel_size,
-                stride=head.stride,
-                padding=head.padding,
-                dilation=head.dilation,
-                groups=head.groups,
-                bias=head.bias is not None,
-                padding_mode=head.padding_mode,
-                device=head.weight.device,
-                dtype=head.weight.dtype,
-            )
-            model._init_weights(new_head)
-            with torch.no_grad():
-                new_head.weight[: head.out_channels].copy_(head.weight)
-                if head.bias is not None and new_head.bias is not None:
-                    new_head.bias[: head.out_channels].copy_(head.bias)
-            model.ctc_head = new_head
-        model.config.vocab_size = vocabulary_size
-
-    def load_processor(self) -> Processor:
-        """Load the Transformers-native Parakeet processor.
-
-        Returns:
-            The Parakeet processor.
-
-        Raises:
-            ValueError:
-                If the checkpoint is not packaged for Transformers.
-        """
-        model_id = str(self.config.model.pretrained_model_id)
-        try:
-            processor = AutoProcessor.from_pretrained(
-                model_id, **self._hub_kwargs(model_id=model_id)
-            )
-        except (OSError, ValueError, KeyError) as error:
-            raise ValueError(
-                f"Parakeet checkpoint {model_id!r} is not a Transformers-native "
-                "checkpoint. NeMo collection .nemo files are unsupported; use a "
-                "checkpoint with config.json and processor files."
-            ) from error
-        if not hasattr(processor, "feature_extractor") or not hasattr(
-            processor, "tokenizer"
-        ):
-            raise ValueError(
-                f"Parakeet checkpoint {model_id!r} does not provide a "
-                "Transformers feature extractor and tokenizer."
-            )
-        family = self._load_family(model_id=model_id)
-        if family in _TRANSDUCER_FAMILIES:
-            setattr(processor, "decoder_type", family)
-        self.processor = self._adapt_processor(processor=processor)
-        return self.processor
-
-    def _adapt_processor(self, processor: Processor) -> Processor:
-        """Add retained characters that the native tokenizer cannot encode.
-
-        Added tokens are deliberately ordinary tokens.  This leaves the native BPE
-        vocabulary and every existing special-token ID untouched.
-
-        Returns:
-            The processor with the adapted tokenizer.
-        """
-        characters_to_keep = self.config.model.get("characters_to_keep")
-        if characters_to_keep is None:
-            return processor
-
-        tokenizer = processor.tokenizer
-        unknown_token_id = tokenizer.unk_token_id
-        if unknown_token_id is None:
-            return processor
-
-        for character in dict.fromkeys(str(char) for char in characters_to_keep):
-            token_ids = tokenizer(character, add_special_tokens=False)["input_ids"]
-            if (
-                tokenizer.convert_tokens_to_ids(character) == unknown_token_id
-                or unknown_token_id in token_ids
-            ):
-                tokenizer.add_tokens(character)
-        return processor
-
     def load_saved(self) -> PreTrainedModelData:
         """Load a saved Parakeet model, processor, collator, and metrics.
 
@@ -533,19 +535,12 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
         if family in _TRANSDUCER_FAMILIES:
             setattr(processor, "decoder_type", family)
         processor = self._adapt_processor(processor=processor)
+        strategy = parakeet_decoder_strategy(family)
+        self.decoder_strategy = strategy
         try:
-            if family == "ctc":
-                model = AutoModelForCTC.from_pretrained(
-                    model_path, **self._hub_kwargs(model_id=model_path)
-                )
-            elif family == "tdt":
-                model = AutoModelForTDT.from_pretrained(
-                    model_path, **self._hub_kwargs(model_id=model_path)
-                )
-            else:
-                model = AutoModel.from_pretrained(
-                    model_path, **self._hub_kwargs(model_id=model_path)
-                )
+            model = strategy.load_model(
+                model_id=model_path, kwargs=self._hub_kwargs(model_id=model_path)
+            )
         except (OSError, ValueError, KeyError) as error:
             raise ValueError(
                 f"Parakeet checkpoint {model_path!r} is not a Transformers-native "
@@ -562,6 +557,19 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
             compute_metrics=self.load_compute_metrics(),
         )
 
+    def _resize_model_vocabulary(
+        self, model: PreTrainedModel, family: ParakeetFamily
+    ) -> None:
+        """Resize Parakeet vocabulary-dependent modules after processor adaptation."""
+        processor = getattr(self, "processor", None)
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            return
+
+        vocabulary_size = len(tokenizer)
+        strategy = self.decoder_strategy or parakeet_decoder_strategy(family)
+        strategy.resize_model_vocabulary(model=model, vocabulary_size=vocabulary_size)
+
     def load_compute_metrics(self) -> t.Callable[[EvalPrediction], dict]:
         """Return metrics that decode Parakeet CTC or transducer IDs."""
         return partial(_compute_parakeet_metrics, processor=self.processor)
@@ -573,35 +581,47 @@ class ParakeetModelSetup(Wav2Vec2ModelSetup):
             sample_rate=self.config.model.sampling_rate,
             padding=self.config.padding,
             model_config=self.model_config,
+            decoder_strategy=self.decoder_strategy,
         )
+
+    def load_model(self) -> PreTrainedModel:
+        """Load the model class selected from the Transformers checkpoint config.
+
+        Returns:
+            A Parakeet CTC or RNNT model.
+
+        """
+        model_id = str(self.config.model.pretrained_model_id)
+        family = self._load_family(model_id=model_id)
+        strategy = parakeet_decoder_strategy(family)
+        self.decoder_strategy = strategy
+        model = strategy.load_model(model_id=model_id, kwargs=self._hub_kwargs())
+        self._resize_model_vocabulary(model=model, family=family)
+
+        if self.config.model.get("freeze_feature_encoder", False):
+            encoder = getattr(model, "encoder", None)
+            if encoder is not None:
+                for parameter in encoder.parameters():
+                    parameter.requires_grad = False
+
+        if self.config.gradient_checkpointing and hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
+        self.model_config = model.config
+        return model
 
     def load_trainer_class(self) -> t.Type[Trainer]:
         """Return Trainer or the generation-compatible RNNT Trainer."""
         family = self._load_family(model_id=str(self.config.model.pretrained_model_id))
-        return Trainer if family == "ctc" else ParakeetGenerationTrainer
+        strategy = self.decoder_strategy or parakeet_decoder_strategy(family)
+        self.decoder_strategy = strategy
+        return strategy.trainer_class()
 
-
-def validate_parakeet_transducer_inputs(
-    decoder_input_ids: object,
-    labels: object,
-    processor: object,
-    model_config: object | None = None,
-) -> None:
-    """Require decoder IDs to be the unpadded blank-prefixed labels.
-
-    Raises:
-        ValueError:
-            If the IDs do not equal ``[blank_token_id, *labels]``.
-    """
-    resolved_blank_token_id = get_parakeet_blank_token_id(
-        processor=processor, model_config=model_config
-    )
-    actual_ids = _as_int_list(decoder_input_ids)
-    label_ids = _as_int_list(labels)
-    if actual_ids != [resolved_blank_token_id, *label_ids]:
-        raise ValueError(
-            "Parakeet transducer decoder_input_ids must contain exactly one more "
-            "token and equal [blank_token_id, *labels] before padding."
+    def load_training_arguments(self) -> TrainingArguments:
+        """Return the generic CTC-compatible training arguments."""
+        return TrainingArguments(
+            **self._training_arguments_kwargs(
+                sequence_to_sequence=False, include_max_grad_norm=True
+            )
         )
 
 
@@ -624,6 +644,86 @@ def _as_int_list(values: object) -> list[int]:
     if not isinstance(values, c.Iterable):
         raise TypeError("Expected an integer or iterable of integers")
     return [int(value) for value in t.cast(c.Iterable[int], values)]
+
+
+def parakeet_decoder_strategy(family: ParakeetFamily) -> ParakeetDecoderStrategy:
+    """Create the decoder strategy for an immutable checkpoint family.
+
+    Returns:
+        The strategy implementing the selected decoder contract.
+    """
+    strategies: dict[ParakeetFamily, ParakeetDecoderStrategy] = {
+        "ctc": ParakeetCTCStrategy(),
+        "rnnt": ParakeetRNNTStrategy(),
+        "tdt": ParakeetTDTStrategy(),
+    }
+    return strategies[family]
+
+
+class ParakeetCTCStrategy(ParakeetDecoderStrategy):
+    """Strategy for Parakeet CTC checkpoints."""
+
+    family: t.Literal["ctc"] = "ctc"
+
+    def label_padding_id(self, processor: object, model_config: object | None) -> int:
+        """Return CTC's tokenizer padding sentinel for transcript labels."""
+        return super().label_padding_id(processor=processor, model_config=model_config)
+
+    def load_model(
+        self, model_id: str, kwargs: dict[str, str | bool]
+    ) -> PreTrainedModel:
+        """Load a CTC checkpoint through its native auto class.
+
+        Returns:
+            The loaded CTC model.
+        """
+        return t.cast(
+            PreTrainedModel, AutoModelForCTC.from_pretrained(model_id, **kwargs)
+        )
+
+    def resize_model_vocabulary(
+        self, model: PreTrainedModel, vocabulary_size: int
+    ) -> None:
+        """Resize the CTC output head for adapted token vocabularies."""
+        ParakeetModelSetup._resize_ctc_head(
+            model=model, vocabulary_size=vocabulary_size
+        )
+
+
+class ParakeetRNNTStrategy(ParakeetDecoderStrategy):
+    """Strategy for native Parakeet RNN-T checkpoints."""
+
+    family: t.Literal["rnnt"] = "rnnt"
+
+    def label_padding_id(self, processor: object, model_config: object | None) -> int:
+        """Return RNNT's blank sentinel for padded labels."""
+        return get_parakeet_blank_token_id(
+            processor=processor, model_config=model_config
+        )
+
+    def load_model(
+        self, model_id: str, kwargs: dict[str, str | bool]
+    ) -> PreTrainedModel:
+        """Load an RNNT checkpoint through its native auto class.
+
+        Returns:
+            The loaded RNNT model.
+        """
+        return t.cast(
+            PreTrainedModel, AutoModelForRNNT.from_pretrained(model_id, **kwargs)
+        )
+
+    def resize_model_vocabulary(
+        self, model: PreTrainedModel, vocabulary_size: int
+    ) -> None:
+        """Resize RNNT embedding and joint token heads."""
+        ParakeetModelSetup._resize_transducer_heads(
+            model=model, vocabulary_size=vocabulary_size, family=self.family
+        )
+
+    def trainer_class(self) -> type[Trainer]:
+        """Return the generation-aware transducer trainer."""
+        return ParakeetGenerationTrainer
 
 
 def get_parakeet_blank_token_id(
@@ -667,6 +767,62 @@ def _configured_int(source: object | None, name: str) -> int | None:
     else:
         value = getattr(source, name, None)
     return int(value) if isinstance(value, Integral) else None
+
+
+class ParakeetTDTStrategy(ParakeetRNNTStrategy):
+    """Strategy for token-and-duration transducer checkpoints."""
+
+    family: t.Literal["tdt"] = "tdt"
+
+    def label_padding_id(self, processor: object, model_config: object | None) -> int:
+        """Return TDT's tokenizer padding sentinel for transcript labels."""
+        return ParakeetDecoderStrategy.label_padding_id(
+            self, processor=processor, model_config=model_config
+        )
+
+    def load_model(
+        self, model_id: str, kwargs: dict[str, str | bool]
+    ) -> PreTrainedModel:
+        """Load a TDT checkpoint through its native auto class.
+
+        Returns:
+            The loaded TDT model.
+        """
+        return t.cast(
+            PreTrainedModel, AutoModelForTDT.from_pretrained(model_id, **kwargs)
+        )
+
+    def resize_model_vocabulary(
+        self, model: PreTrainedModel, vocabulary_size: int
+    ) -> None:
+        """Resize TDT token rows while preserving duration rows."""
+        ParakeetModelSetup._resize_transducer_heads(
+            model=model, vocabulary_size=vocabulary_size, family=self.family
+        )
+
+
+def validate_parakeet_transducer_inputs(
+    decoder_input_ids: object,
+    labels: object,
+    processor: object,
+    model_config: object | None = None,
+) -> None:
+    """Require decoder IDs to be the unpadded blank-prefixed labels.
+
+    Raises:
+        ValueError:
+            If the IDs do not equal ``[blank_token_id, *labels]``.
+    """
+    resolved_blank_token_id = get_parakeet_blank_token_id(
+        processor=processor, model_config=model_config
+    )
+    actual_ids = _as_int_list(decoder_input_ids)
+    label_ids = _as_int_list(labels)
+    if actual_ids != [resolved_blank_token_id, *label_ids]:
+        raise ValueError(
+            "Parakeet transducer decoder_input_ids must contain exactly one more "
+            "token and equal [blank_token_id, *labels] before padding."
+        )
 
 
 def parakeet_family(config: PreTrainedConfig) -> ParakeetFamily:
