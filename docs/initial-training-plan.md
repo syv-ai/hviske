@@ -11,8 +11,9 @@ provisional snapshot.
 ## Decision summary
 
 Train and release `syvai/hviske-v6.0` as a Danish-specialised continuation of
-`CohereLabs/cohere-transcribe-03-2026`. This is a proper release run, not a dummy or
-throwaway baseline. The major version reflects the substantially larger and broader
+`nvidia/parakeet-tdt-0.6b-v3` at pinned revision
+`541d1f99c6b0c3cd0b11a95167540bb8edefd82b`. This is a proper release run, not a dummy
+or throwaway baseline. The major version reflects the substantially larger and broader
 training corpus compared with previous Hviske releases.
 
 Use one architecture and one fixed data mixture. Do not spend the first training window
@@ -68,67 +69,25 @@ data-mixture experiments rather than tuning against the leaderboard test sets.
 
 ## Architecture decision
 
-Use the 2.06B-parameter Conformer encoder-decoder model
-`CohereLabs/cohere-transcribe-03-2026`, pinned to revision
-`b1eacc2686a3d08ceaae5f24a88b1d519620bc09`.
+Use the 600M-parameter FastConformer-TDT model `nvidia/parakeet-tdt-0.6b-v3`, pinned to
+revision `541d1f99c6b0c3cd0b11a95167540bb8edefd82b`.
 
-### Why Conformer
+### Why Parakeet TDT
 
-- The current 10.97% leader is in the same 2.06B parameter class. A Danish continuation
-  of a strong general ASR checkpoint is the most direct path to surpassing it.
-- Cohere Transcribe is a purpose-built ASR model, rather than a general sequence model.
-  Its card reports strong multilingual accuracy and efficient inference.
-- The checkpoint is Apache-2.0, supported natively in Transformers and vLLM, and already
-  pinned and implemented in Hviske.
-- `config/sparkie_bilingual.yaml`, the Sparkie runbook, model loading, and training
-  already target this exact checkpoint.
-- Reusing that path avoids delaying the release for a second training stack and makes
-  the released v6.0 checkpoint the natural full-model baseline for the experiments that
-  follow.
+- Native Transformers TDT loss, backward, generation, checkpoint reload, and resume have
+  been validated in Hviske.
+- The multilingual tokenizer represents Danish `æ`, `ø`, and `å` without unknown tokens;
+  its 8,193-token vocabulary and blank ID 8,192 remain unchanged.
+- The 250--4,000-step Danish evaluations improved consistently while English evaluation
+  remained strong, establishing a credible trajectory for the full campaign.
+- The 600M model is materially faster and smaller than the preserved 2.06B Cohere
+  baseline, making the complete 200,000-step campaign practical.
+- `config/bilingual.yaml` now captures the reusable TDT production parameters; run paths,
+  W&B identity, and resume state remain launcher concerns.
 
-Cohere's public card does not list Danish among its 14 pretrained languages. This makes
-the Danish pilot a real gate: the architecture is selected because the repository and
-full experiment path are ready for it, not because Danish quality is assumed.
-
-### Why not Whisper for the primary run
-
-`thorhojhus/whisper-large-v3-turbo-danish`, pinned to
-`8cc640f726b08708193c38bd474ac1b31f44bd38`, is the strongest fallback. It is an
-809M-parameter MIT-licensed model at 11.45% mean WER and can be trained cheaply.
-
-It is not the primary choice because changing to Whisper would fork the current Sparkie
-path, while v6.0 is meant to establish a Cohere full-model baseline before later
-architecture and data-mixture experiments. Whisper also needs explicit short-form
-hallucination checks: the
-leaderboard documents repetition and subtitle-credit failures on very short clips for
-members of this model family.
-
-Switch to this Whisper checkpoint only if the Cohere path fails one of these gates:
-
-- the model cannot complete save, reload, resume, and Danish decoding in the two-step
-  smoke;
-- it cannot fit safely on Sparkie after reducing the per-device batch and preserving the
-  effective batch through accumulation;
-- neither learning-rate pilot improves the frozen Danish development objective; or
-- Cohere training is blocked by access or an unresolved technical incompatibility.
-
-Before activating the fallback for a leaderboard release, obtain immutable revisions,
-train-only split proof, and overlap exclusions for every listed source: CoRal, Common
-Voice, FLEURS, FTSpeech, NST, and all human- or machine-labelled inputs behind its
-pseudo-labelled stream. Its card currently names datasets but not exact splits,
-revisions, or pseudo-label provenance. Without complete evidence, it may be used only
-for an internal engineering run, not as the basis of a leakage-free leaderboard claim.
-
-Do not start both full-size architectures in parallel. Reserve the time and compute
-for systematic mixture experiments instead.
-
-### Why not Parakeet for the primary run
-
-Parakeet is the strongest later speed/serving candidate, not the fastest route to this
-accuracy release. The current open `svale-600M` result is 12.64% mean WER. The strongest
-multilingual Parakeet uses FastConformer-TDT. Hviske now supports the
-Transformers-native Parakeet CTC, RNNT, and TDT paths; the revision-pinned TDT preset
-should still be evaluated separately from the active Cohere campaign.
+The Cohere campaign is retained only as a slower baseline at its complete checkpoint.
+Do not run both full-size campaigns in parallel or replace the active TDT campaign with
+an architecture bake-off.
 
 ## Freeze the benchmark first
 
@@ -271,8 +230,9 @@ time and writes only embedded compressed audio bytes, final text, and source to
 checksummed local Parquet shards. Training and validation require the deterministic
 manifest and complete marker through `HVISKE_MATERIALISED_OVERLAYS_ROOT`; they fail
 closed rather than returning to remote positional joins. This safe local graph supports
-three spawned DataLoader workers while keeping dataset preprocessing serial and avoiding
-the sustained 85–86°C operation observed with four workers. Avoid
+two spawned DataLoader workers while keeping dataset preprocessing serial, avoiding the
+sustained 85–86°C operation observed with four workers, and preventing the long-run swap
+pressure measured with three. Avoid
 loading the same source both directly and through the unified repository.
 
 Do not use the manifest's FLEURS rows. Common Voice rows may be used only when their
@@ -413,12 +373,12 @@ criteria. These thresholds define previously ambiguous pilot and continuation te
 
 ## Training recipe
 
-Start from the pinned Cohere checkpoint and preserve the existing tested Sparkie
-defaults unless a pilot shows a concrete failure:
+Start from the pinned Parakeet TDT checkpoint and preserve the tested production
+defaults unless a measured failure requires a change:
 
-- **Audio:** 16 kHz, 1--10 second examples.
-- **Prompt:** Danish or per-source language, punctuation enabled.
-- **Parameters:** full encoder and decoder fine-tuning.
+- **Audio:** 16 kHz, 1--8 second examples.
+- **Targets:** exact unpadded `[blank_token_id, *labels]` TDT decoder inputs.
+- **Parameters:** full FastConformer and transducer fine-tuning.
 - **Precision:** BF16 where supported.
 - **Memory:** gradient checkpointing; reduce per-device batch before changing the
   effective batch.
@@ -428,7 +388,7 @@ defaults unless a pilot shows a concrete failure:
   before audio decoding; the source probabilities continue to interleave every stream.
   The old global 128-row smoke took 127 minutes, read 90 GB, and reached 19 GB worker
   RSS before its first batch.
-- **Effective batch:** 256 examples.
+- **Batching:** per-device batch 6 with gradient accumulation to an effective batch of 60.
 - **Optimiser:** AdamW, betas 0.9 and 0.98, max gradient norm 1.0.
 - **Augmentation:** existing peak normalisation, gain, background/coloured noise, and
   filtering.
@@ -442,15 +402,15 @@ Training uses `max_steps` for the cosine-scheduler horizon and the tested
 `max_steps=200000` and leaves `stop_after_steps` unset. The owner-waived 2,000-step
 learning-rate pilots, if requested as optional diagnostics, retain their explicit
 `max_steps=100000` horizon; they do not gate or redefine the full run. The direct run
-starts from the pinned Cohere checkpoint and continues to 200,000 steps.
+starts from the pinned Parakeet TDT checkpoint and continues to 200,000 steps.
 
-At batch 256 and the frozen source probabilities, the campaign coverage is:
+At effective batch 60 and the frozen source probabilities, the campaign exposure is:
 
-| Source | Published/accepted rows | Minimum steps | Expected rows at 200,000 steps | Coverage |
+| Source | Published/accepted rows | Steps for one row-equivalent | Expected rows at 200,000 steps | Coverage |
 | --- | ---: | ---: | ---: | ---: |
-| P1 | 4,767,938 | 181,075 | 5,266,278 | 110.5% |
-| DRTV | 5,178,843 | 157,344 | 6,582,835 | 127.1% |
-| YouTube | 3,208,785 | 139,271 | 4,608,000 | 143.6% |
+| P1 | 4,767,938 | 772,584 | 1,234,284 | 25.9% |
+| DRTV | 5,178,843 | 671,334 | 1,542,852 | 29.8% |
+| YouTube | 3,208,785 | 594,219 | 1,080,000 | 33.7% |
 
 Do not add a broad hyperparameter sweep. If the owner requests the waived diagnostics,
 compare only learning rates `5e-6` and `1e-5`. All other settings, source ordering, data
@@ -534,24 +494,25 @@ run on these optional diagnostics.
 
 ### Full release run
 
-Launch directly from the pinned Cohere checkpoint with its fresh optimiser and scheduler
-state. Evaluate the full frozen development suite every 2,000 steps and make
-continuation decisions at 10k, 25k, 50k, and 75k steps.
+Launch directly from the pinned Parakeet TDT checkpoint with fresh optimiser and
+scheduler state. Evaluate the full frozen development suite every 2,000 steps and
+complete the 200,000-step horizon unless a safety or correctness failure requires a
+checkpointed interruption and resume.
 
 At each gate:
 
-- compare against the untouched Cohere base, Hviske v5, and any optional pilot
-  checkpoints;
+- compare against the untouched Parakeet TDT base, the preserved Cohere baseline,
+  Hviske v5, and earlier TDT checkpoints;
 - inspect all five Danish domains and the P1/DRTV/YouTube diagnostics;
 - inspect subtitle-credit, repetition, silence, and short-clip failures;
 - verify realised examples and audio seconds per source;
 - verify throughput, memory, temperature, disk, and checkpoint reload; and
 - apply the predeclared patience-reset rule.
 
-The 200,000-step value is a ceiling. At stopping or at the ceiling, apply the final
+Complete all 200,000 optimiser steps. After the final checkpoint, apply the final
 checkpoint order exactly. The minimum useful-release gate determines whether the result
 is releasable; the leaderboard and headline targets determine the claims that may be
-made. Do not continue merely to consume the budget.
+made.
 
 ## Blind leaderboard and release
 

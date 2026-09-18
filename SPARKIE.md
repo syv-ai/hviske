@@ -121,7 +121,7 @@ and training:
 ```bash
 export HVISKE_MATERIALISED_OVERLAYS_ROOT="$HOME/hviske-v6-overlays"
 uv run python src/scripts/finetune_asr_model.py \
-  --config-name sparkie_bilingual --cfg job
+  --config-name bilingual --cfg job
 ```
 
 The package-level materialised-overlay implementation validates immutable revisions,
@@ -130,15 +130,15 @@ materialised stream is opened. Keep positional equality checks strict and never 
 training at an incomplete directory.
 
 The preset deliberately uses `dataset_num_workers=1` and
-`dataloader_num_workers=3`. For regular datasets, `dataset_num_workers=1` maps to
+`dataloader_num_workers=2`. For regular datasets, `dataset_num_workers=1` maps to
 in-process preprocessing (`num_proc=None`), not a one-worker child process. Validation
 filtering happens while Hub and `httpx` connections may already be open; forking
 preprocessing workers can inherit one of those sockets and deadlock in `CLOSE-WAIT`.
 Keep preprocessing serial for this streaming campaign. The local Parquet artefact has
-independent physical shards, so three spawned DataLoader workers can interleave shards
+independent physical shards, so two spawned DataLoader workers can interleave shards
 without sharing a positional offset and can restart deterministically. Four workers drove
-the GB10 to sustained 85–86°C operation; three retain parallel loading with safer thermal
-headroom. Keep positional
+the GB10 to sustained 85–86°C operation, while three created excessive long-run swap
+pressure without a meaningful throughput gain. Keep positional
 equality checks strict during materialisation and do not relax them: generic keyed and
 non-materialised positional overlays remain supported by the reusable loader.
 The per-source streaming shuffle is applied after the local materialised shards are
@@ -162,19 +162,20 @@ backoff, and gives the parent a bounded join grace. An already-selected `spawn` 
 is reused; a conflicting method fails clearly instead of silently falling back to
 `fork`. Do not raise `dataset_num_workers` for Hub streams. Every smoke, pilot,
 full-run, and interruption-recovery command below inherits these values from
-`config/sparkie_bilingual.yaml`; do not add a preprocessing-worker override.
+`config/bilingual.yaml`; do not add a preprocessing-worker override.
 
 Remote `hf://` reads use the project-owned retry policy in
-`config/sparkie_bilingual.yaml`: six retries after the initial request, exponential
+`config/bilingual.yaml`: six retries after the initial request, exponential
 backoff from 1 second capped at 30 seconds, and up to 0.5 seconds of jitter. It retries
-only transport failures, HTTP 429, and HTTP 5xx responses. A closed Hub HTTP client is
-reset in that worker before retrying. Authentication, not-found, schema, and data errors
-remain fatal, and local/materialised Parquet reads do not use this policy. Keep these
-bounds conservative for multi-week runs; repeated exhaustion is an operational failure
-to investigate rather than an invitation to increase the retry budget.
+only transport failures, HTTP 429/499, and HTTP 5xx responses. A closed Hub HTTP
+client is reset in that worker before retrying. Authentication, not-found, schema, and
+data errors remain fatal, and local/materialised Parquet reads do not use this policy.
+Keep these bounds conservative for multi-week runs; repeated exhaustion is an
+operational failure to investigate rather than an invitation to increase the retry
+budget.
 
-Do not proceed if any validation check fails. Fix access, schema, revision, or local-file
-errors before retrying. If a run hangs during validation materialisation,
+Do not proceed if any validation check fails. Fix access, schema, revision, or
+local-file errors before retrying. If a run hangs during validation materialisation,
 stop that tmux session, leave `dataset_num_workers` at 1 (in-process preprocessing), and
 restart the same command (or the resume command below after a checkpoint exists); do not
 retry by increasing preprocessing workers.
@@ -216,7 +217,7 @@ persist_wandb_id "$wandb_state_dir/smoke.id" "$smoke_id"
 smoke_dir_q=$(printf '%q' "$PWD/runs/smoke")
 smoke_metrics_q=$(printf '%q' "$PWD/runs/smoke/metrics.jsonl")
 tmux new-session -d -s hviske-smoke \
-  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-smoke experiment_tracking.id=$smoke_id experiment_tracking.mode=online experiment_tracking.resume=never model_dir=$smoke_dir_q evaluation_steps='[2]' evaluation_metrics_path=$smoke_metrics_q stop_after_steps=2 save_steps=2 max_validation_samples_per_dataset=32"
+  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-smoke experiment_tracking.id=$smoke_id experiment_tracking.mode=online experiment_tracking.resume=never model_dir=$smoke_dir_q evaluation_steps='[2]' evaluation_metrics_path=$smoke_metrics_q stop_after_steps=2 save_steps=2 max_validation_samples_per_dataset=32"
 ```
 
 Inspect the resolved log, GPU memory, and checkpoint before starting the pilots. The
@@ -232,7 +233,7 @@ persist_wandb_id "$wandb_state_dir/pilot-5e-6-seed-4242.id" "$pilot_5e6_id"
 pilot_5e6_dir_q=$(printf '%q' "$PWD/runs/pilot-5e-6-seed-4242")
 pilot_5e6_metrics_q=$(printf '%q' "$PWD/runs/pilot-5e-6-seed-4242/metrics.jsonl")
 tmux new-session -d -s hviske-pilot-5e-6 \
-  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-5e-6-seed-4242 experiment_tracking.id=$pilot_5e6_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=5e-6 seed=4242 model_dir=$pilot_5e6_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$pilot_5e6_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
+  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-5e-6-seed-4242 experiment_tracking.id=$pilot_5e6_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=5e-6 seed=4242 model_dir=$pilot_5e6_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$pilot_5e6_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
 ```
 
 After the `5e-6` session exits and its results are reviewed, run the independent `1e-5`
@@ -244,7 +245,7 @@ persist_wandb_id "$wandb_state_dir/pilot-1e-5-seed-4242.id" "$pilot_1e5_id"
 pilot_1e5_dir_q=$(printf '%q' "$PWD/runs/pilot-1e-5-seed-4242")
 pilot_1e5_metrics_q=$(printf '%q' "$PWD/runs/pilot-1e-5-seed-4242/metrics.jsonl")
 tmux new-session -d -s hviske-pilot-1e-5 \
-  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-1e-5-seed-4242 experiment_tracking.id=$pilot_1e5_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=1e-5 seed=4242 model_dir=$pilot_1e5_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$pilot_1e5_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
+  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-1e-5-seed-4242 experiment_tracking.id=$pilot_1e5_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=1e-5 seed=4242 model_dir=$pilot_1e5_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$pilot_1e5_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
 ```
 
 Review the `5e-6` pilot after its tmux session exits before launching the `1e-5` pilot;
@@ -259,19 +260,19 @@ persist_wandb_id "$wandb_state_dir/pilot-winner-seed-4243.id" "$repeat_id"
 repeat_dir_q=$(printf '%q' "$PWD/runs/pilot-winner-seed-4243")
 repeat_metrics_q=$(printf '%q' "$PWD/runs/pilot-winner-seed-4243/metrics.jsonl")
 tmux new-session -d -s hviske-pilot-seed-4243 \
-  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-$winner_lr-seed-4243 experiment_tracking.id=$repeat_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=$winner_lr seed=4243 model_dir=$repeat_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$repeat_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
+  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0-pilot experiment_tracking.name_run=v6.0-pilot-$winner_lr-seed-4243 experiment_tracking.id=$repeat_id experiment_tracking.mode=online experiment_tracking.resume=never model.learning_rate=$winner_lr seed=4243 model_dir=$repeat_dir_q evaluation_steps='[250,500,1000,2000]' evaluation_metrics_path=$repeat_metrics_q stop_after_steps=2000 max_steps=100000 save_steps=500 max_validation_samples_per_dataset=256"
 ```
 
 The current campaign proceeds directly from the smoke to the full run; the owner-waived
 pilots are not a prerequisite and no pilot checkpoint is required. Start from the pinned
-Cohere base with a fresh persisted ID and its own output directory:
+Parakeet TDT base with a fresh persisted ID and its own output directory:
 
 ```bash
 full_id=$(new_wandb_id)
 persist_wandb_id "$wandb_state_dir/full.id" "$full_id"
 full_dir_q=$(printf '%q' "$PWD/runs/hviske-v6.0")
 tmux new-session -d -s hviske-v6-0 \
-  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-full experiment_tracking.id=$full_id experiment_tracking.mode=online experiment_tracking.resume=never model_dir=$full_dir_q eval_steps=2000 max_steps=200000 max_validation_samples_per_dataset=1000"
+  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name bilingual model_id=hviske-v6.0 model_dir=$full_dir_q experiment_tracking.name_group=v6.0-tdt experiment_tracking.name_run=v6.0-tdt-full-200k-max8-seed-4242 experiment_tracking.id=$full_id experiment_tracking.resume=never"
 ```
 
 If the full run is interrupted, preserve the local checkpoint and read the persisted
@@ -283,7 +284,7 @@ full_id=$(<"$wandb_state_dir/full.id")
 checkpoint="$PWD/runs/hviske-v6.0/checkpoint-<step>"
 checkpoint_q=$(printf '%q' "$checkpoint")
 tmux new-session -d -s hviske-v6-0-resume \
-  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name sparkie_bilingual experiment_tracking.name_experiment=hviske experiment_tracking.name_group=v6.0 experiment_tracking.name_run=v6.0-full experiment_tracking.id=$full_id experiment_tracking.mode=online experiment_tracking.resume=must resume_from_checkpoint=$checkpoint_q model_dir=$full_dir_q eval_steps=2000 max_steps=200000 max_validation_samples_per_dataset=1000"
+  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$p1_revision_q HVISKE_OVERLAY_REVISION=$overlay_revision_q HVISKE_MATERIALISED_OVERLAYS_ROOT=$materialised_overlay_root_q WANDB_PROJECT=$wandb_project_q WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name bilingual model_id=hviske-v6.0 model_dir=$full_dir_q experiment_tracking.name_group=v6.0-tdt experiment_tracking.name_run=v6.0-tdt-full-200k-max8-seed-4242 experiment_tracking.id=$full_id experiment_tracking.resume=must resume_from_checkpoint=$checkpoint_q ignore_data_skip=true"
 ```
 
 The full ID file is the persistence record needed for interruption recovery; never put a
@@ -308,7 +309,16 @@ free space for the next checkpoint and final model save.
 
 ## Private publication
 
-The Sparkie preset keeps automatic publication disabled. Publish only after reviewing
-the selected pilot or full-run checkpoint, and verify that the Hub destination is
-private before and after upload. Never upload raw audio, local manifests, Hydra output,
-checkpoints, caches, or experiment-tracking artefacts.
+The bilingual preset keeps automatic publication disabled. After selecting and reviewing
+the final model package, use the publication-only command; it validates the package and
+provenance without loading data or invoking training:
+
+```bash
+uv run python src/scripts/publish_model.py \
+  runs/hviske-v6.0 syvai/hviske-v6.0 --private \
+  --evaluation-status 'Full-run evaluation reviewed before publication.'
+```
+
+The command verifies private Hub visibility before and after upload. Never upload raw
+audio, local manifests, Hydra output, checkpoint history, caches, or
+experiment-tracking artefacts.

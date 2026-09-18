@@ -8,6 +8,13 @@ from omegaconf import OmegaConf
 import hviske.finetune as finetune_module
 
 
+def test_bilingual_preset_requires_cuda() -> None:
+    """The production bilingual preset must not silently run on CPU."""
+    config = compose(config_name="bilingual")
+
+    assert config.require_cuda is True
+
+
 def test_cuda_requirement_check_fails_with_runtime_details(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -58,10 +65,3 @@ def test_generic_preset_does_not_require_cuda(monkeypatch: MonkeyPatch) -> None:
 
     assert config.require_cuda is False
     finetune_module.check_cuda_requirement(config=config)
-
-
-def test_sparkie_preset_requires_cuda() -> None:
-    """The production Sparkie preset must not silently run on CPU."""
-    config = compose(config_name="sparkie_bilingual")
-
-    assert config.require_cuda is True

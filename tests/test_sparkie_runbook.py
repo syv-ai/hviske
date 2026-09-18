@@ -22,15 +22,21 @@ def test_sparkie_full_commands_match_training_plan_evaluation_cadence() -> None:
     full_commands = [
         line
         for line in runbook.splitlines()
-        if line.startswith('  "env ') and "name_run=v6.0-full" in line
+        if line.startswith('  "env ')
+        and "name_run=v6.0-tdt-full-200k-max8-seed-4242" in line
     ]
 
     assert len(full_commands) == 2
-    assert all("eval_steps=2000" in command for command in full_commands)
-    assert all("max_steps=200000" in command for command in full_commands)
+    assert all("--config-name bilingual" in command for command in full_commands)
+    assert all("model_id=hviske-v6.0" in command for command in full_commands)
+    assert all("model_dir=$full_dir_q" in command for command in full_commands)
+    assert all("eval_steps=" not in command for command in full_commands)
+    assert all("max_steps=" not in command for command in full_commands)
     assert (
         "Evaluate the full frozen development suite every 2,000 steps" in training_plan
     )
+    assert "src/scripts/publish_model.py" in runbook
+    assert "runs/hviske-v6.0 syvai/hviske-v6.0 --private" in runbook
 
 
 def test_sparkie_runbook_documents_materialised_worker_safety() -> None:
@@ -38,12 +44,12 @@ def test_sparkie_runbook_documents_materialised_worker_safety() -> None:
     runbook = RUNBOOK.read_text()
 
     assert "dataset_num_workers=1" in runbook
-    assert "dataloader_num_workers=3" in runbook
+    assert "dataloader_num_workers=2" in runbook
     assert "HVISKE_MATERIALISED_OVERLAYS_ROOT" in runbook
     assert "package-level materialised-overlay implementation" in runbook
     assert "CLOSE-WAIT" in runbook
     assert "not a one-worker child process" in runbook
-    assert "three spawned DataLoader workers" in runbook
+    assert "two spawned DataLoader workers" in runbook
     assert "85–86°C" in runbook
     assert "positional equality checks strict" in runbook
     assert "do not relax them" in runbook

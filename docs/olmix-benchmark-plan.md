@@ -2,10 +2,13 @@
 
 ## Goal
 
-Find a reproducible static mixture for Hviske's existing offline dataset sampler. The
-method follows OlmixBase: train small proxy models on sampled domain mixtures, fit a
-per-task log-linear performance surface, and optimise that surface under a natural-mix
-prior and finite-data constraints.
+This is an inactive design plan retained for future v6.x mixture work; it does not alter
+the fixed mixture or parameters of the current 200,000-step Parakeet TDT campaign.
+
+The proposed goal is to find a reproducible static mixture for Hviske's existing offline
+dataset sampler. The method follows OlmixBase: train small proxy models on sampled
+domain mixtures, fit a per-task log-linear performance surface, and optimise that
+surface under a natural-mix prior and finite-data constraints.
 
 This plan starts only after the private segmented P1 dataset described in
 [`p1-segmentation-plan.md`](p1-segmentation-plan.md) is published, validated, and
@@ -79,7 +82,7 @@ examples, so example counts are the primary operational analogue. Also retain au
 seconds and duration distributions to quantify the effect of variable clip lengths.
 
 For a group weight `p_j`, expand its source weights using the fixed conditional
-proportions from `config/sparkie_bilingual.yaml`:
+proportions from `config/bilingual.yaml`:
 
 ```text
 w_s = p_j * w_base_s / sum(w_base_t for t in group j)
@@ -97,7 +100,7 @@ while explicit lower bounds ensure both languages remain trainable.
 ## Evaluation objective
 
 Use the five pinned validation tasks already configured in
-`config/sparkie_bilingual.yaml`:
+`config/bilingual.yaml`:
 
 - CoRal read-aloud, Danish;
 - CoRal conversation, Danish;
@@ -459,11 +462,11 @@ Improvement over `p0` is reported but is not a substitute for beating production
 A failed confirmation invalidates the selected surface. Add the confirmation points to
 the design, refit, and repeat rather than hand-adjusting weights.
 
-## Phase 8: transfer to the full Cohere model
+## Phase 8: transfer to the production architecture
 
-Proxy ranking is evidence, not proof of transfer to
-`CohereLabs/cohere-transcribe-03-2026`. Run a matched target-model comparison between
-`p_base` and the selected mixture with identical initial weights, seed, exposure,
+Proxy ranking is evidence, not proof of transfer to the pinned production architecture.
+For a future v6.x experiment, run a matched Parakeet TDT comparison between `p_base` and
+the selected mixture with identical initial weights, revision, seed, exposure,
 evaluation subsets, and decoding.
 
 Use the shortest target-model budget that includes the proxy-selected stable exposure.

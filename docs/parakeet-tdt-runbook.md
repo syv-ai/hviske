@@ -115,5 +115,5 @@ workers have closed.
 **Gate:** each pilot has finite training and validation losses at every reviewed step,
 has independent checkpoints and metrics, reaches the requested bounded stop without
 changing `config/model/cohere.yaml` or
-`config/sparkie_bilingual.yaml`, and has a clean reload/resume record. Do not start a
+`config/bilingual.yaml`, and has a clean reload/resume record. Do not start a
 longer run, publish a model, or alter Sparkie until the pilot comparison is reviewed.

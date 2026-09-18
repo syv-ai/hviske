@@ -1,4 +1,4 @@
-"""Regression tests for the production Sparkie bilingual preset."""
+"""Regression tests for the production bilingual preset."""
 
 import typing as t
 from pathlib import Path
@@ -66,38 +66,7 @@ TRAINING_PROBABILITIES = [
 ]
 
 
-def test_p1_segments_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The P1 segments revision cannot silently follow a mutable branch."""
-    monkeypatch.delenv("P1_SEGMENTS_REVISION", raising=False)
-    config = compose(config_name="sparkie_bilingual")
-    OmegaConf.resolve(config)
-
-    from hviske.utils import validate_immutable_source_revision
-
-    with pytest.raises(ValueError, match="P1_SEGMENTS_REVISION is required"):
-        validate_immutable_source_revision(
-            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
-        )
-
-
-@pytest.mark.parametrize("revision", ["main", "0123456", "g" * 40])
-def test_p1_segments_revision_rejects_mutable_or_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, revision: str
-) -> None:
-    """P1 segment loads reject branches, short SHAs and non-hex revisions."""
-    monkeypatch.setenv("P1_SEGMENTS_REVISION", revision)
-    config = compose(config_name="sparkie_bilingual")
-    OmegaConf.resolve(config)
-
-    from hviske.utils import validate_immutable_source_revision
-
-    with pytest.raises(ValueError, match="full 40-character"):
-        validate_immutable_source_revision(
-            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
-        )
-
-
-def test_sparkie_dataset_coordinates_and_revisions(
+def test_bilingual_dataset_coordinates_and_revisions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every Hub source uses the approved subset, split, columns, and revision."""
@@ -253,10 +222,10 @@ def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
     """
     monkeypatch.setenv("P1_SEGMENTS_REVISION", P1_SEGMENTS_SHA)
     monkeypatch.setenv("HVISKE_OVERLAY_REVISION", "9" * 40)
-    return compose(config_name="sparkie_bilingual")
+    return compose(config_name="bilingual")
 
 
-def test_sparkie_evaluation_and_exclusions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bilingual_evaluation_and_exclusions(monkeypatch: pytest.MonkeyPatch) -> None:
     """FLEURS remains evaluation-only and superseded English sources stay absent."""
     config = _preset(monkeypatch)
     evaluations = config.evaluation_datasets
@@ -295,7 +264,9 @@ def test_sparkie_evaluation_and_exclusions(monkeypatch: pytest.MonkeyPatch) -> N
     assert not Path("config/datasets/fleurs_en_us.yaml").exists()
 
 
-def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bilingual_private_publication_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Training stays local and publication metadata names every Hub source."""
     config = _preset(monkeypatch)
 
@@ -303,23 +274,37 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     assert config.enable_experiment_tracking is True
     assert config.experiment_tracking.type == "wandb"
     assert config.experiment_tracking.name_experiment == "hviske"
-    assert config.experiment_tracking.name_group == "v6.0"
-    assert config.experiment_tracking.name_run == "v6.0-full"
+    assert config.experiment_tracking.name_group == "default"
+    assert config.experiment_tracking.name_run == config.model_id
     assert config.experiment_tracking.entity is None
-    assert config.experiment_tracking.resume == "never"
     assert config.experiment_tracking.job_type == "train"
-    assert list(config.experiment_tracking.tags) == ["v6.0", "production", "cohere"]
+    assert list(config.experiment_tracking.tags) == [
+        "bilingual",
+        "production",
+        "parakeet-tdt",
+        "max8s",
+    ]
     assert config.experiment_tracking.mode == "online"
     assert config.experiment_tracking.log_model is False
     assert config.experiment_tracking.watch is False
-    assert config.model.revision == "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
+    assert config.model.name == "parakeet-tdt"
+    assert config.model.revision == "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+    assert config.model.learning_rate == 5e-6
+    assert str(config.model_id).startswith("parakeet-tdt-")
     assert config.private is True
     assert config.private_only is True
     assert config.save_total_limit == 3
     assert config.max_validation_samples_per_dataset == 1000
+    assert config.max_seconds_per_example == 8.0
     assert config.shuffle_buffer_size == 1
+    assert config.total_batch_size == 60
+    assert config.per_device_batch_size == 6
     assert config.max_steps == 200_000
     assert config.stop_after_steps is None
+    assert config.warmup_steps == 1_000
+    assert config.logging_steps == 10
+    assert config.eval_steps == 2_000
+    assert config.save_steps == 500
     assert list(config.model_card_languages) == ["da", "en"]
     assert list(config.training_dataset_ids) == [
         "syvai/p1-segments",
@@ -332,7 +317,7 @@ def test_sparkie_private_publication_metadata(monkeypatch: pytest.MonkeyPatch) -
     ]
 
 
-def test_sparkie_shuffle_buffers_are_source_specific(
+def test_bilingual_shuffle_buffers_are_source_specific(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The production preset keeps exact effective shuffle values per source."""
@@ -362,7 +347,7 @@ def test_sparkie_shuffle_buffers_are_source_specific(
     } == expected_buffers
 
 
-def test_sparkie_training_order_and_probabilities(
+def test_bilingual_training_order_and_probabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The preset keeps source order aligned with the approved probabilities."""
@@ -379,7 +364,7 @@ def test_sparkie_training_order_and_probabilities(
     assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
 
 
-def test_sparkie_wandb_payload_redacts_local_paths(
+def test_bilingual_wandb_payload_redacts_local_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The resolved production payload contains no local filesystem locations."""
@@ -394,18 +379,49 @@ def test_sparkie_wandb_payload_redacts_local_paths(
     assert youtube["manifest_path"] == "[REDACTED]"
 
 
-def test_sparkie_worker_counts_require_local_overlay_artifact(
+def test_bilingual_worker_counts_require_local_overlay_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Local shards enable workers while Hub preprocessing remains serial."""
     config = _preset(monkeypatch)
 
     assert config.dataset_num_workers == 1
-    assert config.dataloader_num_workers == 3
+    assert config.dataloader_num_workers == 2
     assert config.require_materialised_overlays is True
     assert config.materialised_overlay_root is None
     assert config.datasets.drtv_local.local_vtt_num_shards >= 4
     assert config.datasets.youtube_local.local_vtt_num_shards >= 4
+
+
+def test_p1_segments_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The P1 segments revision cannot silently follow a mutable branch."""
+    monkeypatch.delenv("P1_SEGMENTS_REVISION", raising=False)
+    config = compose(config_name="bilingual")
+    OmegaConf.resolve(config)
+
+    from hviske.utils import validate_immutable_source_revision
+
+    with pytest.raises(ValueError, match="P1_SEGMENTS_REVISION is required"):
+        validate_immutable_source_revision(
+            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
+        )
+
+
+@pytest.mark.parametrize("revision", ["main", "0123456", "g" * 40])
+def test_p1_segments_revision_rejects_mutable_or_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, revision: str
+) -> None:
+    """P1 segment loads reject branches, short SHAs and non-hex revisions."""
+    monkeypatch.setenv("P1_SEGMENTS_REVISION", revision)
+    config = compose(config_name="bilingual")
+    OmegaConf.resolve(config)
+
+    from hviske.utils import validate_immutable_source_revision
+
+    with pytest.raises(ValueError, match="full 40-character"):
+        validate_immutable_source_revision(
+            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
+        )
 
 
 def test_youtube_local_manifest_is_danish() -> None:

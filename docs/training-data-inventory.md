@@ -2,7 +2,7 @@
 
 ## Scope
 
-This inventory covers the 15 active streams in `config/sparkie_bilingual.yaml`. The
+This inventory covers the 15 active streams in `config/bilingual.yaml`. The
 reusable Danish VoxPopuli configuration remains available but is not selected. Hours are
 for the configured training split where a split-level figure is available.
 
@@ -14,8 +14,8 @@ The figures are not yet a uniform post-filter measurement:
 - People's Speech clean/train is an estimate from its row count and partial duration
   statistics because its card publishes only the 30,000+ hour all-configuration total.
 
-Exact post-quality, post-deduplication hours under the strict `1 < duration < 10`
-runtime filter remain a required pre-training artefact.
+Exact post-quality, post-deduplication hours under the production
+`1 < duration < 8` runtime filter remain a required campaign artefact.
 
 ## Dataset inventory
 
@@ -37,13 +37,19 @@ runtime filter remain a required pre-training artefact.
 | LibriSpeech train-clean-360 | en    | Read/prepared          |          ~360 |
 | LibriSpeech train-other-500 | en    | Read/prepared          |          ~500 |
 
-Only the local manifests currently have exact post-filter measurements:
+The original local-manifest scan used the historical 1--10-second filter. A subsequent
+production-policy scan measured how much of that mass survives the strict
+`1 < duration < 8` filter:
 
-| Dataset              |         Accepted rows |   Strict 1--10s hours |
-| -------------------- | --------------------: | --------------------: |
-| DRTV local           |             5,178,843 |              6,390.27 |
-| Danish YouTube local |             3,208,785 |              2,001.97 |
-| P1 segments          | Pending final release | Pending final release |
+| Dataset | Historical 1--10s rows | Historical 1--10s hours | Rows retained below 8s | Hours retained below 8s |
+| -------------------- | ----------------------: | -----------------------: | ----------------------: | -----------------------: |
+| DRTV local | 5,178,843 | 6,390.27 | 99.32% | 98.68% |
+| Danish YouTube local | 3,208,785 | 2,001.97 | 99.75% | 99.01% |
+| P1 segments | Pending final release | Pending final release | Pending final release | Pending final release |
+
+The rounded retention figures correspond to approximately 5.14 million DRTV rows and
+3.20 million YouTube rows. Regenerate exact 1--8-second accepted counts from the pinned
+manifests for final release provenance.
 
 ### Interpretation notes
 
@@ -58,14 +64,15 @@ Only the local manifests currently have exact post-filter measurements:
 - Danish VoxPopuli is excluded from the active mix because, at unified audio revision
   `5a3a49ee981baab6e1e37ddd2c45f9943c27d08f` and positional overlay shard range
   `0--354`, its first 100 joined clips are OGG mono 16 kHz (duration min 16.15,
-  median 30, max 30); none survive the strict `1 < duration < 10` filter. Keeping it
+  median 30, max 30); none survive either the historical 10-second filter or the
+  production `1 < duration < 8` filter. Keeping it
   active would scan 1.745 million rows without yielding an example. Its reusable dataset
   YAML is retained for future use.
 - NST's approximately 250 hours come from the existing Hviske v5 provenance rather than
   a full-split duration scan.
 - People's Speech has 1,501,271 clean/train rows. The approximately 5,790-hour estimate
   uses the dataset server's partial mean duration of 13.89 seconds and is not precise
-  enough for final weighting. The 10-second filter may reject a large share.
+  enough for final weighting. The 8-second production filter may reject a large share.
 - People's Speech mixes interviews, government recordings, radio, lectures, sermons, and
   other sources. Do not count the whole corpus as confirmed conversation without a
   source-level stratification.

@@ -97,17 +97,18 @@ Here are some of the more important available keys:
   to the Hugging Face Hub, and if so, which organisation to push it to. If `private` is
   set to `True`, the model will be private. The default is not to push the model to the
   Hub. `private_only` hard-fails public destinations and verifies Hub visibility before
-  and after upload. The production Sparkie preset keeps publication off during training.
-  Enable publication through the general finetuning entry point only after confirming
-  the destination and privacy settings; local manifest paths must never be included.
+  and after upload. The production bilingual preset keeps publication off during
+  training. Use `src/scripts/publish_model.py` only after reviewing the saved package;
+  local manifest paths must never be included.
 - `enable_experiment_tracking`: Whether training monitoring during training should be
   enabled. Defaults to false. You can also set `experiment_tracking` to either `wandb`
   or `mlflow` to specify which experiment tracking tool to use (`wandb` is used by
-  default). The production Sparkie preset uses the online W&B project `hviske`, group
-  `v6.0`, and the authenticated user's default workspace (no hardcoded entity). Generate
-  and persist a fresh ID for every smoke, pilot, and full phase, using `resume=never` for
-  new runs so an ID collision fails. Reuse only the persisted full-run ID with
-  `experiment_tracking.resume=must` when resuming a local checkpoint. Keep
+  default). The production bilingual preset uses the online W&B project `hviske` and
+  the authenticated user's default workspace (no hardcoded entity). Supply the run group,
+  name, ID, and resume policy at launch time. Generate and persist a fresh ID for every
+  smoke, pilot, and full phase, using `resume=never` for new runs so an ID collision fails.
+  Reuse only the persisted full-run ID with `experiment_tracking.resume=must` when
+  resuming a local checkpoint. Keep
   `WANDB_LOG_MODEL=false` and `WANDB_WATCH=false` so checkpoints stay local while metrics
   and configuration are logged online. Authenticate with
   `uv run wandb login --verify`; the Python preflight never prompts or calls
@@ -146,13 +147,13 @@ Use `config/datasets/drtv_local.yaml` or `youtube_local.yaml` as the dataset
 configuration. Training seeks and reads only each cue from the original WAV when it
 is consumed; the manifest stores paths, offsets, text, IDs, durations, and language.
 
-The reproducible Sparkie bilingual preset is `config/sparkie_bilingual.yaml`. Export
+The reproducible production bilingual preset is `config/bilingual.yaml`. Export
 `P1_SEGMENTS_REVISION` and `HVISKE_OVERLAY_REVISION` with their immutable
 40-character commits, then resolve the preset with the general finetuning entry point:
 
 ```bash
 uv run python src/scripts/finetune_asr_model.py \
-  --config-name sparkie_bilingual --cfg job
+  --config-name bilingual --cfg job
 ```
 
 The production preset caps validation materialisation at 1,000 examples per dataset.

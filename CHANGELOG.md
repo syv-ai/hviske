@@ -19,13 +19,15 @@
   existing vocabulary, blank-token IDs, and TDT duration heads while resizing
   vocabulary-dependent CTC and transducer heads.
 - Added Parakeet CTC, RNNT, and revision-pinned TDT model presets.
+- Added a publication-only command with strict Cohere and Parakeet TDT package
+  validation, keeping reviewed uploads separate from training.
 
 ### Changed
 
-- Made the local positional-overlay artefact mandatory for Sparkie and enabled three
-  spawned DataLoader workers while retaining serial dataset preprocessing and generic
-  remote keyed/non-materialised overlay support; four workers exceeded the production
-  thermal limit during a sustained GPU pilot.
+- Made the local positional-overlay artefact mandatory for production bilingual training
+  and enabled two spawned DataLoader workers while retaining serial dataset preprocessing
+  and generic remote keyed/non-materialised overlay support; four workers exceeded the
+  thermal limit and three caused excessive long-run swap pressure.
 - Tuned the production Sparkie shuffle buffers after the wf2t12vq smoke: a one-row
   global buffer for already-sharded Hub sources, 128 rows for local DRTV and YouTube,
   and 16 rows for the five positional unified sources. The old global 128-row graph took
@@ -33,8 +35,11 @@
   200,000-step training horizon remains unchanged.
 - Switched production Sparkie P1 training to direct `syvai/p1-segments` loading with a
   required immutable `P1_SEGMENTS_REVISION`; generic transcript joins remain supported.
-- Kept the active Cohere campaign and its default unchanged while adding the
-  isolated Parakeet TDT preset and runbook prerequisites.
+- Renamed the host-specific bilingual preset to `config/bilingual.yaml` and made the
+  validated Parakeet TDT production parameters its defaults: 8-second clips, learning
+  rate `5e-6`, two loader workers, batch 6/effective batch 60, 200,000 steps, and
+  2,000-step evaluation cadence. Run paths and tracking identity remain launch-time
+  concerns.
 
 ### Removed
 

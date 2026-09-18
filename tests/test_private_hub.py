@@ -16,6 +16,11 @@ from transformers import (
     CohereAsrFeatureExtractor,
     CohereAsrForConditionalGeneration,
     CohereAsrProcessor,
+    ParakeetFeatureExtractor,
+    ParakeetForTDT,
+    ParakeetProcessor,
+    ParakeetTDTConfig,
+    ParakeetTokenizer,
     TokenizersBackend,
 )
 from transformers.trainer import Trainer
@@ -237,6 +242,49 @@ def _minimal_cohere_package(
         cohere_processor.save_pretrained(folder)
 
 
+def test_publication_accepts_native_parakeet_tdt_save(tmp_path: Path) -> None:
+    """A saved TDT package follows the pinned Transformers artefact contract."""
+    _minimal_tdt_package(tmp_path)
+
+    utils._validate_model_package(tmp_path)
+
+
+def _minimal_tdt_package(folder: Path) -> None:
+    """Save a tiny native Transformers Parakeet TDT package."""
+    tokenizer = ParakeetTokenizer(
+        vocab={"<pad>": 0, "a": 1, "<unk>": 2, "<s>": 3, "</s>": 4, "<blank>": 5},
+        pad_token="<pad>",
+        unk_token="<unk>",
+        bos_token="<s>",
+        eos_token="</s>",
+        blank_token="<blank>",
+    )
+    processor = ParakeetProcessor(
+        feature_extractor=ParakeetFeatureExtractor(feature_size=1),
+        tokenizer=tokenizer,
+        blank_token="<blank>",
+        decoder_type="tdt",
+    )
+    model = ParakeetForTDT(
+        ParakeetTDTConfig(
+            encoder_config={
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "intermediate_size": 8,
+            },
+            vocab_size=6,
+            decoder_hidden_size=4,
+            num_decoder_layers=1,
+            pad_token_id=0,
+            blank_token_id=5,
+            durations=(0, 1, 2),
+        )
+    )
+    processor.save_pretrained(folder)
+    model.save_pretrained(folder)
+
+
 def test_publication_rejects_corrupt_weights(tmp_path: Path) -> None:
     """Corrupt single-file weights cannot pass the publication gate."""
     _minimal_cohere_package(tmp_path, weights=False)
@@ -282,6 +330,21 @@ def test_publication_rejects_malformed_sharded_index(tmp_path: Path) -> None:
     _minimal_cohere_package(tmp_path, weights=False)
     (tmp_path / "model.safetensors.index.json").write_text("[]", encoding="utf-8")
     with pytest.raises(ValueError, match="Malformed sharded"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_malformed_tdt_processor(tmp_path: Path) -> None:
+    """A TDT package with a non-TDT processor cannot pass validation."""
+    _minimal_tdt_package(tmp_path)
+    processor_config = tmp_path / "processor_config.json"
+    processor_config.write_text(
+        processor_config.read_text(encoding="utf-8").replace(
+            '"decoder_type": "tdt"', '"decoder_type": "rnnt"'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="wrong decoder_type"):
         utils._validate_model_package(tmp_path)
 
 
@@ -377,6 +440,21 @@ def test_publication_rejects_wrong_model_type(tmp_path: Path) -> None:
     _minimal_cohere_package(tmp_path)
     (tmp_path / "config.json").write_text('{"model_type": "whisper"}', encoding="utf-8")
     with pytest.raises(ValueError, match="wrong model_type"):
+        utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_wrong_parakeet_family(tmp_path: Path) -> None:
+    """A TDT package relabelled as another Parakeet family is rejected."""
+    _minimal_tdt_package(tmp_path)
+    config = tmp_path / "config.json"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            '"model_type": "parakeet_tdt"', '"model_type": "parakeet_rnnt"'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported model family"):
         utils._validate_model_package(tmp_path)
 
 

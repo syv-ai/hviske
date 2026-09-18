@@ -544,11 +544,11 @@ def publish_model_folder(
 
 
 def _copy_model_artefacts(source: Path, destination: Path) -> None:
-    """Copy a complete, reloadable Cohere package using the strict allowlist.
+    """Copy a complete, reloadable model package using the strict allowlist.
 
     Raises:
         ValueError:
-            If the source is not a complete Cohere package.
+            If the source is not a complete supported model package.
     """
     if not source.is_dir():
         raise ValueError(f"Model output directory does not exist: {source}")
@@ -563,7 +563,7 @@ def _copy_model_artefacts(source: Path, destination: Path) -> None:
 
 
 def _validate_model_package(source: Path) -> None:
-    """Check that a saved Cohere model has all reload-critical files.
+    """Check that a saved supported model has all reload-critical files.
 
     Raises:
         ValueError:
@@ -578,39 +578,96 @@ def _validate_model_package(source: Path) -> None:
         try:
             document = json.loads((source / name).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"Cohere {name} is not valid JSON") from error
+            raise ValueError(f"Model {name} is not valid JSON") from error
         if not isinstance(document, dict):
-            raise ValueError(f"Cohere {name} must contain an object")
+            raise ValueError(f"Model {name} must contain an object")
         documents[name] = document
-    if documents["config.json"].get("model_type") != "cohere_asr":
-        raise ValueError("Cohere config.json has the wrong model_type")
+    model_type = documents["config.json"].get("model_type")
     processor = documents["processor_config.json"]
-    if processor.get("processor_class") != "CohereAsrProcessor":
-        raise ValueError("Cohere processor config has the wrong processor_class")
-    feature_extractor = processor.get("feature_extractor")
-    if not isinstance(feature_extractor, dict):
-        raise ValueError("Cohere processor config has no feature extractor metadata")
-    if feature_extractor.get("feature_extractor_type") != "CohereAsrFeatureExtractor":
-        raise ValueError("Cohere processor config has the wrong feature extractor")
-    if (
-        not isinstance(feature_extractor.get("sampling_rate"), int)
-        or feature_extractor["sampling_rate"] <= 0
-    ):
-        raise ValueError("Cohere processor config has an invalid sampling rate")
     tokenizer = documents["tokenizer_config.json"]
-    if tokenizer.get("tokenizer_class") != "TokenizersBackend":
-        raise ValueError("Cohere tokenizer config has the wrong tokenizer_class")
-    if tokenizer.get("backend") != "tokenizers":
-        raise ValueError("Cohere tokenizer config has the wrong backend")
+    if model_type == "cohere_asr":
+        family_label = "Cohere"
+        if processor.get("processor_class") != "CohereAsrProcessor":
+            raise ValueError("Cohere processor config has the wrong processor_class")
+        feature_extractor = processor.get("feature_extractor")
+        if not isinstance(feature_extractor, dict):
+            raise ValueError(
+                "Cohere processor config has no feature extractor metadata"
+            )
+        if (
+            feature_extractor.get("feature_extractor_type")
+            != "CohereAsrFeatureExtractor"
+        ):
+            raise ValueError("Cohere processor config has the wrong feature extractor")
+        if (
+            not isinstance(feature_extractor.get("sampling_rate"), int)
+            or feature_extractor["sampling_rate"] <= 0
+        ):
+            raise ValueError("Cohere processor config has an invalid sampling rate")
+        if tokenizer.get("tokenizer_class") != "TokenizersBackend":
+            raise ValueError("Cohere tokenizer config has the wrong tokenizer_class")
+        if tokenizer.get("backend") != "tokenizers":
+            raise ValueError("Cohere tokenizer config has the wrong backend")
+    elif model_type == "parakeet_tdt":
+        family_label = "Parakeet TDT"
+        architectures = documents["config.json"].get("architectures")
+        if not isinstance(architectures, list) or "ParakeetForTDT" not in architectures:
+            raise ValueError("Parakeet TDT config has the wrong architecture")
+        durations = documents["config.json"].get("durations")
+        if (
+            not isinstance(durations, list)
+            or not durations
+            or not all(
+                isinstance(duration, int) and duration >= 0 for duration in durations
+            )
+        ):
+            raise ValueError("Parakeet TDT config has invalid durations")
+        if processor.get("processor_class") != "ParakeetProcessor":
+            raise ValueError(
+                "Parakeet TDT processor config has the wrong processor_class"
+            )
+        if processor.get("decoder_type") != "tdt":
+            raise ValueError("Parakeet TDT processor config has the wrong decoder_type")
+        if (
+            not isinstance(processor.get("blank_token"), str)
+            or not processor["blank_token"]
+        ):
+            raise ValueError("Parakeet TDT processor config has no blank token")
+        feature_extractor = processor.get("feature_extractor")
+        if not isinstance(feature_extractor, dict):
+            raise ValueError(
+                "Parakeet TDT processor config has no feature extractor metadata"
+            )
+        if (
+            feature_extractor.get("feature_extractor_type")
+            != "ParakeetFeatureExtractor"
+        ):
+            raise ValueError(
+                "Parakeet TDT processor config has the wrong feature extractor"
+            )
+        if feature_extractor.get("sampling_rate") != 16_000:
+            raise ValueError(
+                "Parakeet TDT processor config has the wrong sampling rate"
+            )
+        if tokenizer.get("tokenizer_class") != "ParakeetTokenizer":
+            raise ValueError(
+                "Parakeet TDT tokenizer config has the wrong tokenizer_class"
+            )
+        if tokenizer.get("backend") != "tokenizers":
+            raise ValueError("Parakeet TDT tokenizer config has the wrong backend")
+    elif processor.get("processor_class") == "CohereAsrProcessor":
+        raise ValueError("Cohere config.json has the wrong model_type")
+    else:
+        raise ValueError(f"Unsupported model family: {model_type!r}")
     tokenizer_json = source / "tokenizer.json"
     if not _regular_file(tokenizer_json):
-        raise ValueError("Cohere package is missing tokenizer.json")
+        raise ValueError(f"{family_label} package is missing tokenizer.json")
     try:
         tokenizer_document = json.loads(tokenizer_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise ValueError("Cohere tokenizer.json is not valid JSON") from error
+        raise ValueError(f"{family_label} tokenizer.json is not valid JSON") from error
     if not isinstance(tokenizer_document, dict):
-        raise ValueError("Cohere tokenizer.json must contain an object")
+        raise ValueError(f"{family_label} tokenizer.json must contain an object")
 
     single = source / "model.safetensors"
     index_path = source / "model.safetensors.index.json"
@@ -621,12 +678,14 @@ def _validate_model_package(source: Path) -> None:
         and path.suffix == ".safetensors"
     )
     if _regular_file(single) and (shard_paths or _regular_file(index_path)):
-        raise ValueError("Cohere package contains conflicting weight layouts")
+        raise ValueError(f"{family_label} package contains conflicting weight layouts")
     if _regular_file(single):
         _validate_safetensors_file(single)
         return
     if not _regular_file(index_path):
-        raise ValueError("Cohere package needs model.safetensors or a complete index")
+        raise ValueError(
+            f"{family_label} package needs model.safetensors or a complete index"
+        )
     try:
         index = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
