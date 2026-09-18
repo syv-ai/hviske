@@ -19,10 +19,12 @@ import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 import yaml
-from huggingface_hub import CommitInfo, HfFileSystem
+from huggingface_hub import CommitInfo, HfApi, HfFileSystem
+from huggingface_hub.errors import BadRequestError, HfHubHTTPError
 from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
 from p1_dataset.contracts import LedgerState, OutputRow, ShardEvidence
+from p1_dataset.hub_diagnostics import annotate_hub_error, classify_hub_error
 from p1_dataset.ledger import Ledger
 from p1_dataset.publish import (
     AllowListError,
@@ -33,6 +35,7 @@ from p1_dataset.publish import (
     UploadOperation,
     VerificationError,
     _commit_sha,
+    _remote_digest,
     _stream_remote,
     build_dataset_card,
     initialise_private_dataset,
@@ -149,7 +152,9 @@ class MemoryHub:
         """Return size and optionally content-digest metadata."""
         result = []
         for path in paths:
-            content = self.files[path]
+            if path not in self.files and path not in self.existing_paths:
+                continue
+            content = self.files.get(path, b"")
             attrs: dict[str, object] = {"path": path, "size": len(content)}
             if self.expose_digest:
                 attrs["sha256"] = hashlib.sha256(content).hexdigest()
@@ -344,6 +349,31 @@ def test_card_is_readable_and_contract_driven() -> None:
     assert "Roest" not in card
 
 
+def test_collision_check_queries_only_proposed_paths(tmp_path: Path) -> None:
+    """Collision safety does not enumerate an increasingly large repository tree."""
+    path = tmp_path / "one.parquet"
+    write_valid_shard(path)
+
+    class NoListingHub(MemoryHub):
+        def list_repo_files(
+            self, repo_id: str, *, repo_type: str, revision: str | None = None
+        ) -> c.Iterable[str]:
+            del repo_id, repo_type, revision
+            raise AssertionError("full repository listing must not be used")
+
+    hub = NoListingHub(sha="b" * 40)
+    publish_batch(
+        hub,
+        "org/p1",
+        "batch",
+        [LocalShard(path, "one.parquet", 1)],
+        expected_pipeline_version="test",
+        expected_pipeline_config_sha256="b" * 64,
+    )
+
+    assert hub.commits == [("one.parquet", "manifests/batch.json")]
+
+
 def test_commit_has_fewer_than_100_operations(tmp_path: Path) -> None:
     """A batch that would reach 100 Hub operations is refused."""
     shards = []
@@ -411,7 +441,7 @@ def test_commit_is_recoverable_before_verification_and_purge(tmp_path: Path) -> 
 def test_commit_sha_prefers_commit_info_oid_and_accepts_plain_sha() -> None:
     """CommitInfo URLs do not hide their immutable object identifiers."""
     commit = CommitInfo(
-        commit_url="https://huggingface.co/commit/main",
+        commit_url="https://huggingface.co/datasets/org/repo/commit/main",
         commit_message="",
         commit_description="",
         oid="a" * 40,
@@ -427,7 +457,7 @@ def test_commit_sha_prefers_commit_info_oid_and_accepts_plain_sha() -> None:
         "a" * 39,
         "a" * 41,
         CommitInfo(
-            commit_url="https://huggingface.co/commit/main",
+            commit_url="https://huggingface.co/datasets/org/repo/commit/main",
             commit_message="",
             commit_description="",
             oid="main",
@@ -579,6 +609,76 @@ def test_failed_verification_resumes_without_reupload_or_early_purge(
         assert not manifest_path.exists()
 
 
+def test_hf_adapter_tags_opaque_create_failure_without_leaking(tmp_path: Path) -> None:
+    """Adapter phase hints are bounded even when transport details are private."""
+    path = tmp_path / "private-source-id.parquet"
+    path.write_bytes(b"bytes")
+    adapter = object.__new__(HfApiAdapter)
+    adapter._token = True
+    error = BadRequestError(
+        "private-source-id token=hf_secret",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://signed.test/object?token=secret"),
+        ),
+    )
+
+    class Api:
+        def create_commit(self, **kwargs: object) -> object:
+            del kwargs
+            raise error
+
+    adapter._api = t.cast(HfApi, Api())
+    with pytest.raises(BadRequestError) as captured:
+        adapter.create_commit(
+            "org/private",
+            [UploadOperation(path_in_repo="data/one.parquet", path=path)],
+            repo_type="dataset",
+            commit_message="test",
+        )
+
+    diagnostic = classify_hub_error(captured.value)
+    assert diagnostic.phase == "create_commit"
+    assert diagnostic.reason == "unknown"
+    assert "private" not in repr(diagnostic)
+    assert "signed.test" not in repr(diagnostic)
+    assert "secret" not in repr(diagnostic)
+
+
+def test_hf_adapter_uses_path_operations_and_preserves_exact_bytes(
+    tmp_path: Path,
+) -> None:
+    """Native Hub operations retain the source path and its exact bytes."""
+    path = tmp_path / "private-source-id.parquet"
+    expected = b"exact parquet bytes"
+    path.write_bytes(expected)
+    adapter = object.__new__(HfApiAdapter)
+    adapter._token = True
+
+    class Api:
+        def create_commit(self, **kwargs: object) -> object:
+            assert kwargs["num_threads"] == 1
+            operations = t.cast(list[object], kwargs["operations"])
+            paths = [
+                t.cast(str, getattr(operation, "path_or_fileobj"))
+                for operation in operations
+            ]
+            assert paths == [str(path)]
+            assert [Path(item).read_bytes() for item in paths] == [expected]
+            return SimpleNamespace(commit_id="a" * 40)
+
+    adapter._api = t.cast(HfApi, Api())
+    result = adapter.create_commit(
+        "org/private",
+        [UploadOperation(path_in_repo="data/one.parquet", path=path)],
+        repo_type="dataset",
+        commit_message="test",
+        parent_commit="b" * 40,
+    )
+
+    assert getattr(result, "commit_id") == "a" * 40
+
+
 def test_hf_digest_stream_uses_explicit_dataset_namespace() -> None:
     """The filesystem adapter never ambiguously addresses a model repository."""
     adapter = object.__new__(HfApiAdapter)
@@ -596,6 +696,128 @@ def test_hf_digest_stream_uses_explicit_dataset_namespace() -> None:
         )
     ) == [b"payload"]
     assert paths == ["datasets/org/p1/shards/one.parquet"]
+
+
+def test_hf_lfs_forbidden_failure_is_safe_and_non_retryable() -> None:
+    """LFS authorisation failures expose only a bounded classification."""
+    error = HfHubHTTPError(
+        "private/path token=hf_secret",
+        response=httpx.Response(
+            403,
+            request=httpx.Request(
+                "POST",
+                "https://huggingface.co/api/datasets/org/repo/info/lfs/objects/batch"
+                "?token=hf_secret",
+            ),
+            json={"error": "private/path token=hf_secret"},
+        ),
+    )
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.status_code == 403
+    assert diagnostic.phase == "lfs_batch"
+    assert diagnostic.reason == "authorisation"
+    assert not diagnostic.retryable
+    assert "huggingface.co" not in repr(diagnostic)
+    assert "private/path" not in repr(diagnostic)
+    assert "hf_secret" not in repr(diagnostic)
+
+
+def test_hf_missing_uploaded_object_is_retryable_without_transport_details() -> None:
+    """The known grouped-upload failure has only a bounded diagnosis."""
+    body = (
+        "Bad request for commit endpoint:\n"
+        "Your push was rejected because an LFS pointer pointed to a file that does "
+        "not exist. "
+        "offending/private.parquet token=hf_secret https://signed.test/object"
+    )
+    error = BadRequestError(
+        "private source-id " + body,
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://huggingface.co/api/datasets/org/repo/commit"
+            ),
+            content=body.encode(),
+        ),
+    )
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.status_code == 400
+    assert diagnostic.phase == "commit"
+    assert diagnostic.reason == "missing_uploaded_object"
+    assert diagnostic.retryable
+    assert "offending" not in repr(diagnostic)
+    assert "hf_secret" not in repr(diagnostic)
+    assert "signed.test" not in repr(diagnostic)
+    assert "source-id" not in repr(diagnostic)
+
+
+def test_hf_near_match_400_is_unknown_and_non_retryable() -> None:
+    """Only the exact missing-object phrase is allowlisted."""
+    error = BadRequestError(
+        "private source-id",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://huggingface.co/api/datasets/org/repo/commit"
+            ),
+            content=b"An LFS pointer points to a file that does not exist.",
+        ),
+    )
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.phase == "commit"
+    assert diagnostic.reason == "unknown"
+    assert not diagnostic.retryable
+
+
+def test_hf_tagged_missing_uploaded_object_is_unknown_without_phrase() -> None:
+    """Code-supplied missing-object tags cannot override server evidence."""
+    error = BadRequestError(
+        "unrelated manually tagged failure",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://huggingface.co/api/datasets/org/repo/commit"
+            ),
+            json={"error": "unrelated validation failure"},
+        ),
+    )
+    annotate_hub_error(error, phase="commit", reason="missing_uploaded_object")
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.reason == "unknown"
+    assert not diagnostic.retryable
+
+
+def test_hf_xet_failure_is_classified_without_transport_details() -> None:
+    """Xet endpoint failures expose a safe phase and no request data."""
+    error = HfHubHTTPError(
+        "signed URL https://cas-server.xethub.hf.co/reconstruction/object",
+        response=httpx.Response(
+            403,
+            request=httpx.Request(
+                "GET",
+                "https://cas-server.xethub.hf.co/reconstruction/object"
+                "?X-Amz-Signature=signed",
+            ),
+            json={"error": "private/object signed"},
+        ),
+    )
+
+    diagnostic = classify_hub_error(error)
+
+    assert diagnostic.status_code == 403
+    assert diagnostic.phase == "xet"
+    assert diagnostic.reason == "authorisation"
+    assert not diagnostic.retryable
+    assert "xethub" not in repr(diagnostic)
+    assert "signed" not in repr(diagnostic)
 
 
 def test_initialisation_commits_card_and_attributes_privately() -> None:
@@ -882,12 +1104,14 @@ class RacingHub(MemoryHub):
         self.head = self.commit_id
         return result
 
-    def list_repo_files(
-        self, repo_id: str, *, repo_type: str, revision: str | None = None
-    ) -> c.Iterable[str]:
+    def get_paths_info(
+        self, repo_id: str, paths: list[str], *, repo_type: str, revision: str
+    ) -> list[object]:
         """Return the old immutable snapshot before racing a competitor."""
         self.revisions.append(revision)
-        snapshot = tuple(self.files) + self.existing_paths
+        snapshot = super().get_paths_info(
+            repo_id, paths, repo_type=repo_type, revision=revision
+        )
         if self.race:
             self.race = False
             self.files[self.race_path] = self.race_bytes
@@ -927,7 +1151,7 @@ def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
     """Publishing never overwrites a path owned by an existing publication."""
     path = tmp_path / "one.parquet"
     write_valid_shard(path)
-    hub = MemoryHub(existing_paths=("one.parquet",))
+    hub = MemoryHub(sha="b" * 40, existing_paths=("one.parquet",))
     with pytest.raises(AllowListError, match="collision"):
         publish_batch(
             hub,
@@ -938,6 +1162,19 @@ def test_remote_path_collision_is_refused(tmp_path: Path) -> None:
             expected_pipeline_config_sha256="b" * 64,
         )
     assert not hub.commits
+
+
+def test_repo_file_metadata_distinguishes_lfs_and_git_identity() -> None:
+    """RepoFile metadata never mistakes a Git SHA-1 for content SHA-256."""
+    payload = b"realistic remote object"
+    lfs = SimpleNamespace(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    lfs_file = SimpleNamespace(
+        path="data/one.parquet", size=len(payload), blob_id="a" * 40, lfs=lfs
+    )
+    git_file = SimpleNamespace(path="README.md", size=len(payload), blob_id="b" * 40)
+
+    assert _remote_digest(lfs_file) == lfs.sha256
+    assert _remote_digest(git_file) is None
 
 
 def test_stream_decode_failure_retains_the_pending_batch(tmp_path: Path) -> None:

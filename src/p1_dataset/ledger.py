@@ -28,6 +28,7 @@ from .contracts import (
     ShardEvidence,
     valid_ledger_transition,
 )
+from .publication_layout import is_allowed_shard_path
 
 _SCHEMA_VERSION = 3
 _SEQUENCE_TABLE = "ledger_sequences"
@@ -53,6 +54,244 @@ _FORBIDDEN_KEYS = {
     "waveform",
 }
 _FORBIDDEN_PATH_PARTS = {".cache", "cache", "scratch", "tmp"}
+
+
+@dataclass(frozen=True)
+class LedgerColumn:
+    """Canonical declaration and introspection shape for one ledger column."""
+
+    name: str
+    declared_type: str
+    not_null: bool
+    default: str | None
+    primary_key: int
+    autoincrement: bool = False
+    hidden: int = 0
+
+    def declaration(self) -> str:
+        """Return the SQL declaration used for a fresh ledger."""
+        declaration = f"{self.name} {self.declared_type}"
+        if self.primary_key:
+            declaration += " PRIMARY KEY"
+            if self.autoincrement:
+                declaration += " AUTOINCREMENT"
+        if self.not_null:
+            declaration += " NOT NULL"
+        if self.default is not None:
+            declaration += f" DEFAULT {self.default}"
+        return declaration
+
+
+@dataclass(frozen=True)
+class LedgerForeignKey:
+    """Canonical shape for one ledger foreign-key relationship."""
+
+    columns: tuple[str, ...]
+    referred_table: str
+    referred_columns: tuple[str, ...]
+    on_update: str = "NO ACTION"
+    on_delete: str = "NO ACTION"
+    match: str = "NONE"
+
+
+@dataclass(frozen=True)
+class LedgerIndex:
+    """Canonical declaration and introspection shape for one ledger index."""
+
+    name: str
+    columns: tuple[str, ...]
+    unique: bool = False
+    descending: tuple[bool, ...] = ()
+    collations: tuple[str, ...] = ()
+    partial: bool = False
+
+    def column_definitions(self) -> tuple[str, ...]:
+        """Return the canonical SQL definitions for indexed columns."""
+        descending = self.descending or (False,) * len(self.columns)
+        collations = self.collations or ("BINARY",) * len(self.columns)
+        return tuple(
+            f"{column}"
+            + (f" COLLATE {collation}" if collation.upper() != "BINARY" else "")
+            + (" DESC" if is_descending else "")
+            for column, collation, is_descending in zip(
+                self.columns, collations, descending, strict=True
+            )
+        )
+
+
+@dataclass(frozen=True)
+class LedgerTable:
+    """Canonical declaration and introspection shape for one ledger table."""
+
+    name: str
+    columns: tuple[LedgerColumn, ...]
+    indexes: tuple[LedgerIndex, ...] = ()
+    foreign_keys: tuple[LedgerForeignKey, ...] = ()
+    checks: tuple[str, ...] = ()
+
+    def create_statement(self) -> str:
+        """Return the canonical CREATE TABLE statement."""
+        definitions = [column.declaration() for column in self.columns]
+        definitions.extend(
+            f"FOREIGN KEY ({', '.join(key.columns)}) REFERENCES "
+            f"{key.referred_table} ({', '.join(key.referred_columns)})"
+            for key in self.foreign_keys
+        )
+        definitions.extend(f"CHECK ({check})" for check in self.checks)
+        return f"CREATE TABLE {self.name} (" + ", ".join(definitions) + ")"
+
+
+@dataclass(frozen=True)
+class LedgerSchema:
+    """Canonical current Ledger schema shared by creation and preflight."""
+
+    version: int
+    tables: tuple[LedgerTable, ...]
+    internal_tables: tuple[LedgerTable, ...] = ()
+
+    @property
+    def all_table_names(self) -> frozenset[str]:
+        """Declared user and SQLite-internal table names."""
+        return self.table_names | frozenset(
+            table.name for table in self.internal_tables
+        )
+
+    @property
+    def table_names(self) -> frozenset[str]:
+        """Declared user-table names."""
+        return frozenset(table.name for table in self.tables)
+
+
+LEDGER_SCHEMA = LedgerSchema(
+    version=_SCHEMA_VERSION,
+    tables=(
+        LedgerTable(
+            name="ledger_sequences",
+            columns=(
+                LedgerColumn("kind", "TEXT", False, None, 1),
+                LedgerColumn("next_value", "INTEGER", True, None, 0),
+            ),
+            checks=("next_value > 0",),
+        ),
+        LedgerTable(
+            name="programmes",
+            columns=(
+                LedgerColumn("programme_id", "TEXT", False, None, 1),
+                LedgerColumn("source_file_id", "TEXT", True, None, 0),
+                LedgerColumn("state", "TEXT", True, None, 0),
+                LedgerColumn("source_revisions", "TEXT", True, None, 0),
+                LedgerColumn("pipeline_digest", "TEXT", True, None, 0),
+                LedgerColumn("commit_id", "TEXT", False, None, 0),
+                LedgerColumn("attempts", "INTEGER", True, "0", 0),
+                LedgerColumn("accepted_count", "INTEGER", True, "0", 0),
+                LedgerColumn("rejected_count", "INTEGER", True, "0", 0),
+                LedgerColumn("source_duration_ms", "INTEGER", False, None, 0),
+                LedgerColumn("processed_duration_ms", "INTEGER", False, None, 0),
+                LedgerColumn("rejection_counts", "TEXT", True, "'{}'", 0),
+                LedgerColumn("processing_started_at", "TEXT", False, None, 0),
+                LedgerColumn("discovered_at", "TEXT", True, None, 0),
+                LedgerColumn("verification_time", "TEXT", False, None, 0),
+                LedgerColumn("purge_time", "TEXT", False, None, 0),
+                LedgerColumn("source_temp_purged_at", "TEXT", False, None, 0),
+                LedgerColumn("source_temp_purge_evidence", "TEXT", True, "'{}'", 0),
+                LedgerColumn("last_evidence", "TEXT", True, "'{}'", 0),
+                LedgerColumn("last_error", "TEXT", False, None, 0),
+                LedgerColumn("updated_at", "TEXT", True, None, 0),
+            ),
+            indexes=(LedgerIndex("programmes_state", ("state",)),),
+        ),
+        LedgerTable(
+            name="batches",
+            columns=(
+                LedgerColumn("batch_id", "TEXT", False, None, 1),
+                LedgerColumn("state", "TEXT", True, None, 0),
+                LedgerColumn("pipeline_digest", "TEXT", True, None, 0),
+                LedgerColumn("commit_id", "TEXT", False, None, 0),
+                LedgerColumn("attempts", "INTEGER", True, "0", 0),
+                LedgerColumn("programme_count", "INTEGER", True, "0", 0),
+                LedgerColumn("row_count", "INTEGER", True, "0", 0),
+                LedgerColumn("rejection_counts", "TEXT", True, "'{}'", 0),
+                LedgerColumn("duration_ms", "INTEGER", False, None, 0),
+                LedgerColumn("processing_started_at", "TEXT", False, None, 0),
+                LedgerColumn("verification_time", "TEXT", False, None, 0),
+                LedgerColumn("purge_time", "TEXT", False, None, 0),
+                LedgerColumn("publication_artifact_purged_at", "TEXT", False, None, 0),
+                LedgerColumn(
+                    "publication_artifact_purge_evidence", "TEXT", True, "'{}'", 0
+                ),
+                LedgerColumn("remote_checked_at", "TEXT", False, None, 0),
+                LedgerColumn("remote_present", "INTEGER", False, None, 0),
+                LedgerColumn("last_evidence", "TEXT", True, "'{}'", 0),
+                LedgerColumn("last_error", "TEXT", False, None, 0),
+                LedgerColumn("created_at", "TEXT", True, None, 0),
+                LedgerColumn("updated_at", "TEXT", True, None, 0),
+                LedgerColumn("sealed", "INTEGER", True, "0", 0),
+            ),
+            indexes=(LedgerIndex("batches_state", ("state",)),),
+        ),
+        LedgerTable(
+            name="shards",
+            columns=(
+                LedgerColumn("shard_id", "TEXT", False, None, 1),
+                LedgerColumn("programme_id", "TEXT", False, None, 0),
+                LedgerColumn("batch_id", "TEXT", False, None, 0),
+                LedgerColumn("state", "TEXT", True, None, 0),
+                LedgerColumn("path", "TEXT", True, None, 0),
+                LedgerColumn("byte_size", "INTEGER", True, None, 0),
+                LedgerColumn("row_count", "INTEGER", True, None, 0),
+                LedgerColumn("sha256", "TEXT", True, None, 0),
+                LedgerColumn("local_path", "TEXT", False, None, 0),
+                LedgerColumn("verification_time", "TEXT", False, None, 0),
+                LedgerColumn("purge_time", "TEXT", False, None, 0),
+                LedgerColumn("last_evidence", "TEXT", True, "'{}'", 0),
+                LedgerColumn("last_error", "TEXT", False, None, 0),
+                LedgerColumn("created_at", "TEXT", True, None, 0),
+                LedgerColumn("updated_at", "TEXT", True, None, 0),
+            ),
+            indexes=(LedgerIndex("shards_batch", ("batch_id", "shard_id")),),
+            foreign_keys=(
+                LedgerForeignKey(("programme_id",), "programmes", ("programme_id",)),
+                LedgerForeignKey(("batch_id",), "batches", ("batch_id",)),
+            ),
+        ),
+        LedgerTable(
+            name="audit_candidates",
+            columns=(
+                LedgerColumn("candidate_id", "INTEGER", False, None, 1, True),
+                LedgerColumn("batch_id", "TEXT", True, None, 0),
+                LedgerColumn("programme_id", "TEXT", True, None, 0),
+                LedgerColumn("candidate_json", "TEXT", True, None, 0),
+                LedgerColumn("local_path", "TEXT", True, None, 0),
+                LedgerColumn("local_row_locator", "INTEGER", True, None, 0),
+                LedgerColumn("created_at", "TEXT", True, None, 0),
+            ),
+            indexes=(
+                LedgerIndex("audit_candidates_batch", ("batch_id", "candidate_id")),
+            ),
+            foreign_keys=(
+                LedgerForeignKey(("batch_id",), "batches", ("batch_id",)),
+                LedgerForeignKey(("programme_id",), "programmes", ("programme_id",)),
+            ),
+            checks=("local_row_locator >= 0",),
+        ),
+        LedgerTable(
+            name="ledger_metadata",
+            columns=(
+                LedgerColumn("key", "TEXT", False, None, 1),
+                LedgerColumn("value", "TEXT", True, None, 0),
+            ),
+        ),
+    ),
+    internal_tables=(
+        LedgerTable(
+            name="sqlite_sequence",
+            columns=(
+                LedgerColumn("name", "", False, None, 0),
+                LedgerColumn("seq", "", False, None, 0),
+            ),
+        ),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -1631,6 +1870,97 @@ class Ledger:
             ).fetchall()
         return tuple(self._shard_record(row) for row in rows)
 
+    def remap_remote_paths(
+        self, mapping: Mapping[str, str], *, verify_local: bool = True
+    ) -> int:
+        """Atomically remap legacy paths for local, uncommitted shard evidence.
+
+        Returns:
+            Number of remapped shard records.
+
+        Raises:
+            EvidenceError:
+                If mapping coverage, state, collisions, or local evidence is unsafe.
+        """
+        if not isinstance(mapping, Mapping):
+            raise EvidenceError("path mapping must be a mapping")
+        if any(
+            not isinstance(old, str) or not isinstance(new, str)
+            for old, new in mapping.items()
+        ):
+            raise EvidenceError("path mapping must contain only strings")
+        safe_mapping = dict(mapping)
+        for old, new in safe_mapping.items():
+            if not is_allowed_shard_path(old) or not is_allowed_shard_path(new):
+                raise EvidenceError("path mapping contains a noncanonical path")
+            if not old.startswith("data/train/") or not new.startswith(
+                "data-shards/train/"
+            ):
+                raise EvidenceError("migration paths must move legacy shards only")
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """SELECT s.*, b.state AS batch_state, b.commit_id AS batch_commit_id
+                FROM shards AS s LEFT JOIN batches AS b ON b.batch_id = s.batch_id
+                ORDER BY s.shard_id"""
+            ).fetchall()
+            # A migration is deliberately narrower than ``pending_shards``.  Rows
+            # which are still being discovered, retrying, or already published are
+            # recovery work for the normal pipeline, not migration candidates.
+            eligible = [
+                row
+                for row in rows
+                if row["state"] == LedgerState.SHARDED.value
+                and row["batch_state"] == LedgerState.SHARDED.value
+                and row["batch_commit_id"] is None
+                and row["local_path"] is not None
+                and str(row["path"]).startswith("data/train/")
+            ]
+            legacy_occurrences = [str(row["path"]) for row in eligible]
+            if len(legacy_occurrences) != len(set(legacy_occurrences)):
+                raise EvidenceError("a legacy path occurs more than once")
+            if set(safe_mapping) != set(legacy_occurrences):
+                raise EvidenceError("path mapping is incomplete")
+            targets = tuple(safe_mapping.values())
+            if len(targets) != len(set(targets)):
+                raise EvidenceError("path mapping contains a collision")
+            existing = {
+                str(row["path"]) for row in rows if str(row["path"]) not in safe_mapping
+            }
+            if existing.intersection(targets):
+                raise EvidenceError("path mapping collides with ledger evidence")
+            for row in eligible:
+                old = str(row["path"])
+                local_path = Path(str(row["local_path"]))
+                if verify_local:
+                    if local_path.is_symlink() or not local_path.is_file():
+                        raise EvidenceError("local shard evidence is unavailable")
+                    digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
+                    if (
+                        digest != row["sha256"]
+                        or local_path.stat().st_size != row["byte_size"]
+                    ):
+                        raise EvidenceError("local shard evidence changed")
+                connection.execute(
+                    "UPDATE shards SET path = ?, updated_at = ? WHERE shard_id = ?",
+                    (safe_mapping[old], self._now(), row["shard_id"]),
+                )
+        return len(safe_mapping)
+
+    remap_uncommitted_paths = remap_remote_paths
+
+    @staticmethod
+    def _replace_audit_paths(value: object, mapping: Mapping[str, str]) -> object:
+        if isinstance(value, str):
+            return mapping.get(value, value)
+        if isinstance(value, list):
+            return [Ledger._replace_audit_paths(item, mapping) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): Ledger._replace_audit_paths(item, mapping)
+                for key, item in value.items()
+            }
+        return value
+
     def programme(self, programme_id: str) -> ProgrammeRecord:
         """Return one programme record."""
         row = self._fetch("programmes", "programme_id", programme_id)
@@ -1843,6 +2173,24 @@ class Ledger:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if version > _SCHEMA_VERSION:
             raise LedgerError("ledger schema is newer than this package")
+        if (
+            version == 0
+            and not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
+            ).fetchone()
+        ):
+            for table in LEDGER_SCHEMA.tables:
+                connection.execute(table.create_statement())
+                for index in table.indexes:
+                    columns = ", ".join(index.column_definitions())
+                    unique = "UNIQUE " if index.unique else ""
+                    partial = " WHERE 1" if index.partial else ""
+                    connection.execute(
+                        f"CREATE {unique}INDEX {index.name} ON {table.name} "
+                        f"({columns}){partial}"
+                    )
+            connection.execute(f"PRAGMA user_version = {LEDGER_SCHEMA.version}")
+            return
         connection.execute(
             f"""CREATE TABLE IF NOT EXISTS {_SEQUENCE_TABLE} (
                 kind TEXT PRIMARY KEY,

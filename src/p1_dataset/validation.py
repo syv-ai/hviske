@@ -1036,12 +1036,30 @@ class PinnedHubClipRetriever:
         revision: str,
         expected_pipeline_version: str | None = None,
         expected_pipeline_config_sha256: str | None = None,
+        expected_visibility: str = "private",
     ) -> None:
         """Initialise a retriever pinned to a complete Hub commit SHA.
 
+        Args:
+            hub:
+                Hub adapter used for immutable metadata and row retrieval.
+            repository (optional):
+                Pinned dataset repository identifier.
+            repo_id (optional):
+                Backwards-compatible alias for ``repository``.
+            revision:
+                Complete immutable Hub commit SHA.
+            expected_pipeline_version (optional):
+                Pipeline version required in the retrieved row.
+            expected_pipeline_config_sha256 (optional):
+                Pipeline digest required in the retrieved row.
+            expected_visibility (optional):
+                Required repository visibility, defaulting to the historical private
+                policy.
+
         Raises:
             ValueError:
-                If revision is not a complete commit SHA.
+                If revision, visibility, or pipeline evidence is malformed.
         """
         if not _COMMIT_SHA.fullmatch(revision):
             raise ValueError("revision must be a complete 40-character commit SHA")
@@ -1055,6 +1073,8 @@ class PinnedHubClipRetriever:
             expected_pipeline_config_sha256
         ):
             raise ValueError("expected pipeline configuration digest must be SHA-256")
+        if expected_visibility not in {"private", "public"}:
+            raise ValueError("expected visibility must be exactly private or public")
         selected_repository = repository or repo_id
         if not selected_repository:
             raise ValueError("repository must be supplied")
@@ -1063,6 +1083,7 @@ class PinnedHubClipRetriever:
         self.revision = revision
         self.expected_pipeline_version = expected_pipeline_version
         self.expected_pipeline_config_sha256 = expected_pipeline_config_sha256
+        self.expected_visibility = expected_visibility
         self._repository_verified = False
 
     def retrieve(self, entry: MetadataRow) -> bytes:
@@ -1146,12 +1167,12 @@ class PinnedHubClipRetriever:
         return row
 
     def verify_repository(self) -> None:
-        """Verify the pinned private dataset revision before retrieval.
+        """Verify the pinned dataset visibility and revision before retrieval.
 
         Raises:
             ValueError:
-                If repository metadata is unavailable, public, or resolves to a
-                different commit than the pinned revision.
+                If repository metadata is unavailable, has the wrong visibility, or
+                resolves to a different commit than the pinned revision.
         """
         getter = getattr(self.hub, "repo_info", None)
         if not callable(getter):
@@ -1184,8 +1205,13 @@ class PinnedHubClipRetriever:
                 None,
             )
         )
-        if private is not True or resolved_sha != self.revision:
-            raise ValueError("pinned dataset is not private at the requested revision")
+        expected_private = self.expected_visibility == "private"
+        if type(private) is not bool or private is not expected_private:
+            raise ValueError(
+                "pinned dataset visibility differs from the requested visibility"
+            )
+        if resolved_sha != self.revision:
+            raise ValueError("pinned dataset differs from the requested revision")
         self._repository_verified = True
 
 
