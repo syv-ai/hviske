@@ -99,14 +99,13 @@ Before changing data or starting a pilot:
 3. Set `W*` and `T` from the strongest verified result before the first full-model
    continuation gate, then freeze them for this run.
 4. Save the official decoding configuration and normaliser version.
-5. Add a native Cohere backend to the upstream harness. The current `cohere-asr` backend
-   calls `model.transcribe()`, which a saved native `CohereAsrForConditionalGeneration`
-   checkpoint does not provide.
+5. Add a native Parakeet TDT backend to the upstream harness that loads the pinned
+   processor and saved `ParakeetForTDT` checkpoint without changing decoding semantics.
 6. Upstream or otherwise agree the backend with the leaderboard maintainers, then pin
    that accepted harness revision.
 7. Confirm that the pinned harness reproduces one published reference result within
-   rounding tolerance and can evaluate the untouched Cohere base and a saved two-step
-   Hviske checkpoint.
+   rounding tolerance and can evaluate the untouched Parakeet TDT base and a saved
+   Hviske TDT checkpoint. Retain Cohere only as a historical comparison.
 8. Make no further harness changes. Do not copy only its WER normaliser into Hviske and
    call the result a leaderboard score.
 

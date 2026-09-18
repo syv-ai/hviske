@@ -10,10 +10,11 @@ The pipeline must never materialise the complete source or derived corpus on loc
 disk or Sparkie. It processes bounded batches, uploads completed Parquet shards,
 verifies the remote bytes, and deletes the local copies.
 
-This dataset is a hard prerequisite for the post-v6.0 data-mixture experiments. The
-current runtime join between `syvai/p1` and `syvai/p1-transcripts` is not a training
-solution because each usable transcript covers a complete radio programme while Hviske
-rejects audio at or above 10 seconds.
+This dataset supplies the current v6.0 campaign and later data-mixture experiments. The
+old runtime join between `syvai/p1` and `syvai/p1-transcripts` was not a training
+solution because each usable transcript covered a complete radio programme. The P1
+publication contract permits clips below 10 seconds for reuse, while the v6.0 production
+trainer applies the stricter `1 < duration < 8` cutoff.
 
 The active v8 quality policy is deliberately relaxed: source timestamps and structural
 integrity are the acceptance criteria. Best-effort lexical ownership is retained and
@@ -132,7 +133,8 @@ path. Generic model-backed alignment code remains available only for future data
 Build candidates from consecutive words with these rules:
 
 - Target speech-bearing clips between 2 and 8 seconds.
-- Enforce a final duration below 10 seconds, never equal to 10 seconds.
+- Keep the reusable P1 dataset's safety ceiling below 10 seconds, never equal to 10
+  seconds. Clips at or above 8 seconds are outside the v6.0 production training set.
 - Prefer punctuation and source timestamp gaps as boundaries.
 - Never cross a change between positive timed anchors with different speakers.
 - Do not split a word or duplicate a word across adjacent candidates.
@@ -147,9 +149,10 @@ hard-coded assumptions. Store them in a versioned configuration file.
 
 ### Timestamp-native alignment
 
-The active v8 path uses no refinement model. It accepts each speaker-safe candidate
-when its duration is in the half-open range 1,000 ms <= duration < 10,000 ms and
-publishes boundaries exactly at the first timed word start and last timed word end.
+The active v8 path uses no refinement model. The reusable dataset accepts each
+speaker-safe candidate in the half-open range 1,000 ms <= duration < 10,000 ms and
+publishes boundaries exactly at the first timed word start and last timed word end. The
+current production trainer independently excludes examples at or above 8,000 ms.
 A programme is not rejected merely because lexical ownership cannot be proven by
 speaker metadata. The source audio clock is authoritative, and the terminal source
 word endpoint is validated against decoded audio before segmentation.
