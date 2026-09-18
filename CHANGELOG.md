@@ -20,7 +20,8 @@
   vocabulary-dependent CTC and transducer heads.
 - Added Parakeet CTC, RNNT, and revision-pinned TDT model presets.
 - Added a publication-only command with strict Cohere and Parakeet TDT package
-  validation, keeping reviewed uploads separate from training.
+  validation, including package-family/provenance matching and an explicit preserved
+  Cohere publication preset, while keeping reviewed uploads separate from training.
 
 ### Changed
 

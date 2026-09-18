@@ -99,7 +99,9 @@ Here are some of the more important available keys:
   Hub. `private_only` hard-fails public destinations and verifies Hub visibility before
   and after upload. The production bilingual preset keeps publication off during
   training. Use `src/scripts/publish_model.py` only after reviewing the saved package;
-  local manifest paths must never be included.
+  local manifest paths must never be included. The command defaults to TDT provenance;
+  use `--config-name cohere_publication` only for the preserved Cohere baseline. Package
+  validation rejects a model family that contradicts the selected provenance preset.
 - `enable_experiment_tracking`: Whether training monitoring during training should be
   enabled. Defaults to false. You can also set `experiment_tracking` to either `wandb`
   or `mlflow` to specify which experiment tracking tool to use (`wandb` is used by

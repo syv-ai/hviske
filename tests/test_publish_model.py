@@ -4,10 +4,24 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from hydra import compose
 from omegaconf import OmegaConf
 
 import hviske.finetune as finetune_module
 from scripts import publish_model
+
+
+def test_cohere_publication_preset_has_matching_package_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preserved Cohere baseline has an explicit publication provenance path."""
+    monkeypatch.setenv("P1_SEGMENTS_REVISION", "1" * 40)
+    monkeypatch.setenv("HVISKE_OVERLAY_REVISION", "2" * 40)
+
+    config = compose(config_name="cohere_publication")
+
+    assert config.model.pretrained_model_id == "CohereLabs/cohere-transcribe-03-2026"
+    assert publish_model._expected_model_type(config=config) == "cohere_asr"
 
 
 def test_publish_command_does_not_invoke_training(
@@ -60,3 +74,4 @@ def test_publish_command_does_not_invoke_training(
     assert published["private"] is True
     assert published["evaluation_status"] == "Reviewed."
     assert published["finetuned_from"] == "nvidia/parakeet-tdt-0.6b-v3"
+    assert published["expected_model_type"] == "parakeet_tdt"

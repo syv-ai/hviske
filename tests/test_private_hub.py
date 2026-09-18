@@ -179,7 +179,7 @@ def test_private_only_refuses_private_false() -> None:
 def test_publication_accepts_native_cohere_save_and_reload(tmp_path: Path) -> None:
     """A native Transformers save passes validation and local reload."""
     _minimal_cohere_package(tmp_path)
-    utils._validate_model_package(tmp_path)
+    assert utils._validate_model_package(tmp_path) == "cohere_asr"
 
     processor = CohereAsrProcessor.from_pretrained(tmp_path, local_files_only=True)
     model = CohereAsrForConditionalGeneration.from_pretrained(
@@ -246,7 +246,7 @@ def test_publication_accepts_native_parakeet_tdt_save(tmp_path: Path) -> None:
     """A saved TDT package follows the pinned Transformers artefact contract."""
     _minimal_tdt_package(tmp_path)
 
-    utils._validate_model_package(tmp_path)
+    assert utils._validate_model_package(tmp_path) == "parakeet_tdt"
 
 
 def _minimal_tdt_package(folder: Path) -> None:
@@ -376,6 +376,20 @@ def test_publication_rejects_missing_weights(tmp_path: Path) -> None:
     _minimal_cohere_package(tmp_path, weights=False)
     with pytest.raises(ValueError, match="needs model"):
         utils._validate_model_package(tmp_path)
+
+
+def test_publication_rejects_package_family_provenance_mismatch(tmp_path: Path) -> None:
+    """A valid package cannot be published with another model family's metadata."""
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    _minimal_cohere_package(source)
+
+    with pytest.raises(ValueError, match="does not match publication provenance"):
+        utils._copy_model_artefacts(
+            source=source, destination=destination, expected_model_type="parakeet_tdt"
+        )
 
 
 def test_publication_rejects_per_shard_tensor_set_mismatch(tmp_path: Path) -> None:

@@ -122,9 +122,9 @@ test sets:
 The live benchmark currently applies NFKC, Danish numeral canonicalisation, lowercasing,
 punctuation removal, filler-word removal, and whitespace collapse. Its Whisper backend
 uses normal short-form decoding below roughly 30 seconds and timestamped long-form
-decoding above that threshold; Cohere must follow its own native chunking contract. Pin
-the code rather than relying on this prose because the methodology has changed several
-times.
+decoding above that threshold; Parakeet TDT must follow its native generation
+contract. Pin the code rather than relying on this prose because the methodology has
+changed several times.
 
 ## Data contract
 
@@ -162,11 +162,12 @@ are uncertain.
 Use the local Sparkie WAV/VTT corpora through immutable JSONL manifests. A metadata-only
 scan on Sparkie measured:
 
-- **DRTV:** 5,195,010 cues across 20,406 files and 6,442.55 overlap-corrected hours;
-  5,178,843 cues and 6,390.27 overlap-corrected hours survive the strict 1--10 second
-  filter.
+- **DRTV:** 5,195,010 cues across 20,406 files and 6,442.55 overlap-corrected hours.
+  The historical 1--10-second scan retained 5,178,843 cues and 6,390.27 hours; the
+  production 8-second policy retains 99.32% of those rows and 98.68% of those hours.
 - **Danish YouTube:** 3,558,613 cues across 11,646 files and 2,094.05 overlap-corrected
-  hours; 3,208,785 cues and 2,001.97 overlap-corrected hours survive the filter.
+  hours. The historical 1--10-second scan retained 3,208,785 cues and 2,001.97 hours;
+  the production 8-second policy retains 99.75% of those rows and 99.01% of those hours.
 
 The manifests were last modified on 9 September 2026. Neither contains malformed rows,
 empty text, or duration mismatches. Overlapping cues account for less than 0.1 hours in
@@ -179,7 +180,7 @@ The following are still required before the first pilot:
 - hash the manifest and all referenced file identities;
 - reject missing audio, malformed captions, empty text, invalid offsets, and decode
   failures;
-- report accepted rows and hours after the shared 1--10 second filter;
+- report accepted rows and hours after the shared 1--8-second production filter;
 - remove caption credits, repeated intros/outros, and rolling-caption duplication;
 - estimate Danish-language and speech presence on a stratified sample; and
 - document the right to train and release model weights from each corpus.
@@ -214,7 +215,7 @@ At the current moving revision, the manifest contains 3,414,589 rows and marks a
 unified audio revision
 `5a3a49ee981baab6e1e37ddd2c45f9943c27d08f` and positional overlay shard range `0--354`,
 its first 100 joined clips are OGG mono 16 kHz (duration min 16.15, median 30, max 30),
-so none survive the strict `1 < duration < 10` filter. Keeping it active would scan
+so none survive the production `1 < duration < 8` filter. Keeping it active would scan
 1.745 million rows without yielding an example. Its known subtitle-credit hallucinations
 are therefore a release-blocking regression category, not harmless label noise.
 
@@ -329,7 +330,7 @@ Also report:
 - per-domain WER and CER;
 - insertion, deletion, and substitution counts;
 - short-clip buckets, especially clips below two seconds;
-- duration buckets through the 10-second training cutoff and a separate long-form set;
+- duration buckets through the 8-second training cutoff and a separate long-form set;
 - subtitle-credit and common hallucination phrase rates;
 - empty-reference and no-speech behaviour;
 - Danish characters, casing, punctuation, and numeral behaviour; and
@@ -341,8 +342,9 @@ per-example IDs, references, hypotheses, and edit counts.
 
 ### Predeclared selection and regression gates
 
-Calculate all deltas against the untouched Cohere base on the same frozen examples and
-decoding settings. Freeze these thresholds before either pilot:
+Calculate primary deltas against the untouched Parakeet TDT base on the same frozen
+examples and decoding settings; retain Cohere as a historical secondary comparison.
+Freeze these thresholds before either pilot:
 
 - **Pilot improvement:** at least 0.20 absolute mean-WER improvement on the five-domain
   deterministic subset at step 2,000.
@@ -427,7 +429,8 @@ This can start before the final datasets are available.
 - Update P1 configuration to consume `syvai/p1-segments` directly.
 - Strengthen validation so every source reaches a real processed training batch.
 - Add manifest statistics, benchmark exclusion, and cross-source deduplication.
-- Update the Sparkie preset and tests to the predeclared v6.0 group-mass matrix.
+- Update the production bilingual preset and tests to the predeclared v6.0 group-mass
+  matrix.
 
 The final pinning and complete audit happen as soon as P1 and v5-tiny stop moving.
 
@@ -435,9 +438,9 @@ The final pinning and complete audit happen as soon as P1 and v5-tiny stop movin
 
 Run in parallel with workstream A.
 
-- Implement and upstream the native saved-checkpoint Cohere backend.
+- Implement and upstream the native saved-checkpoint Parakeet TDT backend.
 - Pin and reproduce the accepted leaderboard harness.
-- Smoke the exact backend with the base model and a locally saved two-step checkpoint.
+- Smoke the exact backend with the base model and a locally saved TDT checkpoint.
 - Materialise the development suite and stable IDs.
 - Add per-example hypotheses and edit counts to release evaluation.
 - Draft the model card with placeholders for final revisions, counts, hours, and scores.
@@ -473,8 +476,8 @@ Stop `qwen38-ar` only after this gate passes and immediately before the GPU smok
 The smoke must cover forward pass, backward pass, evaluation, save, clean reload, and
 resume from checkpoint. Confirm Danish and English examples both decode sensibly.
 
-Failure here triggers a focused fix. If Cohere remains incompatible or unsafe on
-Sparkie, activate the pinned Whisper fallback rather than opening an architecture sweep.
+Failure here triggers a focused TDT fix. Preserve the last complete checkpoint and do
+not switch architectures or open a sweep unless TDT becomes operationally unusable.
 
 ### Gate 3: owner-waived learning-rate pilots
 
@@ -520,7 +523,7 @@ After checkpoint selection:
 
 1. freeze the checkpoint, decoding settings, model card draft, code commit, lockfile,
    source revisions, manifest digests, and development report;
-2. rerun the pinned native Cohere backend smoke on the exact frozen checkpoint;
+2. rerun the pinned native Parakeet TDT backend smoke on the frozen checkpoint;
 3. run the pinned official leaderboard harness once on all five test sets;
 4. retain its raw per-example output and identify the model that defines frozen `W*`;
 5. compare the candidate against that exact model with the predeclared significance

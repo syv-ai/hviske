@@ -14,6 +14,11 @@ from hviske.utils import (
     validate_transcript_revision,
 )
 
+_MODEL_TYPES_BY_BASE_ID = {
+    "CohereLabs/cohere-transcribe-03-2026": "cohere_asr",
+    "nvidia/parakeet-tdt-0.6b-v3": "parakeet_tdt",
+}
+
 
 @click.command()
 @click.argument(
@@ -65,7 +70,27 @@ def main(
         evaluation_status=evaluation_status,
         reviewed_model_card=reviewed_model_card,
         finetuned_from_revision=str(config.model.revision),
+        expected_model_type=_expected_model_type(config=config),
     )
+
+
+def _expected_model_type(config: DictConfig) -> str:
+    """Resolve the only package family valid for the provenance preset.
+
+    Returns:
+        The Transformers model type required in the saved package.
+
+    Raises:
+        ValueError:
+            If the preset's base model has no supported publication contract.
+    """
+    base_model_id = str(config.model.pretrained_model_id)
+    try:
+        return _MODEL_TYPES_BY_BASE_ID[base_model_id]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported publication base model: {base_model_id!r}"
+        ) from error
 
 
 def _load_config(config_name: str) -> DictConfig:

@@ -1,10 +1,10 @@
 # Sparkie bilingual runbook
 
-This runbook is for the private `syvai/hviske-v6.0` Cohere run. Training and
-publication are deliberately separate. Native Parakeet TDT validation is also
-separate; use [`docs/parakeet-tdt-runbook.md`](docs/parakeet-tdt-runbook.md) for its
-pinned zero-shot, smoke, reload/resume, and bounded pilot gates. Do not change the
-active Cohere campaign while running those isolated checks.
+This runbook is for the private `syvai/hviske-v6.0` Parakeet TDT campaign. Training
+and publication are deliberately separate. The production preset uses the pinned TDT
+base, 1--8-second audio, per-device batch 6, effective batch 60, and two DataLoader
+workers. The preserved Cohere checkpoint is a historical baseline, not the active
+campaign.
 
 ## Prerequisites and authentication
 
@@ -36,11 +36,10 @@ nvidia-smi
 uv run python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
 ```
 
-The Hugging Face account must have accepted access to
-`CohereLabs/cohere-transcribe-03-2026`, read access to the manually gated
-`syvai/p1-segments` dataset, and read access to every public source. It also needs
-write access to create and upload the private `syvai/hviske-v6.0` model. Never put
-tokens in this runbook, shell history, manifests, or Hydra configuration.
+The Hugging Face account must have read access to the manually gated
+`syvai/p1-segments` dataset and every public source. It also needs write access to
+create and upload the private `syvai/hviske-v6.0` model. Never put tokens in this
+runbook, shell history, manifests, or Hydra configuration.
 
 Set the two immutable data-gate revisions:
 
@@ -89,7 +88,8 @@ only its inclusive source-contiguous shard range at both immutable revisions:
 configuration remains available, but is not selected: at unified audio revision
 `5a3a49ee981baab6e1e37ddd2c45f9943c27d08f` and positional overlay shard range `0--354`,
 its first 100 joined clips are OGG mono 16 kHz (duration min 16.15, median 30, max 30),
-so none survive the strict `1 < duration < 10` filter. Keeping it active would scan
+so none survive either the historical 10-second filter or the production
+`1 < duration < 8` filter. Keeping it active would scan
 1.745 million rows without yielding an example. Boundary shards deliberately appear in
 both adjacent ranges so filters retain complete source coverage. Empty shard numbers may
 be absent, but the resolved base and overlay basename order must match.

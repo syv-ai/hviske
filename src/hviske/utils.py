@@ -469,6 +469,7 @@ def publish_model_folder(
     training_sources: list[dict[str, object]] | None = None,
     reviewed_model_card: Path | None = None,
     finetuned_from_revision: str | None = None,
+    expected_model_type: str | None = None,
 ) -> CommitInfo:
     """Publish a model folder through one private Hub commit.
 
@@ -495,6 +496,8 @@ def publish_model_folder(
             A reviewed README to use instead of the generated card.
         finetuned_from_revision:
             Immutable revision of the base model. Required for publication.
+        expected_model_type:
+            Saved package model type required by the selected provenance preset.
 
     Returns:
         The model-file upload commit information.
@@ -521,7 +524,11 @@ def publish_model_folder(
             languages.append(required_language)
     with tempfile.TemporaryDirectory(prefix="hviske-model-") as staging_dir:
         staging_path = Path(staging_dir)
-        _copy_model_artefacts(source=Path(folder_path), destination=staging_path)
+        _copy_model_artefacts(
+            source=Path(folder_path),
+            destination=staging_path,
+            expected_model_type=expected_model_type,
+        )
         _stage_model_card(
             destination=staging_path / "README.md",
             finetuned_from=finetuned_from,
@@ -543,16 +550,23 @@ def publish_model_folder(
     return commit
 
 
-def _copy_model_artefacts(source: Path, destination: Path) -> None:
+def _copy_model_artefacts(
+    source: Path, destination: Path, expected_model_type: str | None = None
+) -> None:
     """Copy a complete, reloadable model package using the strict allowlist.
 
     Raises:
         ValueError:
-            If the source is not a complete supported model package.
+            If the source is incomplete or its family contradicts the provenance.
     """
     if not source.is_dir():
         raise ValueError(f"Model output directory does not exist: {source}")
-    _validate_model_package(source=source)
+    model_type = _validate_model_package(source=source)
+    if expected_model_type is not None and model_type != expected_model_type:
+        raise ValueError(
+            "Model package type does not match publication provenance: "
+            f"expected {expected_model_type!r}, found {model_type!r}"
+        )
     for candidate in source.iterdir():
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -562,8 +576,11 @@ def _copy_model_artefacts(source: Path, destination: Path) -> None:
         shutil.copy2(candidate, destination / candidate.name)
 
 
-def _validate_model_package(source: Path) -> None:
+def _validate_model_package(source: Path) -> str:
     """Check that a saved supported model has all reload-critical files.
+
+    Returns:
+        The validated package's model type.
 
     Raises:
         ValueError:
@@ -681,7 +698,7 @@ def _validate_model_package(source: Path) -> None:
         raise ValueError(f"{family_label} package contains conflicting weight layouts")
     if _regular_file(single):
         _validate_safetensors_file(single)
-        return
+        return str(model_type)
     if not _regular_file(index_path):
         raise ValueError(
             f"{family_label} package needs model.safetensors or a complete index"
@@ -738,6 +755,7 @@ def _validate_model_package(source: Path) -> None:
                 f"Sharded tensor set does not match index for {shard_name}: "
                 + ", ".join(sorted(extra))
             )
+    return str(model_type)
 
 
 def _regular_file(path: Path) -> bool:

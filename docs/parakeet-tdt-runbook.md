@@ -1,9 +1,10 @@
 # Parakeet TDT validation runbook
 
-This is an isolated validation path for the native Transformers
-`nvidia/parakeet-tdt-0.6b-v3` preset. It does not change the active Cohere
-configuration, campaign, W&B project, or production Sparkie commands. The commands
-below are runbook templates only; review every gate before launching one.
+This records the isolated validation path that qualified the native Transformers
+`nvidia/parakeet-tdt-0.6b-v3` preset for production. The active bilingual campaign now
+uses that pinned TDT base with 1--8-second audio and effective batch 60. The commands
+below remain diagnostic templates only; never run them against the active campaign's
+output directory or W&B identity.
 
 ## Fixed base and local prerequisites
 
@@ -20,7 +21,7 @@ uv run python src/scripts/finetune_asr_model.py --config-name asr_finetuning \
 
 Do not replace the revision with `main`, and do not pass the base revision when
 loading a local saved model. Keep each experiment in its own output directory.
-Never launch these commands against the active Cohere output directory.
+Never launch these commands against the active production output directory.
 
 ## Gate 1: isolated zero-shot base evaluation
 
@@ -94,7 +95,7 @@ reports global step 4 (or a later explicitly requested step).
 
 Only after Gates 1-2 pass, run pilots serially in fresh directories. Review the
 metrics at exactly steps 250, 500, 1000, and 2000 before selecting a learning rate.
-The scheduler horizon remains bounded and no pilot is the active Cohere campaign:
+The scheduler horizon remains bounded and no pilot is the active production campaign:
 
 ```bash
 for lr in 5e-6 1e-5; do
@@ -114,6 +115,5 @@ workers have closed.
 
 **Gate:** each pilot has finite training and validation losses at every reviewed step,
 has independent checkpoints and metrics, reaches the requested bounded stop without
-changing `config/model/cohere.yaml` or
-`config/bilingual.yaml`, and has a clean reload/resume record. Do not start a
+changing `config/bilingual.yaml`, and has a clean reload/resume record. Do not start a
 longer run, publish a model, or alter Sparkie until the pilot comparison is reviewed.

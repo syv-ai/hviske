@@ -1,0 +1,5 @@
+# Publication provenance for the preserved Cohere baseline; not a training preset.
+defaults:
+  - bilingual
+  - override model: cohere
+  - _self_
