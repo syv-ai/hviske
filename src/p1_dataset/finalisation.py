@@ -269,7 +269,9 @@ def _cas_card_update(
         raise
     except Exception:
         raise FinalisationError("card metadata is unavailable") from None
-    if tuple(current_files) != tuple(remote_files) or not _four_sections(before):
+    if tuple(current_files) != tuple(remote_files) or not _has_required_sections(
+        before
+    ):
         raise FinalisationError("card or inventory changed during CAS preparation")
     updated = _add_card_statistics(before.decode("utf-8"), report).encode("utf-8")
     if len(updated) > _MAX_README_BYTES:
@@ -333,7 +335,7 @@ def _add_card_statistics(card: str, report: dict[str, object]) -> str:
     return card[: source_heading.start()] + block + card[source_heading.start() :]
 
 
-def _four_sections(card: bytes) -> bool:
+def _has_required_sections(card: bytes) -> bool:
     """Check the private card's required structural sections.
 
     The private card deliberately has no licence heading: licensing provenance is

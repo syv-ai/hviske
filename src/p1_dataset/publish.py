@@ -310,7 +310,7 @@ def build_dataset_card(
     schema, pipeline, model, and licence-provenance labels are never rendered.
 
     Returns:
-        The four-section Markdown card with machine-only identity coordinates.
+        The three-section Markdown card with machine-only identity coordinates.
     """
     del source_provenance, permitted_use, field_schema, known_limitations
     del rejection_policy, model_revisions, dataset_license
