@@ -2,15 +2,11 @@
 
 import logging
 import os
-import sys
-from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import Type
 
-import torch
 from omegaconf import DictConfig
-from torch.backends.mps import is_available as mps_is_available
 from transformers import (
     AutoConfig,
     AutoModelForSpeechSeq2Seq,
@@ -19,21 +15,20 @@ from transformers import (
     WhisperProcessor,
 )
 from transformers.trainer import Trainer
-from transformers.trainer_pt_utils import AcceleratorConfig
 from transformers.trainer_seq2seq import Seq2SeqTrainer
-from transformers.trainer_utils import EvalPrediction, SchedulerType
-from transformers.training_args import OptimizerNames, TrainingArguments
+from transformers.training_args import TrainingArguments
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 
+from .base_model_setup import BaseModelSetup
 from .compute_metrics import compute_error_rate_metrics
 from .data_collators import DataCollatorSpeechSeq2SeqWithPadding
-from .data_models import ModelSetup, PreTrainedModelData, Processor
+from .data_models import PreTrainedModelData, Processor
 from .utils import transformers_output_ignored
 
 logger = logging.getLogger(__package__)
 
 
-class WhisperModelSetup(ModelSetup):
+class WhisperModelSetup(BaseModelSetup):
     """Model setup for Whisper models."""
 
     def __init__(self, config: DictConfig) -> None:
@@ -43,13 +38,8 @@ class WhisperModelSetup(ModelSetup):
             config:
                 The Hydra configuration object.
         """
-        self.config = config
+        super().__init__(config=config)
         self.processor: WhisperProcessor
-        self.is_main_process = os.getenv("RANK", "0") == "0"
-
-    def load_compute_metrics(self) -> Callable[[EvalPrediction], dict]:
-        """Return the function used to compute metrics during training."""
-        return partial(compute_error_rate_metrics, processor=self.processor)
 
     def load_data_collator(self) -> DataCollatorSpeechSeq2SeqWithPadding:
         """Return the data collator for the model.
@@ -194,103 +184,6 @@ class WhisperModelSetup(ModelSetup):
 
     def load_training_arguments(self) -> TrainingArguments:
         """Return the training arguments for the model."""
-        # Compute the gradient accumulation based on the total batch size in the config
-        num_devices = max(torch.cuda.device_count(), 1)
-        per_device_total_batch_size = self.config.total_batch_size // num_devices
-        gradient_accumulation_steps = (
-            per_device_total_batch_size // self.config.per_device_batch_size
+        return Seq2SeqTrainingArguments(
+            **self._training_arguments_kwargs(sequence_to_sequence=True)
         )
-        logger.info(
-            f"Using a gradient accumulation of {gradient_accumulation_steps} "
-            f"to achieve a total batch size of {self.config.total_batch_size} "
-            f"with {num_devices} devices and a per device batch size of "
-            f"{self.config.per_device_batch_size}."
-        )
-
-        if gradient_accumulation_steps == 0:
-            if self.is_main_process:
-                logger.warning(
-                    "Your `total_batch_size` is too small "
-                    f"({self.config.total_batch_size}), relative to the number of "
-                    f"devices ({num_devices}) and your `per_device_batch_size` "
-                    f"({self.config.per_device_batch_size}). It has been set to "
-                    "`per_device_batch_size * num_devices` = "
-                    f"{self.config.per_device_batch_size * num_devices}."
-                )
-            gradient_accumulation_steps = 1
-
-        fp16 = False
-        bf16 = False
-        if not mps_is_available():
-            if self.config.bf16_allowed and torch.cuda.is_bf16_supported():
-                bf16 = True
-                if self.is_main_process:
-                    logger.info("Mixed precision training with BF16 enabled.")
-            elif self.config.fp16_allowed and torch.cuda.is_available():
-                fp16 = True
-                if self.is_main_process:
-                    logger.info("Mixed precision training with FP16 enabled.")
-
-        if self.config.early_stopping:
-            self.config.save_total_limit = max(self.config.save_total_limit, 1)
-
-        metric_name = (
-            (
-                "val_"
-                + self.config.evaluation_datasets[0].id.split("/")[-1]
-                + "_"
-                + self.config.evaluation_datasets[0].subset
-                + "_cer"
-            )
-            .lower()
-            .replace("-", "_")
-        )
-        args = Seq2SeqTrainingArguments(
-            output_dir=self.config.model_dir,
-            hub_model_id=f"{self.config.hub_organisation}/{self.config.model_id}",
-            hub_private_repo=self.config.private,
-            per_device_train_batch_size=self.config.per_device_batch_size,
-            per_device_eval_batch_size=self.config.per_device_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=self.config.model.learning_rate,
-            lr_scheduler_type=SchedulerType.COSINE,
-            warmup_steps=self.config.warmup_steps,
-            max_steps=self.config.max_steps,
-            fp16=fp16,
-            bf16=bf16,
-            push_to_hub=False,
-            eval_strategy="steps",
-            eval_steps=(
-                1 if self.config.get("evaluation_steps") else self.config.eval_steps
-            ),
-            save_steps=self.config.save_steps,
-            save_strategy="no" if self.config.save_total_limit == 0 else "steps",
-            logging_steps=self.config.logging_steps,
-            length_column_name="input_length",
-            gradient_checkpointing=self.config.gradient_checkpointing,
-            gradient_checkpointing_kwargs=dict(use_reentrant=False),
-            save_total_limit=self.config.save_total_limit,
-            load_best_model_at_end=self.config.early_stopping,
-            metric_for_best_model=metric_name,
-            greater_is_better=False,
-            seed=self.config.seed,
-            remove_unused_columns=False,
-            optim=OptimizerNames.ADAMW_TORCH,
-            adam_beta1=self.config.adam_first_momentum,
-            adam_beta2=self.config.adam_second_momentum,
-            report_to=[self.config.experiment_tracking.type]
-            if self.config.enable_experiment_tracking
-            else [],
-            ignore_data_skip=self.config.ignore_data_skip,
-            predict_with_generate=True,
-            generation_max_length=self.config.model.max_length,
-            use_cpu=hasattr(sys, "_called_from_test"),
-            dataloader_num_workers=self.config.dataloader_num_workers,
-            dataloader_drop_last=True,
-            ddp_find_unused_parameters=False,
-            accelerator_config=AcceleratorConfig(
-                # TODO: See if we can avoid this, as it uses more memory
-                dispatch_batches=False
-            ).to_dict(),
-        )
-        return args
