@@ -6,7 +6,6 @@ p1:
   audio_column: audio
   filter_dataset: true
   language: da
-  # The revision is supplied by the production gate, never a moving branch.
-  revision: ${oc.env:P1_SEGMENTS_REVISION,""}
-  immutable_revision_env: P1_SEGMENTS_REVISION
+  # Frozen published dataset revision; never follow a moving branch.
+  revision: 44284e5849b6b1d96b874891c579654a644e0e2f
   trust_remote_code: false

@@ -22,10 +22,10 @@ The Sparkie preset requires CUDA and access to the manually gated
 repository. Never put tokens in this runbook, shell history, configuration, or
 commands.
 
-Set the immutable P1 revision before resolving the production configuration:
+Resolve the production configuration before launching. The immutable P1 revision is
+already pinned in `config/datasets/p1.yaml`:
 
 ```bash
-export P1_SEGMENTS_REVISION=<full-40-hex-p1-segments-commit-sha>
 uv run python src/scripts/finetune_asr_model.py --config-name bilingual --cfg job
 ```
 
@@ -56,8 +56,8 @@ for acoustic and linguistic balance, not row count:
 | English | LibriSpeech other 500 | 0.057586805712 |
 
 The preset retains a 60/40 Danish/English split and filters examples to the configured
-1--8-second duration range. Public dataset revisions are pinned in the configuration;
-P1 is pinned at launch through `P1_SEGMENTS_REVISION`.
+1--8-second duration range. All dataset revisions, including P1, are pinned in the
+configuration.
 
 ## Smoke, pilot, and full run
 
@@ -69,7 +69,7 @@ export WANDB_PROJECT=hviske
 wandb_id=$(uv run python -c 'import wandb; print(wandb.util.generate_id())')
 run_dir="$PWD/runs/smoke"
 tmux new-session -d -s hviske-smoke \
-  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP P1_SEGMENTS_REVISION=$P1_SEGMENTS_REVISION WANDB_PROJECT=$WANDB_PROJECT WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name bilingual experiment_tracking.name_run=v6.0-smoke experiment_tracking.id=$wandb_id experiment_tracking.resume=never model_dir=$run_dir evaluation_steps='[2]' stop_after_steps=2 max_validation_samples_per_dataset=32"
+  "env -u WANDB_API_KEY -u WANDB_ENTITY -u WANDB_BASE_URL -u WANDB_RUN_ID -u WANDB_RESUME -u WANDB_NAME -u WANDB_RUN_GROUP WANDB_PROJECT=$WANDB_PROJECT WANDB_MODE=online WANDB_LOG_MODEL=false WANDB_WATCH=false uv run python src/scripts/finetune_asr_model.py --config-name bilingual experiment_tracking.name_run=v6.0-smoke experiment_tracking.id=$wandb_id experiment_tracking.resume=never model_dir=$run_dir evaluation_steps='[2]' stop_after_steps=2 max_validation_samples_per_dataset=32"
 ```
 
 Inspect the resolved configuration, loss, evaluation metrics, checkpoint, GPU memory,

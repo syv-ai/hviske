@@ -6,6 +6,8 @@
 
 - Reconciled the retained script inventory and documented P1 as a consumed, manually
   gated published dataset with its exact archival source and Hub commit.
+- Pinned the frozen P1 dataset revision directly in its configuration, removing the
+  launch-time `P1_SEGMENTS_REVISION` requirement while retaining reproducible loading.
 - Kept Parakeet RNNT/TDT blank-prefix validation at both preprocessing and collation
   boundaries, giving model configuration blank IDs precedence over processor metadata.
 

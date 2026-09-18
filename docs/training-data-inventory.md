@@ -29,9 +29,8 @@ at `syvai/p1-segments`, path `archives/hviske-p1-pipeline/f3dcf16/`, Hub commit
 | LibriSpeech train-other-500 | en | Read/prepared |
 
 All sources use the shared 1--8-second runtime filter unless their dataset
-configuration states otherwise. Public source revisions, columns, and splits are kept in
-`config/datasets/`; the P1 revision is supplied at launch through
-`P1_SEGMENTS_REVISION`.
+configuration states otherwise. Source revisions, columns, and splits—including the
+frozen P1 revision—are pinned in `config/datasets/`.
 
 ## Sampling implications
 

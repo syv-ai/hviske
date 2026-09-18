@@ -18,7 +18,7 @@ def test_sparkie_runbook_documents_p1_gate_and_publication() -> None:
     """The runbook retains the consumed P1 gate and publication command."""
     runbook = RUNBOOK.read_text()
 
-    assert "P1_SEGMENTS_REVISION" in runbook
+    assert "P1_SEGMENTS_REVISION" not in runbook
     assert "syvai/p1-segments" in runbook
     assert "archives/hviske-p1-pipeline/f3dcf16/" in runbook
     assert "44284e5849b6b1d96b874891c579654a644e0e2f" in runbook

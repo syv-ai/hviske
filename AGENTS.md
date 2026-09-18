@@ -108,9 +108,9 @@ Use Conventional Commit subjects such as `feat:`, `fix:`, or `docs:`.
   standalone reviewed-directory publication command.
 - N-gram training may run `sudo apt-get` when `apt-get` is present. It downloads
   and compiles KenLM under `cache_dir`, or `~/.cache` when that is unset.
-- P1 is consumed as the manually gated `syvai/p1-segments` Hub dataset. Producer code
-  and local caption-manifest utilities are archived outside this repository; set only
-  `P1_SEGMENTS_REVISION` when running the production bilingual configuration.
+- P1 is consumed as the manually gated `syvai/p1-segments` Hub dataset at the immutable
+  revision pinned in `config/datasets/p1.yaml`. Producer code and local caption-manifest
+  utilities are archived outside this repository.
 - Training and evaluation can create caches, Hydra outputs, result files, and
   tracking directories. Do not commit generated artifacts. Slopo's database and
   reports under `.slopo/` are also generated and ignored.

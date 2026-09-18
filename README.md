@@ -42,8 +42,7 @@ characters when needed.
 The reusable dataset configurations include CoRal, FLEURS, FTSpeech, Nota, NST,
 VoxPopuli, People's Speech, AMI, LibriSpeech, and the published P1 dataset. P1 is
 consumed directly from `syvai/p1-segments` with `audio` and `text` columns. Its
-manually gated immutable revision must be supplied through
-`P1_SEGMENTS_REVISION` before a production run.
+manually gated, immutable revision is pinned in the dataset configuration.
 
 P1 producer code is archived outside this repository. The exact source archive is
 `syvai/p1-segments`, path `archives/hviske-p1-pipeline/f3dcf16/`, Hub commit
@@ -52,8 +51,7 @@ P1 producer code is archived outside this repository. The exact source archive i
 The production bilingual preset is `config/bilingual.yaml`:
 
 ```bash
-P1_SEGMENTS_REVISION=<full-40-hex-commit-sha> \
-  uv run python src/scripts/finetune_asr_model.py --config-name bilingual --cfg job
+uv run python src/scripts/finetune_asr_model.py --config-name bilingual --cfg job
 ```
 
 See [`SPARKIE.md`](SPARKIE.md) for the GPU runbook and integrated checkpoint

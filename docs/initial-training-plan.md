@@ -3,8 +3,8 @@
 ## Status
 
 The production consumer loads `syvai/p1-segments` directly as a normal Hub dataset with
-`audio` and `text`. Training is gated until its manually gated immutable revision is
-supplied through `P1_SEGMENTS_REVISION` and the data checks pass.
+`audio` and `text`. Its manually gated immutable revision is pinned in the dataset
+configuration, and training remains gated on the data checks.
 
 The retired P1 producer is preserved in this exact source archive:
 
@@ -37,13 +37,13 @@ best-effort annotations when the audio and transcript are structurally valid.
 
 ### P1 segments
 
-Use `syvai/p1-segments` directly. Before training:
+Use `syvai/p1-segments` directly at the revision pinned in the dataset configuration.
+Before training:
 
-1. supply a full 40-character `P1_SEGMENTS_REVISION`;
-2. verify Hub access and the expected `audio` and `text` columns;
-3. stream and decode genuine post-filter examples;
-4. process and collate a representative batch; and
-5. reconcile the resolved revision with the publication archive above.
+1. verify Hub access and the expected `audio` and `text` columns;
+2. stream and decode genuine post-filter examples;
+3. process and collate a representative batch; and
+4. reconcile the resolved revision with the publication archive above.
 
 Do not reintroduce the retired producer or a runtime transcript join.
 
@@ -74,9 +74,9 @@ malformed or mixed transducer batches fail closed rather than silently changing 
 
 ### Data gate
 
-Resolve the bilingual configuration with `P1_SEGMENTS_REVISION`, verify every active
-stream yields examples, and record the Hviske commit, lockfile digest, revisions, and
-hardware. Run focused data, configuration, Parakeet, and publication tests.
+Resolve the bilingual configuration, verify every active stream yields examples, and
+record the Hviske commit, lockfile digest, revisions, and hardware. Run focused data,
+configuration, Parakeet, and publication tests.
 
 ### Model smoke
 

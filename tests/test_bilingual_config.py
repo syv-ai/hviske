@@ -10,7 +10,7 @@ from omegaconf import DictConfig, OmegaConf
 
 import hviske.experiment_tracking.wandb_setup as wandb_module
 
-P1_SEGMENTS_SHA = "0123456789abcdef0123456789abcdef01234567"
+P1_SEGMENTS_SHA = "44284e5849b6b1d96b874891c579654a644e0e2f"
 
 
 TRAINING_NAMES = [
@@ -153,7 +153,7 @@ def test_bilingual_dataset_coordinates_and_revisions(
     assert {
         name: datasets[name].revision for name in expected_revisions
     } == expected_revisions
-    assert datasets.p1.immutable_revision_env == "P1_SEGMENTS_REVISION"
+    assert "immutable_revision_env" not in datasets.p1
     assert datasets.p1.revision == P1_SEGMENTS_SHA
     assert datasets.p1.trust_remote_code is False
     assert all(
@@ -194,12 +194,12 @@ def test_bilingual_dataset_coordinates_and_revisions(
 
 
 def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
-    """Resolve the preset with placeholders for private p1 schema fields.
+    """Resolve the preset without a launch-time P1 revision override.
 
     Returns:
         The resolved Sparkie preset.
     """
-    monkeypatch.setenv("P1_SEGMENTS_REVISION", P1_SEGMENTS_SHA)
+    monkeypatch.delenv("P1_SEGMENTS_REVISION", raising=False)
     return compose(config_name="bilingual")
 
 
@@ -350,32 +350,19 @@ def test_bilingual_wandb_payload_has_published_sources(
     assert all(isinstance(dataset, dict) for dataset in datasets.values())
 
 
-def test_p1_segments_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The P1 segments revision cannot silently follow a mutable branch."""
-    monkeypatch.delenv("P1_SEGMENTS_REVISION", raising=False)
+def test_p1_segments_revision_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The P1 dataset always resolves to its frozen published commit."""
+    monkeypatch.setenv("P1_SEGMENTS_REVISION", "main")
     config = compose(config_name="bilingual")
     OmegaConf.resolve(config)
 
     from hviske.utils import validate_immutable_source_revision
 
-    with pytest.raises(ValueError, match="P1_SEGMENTS_REVISION is required"):
+    assert config.datasets.p1.revision == P1_SEGMENTS_SHA
+    assert "immutable_revision_env" not in config.datasets.p1
+    assert (
         validate_immutable_source_revision(
-            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
+            str(config.datasets.p1.revision), revision_label="P1 dataset revision"
         )
-
-
-@pytest.mark.parametrize("revision", ["main", "0123456", "g" * 40])
-def test_p1_segments_revision_rejects_mutable_or_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, revision: str
-) -> None:
-    """P1 segment loads reject branches, short SHAs and non-hex revisions."""
-    monkeypatch.setenv("P1_SEGMENTS_REVISION", revision)
-    config = compose(config_name="bilingual")
-    OmegaConf.resolve(config)
-
-    from hviske.utils import validate_immutable_source_revision
-
-    with pytest.raises(ValueError, match="full 40-character"):
-        validate_immutable_source_revision(
-            str(config.datasets.p1.revision), revision_label="P1_SEGMENTS_REVISION"
-        )
+        == P1_SEGMENTS_SHA
+    )
