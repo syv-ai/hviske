@@ -32,6 +32,39 @@ class FakeRepositoryNotFoundError(Exception):
     """Hub repository-not-found error for the mocked API."""
 
 
+def test_generated_tdt_model_card_is_family_neutral(tmp_path: Path) -> None:
+    """Generated TDT provenance never labels the package as Cohere."""
+    destination = tmp_path / "README.md"
+    utils._stage_model_card(
+        destination=destination,
+        finetuned_from="nvidia/parakeet-tdt-0.6b-v3",
+        finetuned_from_revision="541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+        model_card_languages=["da", "en"],
+        training_dataset_ids=["org/dataset"],
+        training_sources=[_source("org/dataset")],
+        evaluation_status="Reviewed.",
+        reviewed_model_card=None,
+    )
+
+    card = destination.read_text(encoding="utf-8")
+    assert "This private ASR checkpoint" in card
+    assert "Cohere checkpoint" not in card
+    assert "base_model: nvidia/parakeet-tdt-0.6b-v3" in card
+
+
+def _source(dataset_id: str) -> dict[str, object]:
+    """Return complete provenance metadata for publication tests."""
+    return {
+        "id": dataset_id,
+        "source": dataset_id,
+        "subset": "none",
+        "split": "train",
+        "revision": "sha256-test",
+        "probability": 1.0,
+        "language": "da",
+    }
+
+
 def test_model_card_frontmatter_accepts_exact_top_level_metadata() -> None:
     """Valid frontmatter returns the exact required top-level strings."""
     card = (
@@ -100,19 +133,6 @@ def test_model_card_requires_pinned_base_metadata(tmp_path: Path) -> None:
             reviewed_model_card=None,
             finetuned_from_revision=None,
         )
-
-
-def _source(dataset_id: str) -> dict[str, object]:
-    """Return complete provenance metadata for publication tests."""
-    return {
-        "id": dataset_id,
-        "source": dataset_id,
-        "subset": "none",
-        "split": "train",
-        "revision": "sha256-test",
-        "probability": 1.0,
-        "language": "da",
-    }
 
 
 def test_private_only_creates_missing_repository_as_private(

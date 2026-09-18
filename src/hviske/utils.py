@@ -849,8 +849,8 @@ def _stage_model_card(
         )
         + f"datasets:\n{dataset_lines}\n---\n\n"
         + "# Private internal Danish-English ASR checkpoint\n\n"
-        "This private Cohere checkpoint is for internal research, evaluation and "
-        "testing only. It is not for public distribution or production use.\n\n"
+        "This private ASR checkpoint is for internal research, evaluation and testing "
+        "only. It is not for public distribution or production use.\n\n"
         "## Training-source provenance\n\n"
         f"{source_lines}\n\n## Evaluation status\n\n{evaluation_status}\n",
         encoding="utf-8",
