@@ -1,4 +1,4 @@
-"""Function used to compute metrics during ASR training of Wav2Vec 2.0 models."""
+"""Function used to compute metrics during ASR training."""
 
 import logging
 import os
