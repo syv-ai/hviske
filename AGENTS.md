@@ -9,7 +9,7 @@ speech-recognition models, with dataset and decoder tooling. It exposes the
 - Python `>=3.11,<3.13`, managed with `uv` and packaged with Hatchling.
 - PyTorch, Hugging Face Datasets and Transformers, Hydra, and Click.
 - Pytest, Ruff, Ty, Vulture, Slopo, and pre-commit for quality checks.
-- Optional dependency groups include `kenlm`, `demo`, and `plotting`.
+- Optional dependency groups include `kenlm`, and `plotting`.
 
 ## Layout
 
@@ -51,7 +51,6 @@ Hydra entry points accept `key=value` overrides. Common examples are:
 ```bash
 uv run python src/scripts/finetune_asr_model.py model=wav2vec2-small
 uv run python src/scripts/evaluate_model.py model_id=ORG/MODEL
-uv run python src/scripts/run_asr_demo.py
 uv run python src/scripts/finetune_asr_model.py model=wav2vec2-small
 ```
 
