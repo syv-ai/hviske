@@ -268,7 +268,6 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
     padding: bool | str
     return_tensors: str = "pt"
     model_config: object | None = None
-    blank_token_id: int | None = None
 
     def __post_init__(self) -> None:
         """Reject frame padding without an explicit Parakeet frame length.
@@ -301,7 +300,7 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
                 If examples do not contain preprocessed features or raw audio.
         """
         start_worker_shutdown_watcher()
-        has_decoder_inputs = "decoder_input_ids" in features[0]
+        has_decoder_inputs = any("decoder_input_ids" in feature for feature in features)
         if has_decoder_inputs:
             if any("decoder_input_ids" not in feature for feature in features):
                 raise ValueError(
@@ -313,7 +312,6 @@ class DataCollatorParakeetWithPadding(DataCollatorMixin):
                     labels=feature["labels"],
                     processor=self.processor,
                     model_config=self.model_config,
-                    blank_token_id=self.blank_token_id,
                 )
 
         if "input_features" in features[0]:

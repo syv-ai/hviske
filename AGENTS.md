@@ -9,12 +9,13 @@ speech-recognition models, with dataset and decoder tooling. It exposes the
 - Python `>=3.11,<3.13`, managed with `uv` and packaged with Hatchling.
 - PyTorch, Hugging Face Datasets and Transformers, Hydra, and Click.
 - Pytest, Ruff, Ty, Vulture, Slopo, and pre-commit for quality checks.
-- Optional dependency groups include `kenlm`, and `plotting`.
+- The optional `kenlm` dependency group supports n-gram decoder training.
 
 ## Layout
 
 - `src/hviske/`: data processing, models, metrics, training, and evaluation.
-- `src/scripts/`: Hydra entry points and dataset, evaluation, and maintenance tools.
+- `src/scripts/`: the four reusable entry points (`finetune_asr_model.py`,
+  `evaluate_model.py`, `publish_model.py`, and `fix_dot_env_file.py`).
 - `config/`: Hydra root configurations and configuration groups.
 - `tests/`: pytest tests and shared fixtures.
 - `.github/workflows/ci.yaml`: pull-request checks run on GitHub Actions.
@@ -105,6 +106,9 @@ Use Conventional Commit subjects such as `feat:`, `fix:`, or `docs:`.
   ordinarily misses Hugging Face's `models--...` cache directories.
 - N-gram training may run `sudo apt-get` when `apt-get` is present. It downloads
   and compiles KenLM under `cache_dir`, or `~/.cache` when that is unset.
+- P1 is consumed as the manually gated `syvai/p1-segments` Hub dataset. Producer code
+  and local caption-manifest utilities are archived outside this repository; set only
+  `P1_SEGMENTS_REVISION` when running the production bilingual configuration.
 - Training and evaluation can create caches, Hydra outputs, result files, and
   tracking directories. Do not commit generated artifacts. Slopo's database and
   reports under `.slopo/` are also generated and ignored.

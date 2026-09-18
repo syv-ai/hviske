@@ -44,6 +44,10 @@ from hviske.parakeet import (
     ParakeetModelSetup,
     parakeet_family,
 )
+from hviske.parakeet_contract import (
+    get_parakeet_blank_token_id,
+    validate_parakeet_transducer_inputs,
+)
 
 
 def test_parakeet_collator_pads_frames_masks_and_labels() -> None:
@@ -114,6 +118,65 @@ def test_parakeet_collator_pads_rnnt_decoder_inputs() -> None:
     assert batch["decoder_input_ids"].tolist() == [[0, 1, 2], [0, 3, 0]]
 
 
+def test_parakeet_collator_rejects_malformed_decoder_inputs() -> None:
+    """The collator validates decoder inputs before tokenizer padding."""
+    processor = _tiny_parakeet_processor()
+    collator = DataCollatorParakeetWithPadding(
+        processor=processor, sample_rate=16_000, padding="longest"
+    )
+
+    with pytest.raises(ValueError, match="exactly one more token"):
+        collator(
+            [
+                {
+                    "input_features": torch.zeros(2, 1),
+                    "labels": [1],
+                    "decoder_input_ids": [4, 1],
+                }
+            ]
+        )
+
+
+def _tiny_parakeet_processor() -> ParakeetProcessor:
+    tokenizer = ParakeetTokenizer(
+        vocab={"<pad>": 0, "a": 1, "<unk>": 2, "<s>": 3, "</s>": 4, "<blank>": 5},
+        pad_token="<pad>",
+        unk_token="<unk>",
+        bos_token="<s>",
+        eos_token="</s>",
+        blank_token="<blank>",
+    )
+    return ParakeetProcessor(
+        feature_extractor=ParakeetFeatureExtractor(feature_size=1),
+        tokenizer=tokenizer,
+        blank_token="<blank>",
+        decoder_type="rnnt",
+    )
+
+
+@pytest.mark.parametrize("decoder_first", [True, False])
+def test_parakeet_collator_rejects_mixed_decoder_inputs(decoder_first: bool) -> None:
+    """Every transducer feature must provide decoder inputs, regardless of order."""
+    processor = _tiny_parakeet_processor()
+    collator = DataCollatorParakeetWithPadding(
+        processor=processor, sample_rate=16_000, padding="longest"
+    )
+    transducer_feature = {
+        "input_features": torch.zeros(2, 1),
+        "labels": [1],
+        "decoder_input_ids": [5, 1],
+    }
+    ctc_feature = {"input_features": torch.zeros(2, 1), "labels": [1]}
+    features = (
+        [transducer_feature, ctc_feature]
+        if decoder_first
+        else [ctc_feature, transducer_feature]
+    )
+
+    with pytest.raises(ValueError, match="Every Parakeet transducer feature"):
+        collator(features)
+
+
 def test_parakeet_collator_uses_blank_distinct_from_pad() -> None:
     """TDT/RNNT decoder padding retains the processor's separate blank ID."""
     processor = _tiny_parakeet_processor()
@@ -137,23 +200,6 @@ def test_parakeet_collator_uses_blank_distinct_from_pad() -> None:
     )
 
     assert batch["decoder_input_ids"].tolist() == [[5, 1, 0], [5, 1, 2]]
-
-
-def _tiny_parakeet_processor() -> ParakeetProcessor:
-    tokenizer = ParakeetTokenizer(
-        vocab={"<pad>": 0, "a": 1, "<unk>": 2, "<s>": 3, "</s>": 4, "<blank>": 5},
-        pad_token="<pad>",
-        unk_token="<unk>",
-        bos_token="<s>",
-        eos_token="</s>",
-        blank_token="<blank>",
-    )
-    return ParakeetProcessor(
-        feature_extractor=ParakeetFeatureExtractor(feature_size=1),
-        tokenizer=tokenizer,
-        blank_token="<blank>",
-        decoder_type="rnnt",
-    )
 
 
 def test_parakeet_danish_tokens_resize_ctc_and_save_processor(tmp_path: Path) -> None:
@@ -569,6 +615,20 @@ def test_parakeet_metrics_replace_trainer_padding() -> None:
     decoded_predictions = tokenizer.batch_decode.call_args_list[0].args[0]
     assert -100 not in decoded_predictions
     assert decoded_predictions.tolist() == [[1, 2], [3, 0]]
+
+
+def test_parakeet_model_config_blank_id_takes_precedence() -> None:
+    """Validation uses the model blank ID before processor metadata."""
+    processor = SimpleNamespace(blank_token_id=5)
+    model_config = SimpleNamespace(blank_token_id=4)
+
+    assert get_parakeet_blank_token_id(processor, model_config) == 4
+    validate_parakeet_transducer_inputs(
+        decoder_input_ids=[4, 1],
+        labels=[1],
+        processor=processor,
+        model_config=model_config,
+    )
 
 
 def test_parakeet_processing_keeps_joint_decoder_inputs(

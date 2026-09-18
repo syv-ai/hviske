@@ -10,7 +10,6 @@ def validate_parakeet_transducer_inputs(
     labels: object,
     processor: object,
     model_config: object | None = None,
-    blank_token_id: int | None = None,
 ) -> None:
     """Require decoder IDs to be the unpadded blank-prefixed labels.
 
@@ -23,19 +22,14 @@ def validate_parakeet_transducer_inputs(
             The Parakeet processor used to produce the IDs.
         model_config (optional):
             A model-facing configuration, when available. Defaults to ``None``.
-        blank_token_id (optional):
-            An explicit blank ID for callers that have already resolved model
-            configuration. Defaults to ``None``.
 
     Raises:
         ValueError:
             If the IDs do not equal ``[blank_token_id, *labels]``.
     """
-    resolved_blank_token_id = blank_token_id
-    if resolved_blank_token_id is None:
-        resolved_blank_token_id = get_parakeet_blank_token_id(
-            processor=processor, model_config=model_config
-        )
+    resolved_blank_token_id = get_parakeet_blank_token_id(
+        processor=processor, model_config=model_config
+    )
     actual_ids = _as_int_list(decoder_input_ids)
     label_ids = _as_int_list(labels)
     if actual_ids != [resolved_blank_token_id, *label_ids]:

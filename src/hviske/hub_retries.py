@@ -417,7 +417,7 @@ def configure_hub_streaming_retries(
 
     The policy is copied to an environment variable so a freshly spawned DataLoader
     worker can construct the same filesystem without inheriting an HTTP client. Only
-    the ``hf`` fsspec protocol is changed; local and materialised paths are untouched.
+    the ``hf`` fsspec protocol is changed; local paths are untouched.
 
     Args:
         retry_config (optional):

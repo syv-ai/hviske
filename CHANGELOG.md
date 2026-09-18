@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Reconciled the retained script inventory and documented P1 as a consumed, manually
+  gated published dataset with its exact archival source and Hub commit.
+- Kept Parakeet RNNT/TDT blank-prefix validation at both preprocessing and collation
+  boundaries, giving model configuration blank IDs precedence over processor metadata.
+
+### Removed
+
+- Removed the unreferenced comparison-plot and dataset-download one-off scripts,
+  the inactive Olmix plan, and the obsolete plotting extra and direct dependencies.
+- Removed stale local-caption, overlay, and P1-producer instructions from the active
+  documentation and removed the obsolete vulture and Ruff script entries.
+
 ### Added
 
 - Added privacy-safe private P1 Hub diagnostics and bounded transient retries, deterministic

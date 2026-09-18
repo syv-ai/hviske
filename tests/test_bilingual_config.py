@@ -337,21 +337,17 @@ def test_bilingual_training_order_and_probabilities(
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
 
 
-def test_bilingual_wandb_payload_has_no_overlay_sources(
+def test_bilingual_wandb_payload_has_published_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The resolved production payload contains only base dataset sources."""
+    """The resolved production payload contains configured dataset sources."""
     payload = wandb_module._resolved_config_payload(config=_preset(monkeypatch))
 
     assert payload["model_dir"] == "[REDACTED]"
     assert payload["cache_dir"] is None
     datasets = t.cast(dict[str, object], payload["datasets"])
-    assert "drtv_local" not in datasets
-    assert "youtube_local" not in datasets
-    assert all(
-        isinstance(dataset, dict) and "overlay" not in dataset
-        for dataset in datasets.values()
-    )
+    assert "p1" in datasets
+    assert all(isinstance(dataset, dict) for dataset in datasets.values())
 
 
 def test_p1_segments_revision_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
