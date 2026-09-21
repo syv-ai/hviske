@@ -233,6 +233,7 @@ def parse_vtt(path: Path, stats: VTTParseStats | None = None) -> list[Cue]:
 
     blocks = re.split(r"\n\s*\n", content)
     cues: list[Cue] = []
+    previous_cleaned_caption = ""
     for block in blocks:
         lines = [line.strip() for line in block.splitlines()]
         if not lines:
@@ -252,8 +253,9 @@ def parse_vtt(path: Path, stats: VTTParseStats | None = None) -> list[Cue]:
         except ValueError:
             _skip_cue(stats)
             continue
-        text = _clean_caption_text(" ".join(lines[timing_index + 1 :]))
-        text = _remove_rolling_overlap(cues[-1]["text"] if cues else "", text)
+        cleaned_caption = _clean_caption_text(" ".join(lines[timing_index + 1 :]))
+        text = _remove_rolling_overlap(previous_cleaned_caption, cleaned_caption)
+        previous_cleaned_caption = cleaned_caption
         if not text or end <= start:
             _skip_cue(stats)
             continue
