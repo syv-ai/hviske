@@ -10,6 +10,8 @@ job_type: null
 tags:
   - hviske
 mode: online
+# Keep W&B alive and observable while Hub access is retrying.
+hub_access_heartbeat_seconds: 30.0
 save_code: null
 # Null leaves generic callers' existing W&B environment policy unchanged.
 log_model: null

@@ -17,8 +17,9 @@
 
 ### Fixed
 
-- Hardened Hugging Face streaming retries with credential-safe request context,
-  generator-safe status errors, and rate-limit-aware `Retry-After` backoff.
+- Made transient Hugging Face streaming failures retry indefinitely until manually
+  stopped, with credential-safe logs, rate-limit-aware backoff, and W&B health
+  heartbeats while training is blocked.
 
 ### Removed
 

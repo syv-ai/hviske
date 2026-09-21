@@ -1,4 +1,4 @@
-"""Bounded retries for Hugging Face Hub streaming file reads."""
+"""Interruptible retries for Hugging Face Hub streaming file reads."""
 
 from __future__ import annotations
 
@@ -31,23 +31,23 @@ from .dataloader_shutdown import (
     interruptible_retry_delay,
     raise_or_exit_worker,
     shutdown_requested,
+    start_worker_shutdown_watcher,
 )
+from .hub_access_health import clear_hub_access_retrying, mark_hub_access_retrying
 
 Result = t.TypeVar("Result")
 
 logger = logging.getLogger(__name__)
 
 _POLICY_ENV = "HVISKE_HUB_STREAMING_RETRY_POLICY"
-_RETRYABLE_STATUS_CODES = frozenset({429, 499})
+_RETRYABLE_STATUS_CODES = frozenset({408, 429, 499})
 
 
 @dataclasses.dataclass(frozen=True)
 class HubRetryPolicy:
-    """Retry limits and delays for remote Hub file reads.
+    """Delays for indefinite remote Hub file-read retries.
 
     Args:
-        max_retries:
-            Number of retries after the initial request. Defaults to 6.
         base_delay_seconds:
             Initial exponential backoff delay. Defaults to 1.0.
         max_delay_seconds:
@@ -62,7 +62,6 @@ class HubRetryPolicy:
             Defaults to 300.0.
     """
 
-    max_retries: int = 6
     base_delay_seconds: float = 1.0
     max_delay_seconds: float = 30.0
     jitter_seconds: float = 0.5
@@ -74,14 +73,8 @@ class HubRetryPolicy:
 
         Raises:
             ValueError:
-                If a retry bound is invalid.
+                If a retry delay is invalid.
         """
-        if (
-            not isinstance(self.max_retries, int)
-            or isinstance(self.max_retries, bool)
-            or self.max_retries < 0
-        ):
-            raise ValueError("hub retry max_retries must be a non-negative integer")
         if not all(
             math.isfinite(value)
             for value in (
@@ -118,9 +111,18 @@ class HubRetryPolicy:
             retry_number:
                 Zero-based retry number, where zero is the first retry.
         """
-        exponential = min(
-            self.max_delay_seconds, self.base_delay_seconds * (2**retry_number)
-        )
+        if self.base_delay_seconds == 0:
+            exponential = 0.0
+        elif self.max_delay_seconds == self.base_delay_seconds:
+            exponential = self.max_delay_seconds
+        else:
+            maximum_exponent = math.ceil(
+                math.log2(self.max_delay_seconds / self.base_delay_seconds)
+            )
+            exponent = min(retry_number, maximum_exponent)
+            exponential = min(
+                self.max_delay_seconds, self.base_delay_seconds * (2**exponent)
+            )
         return min(
             self.max_delay_seconds,
             exponential + random.uniform(0.0, self.jitter_seconds),
@@ -192,25 +194,31 @@ class RetryingHfFileSystem(HfFileSystem):
         **kwargs: object,
     ) -> HfFileSystemFile | HfFileSystemStreamFile:
         effective_block_size = block_size if block_size is not None else self.block_size
-        if effective_block_size == 0:
-            stream_block_size = t.cast(int, kwargs.pop("block_size", 0))
-            cache_type = t.cast(str, kwargs.pop("cache_type", "none"))
-            return RetryingHfFileSystemStreamFile(
+
+        def create_file() -> HfFileSystemFile | HfFileSystemStreamFile:
+            if effective_block_size == 0:
+                stream_block_size = t.cast(int, kwargs.pop("block_size", 0))
+                cache_type = t.cast(str, kwargs.pop("cache_type", "none"))
+                return RetryingHfFileSystemStreamFile(
+                    self,
+                    path,
+                    mode=mode,
+                    revision=revision,
+                    block_size=stream_block_size,
+                    cache_type=cache_type,
+                    **kwargs,
+                )
+            return RetryingHfFileSystemFile(
                 self,
                 path,
                 mode=mode,
+                block_size=effective_block_size,
                 revision=revision,
-                block_size=stream_block_size,
-                cache_type=cache_type,
                 **kwargs,
             )
-        return RetryingHfFileSystemFile(
-            self,
-            path,
-            mode=mode,
-            block_size=effective_block_size,
-            revision=revision,
-            **kwargs,
+
+        return _run_with_retries(
+            operation=create_file, policy=self._retry_policy, url=f"hf://{path}"
         )
 
 
@@ -223,10 +231,13 @@ class RetryingHfFileSystemFile(HfFileSystemFile):
             "range": f"bytes={start}-{end - 1}",
             **self.fs._api._build_hf_headers(),
         }
+        request_url = _run_with_retries(
+            operation=self.url, policy=self.fs._retry_policy, url="hf://resolved-file"
+        )
         response = _run_with_retries(
-            lambda: _request_range(url=self.url(), headers=headers),
+            lambda: _request_range(url=request_url, headers=headers),
             policy=self.fs._retry_policy,
-            url=self.url(),
+            url=request_url,
         )
         try:
             hf_raise_for_status(response)
@@ -266,80 +277,116 @@ def _run_with_retries(
     sleeper = time.sleep if sleep is None else sleep
     now = time.time if clock is None else clock
     request_url = None if url is None else _sanitise_url(url)
-    for retry_number in range(policy.max_retries + 1):
-        exit_worker_if_shutdown_requested()
-        caught_error: BaseException | None = None
-        try:
-            return operation()
-        except _RetryableStatus as error:
-            caught_error = error
-        except BaseException as error:
-            if not _is_retryable_error(error):
-                raise
-            caught_error = error
+    retry_number = 0
+    retrying = False
+    start_worker_shutdown_watcher()
+    try:
+        while True:
+            exit_worker_if_shutdown_requested()
+            try:
+                result = operation()
+            except _RetryableStatus as error:
+                caught_error: BaseException = error
+            except BaseException as error:
+                if not _is_retryable_error(error):
+                    raise
+                caught_error = error
+                if "client has been closed" in str(error).lower():
+                    close_session()
+            else:
+                if retrying:
+                    logger.info(
+                        "Hugging Face Hub read recovered after %d retries (%s)",
+                        retry_number,
+                        request_url or "URL unavailable",
+                    )
+                return result
+
             if shutdown_requested():
                 raise_or_exit_worker(error=caught_error)
-            if "client has been closed" in str(error).lower():
-                close_session()
-        if caught_error is None:
-            raise AssertionError("retry loop did not capture its transient error")
-        if shutdown_requested():
-            raise_or_exit_worker(error=caught_error)
-        if retry_number == policy.max_retries:
-            raise caught_error
-        delay = _retry_delay(
-            error=caught_error, retry_number=retry_number, policy=policy, now=now
-        )
-        if isinstance(caught_error, _RetryableStatus):
-            logger.warning(
-                "Transient Hugging Face Hub read failed (HTTP %d from %s); "
-                "retrying in %.2fs (%d/%d)",
-                caught_error.status_code,
-                caught_error.url,
-                delay,
-                retry_number + 1,
-                policy.max_retries,
+            if not retrying:
+                mark_hub_access_retrying()
+                retrying = True
+            delay = _retry_delay(
+                error=caught_error, retry_number=retry_number, policy=policy, now=now
             )
-        elif request_url is None:
             logger.warning(
-                "Transient Hugging Face Hub read failed; retrying in %.2fs (%d/%d)",
-                delay,
+                "Hugging Face Hub read failed (%s); retry attempt %d in %.2fs; "
+                "training will keep retrying until manually stopped",
+                _retry_context(error=caught_error, fallback_url=request_url),
                 retry_number + 1,
-                policy.max_retries,
-            )
-        else:
-            logger.warning(
-                "Transient Hugging Face Hub read failed (%s); retrying in %.2fs "
-                "(%d/%d)",
-                request_url,
                 delay,
-                retry_number + 1,
-                policy.max_retries,
             )
-        interruptible_retry_delay(delay=delay, error=caught_error, sleep=sleeper)
-        if shutdown_requested():
-            raise_or_exit_worker(error=caught_error)
-    raise AssertionError("retry loop did not return or raise")
+            interruptible_retry_delay(delay=delay, error=caught_error, sleep=sleeper)
+            if shutdown_requested():
+                raise_or_exit_worker(error=caught_error)
+            retry_number += 1
+    finally:
+        if retrying:
+            clear_hub_access_retrying()
 
 
 def _is_retryable_error(error: BaseException) -> bool:
-    """Return whether an exception represents a transient transport failure."""
-    if isinstance(error, httpx.RemoteProtocolError):
-        # A peer closing an HTTP stream is transient, unlike local protocol errors.
-        return True
-    if isinstance(
-        error,
+    """Return whether an exception chain contains a transient Hub failure."""
+    for candidate in _exception_chain(error):
+        if isinstance(candidate, HfHubHTTPError):
+            response = getattr(candidate, "response", None)
+            return response is not None and _is_retryable_status(response.status_code)
+        if isinstance(candidate, httpx.RemoteProtocolError):
+            # A peer closing an HTTP stream is transient, unlike local protocol errors.
+            return True
+        if isinstance(
+            candidate,
+            (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                ConnectionError,
+                ConnectionResetError,
+            ),
+        ):
+            return True
+        if (
+            isinstance(candidate, RuntimeError)
+            and "client has been closed" in str(candidate).lower()
+        ):
+            return True
+    return False
+
+
+def _exception_chain(error: BaseException) -> Generator[BaseException, None, None]:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _retry_context(error: BaseException, fallback_url: str | None) -> str:
+    if isinstance(error, _RetryableStatus):
+        return f"HTTP {error.status_code} from {error.url}"
+    hub_error = _hub_http_error(error)
+    if hub_error is not None:
+        response = hub_error.response
+        try:
+            request_url = _sanitise_url(str(response.request.url))
+        except RuntimeError:
+            request_url = fallback_url or "URL unavailable"
+        return f"HTTP {response.status_code} from {request_url}"
+    category = type(error).__name__
+    if fallback_url is None:
+        return category
+    return f"{category} from {fallback_url}"
+
+
+def _hub_http_error(error: BaseException) -> HfHubHTTPError | None:
+    return next(
         (
-            httpx.TimeoutException,
-            httpx.NetworkError,
-            ConnectionError,
-            ConnectionResetError,
+            candidate
+            for candidate in _exception_chain(error)
+            if isinstance(candidate, HfHubHTTPError)
         ),
-    ):
-        return True
-    return (
-        isinstance(error, RuntimeError)
-        and "client has been closed" in str(error).lower()
+        None,
     )
 
 
@@ -349,9 +396,18 @@ def _retry_delay(
     policy: HubRetryPolicy,
     now: Callable[[], float],
 ) -> float:
-    if not isinstance(error, _RetryableStatus) or error.status_code != 429:
+    if isinstance(error, _RetryableStatus):
+        status_code = error.status_code
+        retry_after_header = error.retry_after
+    else:
+        hub_error = _hub_http_error(error)
+        if hub_error is None:
+            return policy.delay(retry_number)
+        status_code = hub_error.response.status_code
+        retry_after_header = hub_error.response.headers.get("Retry-After")
+    if status_code != 429:
         return policy.delay(retry_number)
-    retry_after = _parse_retry_after(error.retry_after, now=now())
+    retry_after = _parse_retry_after(retry_after_header, now=now())
     if retry_after is None:
         retry_after = policy.rate_limit_fallback_seconds
     return min(retry_after, policy.rate_limit_max_delay_seconds)
@@ -383,58 +439,85 @@ class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
 
         Returns:
             Bytes read from the remote stream.
-
-        Raises:
-            AssertionError:
-                If the bounded retry loop reaches an unreachable state.
         """
         exit_worker_if_shutdown_requested()
+        start_worker_shutdown_watcher()
         if self.response is None:
             self._open_connection()
 
-        for retry_number in range(self.fs._retry_policy.max_retries + 1):
-            try:
-                if self.response is None or self._stream_iterator is None:
-                    return b""
-                out = self._read_from_stream(self._stream_iterator, length)
-                self.loc += len(out)
-                return out
-            except BaseException as error:
-                if not _is_retryable_error(error):
-                    raise
-                if self.response is not None:
-                    self.response.close()
-                if shutdown_requested():
-                    raise_or_exit_worker(error=error)
-                if retry_number == self.fs._retry_policy.max_retries:
-                    raise
-                if "client has been closed" in str(error).lower():
-                    close_session()
-                delay = self.fs._retry_policy.delay(retry_number)
-                logger.warning(
-                    "Transient Hugging Face Hub stream interruption; retrying in "
-                    "%.2fs (%d/%d)",
-                    delay,
-                    retry_number + 1,
-                    self.fs._retry_policy.max_retries,
-                )
-                interruptible_retry_delay(delay=delay, error=error, sleep=time.sleep)
-                if shutdown_requested():
-                    raise_or_exit_worker(error=error)
-                self._open_connection()
-        raise AssertionError("stream retry loop did not return or raise")
+        retry_number = 0
+        retrying = False
+        request_url = _sanitise_url(
+            _run_with_retries(
+                operation=self.url,
+                policy=self.fs._retry_policy,
+                url="hf://resolved-stream",
+            )
+        )
+        try:
+            while True:
+                try:
+                    if self.response is None or self._stream_iterator is None:
+                        return b""
+                    out = self._read_from_stream(self._stream_iterator, length)
+                    self.loc += len(out)
+                    if retrying:
+                        logger.info(
+                            "Hugging Face Hub stream recovered after %d retries (%s)",
+                            retry_number,
+                            request_url,
+                        )
+                    return out
+                except BaseException as error:
+                    if not _is_retryable_error(error):
+                        raise
+                    if self.response is not None:
+                        self.response.close()
+                    if shutdown_requested():
+                        raise_or_exit_worker(error=error)
+                    if "client has been closed" in str(error).lower():
+                        close_session()
+                    if not retrying:
+                        mark_hub_access_retrying()
+                        retrying = True
+                    delay = self.fs._retry_policy.delay(retry_number)
+                    logger.warning(
+                        "Hugging Face Hub stream failed (%s); retry attempt %d in "
+                        "%.2fs; training will keep retrying until manually stopped",
+                        _retry_context(error=error, fallback_url=request_url),
+                        retry_number + 1,
+                        delay,
+                    )
+                    interruptible_retry_delay(
+                        delay=delay, error=error, sleep=time.sleep
+                    )
+                    if shutdown_requested():
+                        raise_or_exit_worker(error=error)
+                    retry_number += 1
+                    self._open_connection()
+        finally:
+            if retrying:
+                clear_hub_access_retrying()
 
     def _open_connection(self) -> None:
+        self._close_retry_stream_context()
         self._stream_buffer.clear()
         self._stream_iterator = None
         headers = self.fs._api._build_hf_headers()
         if self.loc > 0:
             headers["Range"] = f"bytes={self.loc}-"
+        request_url = _run_with_retries(
+            operation=self.url, policy=self.fs._retry_policy, url="hf://resolved-stream"
+        )
         try:
             context = _stream_with_retries(
-                url=self.url(), headers=headers, policy=self.fs._retry_policy
+                url=request_url, headers=headers, policy=self.fs._retry_policy
             )
-            self.response = self._exit_stack.enter_context(context)
+            self.response = context.__enter__()
+            self._retry_stream_context = context
+            if not getattr(self, "_retry_stream_cleanup_registered", False):
+                self._exit_stack.callback(self._close_retry_stream_context)
+                self._retry_stream_cleanup_registered = True
         except HfHubHTTPError as error:
             if self.loc > 0 and error.response.status_code == 416:
                 # Match HfFileSystemStreamFile: an exhausted resumed range is EOF.
@@ -442,6 +525,13 @@ class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
                 return
             raise
         self._stream_iterator = self.response.iter_bytes()
+
+    def _close_retry_stream_context(self) -> None:
+        context = getattr(self, "_retry_stream_context", None)
+        if context is None:
+            return
+        self._retry_stream_context = None
+        context.__exit__(None, None, None)
 
 
 @contextlib.contextmanager
@@ -497,9 +587,6 @@ def _policy_from_environment() -> HubRetryPolicy:
 def _policy_from_config(retry_config: Mapping[str, object] | None) -> HubRetryPolicy:
     if retry_config is None:
         return _policy_from_environment()
-    max_retries = t.cast(
-        int, retry_config.get("max_retries", _DEFAULT_POLICY.max_retries)
-    )
     base_delay_seconds = t.cast(
         float | int,
         retry_config.get("base_delay_seconds", _DEFAULT_POLICY.base_delay_seconds),
@@ -524,7 +611,6 @@ def _policy_from_config(retry_config: Mapping[str, object] | None) -> HubRetryPo
         ),
     )
     return HubRetryPolicy(
-        max_retries=max_retries,
         base_delay_seconds=float(base_delay_seconds),
         max_delay_seconds=float(max_delay_seconds),
         jitter_seconds=float(jitter_seconds),
@@ -555,6 +641,26 @@ def configure_hub_streaming_retries(
     RetryingHfFileSystem.clear_instance_cache()
     fsspec.register_implementation("hf", RetryingHfFileSystem, clobber=True)
     return policy
+
+
+def retry_hub_access(operation: Callable[[], Result], url: str | None = None) -> Result:
+    """Run a Hub operation until it succeeds or manual shutdown is requested.
+
+    Deterministic errors, including authentication and missing-resource responses,
+    still fail immediately.
+
+    Args:
+        operation:
+            Hub operation to execute.
+        url (optional):
+            Credential-free request context for retry logs. Defaults to unavailable.
+
+    Returns:
+        The operation result.
+    """
+    return _run_with_retries(
+        operation=operation, policy=_policy_from_environment(), url=url
+    )
 
 
 # Register at import time so a fresh spawn worker resolves ``hf://`` paths to the

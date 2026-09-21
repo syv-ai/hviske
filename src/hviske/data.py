@@ -38,7 +38,7 @@ from omegaconf import DictConfig
 from . import audio as audio_module
 from .audio import SoundfileAudio
 from .dataloader_shutdown import start_worker_shutdown_watcher
-from .hub_retries import configure_hub_streaming_retries
+from .hub_retries import configure_hub_streaming_retries, retry_hub_access
 from .local_vtt import decode_vtt_audio, load_vtt_manifest
 from .parakeet import validate_parakeet_transducer_inputs
 from .utils import (
@@ -171,7 +171,10 @@ def _load_transcript_dataset(
     if data_files is not None:
         kwargs["data_files"] = data_files
     with no_datasets_progress_bars():
-        dataset = dataset_loader(**kwargs)
+        dataset = retry_hub_access(
+            operation=lambda: dataset_loader(**kwargs),
+            url=f"hf://datasets/{dataset_id}",
+        )
     if isinstance(dataset, Dataset):
         return dataset
     try:
@@ -275,8 +278,11 @@ def _resolve_hub_data_files(
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     api = t.cast(_HubFileLister, hub_api) if hub_api is not None else HfApi(token=token)
     try:
-        repo_files = api.list_repo_files(
-            repo_id=dataset_id, repo_type="dataset", revision=str(revision)
+        repo_files = retry_hub_access(
+            operation=lambda: api.list_repo_files(
+                repo_id=dataset_id, repo_type="dataset", revision=str(revision)
+            ),
+            url=f"hf://datasets/{dataset_id}",
         )
     except AttributeError as error:
         raise ValueError("Hub API client cannot list repository files") from error
@@ -828,7 +834,10 @@ def load_data_for_finetuning(
             if base_data_files is not None:
                 kwargs["data_files"] = base_data_files
             with no_datasets_progress_bars():
-                ds = load_dataset(**kwargs)
+                ds = retry_hub_access(
+                    operation=lambda: load_dataset(**kwargs),
+                    url=f"hf://datasets/{dataset_config.id}",
+                )
 
         if not isinstance(ds, Dataset | IterableDataset):
             raise ValueError(f"Unsupported dataset type: {type(ds)}")
@@ -1009,7 +1018,10 @@ def load_data_for_finetuning(
         if dataset_config.get("revision") is not None:
             validation_kwargs["revision"] = dataset_config.revision
         with no_datasets_progress_bars():
-            val = load_dataset(**validation_kwargs)
+            val = retry_hub_access(
+                operation=lambda: load_dataset(**validation_kwargs),
+                url=f"hf://datasets/{dataset_config.id}",
+            )
         if not isinstance(val, IterableDataset):
             raise ValueError(f"Unsupported validation dataset type: {type(val)}")
         max_samples = config.get("max_validation_samples_per_dataset")

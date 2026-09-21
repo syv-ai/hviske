@@ -83,9 +83,8 @@ streaming: true
 cache_dir: null
 # Keep already-sharded Hub sources cheap to start; sources can override this.
 shuffle_buffer_size: 1
-# Bounded retries apply only to hf:// streaming reads; local files are unchanged.
+# Hub streaming reads retry until manually stopped; local files are unchanged.
 hub_streaming_retries:
-  max_retries: 6
   base_delay_seconds: 1.0
   max_delay_seconds: 30.0
   jitter_seconds: 0.5

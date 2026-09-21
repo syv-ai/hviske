@@ -20,6 +20,8 @@ from .data import load_data_for_finetuning
 from .data_models import ModelSetup
 from .dataloader_shutdown import DataLoaderShutdownController
 from .experiment_tracking import ExTrackingSetup, load_extracking_setup
+from .hub_access_health import HubAccessHealthScope
+from .hub_retries import configure_hub_streaming_retries, retry_hub_access
 from .model_publication import push_model_to_hub, validate_private_only_config
 from .model_setup import load_model_setup
 from .ngram import train_and_store_ngram_model
@@ -41,7 +43,10 @@ def finetune(config: DictConfig) -> None:
     worker_shutdown = DataLoaderShutdownController(
         enabled=int(config.get("dataloader_num_workers") or 0) > 0
     )
-    with worker_shutdown:
+    health_scope = HubAccessHealthScope(
+        run_key=str(config.get("model_dir") or config.get("model_id") or os.getpid())
+    )
+    with worker_shutdown, health_scope:
         extracking_setup: ExTrackingSetup | None = None
         try:
             # Note whether this is the main process in a distributed setting.
@@ -52,12 +57,21 @@ def finetune(config: DictConfig) -> None:
             if extracking_setup is not None:
                 extracking_setup.run_initialization()
 
+            configure_hub_streaming_retries(
+                retry_config=config.get("hub_streaming_retries")
+            )
             download_background_noises()
             model_setup: ModelSetup = load_model_setup(config=config)
-            processor = model_setup.load_processor()
+            processor = retry_hub_access(
+                operation=model_setup.load_processor,
+                url=str(config.model.get("pretrained_model_id") or "model processor"),
+            )
             dataset = load_data_for_finetuning(config=config, processor=processor)
             processor.save_pretrained(save_directory=config.model_dir)
-            model = model_setup.load_model()
+            model = retry_hub_access(
+                operation=model_setup.load_model,
+                url=str(config.model.get("pretrained_model_id") or "model"),
+            )
 
             vals = {
                 split_name: split

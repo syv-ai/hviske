@@ -212,16 +212,17 @@ def test_shutdown_interrupts_range_and_stream_retries(
 
     with pytest.raises(httpx.ReadTimeout) as range_error:
         hub_retries._run_with_retries(
-            operation=fail, policy=hub_retries.HubRetryPolicy(max_retries=3)
+            operation=fail, policy=hub_retries.HubRetryPolicy()
         )
     assert range_error.value is error
 
     response = SimpleNamespace(close=lambda: None)
     stream_file = SimpleNamespace(
-        fs=SimpleNamespace(_retry_policy=hub_retries.HubRetryPolicy(max_retries=3)),
+        fs=SimpleNamespace(_retry_policy=hub_retries.HubRetryPolicy()),
         response=response,
         _stream_iterator=object(),
         _read_from_stream=lambda *_: (_ for _ in ()).throw(error),
+        url=lambda: "https://huggingface.co/file",
     )
     with pytest.raises(httpx.ReadTimeout) as stream_error:
         hub_retries.RetryingHfFileSystemStreamFile.read(
@@ -391,10 +392,7 @@ class _BackoffDataset(Dataset[int]):
                 httpx.ReadTimeout("worker shutdown test")
             ),
             policy=hub_retries.HubRetryPolicy(
-                max_retries=3,
-                base_delay_seconds=30.0,
-                max_delay_seconds=30.0,
-                jitter_seconds=0.0,
+                base_delay_seconds=30.0, max_delay_seconds=30.0, jitter_seconds=0.0
             ),
             sleep=mark_backoff_and_sleep,
         )

@@ -63,6 +63,54 @@ def _config(**tracking_overrides: object) -> DictConfig:
     )
 
 
+def test_health_monitor_start_failure_does_not_block_training(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Health telemetry startup cannot fail W&B run initialisation."""
+
+    class BrokenMonitor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        @staticmethod
+        def start() -> None:
+            raise RuntimeError("monitor startup failed")
+
+        @staticmethod
+        def stop() -> None:
+            pass
+
+    monkeypatch.setattr(wandb_module, "HubAccessHealthMonitor", BrokenMonitor)
+    monkeypatch.setattr(wandb_module.wandb, "init", lambda **_: None)
+
+    WandbSetup(config=_config()).run_initialization()
+
+
+def test_health_monitor_stop_failure_does_not_block_wandb_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Health telemetry cleanup cannot terminate tracking finalisation."""
+    exit_codes: list[int] = []
+
+    class BrokenMonitor:
+        @staticmethod
+        def stop() -> None:
+            raise RuntimeError("monitor cleanup failed")
+
+    monkeypatch.setattr(
+        wandb_module.wandb,
+        "finish",
+        lambda **kwargs: exit_codes.append(int(kwargs["exit_code"])),
+    )
+    setup = WandbSetup(config=_config())
+    monkeypatch.setattr(setup, "_hub_access_monitor", BrokenMonitor())
+
+    setup.run_finalization(exit_code=1)
+
+    assert exit_codes == [1]
+    assert setup._hub_access_monitor is None
+
+
 def test_mlflow_finalization_marks_failed_runs(monkeypatch: pytest.MonkeyPatch) -> None:
     """MLflow retains its backend while recording failed training."""
     statuses: list[str] = []
@@ -242,15 +290,22 @@ def test_wandb_finalization_passes_exit_code(monkeypatch: pytest.MonkeyPatch) ->
 def test_wandb_init_uses_plain_resolved_safe_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Initialisation passes production fields without credentials."""
+    """Initialisation passes production fields and starts Hub health reporting."""
     calls: list[dict[str, object]] = []
+    health: list[dict[str, float]] = []
     monkeypatch.setattr(
         wandb_module.wandb, "init", lambda **kwargs: calls.append(kwargs)
     )
+    monkeypatch.setattr(
+        wandb_module.wandb, "log", lambda metrics: health.append(dict(metrics))
+    )
+    monkeypatch.setattr(wandb_module.wandb, "finish", lambda **_: None)
     monkeypatch.setenv("WANDB_LOG_MODEL", "true")
     monkeypatch.setenv("WANDB_WATCH", "all")
 
-    WandbSetup(config=_config()).run_initialization()
+    setup = WandbSetup(config=_config())
+    setup.run_initialization()
+    setup.run_finalization()
     assert os.environ["WANDB_LOG_MODEL"] == "false"
     assert os.environ["WANDB_WATCH"] == "false"
 
@@ -265,6 +320,8 @@ def test_wandb_init_uses_plain_resolved_safe_config(
     assert isinstance(payload, dict)
     assert payload["resolved_value"] == "run"
     assert payload["api_key"] == "[REDACTED]"
+    assert health[0]["health/hub_access_blocked"] == 0
+    assert setup._hub_access_monitor is None
 
 
 def test_wandb_payload_redacts_resolved_paths_without_redacting_hyperparameters() -> (
@@ -356,3 +413,10 @@ def test_wandb_rejects_ambiguous_fresh_resume() -> None:
     """A fresh run cannot use an implicit resumable W&B ID."""
     with pytest.raises(ValueError, match="explicit run ID"):
         WandbSetup(config=_config(id=None, resume="allow"))
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("inf"), True])
+def test_wandb_rejects_invalid_hub_health_interval(interval: object) -> None:
+    """Hub access heartbeats require a positive finite interval."""
+    with pytest.raises(ValueError, match="heartbeat interval"):
+        WandbSetup(config=_config(hub_access_heartbeat_seconds=interval))

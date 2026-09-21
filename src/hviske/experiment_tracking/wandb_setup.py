@@ -1,6 +1,8 @@
 """Weights & Biases experiment tracking setup and preflight helpers."""
 
 import collections.abc as c
+import logging
+import math
 import os
 import typing as t
 
@@ -8,7 +10,10 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 from wandb.sdk.lib import auth as wandb_auth
 
+from ..hub_access_health import HubAccessHealthMonitor
 from .extracking_setup import ExTrackingSetup
+
+logger = logging.getLogger(__name__)
 
 
 class WandbSetup(ExTrackingSetup):
@@ -23,6 +28,12 @@ class WandbSetup(ExTrackingSetup):
         """
         super().__init__(config=config)
         validate_wandb_config(config=config)
+        self._hub_access_monitor: HubAccessHealthMonitor | None = None
+
+    @staticmethod
+    def _log_hub_access_health(metrics: c.Mapping[str, float]) -> None:
+        log_fn = t.cast(c.Callable[[dict[str, float]], None], wandb.log)
+        log_fn(dict(metrics))
 
     def run_finalization(self, exit_code: int = 0) -> None:
         """Finish the W&B run and report its process exit status.
@@ -31,6 +42,16 @@ class WandbSetup(ExTrackingSetup):
             exit_code (optional):
                 The process exit code to report. Defaults to ``0``.
         """
+        if self._hub_access_monitor is not None:
+            try:
+                self._hub_access_monitor.stop()
+            except BaseException:
+                logger.exception(
+                    "Hugging Face Hub health monitor failed to stop; "
+                    "tracking finalisation will continue"
+                )
+            finally:
+                self._hub_access_monitor = None
         wandb.finish(exit_code=exit_code)  # type: ignore[attr-defined]
 
     def run_initialization(self) -> None:
@@ -52,6 +73,20 @@ class WandbSetup(ExTrackingSetup):
             init_kwargs["tags"] = [str(tag) for tag in tags]
         init_fn = t.cast(c.Callable[..., object], wandb.init)
         init_fn(**init_kwargs)
+        monitor = HubAccessHealthMonitor(
+            report=self._log_hub_access_health,
+            heartbeat_seconds=float(tracking.get("hub_access_heartbeat_seconds", 30.0)),
+        )
+        try:
+            monitor.start()
+        except BaseException:
+            monitor.stop()
+            logger.exception(
+                "Hugging Face Hub health monitor failed to start; "
+                "training will continue"
+            )
+        else:
+            self._hub_access_monitor = monitor
 
 
 def _resolved_config_payload(config: DictConfig) -> dict[str, object]:
@@ -273,6 +308,17 @@ def validate_wandb_config(config: DictConfig) -> None:
     tags = tracking.get("tags")
     if tags is not None and not OmegaConf.is_list(tags):
         raise ValueError("W&B tags must be a list")
+
+    heartbeat_seconds = tracking.get("hub_access_heartbeat_seconds", 30.0)
+    if (
+        not isinstance(heartbeat_seconds, int | float)
+        or isinstance(heartbeat_seconds, bool)
+        or not math.isfinite(heartbeat_seconds)
+        or heartbeat_seconds <= 0
+    ):
+        raise ValueError(
+            "W&B Hub access heartbeat interval must be positive and finite"
+        )
 
     if tracking.get("production"):
         if mode != "online":
