@@ -39,6 +39,7 @@ from . import audio as audio_module
 from .audio import SoundfileAudio
 from .dataloader_shutdown import start_worker_shutdown_watcher
 from .hub_retries import configure_hub_streaming_retries
+from .local_vtt import decode_vtt_audio, load_vtt_manifest
 from .parakeet import validate_parakeet_transducer_inputs
 from .utils import (
     NUMERAL_REGEX,
@@ -744,6 +745,7 @@ def load_data_for_finetuning(
         if is_main_process:
             logger.info(f"Loading dataset {dataset_name!r}")
 
+        is_local_vtt = dataset_config.get("type") == "local_vtt"
         transcript_dataset_id = dataset_config.get("transcript_dataset_id")
         transcript_revision = None
         if transcript_dataset_id is not None:
@@ -751,7 +753,7 @@ def load_data_for_finetuning(
                 str(dataset_config.transcript_revision)
             )
         base_data_files: list[str] | None = None
-        is_hub_dataset = not Path(dataset_config.id).exists()
+        is_hub_dataset = not is_local_vtt and not Path(dataset_config.id).exists()
         if is_hub_dataset:
             base_data_files = _resolve_hub_data_files(
                 dataset_id=str(dataset_config.id),
@@ -761,9 +763,16 @@ def load_data_for_finetuning(
                 ),
             )
 
+        if is_local_vtt:
+            ds = load_vtt_manifest(
+                manifest_path=Path(dataset_config.manifest_path),
+                min_seconds=config.min_seconds_per_example,
+                max_seconds=config.max_seconds_per_example,
+                num_shards=dataset_config.get("local_vtt_num_shards", 1),
+            )
         # Load from disk if the dataset ID is a path and it is stored as an arrow
         # dataset
-        if Path(dataset_config.id).exists():
+        elif Path(dataset_config.id).exists():
             train_path = Path(dataset_config.id) / dataset_config.train_name
             data_files = list(map(str, train_path.glob("data-*.arrow")))
             if len(data_files) == 0:
@@ -825,9 +834,10 @@ def load_data_for_finetuning(
             raise ValueError(f"Unsupported dataset type: {type(ds)}")
         ds = _resolve_streaming_features(dataset=ds)
 
-        audio_column = str(dataset_config.audio_column)
-        if audio_column in (ds.column_names or []):
-            ds = ds.cast_column(column=audio_column, feature=Audio(decode=False))
+        if not is_local_vtt:
+            audio_column = str(dataset_config.audio_column)
+            if audio_column in (ds.column_names or []):
+                ds = ds.cast_column(column=audio_column, feature=Audio(decode=False))
 
         row_filters = dataset_config.get("filters")
         if row_filters is not None:
@@ -835,9 +845,9 @@ def load_data_for_finetuning(
                 dataset=ds, filters=t.cast(Mapping[str, object], row_filters)
             )
 
-        if dataset_config.text_column != "text":
+        if not is_local_vtt and dataset_config.text_column != "text":
             ds = ds.rename_column(dataset_config.text_column, "text")
-        if dataset_config.audio_column != "audio":
+        if not is_local_vtt and dataset_config.audio_column != "audio":
             ds = ds.rename_column(dataset_config.audio_column, "audio")
 
         if transcript_dataset_id is not None:
@@ -873,23 +883,35 @@ def load_data_for_finetuning(
         else:
             ds = ds.shuffle(seed=config.seed)
 
-        ds = ds.cast_column(
-            column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
-        )
-        if ds.features is None:
-            raise ValueError("Hub datasets must declare features")
-        language_features = ds.features.copy()
-        language_features["language"] = Value("string")
-        ds = ds.map(
-            function=partial(
-                _set_source_language,
-                language=dataset_config.get("language")
-                or getattr(config.model, "language", None),
-            ),
-            features=language_features,
-        )
+        if not is_local_vtt:
+            ds = ds.cast_column(
+                column="audio", feature=Audio(sampling_rate=config.model.sampling_rate)
+            )
+            if ds.features is None:
+                raise ValueError("Hub datasets must declare features")
+            language_features = ds.features.copy()
+            language_features["language"] = Value("string")
+            ds = ds.map(
+                function=partial(
+                    _set_source_language,
+                    language=dataset_config.get("language")
+                    or getattr(config.model, "language", None),
+                ),
+                features=language_features,
+            )
 
-        if dataset_config.filter_dataset:
+        if is_local_vtt:
+            if ds.features is None:
+                raise ValueError("Local VTT datasets must declare manifest features")
+            local_features = ds.features.copy()
+            local_features["audio"] = Audio(sampling_rate=config.model.sampling_rate)
+            ds = ds.map(
+                function=partial(
+                    decode_vtt_audio, sampling_rate=config.model.sampling_rate
+                ),
+                features=local_features,
+            )
+        elif dataset_config.filter_dataset:
             ds = _standardise_training_dataset(
                 dataset=ds, sampling_rate=config.model.sampling_rate
             )

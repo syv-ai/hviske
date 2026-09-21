@@ -36,24 +36,26 @@ for the retired producer is `syvai/p1-segments`, path
 
 ## Fixed production mix
 
-Do not reorder or rebalance the 13 configured streams. Source probabilities are chosen
+Do not reorder or rebalance the 15 configured streams. Source probabilities are chosen
 for acoustic and linguistic balance, not row count:
 
 | Language | Source | Probability |
 | --- | --- | ---: |
-| Danish | `syvai/p1-segments` | 0.131626801667 |
-| Danish | CoRal read-aloud | 0.021938013562 |
-| Danish | CoRal conversation | 0.164534461864 |
-| Danish | FTSpeech | 0.115173611422 |
-| Danish | Nota | 0.027421557173 |
-| Danish | NST | 0.027422836880 |
-| English | People's Speech clean | 0.204753086973 |
-| English | AMI SDM | 0.051188271743 |
-| English | AMI IHM | 0.038391203807 |
-| English | VoxPopuli | 0.115173611422 |
-| English | LibriSpeech clean 100 | 0.012797067936 |
-| English | LibriSpeech clean 360 | 0.031992669839 |
-| English | LibriSpeech other 500 | 0.057586805712 |
+| Danish | `syvai/p1-segments` | 0.102857 |
+| Danish | DRTV local VTT | 0.128571 |
+| Danish | YouTube local VTT | 0.09 |
+| Danish | CoRal read-aloud | 0.017143 |
+| Danish | CoRal conversation | 0.128572 |
+| Danish | FTSpeech | 0.09 |
+| Danish | Nota | 0.021428 |
+| Danish | NST | 0.021429 |
+| English | People's Speech clean | 0.16 |
+| English | AMI SDM | 0.04 |
+| English | AMI IHM | 0.03 |
+| English | VoxPopuli | 0.09 |
+| English | LibriSpeech clean 100 | 0.01 |
+| English | LibriSpeech clean 360 | 0.025 |
+| English | LibriSpeech other 500 | 0.045 |
 
 The preset retains a 60/40 Danish/English split and filters examples to the configured
 1--8-second duration range. All dataset revisions, including P1, are pinned in the

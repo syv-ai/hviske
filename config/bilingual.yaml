@@ -3,6 +3,8 @@ defaults:
   - model: parakeet-tdt
   - datasets:
     - p1
+    - drtv_local
+    - youtube_local
     - coral_read_aloud
     - coral_conversation
     - ftspeech
@@ -89,21 +91,23 @@ hub_streaming_retries:
   jitter_seconds: 0.5
 padding: longest
 
-# The first six entries are Danish; the final seven are English.
+# The first eight entries are Danish (60%); the final seven are English (40%).
 dataset_probabilities:
-  - 0.131626801667 # p1
-  - 0.021938013562 # coral_read_aloud
-  - 0.164534461864 # coral_conversation
-  - 0.115173611422 # ftspeech
-  - 0.027421557173 # nota
-  - 0.027422836880 # nst
-  - 0.204753086973 # peoples_speech_clean
-  - 0.051188271743 # ami_sdm
-  - 0.038391203807 # ami_ihm
-  - 0.115173611422 # voxpopuli_en
-  - 0.012797067936 # librispeech_clean_train_100
-  - 0.031992669839 # librispeech_clean_train_360
-  - 0.057586805712 # librispeech_other_train_500
+  - 0.102857 # p1
+  - 0.128571 # drtv_local
+  - 0.09 # youtube_local
+  - 0.017143 # coral_read_aloud
+  - 0.128572 # coral_conversation
+  - 0.09 # ftspeech
+  - 0.021428 # nota
+  - 0.021429 # nst
+  - 0.16 # peoples_speech_clean
+  - 0.04 # ami_sdm
+  - 0.03 # ami_ihm
+  - 0.09 # voxpopuli_en
+  - 0.01 # librispeech_clean_train_100
+  - 0.025 # librispeech_clean_train_360
+  - 0.045 # librispeech_other_train_500
 
 # Exact source metadata included when the finetuning entry point publishes privately.
 training_dataset_ids:

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This inventory covers the 13 streams in `config/bilingual.yaml`. The figures are
+This inventory covers the 15 streams in `config/bilingual.yaml`. The figures are
 nominal source or dataset-card estimates, not a substitute for the immutable revision
 and post-filter run report required before training.
 
@@ -15,6 +15,8 @@ at `syvai/p1-segments`, path `archives/hviske-p1-pipeline/f3dcf16/`, Hub commit
 | Dataset / stream | Language | Category |
 | --- | --- | --- |
 | P1 segments | da | Broadcast/conversation |
+| DRTV local VTT | da | Broadcast/captions |
+| YouTube local VTT | da | Video/captions |
 | CoRal v3 conversation | da | Broadcast/conversation |
 | CoRal v3 read-aloud | da | Read/prepared |
 | FTSpeech | da | Parliament |
@@ -47,6 +49,7 @@ meeting speech, while Nota and NST remain read/prepared sources.
 
 Use the dataset cards and pinned Hub revisions named by the configuration as evidence for
 public sources. The exact P1 producer archive is listed above. This repository contains
-only reusable loading, processing, training, evaluation, and publication code; it does
-not contain local caption manifests, source-specific producers, or derived data
-artefacts.
+only reusable loading, processing, training, evaluation, and publication code. DRTV and
+YouTube are consumed from the established local caption
+manifests under `$HOME/drtv-asr-dataset`; the manifests and source-specific producers
+remain outside this repository.
