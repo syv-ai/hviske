@@ -20,6 +20,8 @@
 - Made transient Hugging Face streaming failures retry indefinitely until manually
   stopped, with credential-safe logs, rate-limit-aware backoff, and W&B health
   heartbeats while training is blocked.
+- Enabled the reviewed, revision-pinned Common Voice 19 loader required by the
+  bilingual v2 preset.
 
 ### Removed
 

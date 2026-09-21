@@ -401,7 +401,7 @@ def test_bilingual_v2_common_voice_coordinates_and_filtering(
     ) == ("fsicoli/common_voice_19_0", "en", "train", "sentence", "audio", "en")
     assert dataset.filter_dataset is True
     assert "filters" not in dataset
-    assert dataset.trust_remote_code is False
+    assert dataset.trust_remote_code is True
     assert dataset.revision == "590c8abec6cf7c8d06e650f1438e60332a796e11"
 
 

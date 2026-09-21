@@ -7,4 +7,4 @@ common_voice_19_en:
   filter_dataset: true
   language: en
   revision: 590c8abec6cf7c8d06e650f1438e60332a796e11
-  trust_remote_code: false
+  trust_remote_code: true
