@@ -1,6 +1,7 @@
 """Regression tests for project-owned Hub streaming retries."""
 
 import contextlib
+import email.utils
 import multiprocessing as mp
 import typing as t
 from multiprocessing.connection import Connection
@@ -65,10 +66,13 @@ class _FakeClient:
         return t.cast(httpx.Response, outcome)
 
 
-def _response(status_code: int, content: bytes = b"") -> httpx.Response:
+def _response(
+    status_code: int, content: bytes = b"", headers: dict[str, str] | None = None
+) -> httpx.Response:
     return httpx.Response(
         status_code=status_code,
         content=content,
+        headers=headers,
         request=httpx.Request("GET", "https://huggingface.co/dataset/file"),
     )
 
@@ -134,8 +138,59 @@ def test_range_read_retries_closed_client_and_remote_failures(
     assert client.calls == 4
     assert len(closed_clients) == 1
     assert sleeps == [1.0, 2.0, 4.0]
-    assert caplog.text.count("Transient Hugging Face Hub read failed; retrying in") == 3
+    assert caplog.text.count("Transient Hugging Face Hub read failed") == 3
+    assert "HTTP 499 from https://huggingface.co/dataset/file" in caplog.text
     assert "X-Amz-Signature=secret" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected_delay"),
+    [("45", 45.0), (email.utils.formatdate(1_700_000_060, usegmt=True), 60.0)],
+)
+def test_rate_limit_retry_after_is_honoured(
+    monkeypatch: pytest.MonkeyPatch, retry_after: str, expected_delay: float
+) -> None:
+    """429 retries use both supported Retry-After formats."""
+    client = _FakeClient(
+        [_response(429, headers={"Retry-After": retry_after}), _response(200, b"ok")]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(hub_retries, "get_session", lambda: client)
+
+    response = hub_retries._run_with_retries(
+        lambda: _request_range(
+            url="https://user:password@example.test/file?token=secret", headers={}
+        ),
+        policy=HubRetryPolicy(max_retries=1),
+        sleep=sleeps.append,
+        clock=lambda: 1_700_000_000,
+        url="https://user:password@example.test/file?token=secret",
+    )
+
+    assert response.content == b"ok"
+    assert sleeps == [expected_delay]
+    response.close()
+
+
+def test_rate_limit_retry_without_retry_after_uses_long_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed Retry-After uses a bounded delay longer than normal backoff."""
+    client = _FakeClient(
+        [_response(429, headers={"Retry-After": "not a delay"}), _response(200, b"ok")]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(hub_retries, "get_session", lambda: client)
+
+    response = hub_retries._run_with_retries(
+        lambda: _request_range(url="https://huggingface.co/file", headers={}),
+        policy=HubRetryPolicy(max_retries=1),
+        sleep=sleeps.append,
+    )
+
+    assert response.content == b"ok"
+    assert sleeps == [120.0]
+    response.close()
 
 
 def test_resumed_stream_416_is_eof(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,6 +266,8 @@ def test_retry_exhaustion_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     assert error.value.status_code == 503
+    assert error.value.url == "https://huggingface.co/file"
+    assert "HTTP 503 from https://huggingface.co/file" in str(error.value)
     assert client.calls == 3
     assert sleeps == [1.0, 2.0]
 
@@ -273,6 +330,56 @@ def test_retry_policy_reconfiguration_invalidates_cached_filesystems(
     assert first_filesystem is not second_filesystem
     assert first_filesystem._retry_policy == first_policy
     assert second_filesystem._retry_policy == second_policy
+
+
+def test_retryable_status_survives_context_manager_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status errors remain assignable when a generator context propagates them.
+
+    Raises:
+        _RetryableStatus:
+            The status deliberately propagated through the context manager.
+    """
+    client = _FakeStreamingClient(_response(200))
+    monkeypatch.setattr(hub_retries, "get_session", lambda: client)
+
+    with pytest.raises(hub_retries._RetryableStatus) as error:
+        with hub_retries._stream_with_retries(
+            url="https://user:password@example.test/file?token=secret",
+            headers={},
+            policy=HubRetryPolicy(max_retries=0),
+        ):
+            raise hub_retries._RetryableStatus(
+                status_code=503,
+                url="https://user:password@example.test/file?token=secret",
+            )
+
+    assert error.value.status_code == 503
+    assert error.value.url == "https://example.test/file"
+    assert "password" not in str(error.value)
+    assert "token" not in str(error.value)
+
+
+def test_stream_status_failure_preserves_request_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stream opening errors retain status and sanitised URL after exhaustion."""
+    client = _FakeStreamingClient(_response(503))
+    monkeypatch.setattr(hub_retries, "get_session", lambda: client)
+
+    with pytest.raises(hub_retries._RetryableStatus) as error:
+        with hub_retries._stream_with_retries(
+            url="https://user:password@example.test/file?token=secret",
+            headers={},
+            policy=HubRetryPolicy(max_retries=0),
+        ):
+            pass
+
+    assert error.value.status_code == 503
+    assert error.value.url == "https://example.test/file"
+    assert "password" not in str(error.value)
+    assert "token" not in str(error.value)
 
 
 @pytest.mark.parametrize(

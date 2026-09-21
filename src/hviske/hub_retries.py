@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import email.utils
 import json
 import logging
 import math
@@ -12,6 +13,7 @@ import random
 import time
 import typing as t
 from collections.abc import Callable, Generator, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 import fsspec
 import httpx
@@ -52,12 +54,20 @@ class HubRetryPolicy:
             Upper bound for the exponential backoff delay. Defaults to 30.0.
         jitter_seconds:
             Maximum additional random delay. Defaults to 0.5.
+        rate_limit_fallback_seconds:
+            Delay for a 429 response without a valid ``Retry-After`` header.
+            Defaults to 120.0.
+        rate_limit_max_delay_seconds:
+            Upper bound for a 429 delay, including a ``Retry-After`` value.
+            Defaults to 300.0.
     """
 
     max_retries: int = 6
     base_delay_seconds: float = 1.0
     max_delay_seconds: float = 30.0
     jitter_seconds: float = 0.5
+    rate_limit_fallback_seconds: float = 120.0
+    rate_limit_max_delay_seconds: float = 300.0
 
     def __post_init__(self) -> None:
         """Validate the retry policy.
@@ -78,6 +88,8 @@ class HubRetryPolicy:
                 self.base_delay_seconds,
                 self.max_delay_seconds,
                 self.jitter_seconds,
+                self.rate_limit_fallback_seconds,
+                self.rate_limit_max_delay_seconds,
             )
         ):
             raise ValueError("hub retry delays must be finite")
@@ -89,6 +101,15 @@ class HubRetryPolicy:
             )
         if self.jitter_seconds < 0:
             raise ValueError("hub retry jitter_seconds must be non-negative")
+        if self.rate_limit_fallback_seconds < 0:
+            raise ValueError(
+                "hub retry rate_limit_fallback_seconds must be non-negative"
+            )
+        if self.rate_limit_max_delay_seconds < self.rate_limit_fallback_seconds:
+            raise ValueError(
+                "hub retry rate_limit_max_delay_seconds must be at least "
+                "rate_limit_fallback_seconds"
+            )
 
     def delay(self, retry_number: int) -> float:
         """Return a bounded exponential delay with additive jitter.
@@ -106,9 +127,31 @@ class HubRetryPolicy:
         )
 
 
-@dataclasses.dataclass(frozen=True)
 class _RetryableStatus(Exception):
-    status_code: int
+    """An HTTP status that is safe to retry, with safe request context."""
+
+    def __init__(
+        self, status_code: int, url: str, retry_after: str | None = None
+    ) -> None:
+        self.status_code = status_code
+        self.url = _sanitise_url(url)
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {status_code} from {self.url}")
+
+
+def _sanitise_url(url: str) -> str:
+    """Remove URL credentials, query parameters, and fragments.
+
+    Returns:
+        A URL containing only its scheme, host, port, and path.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "<invalid URL>"
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc.rsplit("@", maxsplit=1)[-1], parsed.path, "", "")
+    )
 
 
 _DEFAULT_POLICY = HubRetryPolicy()
@@ -183,6 +226,7 @@ class RetryingHfFileSystemFile(HfFileSystemFile):
         response = _run_with_retries(
             lambda: _request_range(url=self.url(), headers=headers),
             policy=self.fs._retry_policy,
+            url=self.url(),
         )
         try:
             hf_raise_for_status(response)
@@ -200,8 +244,11 @@ def _request_range(url: str, headers: Mapping[str, str]) -> httpx.Response:
     )
     if _is_retryable_status(response.status_code):
         status_code = response.status_code
+        retry_after = response.headers.get("Retry-After")
         response.close()
-        raise _RetryableStatus(status_code)
+        raise _RetryableStatus(
+            status_code=status_code, url=url, retry_after=retry_after
+        )
     return response
 
 
@@ -213,8 +260,12 @@ def _run_with_retries(
     operation: Callable[[], Result],
     policy: HubRetryPolicy,
     sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    url: str | None = None,
 ) -> Result:
     sleeper = time.sleep if sleep is None else sleep
+    now = time.time if clock is None else clock
+    request_url = None if url is None else _sanitise_url(url)
     for retry_number in range(policy.max_retries + 1):
         exit_worker_if_shutdown_requested()
         caught_error: BaseException | None = None
@@ -236,13 +287,35 @@ def _run_with_retries(
             raise_or_exit_worker(error=caught_error)
         if retry_number == policy.max_retries:
             raise caught_error
-        delay = policy.delay(retry_number)
-        logger.warning(
-            "Transient Hugging Face Hub read failed; retrying in %.2fs (%d/%d)",
-            delay,
-            retry_number + 1,
-            policy.max_retries,
+        delay = _retry_delay(
+            error=caught_error, retry_number=retry_number, policy=policy, now=now
         )
+        if isinstance(caught_error, _RetryableStatus):
+            logger.warning(
+                "Transient Hugging Face Hub read failed (HTTP %d from %s); "
+                "retrying in %.2fs (%d/%d)",
+                caught_error.status_code,
+                caught_error.url,
+                delay,
+                retry_number + 1,
+                policy.max_retries,
+            )
+        elif request_url is None:
+            logger.warning(
+                "Transient Hugging Face Hub read failed; retrying in %.2fs (%d/%d)",
+                delay,
+                retry_number + 1,
+                policy.max_retries,
+            )
+        else:
+            logger.warning(
+                "Transient Hugging Face Hub read failed (%s); retrying in %.2fs "
+                "(%d/%d)",
+                request_url,
+                delay,
+                retry_number + 1,
+                policy.max_retries,
+            )
         interruptible_retry_delay(delay=delay, error=caught_error, sleep=sleeper)
         if shutdown_requested():
             raise_or_exit_worker(error=caught_error)
@@ -268,6 +341,38 @@ def _is_retryable_error(error: BaseException) -> bool:
         isinstance(error, RuntimeError)
         and "client has been closed" in str(error).lower()
     )
+
+
+def _retry_delay(
+    error: BaseException,
+    retry_number: int,
+    policy: HubRetryPolicy,
+    now: Callable[[], float],
+) -> float:
+    if not isinstance(error, _RetryableStatus) or error.status_code != 429:
+        return policy.delay(retry_number)
+    retry_after = _parse_retry_after(error.retry_after, now=now())
+    if retry_after is None:
+        retry_after = policy.rate_limit_fallback_seconds
+    return min(retry_after, policy.rate_limit_max_delay_seconds)
+
+
+def _parse_retry_after(value: str | None, now: float) -> float | None:
+    if value is None:
+        return None
+    try:
+        delay = float(value)
+        if delay < 0:
+            return None
+    except ValueError:
+        try:
+            retry_at = email.utils.parsedate_to_datetime(value).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+        delay = retry_at - now
+    if not math.isfinite(delay):
+        return None
+    return max(0.0, delay)
 
 
 class RetryingHfFileSystemStreamFile(HfFileSystemStreamFile):
@@ -344,7 +449,7 @@ def _stream_with_retries(
     url: str, headers: Mapping[str, str], policy: HubRetryPolicy
 ) -> Generator[httpx.Response, None, None]:
     context, response = _run_with_retries(
-        lambda: _open_stream(url=url, headers=headers), policy=policy
+        lambda: _open_stream(url=url, headers=headers), policy=policy, url=url
     )
     try:
         yield response
@@ -364,7 +469,11 @@ def _open_stream(
     try:
         response = context.__enter__()
         if _is_retryable_status(response.status_code):
-            raise _RetryableStatus(response.status_code)
+            raise _RetryableStatus(
+                status_code=response.status_code,
+                url=url,
+                retry_after=response.headers.get("Retry-After"),
+            )
         hf_raise_for_status(response)
     except BaseException:
         context.__exit__(None, None, None)
@@ -402,11 +511,25 @@ def _policy_from_config(retry_config: Mapping[str, object] | None) -> HubRetryPo
     jitter_seconds = t.cast(
         float | int, retry_config.get("jitter_seconds", _DEFAULT_POLICY.jitter_seconds)
     )
+    rate_limit_fallback_seconds = t.cast(
+        float | int,
+        retry_config.get(
+            "rate_limit_fallback_seconds", _DEFAULT_POLICY.rate_limit_fallback_seconds
+        ),
+    )
+    rate_limit_max_delay_seconds = t.cast(
+        float | int,
+        retry_config.get(
+            "rate_limit_max_delay_seconds", _DEFAULT_POLICY.rate_limit_max_delay_seconds
+        ),
+    )
     return HubRetryPolicy(
         max_retries=max_retries,
         base_delay_seconds=float(base_delay_seconds),
         max_delay_seconds=float(max_delay_seconds),
         jitter_seconds=float(jitter_seconds),
+        rate_limit_fallback_seconds=float(rate_limit_fallback_seconds),
+        rate_limit_max_delay_seconds=float(rate_limit_max_delay_seconds),
     )
 
 
