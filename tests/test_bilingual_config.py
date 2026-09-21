@@ -431,7 +431,7 @@ def test_bilingual_v2_training_order_and_probabilities(
         dataset.get("id", dataset.get("type")) for dataset in config.datasets.values()
     ] == V2_TRAINING_IDS
     assert list(config.dataset_probabilities) == V2_TRAINING_PROBABILITIES
-    assert sum(config.dataset_probabilities) == 1.0
+    assert sum(config.dataset_probabilities) == pytest.approx(1.0)
 
 
 def test_bilingual_wandb_payload_has_published_sources(
