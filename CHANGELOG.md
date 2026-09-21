@@ -15,6 +15,11 @@
 - Kept Parakeet RNNT/TDT blank-prefix validation at both preprocessing and collation
   boundaries, giving model configuration blank IDs precedence over processor metadata.
 
+### Fixed
+
+- Hardened Hugging Face streaming retries with credential-safe request context,
+  generator-safe status errors, and rate-limit-aware `Retry-After` backoff.
+
 ### Removed
 
 - Removed the unreferenced comparison-plot and dataset-download one-off scripts,
