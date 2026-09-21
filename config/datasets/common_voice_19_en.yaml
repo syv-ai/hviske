@@ -1,0 +1,10 @@
+common_voice_19_en:
+  id: fsicoli/common_voice_19_0
+  subset: en
+  train_name: train
+  text_column: sentence
+  audio_column: audio
+  filter_dataset: true
+  language: en
+  revision: 590c8abec6cf7c8d06e650f1438e60332a796e11
+  trust_remote_code: false

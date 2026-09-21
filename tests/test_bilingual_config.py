@@ -64,6 +64,26 @@ TRAINING_PROBABILITIES = [
     0.025,
     0.045,
 ]
+V2_TRAINING_NAMES = [*TRAINING_NAMES, "common_voice_19_en"]
+V2_TRAINING_IDS = [*TRAINING_IDS, "fsicoli/common_voice_19_0"]
+V2_TRAINING_PROBABILITIES = [
+    0.111428,
+    0.139285,
+    0.097500,
+    0.018572,
+    0.139286,
+    0.097500,
+    0.023214,
+    0.023215,
+    0.104000,
+    0.026000,
+    0.019500,
+    0.058500,
+    0.006500,
+    0.016250,
+    0.029250,
+    0.090000,
+]
 
 
 def test_bilingual_dataset_coordinates_and_revisions(
@@ -200,7 +220,7 @@ def test_bilingual_dataset_coordinates_and_revisions(
 
 
 def _preset(monkeypatch: MonkeyPatch) -> DictConfig:
-    """Resolve the preset without a launch-time P1 revision override.
+    """Resolve the original preset without a launch-time P1 revision override.
 
     Returns:
         The resolved Sparkie preset.
@@ -244,7 +264,7 @@ def test_bilingual_evaluation_and_exclusions(monkeypatch: pytest.MonkeyPatch) ->
         "fleurs_en_us",
     ):
         assert excluded not in serialised
-    assert not Path("config/datasets/common_voice_19_en.yaml").exists()
+    assert "common_voice_19_en" not in config.datasets
     assert not Path("config/datasets/fleurs_en_us.yaml").exists()
 
 
@@ -345,6 +365,73 @@ def test_bilingual_training_order_and_probabilities(
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
     assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.6)
     assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
+
+
+def test_bilingual_v2_common_voice_coordinates_and_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Common Voice uses the pinned English Hub source and standard filtering."""
+    dataset = _preset_v2(monkeypatch).datasets.common_voice_19_en
+
+    assert (
+        dataset.id,
+        dataset.subset,
+        dataset.train_name,
+        dataset.text_column,
+        dataset.audio_column,
+        dataset.language,
+    ) == ("fsicoli/common_voice_19_0", "en", "train", "sentence", "audio", "en")
+    assert dataset.filter_dataset is True
+    assert "filters" not in dataset
+    assert dataset.trust_remote_code is False
+    assert dataset.revision == "590c8abec6cf7c8d06e650f1438e60332a796e11"
+
+
+def _preset_v2(monkeypatch: MonkeyPatch) -> DictConfig:
+    """Resolve the bilingual v2 preset without a launch-time P1 revision override.
+
+    Returns:
+        The resolved bilingual v2 preset.
+    """
+    monkeypatch.delenv("P1_SEGMENTS_REVISION", raising=False)
+    return compose(config_name="bilingual_v2")
+
+
+def test_bilingual_v2_preserves_original_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The v2 preset is additive and leaves the original mix untouched."""
+    config = _preset(monkeypatch)
+
+    assert list(config.datasets) == TRAINING_NAMES
+    assert list(config.dataset_probabilities) == TRAINING_PROBABILITIES
+    assert config.max_steps == 200_000
+    assert config.total_batch_size == 60
+    assert "common_voice_19_en" not in config.datasets
+
+
+def test_bilingual_v2_training_horizon_preserves_effective_batch_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The v2 run extends the scheduler horizon without changing batch size."""
+    config = _preset_v2(monkeypatch)
+
+    assert config.max_steps == 715_000
+    assert config.total_batch_size == 60
+
+
+def test_bilingual_v2_training_order_and_probabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The v2 preset appends Common Voice with its approved sampling weight."""
+    config = _preset_v2(monkeypatch)
+
+    assert list(config.datasets) == V2_TRAINING_NAMES
+    assert [
+        dataset.get("id", dataset.get("type")) for dataset in config.datasets.values()
+    ] == V2_TRAINING_IDS
+    assert list(config.dataset_probabilities) == V2_TRAINING_PROBABILITIES
+    assert sum(config.dataset_probabilities) == 1.0
 
 
 def test_bilingual_wandb_payload_has_published_sources(
