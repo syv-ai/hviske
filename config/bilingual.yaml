@@ -95,21 +95,21 @@ padding: longest
 # Expected epochs are nominal raw-row exposures at 200,000 steps and batch size 60.
 # The runtime 1--8-second filter can increase accepted-row epoch counts.
 dataset_probabilities:
-  - 0.102857 # p1 — 0.259 epochs
-  - 0.128571 # drtv_local — 0.300 epochs
-  - 0.09 # youtube_local — 0.337 epochs
-  - 0.017143 # coral_read_aloud — 0.687 epochs
-  - 0.128572 # coral_conversation — 10.478 epochs
-  - 0.09 # ftspeech — 1.085 epochs
-  - 0.021428 # nota — 2.608 epochs
-  - 0.021429 # nst — 1.408 epochs
-  - 0.16 # peoples_speech_clean — 1.279 epochs
-  - 0.04 # ami_sdm — 4.473 epochs
-  - 0.03 # ami_ihm — 3.318 epochs
-  - 0.09 # voxpopuli_en — 5.918 epochs
-  - 0.01 # librispeech_clean_train_100 — 4.205 epochs
-  - 0.025 # librispeech_clean_train_360 — 2.884 epochs
-  - 0.045 # librispeech_other_train_500 — 3.632 epochs
+  - 0.102857 # p1 — 0.26 epochs
+  - 0.128571 # drtv_local — 0.30 epochs
+  - 0.09 # youtube_local — 0.34 epochs
+  - 0.017143 # coral_read_aloud — 0.69 epochs
+  - 0.128572 # coral_conversation — 10.48 epochs
+  - 0.09 # ftspeech — 1.09 epochs
+  - 0.021428 # nota — 2.61 epochs
+  - 0.021429 # nst — 1.41 epochs
+  - 0.16 # peoples_speech_clean — 1.28 epochs
+  - 0.04 # ami_sdm — 4.47 epochs
+  - 0.03 # ami_ihm — 3.32 epochs
+  - 0.09 # voxpopuli_en — 5.92 epochs
+  - 0.01 # librispeech_clean_train_100 — 4.21 epochs
+  - 0.025 # librispeech_clean_train_360 — 2.88 epochs
+  - 0.045 # librispeech_other_train_500 — 3.63 epochs
 
 # Exact source metadata included when the finetuning entry point publishes privately.
 training_dataset_ids:
