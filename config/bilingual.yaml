@@ -92,22 +92,24 @@ hub_streaming_retries:
 padding: longest
 
 # The first eight entries are Danish (60%); the final seven are English (40%).
+# Expected epochs are nominal raw-row exposures at 200,000 steps and batch size 60.
+# The runtime 1--8-second filter can increase accepted-row epoch counts.
 dataset_probabilities:
-  - 0.102857 # p1
-  - 0.128571 # drtv_local
-  - 0.09 # youtube_local
-  - 0.017143 # coral_read_aloud
-  - 0.128572 # coral_conversation
-  - 0.09 # ftspeech
-  - 0.021428 # nota
-  - 0.021429 # nst
-  - 0.16 # peoples_speech_clean
-  - 0.04 # ami_sdm
-  - 0.03 # ami_ihm
-  - 0.09 # voxpopuli_en
-  - 0.01 # librispeech_clean_train_100
-  - 0.025 # librispeech_clean_train_360
-  - 0.045 # librispeech_other_train_500
+  - 0.102857 # p1 — 0.259 epochs
+  - 0.128571 # drtv_local — 0.300 epochs
+  - 0.09 # youtube_local — 0.337 epochs
+  - 0.017143 # coral_read_aloud — 0.687 epochs
+  - 0.128572 # coral_conversation — 10.478 epochs
+  - 0.09 # ftspeech — 1.085 epochs
+  - 0.021428 # nota — 2.608 epochs
+  - 0.021429 # nst — 1.408 epochs
+  - 0.16 # peoples_speech_clean — 1.279 epochs
+  - 0.04 # ami_sdm — 4.473 epochs
+  - 0.03 # ami_ihm — 3.318 epochs
+  - 0.09 # voxpopuli_en — 5.918 epochs
+  - 0.01 # librispeech_clean_train_100 — 4.205 epochs
+  - 0.025 # librispeech_clean_train_360 — 2.884 epochs
+  - 0.045 # librispeech_other_train_500 — 3.632 epochs
 
 # Exact source metadata included when the finetuning entry point publishes privately.
 training_dataset_ids:

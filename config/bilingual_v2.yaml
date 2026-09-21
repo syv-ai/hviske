@@ -97,22 +97,22 @@ padding: longest
 # with a total batch size of 60, this gives approximately 1.002 Danish and 2.438
 # English nominal raw-row epochs for every stream.
 dataset_probabilities:
-  - 0.208896 # p1
-  - 0.225365 # drtv_local
-  - 0.140233 # youtube_local
-  - 0.013111 # coral_read_aloud
-  - 0.006451 # coral_conversation
-  - 0.043623 # ftspeech
-  - 0.004320 # nota
-  - 0.008001 # nst
-  - 0.160100 # peoples_speech_clean
-  - 0.011445 # ami_sdm
-  - 0.011571 # ami_ihm
-  - 0.019460 # voxpopuli_en
-  - 0.003043 # librispeech_clean_train_100
-  - 0.011092 # librispeech_clean_train_360
-  - 0.015857 # librispeech_other_train_500
-  - 0.117432 # common_voice_19_en
+  - 0.208896 # p1 — 1.002 epochs
+  - 0.225365 # drtv_local — 1.002 epochs
+  - 0.140233 # youtube_local — 1.002 epochs
+  - 0.013111 # coral_read_aloud — 1.002 epochs
+  - 0.006451 # coral_conversation — 1.001 epochs
+  - 0.043623 # ftspeech — 1.002 epochs
+  - 0.004320 # nota — 1.002 epochs
+  - 0.008001 # nst — 1.002 epochs
+  - 0.160100 # peoples_speech_clean — 2.438 epochs
+  - 0.011445 # ami_sdm — 2.438 epochs
+  - 0.011571 # ami_ihm — 2.438 epochs
+  - 0.019460 # voxpopuli_en — 2.438 epochs
+  - 0.003043 # librispeech_clean_train_100 — 2.437 epochs
+  - 0.011092 # librispeech_clean_train_360 — 2.438 epochs
+  - 0.015857 # librispeech_other_train_500 — 2.438 epochs
+  - 0.117432 # common_voice_19_en — 2.438 epochs
 
 # Exact source metadata included when the finetuning entry point publishes privately.
 training_dataset_ids:
