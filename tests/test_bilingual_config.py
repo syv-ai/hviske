@@ -15,6 +15,8 @@ P1_SEGMENTS_SHA = "44284e5849b6b1d96b874891c579654a644e0e2f"
 
 TRAINING_NAMES = [
     "p1",
+    "drtv_local",
+    "youtube_local",
     "coral_read_aloud",
     "coral_conversation",
     "ftspeech",
@@ -30,6 +32,8 @@ TRAINING_NAMES = [
 ]
 TRAINING_IDS = [
     "syvai/p1-segments",
+    "local_vtt",
+    "local_vtt",
     "syvai/danish-asr-unified",
     "syvai/danish-asr-unified",
     "syvai/danish-asr-unified",
@@ -44,19 +48,21 @@ TRAINING_IDS = [
     "openslr/librispeech_asr",
 ]
 TRAINING_PROBABILITIES = [
-    0.131626801667,
-    0.021938013562,
-    0.164534461864,
-    0.115173611422,
-    0.027421557173,
-    0.027422836880,
-    0.204753086973,
-    0.051188271743,
-    0.038391203807,
-    0.115173611422,
-    0.012797067936,
-    0.031992669839,
-    0.057586805712,
+    0.102857,
+    0.128571,
+    0.09,
+    0.017143,
+    0.128572,
+    0.09,
+    0.021428,
+    0.021429,
+    0.16,
+    0.04,
+    0.03,
+    0.09,
+    0.01,
+    0.025,
+    0.045,
 ]
 
 
@@ -302,6 +308,8 @@ def test_bilingual_shuffle_buffers_are_source_specific(
 
     expected_buffers = {
         "p1": 1,
+        "drtv_local": 128,
+        "youtube_local": 128,
         "coral_read_aloud": 16,
         "coral_conversation": 16,
         "ftspeech": 16,
@@ -328,13 +336,15 @@ def test_bilingual_training_order_and_probabilities(
     """The preset keeps source order aligned with the approved probabilities."""
     config = _preset(monkeypatch)
 
-    assert len(config.datasets) == 13
+    assert len(config.datasets) == 15
     assert list(config.datasets) == TRAINING_NAMES
     assert [
         dataset.get("id", dataset.get("type")) for dataset in config.datasets.values()
     ] == TRAINING_IDS
     assert list(config.dataset_probabilities) == TRAINING_PROBABILITIES
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
+    assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.6)
+    assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.4)
 
 
 def test_bilingual_wandb_payload_has_published_sources(
@@ -346,6 +356,10 @@ def test_bilingual_wandb_payload_has_published_sources(
     assert payload["model_dir"] == "[REDACTED]"
     assert payload["cache_dir"] is None
     datasets = t.cast(dict[str, object], payload["datasets"])
+    drtv = t.cast(dict[str, object], datasets["drtv_local"])
+    youtube = t.cast(dict[str, object], datasets["youtube_local"])
+    assert drtv["manifest_path"] == "[REDACTED]"
+    assert youtube["manifest_path"] == "[REDACTED]"
     assert "p1" in datasets
     assert all(isinstance(dataset, dict) for dataset in datasets.values())
 

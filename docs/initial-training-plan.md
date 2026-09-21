@@ -49,8 +49,9 @@ Do not reintroduce the retired producer or a runtime transcript join.
 
 ### Public training sources
 
-The production preset combines P1, CoRal read-aloud and conversation, FTSpeech, Nota,
-NST, People's Speech, AMI, VoxPopuli, and LibriSpeech. Their dataset configuration
+The production preset combines P1, local DRTV and Danish YouTube VTT manifests,
+CoRal read-aloud and conversation, FTSpeech, Nota, NST, People's Speech, AMI,
+VoxPopuli, and LibriSpeech. Their dataset configuration
 files pin the reusable public sources and define the columns, splits, language, and
 trust policy. The bilingual preset keeps a 60/40 Danish/English sampling split with
 source-specific probabilities.
@@ -99,6 +100,6 @@ uploaded.
 
 ## Non-goals
 
-This release does not add dataset producers, local caption ingestion, architecture
-sweeps, or leaderboard-driven tuning. Those concerns are outside the reusable training
-and evaluation package.
+This release does not add dataset producers, local caption-manifest builders,
+architecture sweeps, or leaderboard-driven tuning. The reusable training package only
+loads the established local manifests at runtime.

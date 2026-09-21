@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Restored the 15-stream bilingual mix with local DRTV and Danish YouTube VTT manifests,
+  including lazy duration-filtered loading from the established `$HOME` dataset paths.
 - Reconciled the retained script inventory and documented P1 as a consumed, manually
   gated published dataset with its exact archival source and Hub commit.
 - Pinned the frozen P1 dataset revision directly in its configuration, removing the
