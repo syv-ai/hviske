@@ -67,22 +67,40 @@ TRAINING_PROBABILITIES = [
 V2_TRAINING_NAMES = [*TRAINING_NAMES, "common_voice_19_en"]
 V2_TRAINING_IDS = [*TRAINING_IDS, "fsicoli/common_voice_19_0"]
 V2_TRAINING_PROBABILITIES = [
-    0.111428,
-    0.139285,
-    0.097500,
-    0.018572,
-    0.139286,
-    0.097500,
-    0.023214,
-    0.023215,
-    0.104000,
-    0.026000,
-    0.019500,
-    0.058500,
-    0.006500,
-    0.016250,
-    0.029250,
-    0.090000,
+    0.208896,
+    0.225365,
+    0.140233,
+    0.013111,
+    0.006451,
+    0.043623,
+    0.004320,
+    0.008001,
+    0.160100,
+    0.011445,
+    0.011571,
+    0.019460,
+    0.003043,
+    0.011092,
+    0.015857,
+    0.117432,
+]
+V2_NOMINAL_RAW_ROWS = [
+    4_767_938,
+    5_143_820,
+    3_200_734,
+    299_255,
+    147_249,
+    995_677,
+    98_600,
+    182_605,
+    1_501_271,
+    107_319,
+    108_502,
+    182_482,
+    28_539,
+    104_014,
+    148_688,
+    1_101_170,
 ]
 
 
@@ -410,20 +428,40 @@ def test_bilingual_v2_preserves_original_preset(
     assert "common_voice_19_en" not in config.datasets
 
 
+def test_bilingual_v2_probabilities_provide_balanced_nominal_exposure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The v2 mix gives each language's source its intended nominal exposure."""
+    config = _preset_v2(monkeypatch)
+    total_sampled_rows = config.max_steps * config.total_batch_size
+    nominal_exposures = [
+        probability * total_sampled_rows / nominal_rows
+        for probability, nominal_rows in zip(
+            config.dataset_probabilities, V2_NOMINAL_RAW_ROWS, strict=True
+        )
+    ]
+
+    assert nominal_exposures[:8] == pytest.approx([1.002] * 8, abs=0.001)
+    assert nominal_exposures[8:] == pytest.approx([2.438] * 8, abs=0.001)
+    assert nominal_exposures[V2_TRAINING_NAMES.index("coral_conversation")] == (
+        pytest.approx(1.002, abs=0.001)
+    )
+
+
 def test_bilingual_v2_training_horizon_preserves_effective_batch_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The v2 run extends the scheduler horizon without changing batch size."""
+    """The v2 run uses the row-balanced horizon without changing batch size."""
     config = _preset_v2(monkeypatch)
 
-    assert config.max_steps == 715_000
+    assert config.max_steps == 381_000
     assert config.total_batch_size == 60
 
 
 def test_bilingual_v2_training_order_and_probabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The v2 preset appends Common Voice with its approved sampling weight."""
+    """The v2 preset keeps order aligned with its row-balanced probabilities."""
     config = _preset_v2(monkeypatch)
 
     assert list(config.datasets) == V2_TRAINING_NAMES
@@ -432,6 +470,8 @@ def test_bilingual_v2_training_order_and_probabilities(
     ] == V2_TRAINING_IDS
     assert list(config.dataset_probabilities) == V2_TRAINING_PROBABILITIES
     assert sum(config.dataset_probabilities) == pytest.approx(1.0)
+    assert sum(config.dataset_probabilities[:8]) == pytest.approx(0.65)
+    assert sum(config.dataset_probabilities[8:]) == pytest.approx(0.35)
 
 
 def test_bilingual_wandb_payload_has_published_sources(
