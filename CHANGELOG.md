@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Rebalanced the bilingual v2 probabilities against nominal raw training-row counts,
+  preserving the 65% Danish / 35% English mix and reducing its horizon to 381,000 steps.
 - Restored the 15-stream bilingual mix with local DRTV and Danish YouTube VTT manifests,
   including lazy duration-filtered loading from the established `$HOME` dataset paths.
 - Reconciled the retained script inventory and documented P1 as a consumed, manually
@@ -23,7 +25,7 @@
 ### Added
 
 - Added the Common Voice English bilingual v2 training preset with a pinned Hub revision,
-  revised source probabilities, and a 715,000-step training horizon.
+  row-balanced source probabilities, and a 381,000-step training horizon.
 - Added privacy-safe private P1 Hub diagnostics and bounded transient retries, deterministic
   bucketed shard publication with crash-safe ledger migration, and completed-corpus
   finalisation with metadata-only scanning and optional card CAS updates.
