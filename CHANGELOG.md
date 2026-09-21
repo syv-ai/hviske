@@ -22,6 +22,8 @@
 
 ### Added
 
+- Added the Common Voice English bilingual v2 training preset with a pinned Hub revision,
+  revised source probabilities, and a 715,000-step training horizon.
 - Added privacy-safe private P1 Hub diagnostics and bounded transient retries, deterministic
   bucketed shard publication with crash-safe ledger migration, and completed-corpus
   finalisation with metadata-only scanning and optional card CAS updates.
