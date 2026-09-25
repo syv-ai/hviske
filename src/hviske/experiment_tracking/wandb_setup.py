@@ -15,6 +15,9 @@ from .extracking_setup import ExTrackingSetup
 
 logger = logging.getLogger(__name__)
 
+_ALERT_MESSAGE_LIMIT = 512
+_ALERT_IDENTITY_LIMIT = 128
+
 
 class WandbSetup(ExTrackingSetup):
     """Configure an authenticated, online W&B run."""
@@ -34,6 +37,54 @@ class WandbSetup(ExTrackingSetup):
     def _log_hub_access_health(metrics: c.Mapping[str, float]) -> None:
         log_fn = t.cast(c.Callable[[dict[str, float]], None], wandb.log)
         log_fn(dict(metrics))
+
+    def report_failure(self, error: BaseException) -> None:
+        """Send a best-effort alert for an unhandled online-run failure.
+
+        Args:
+            error:
+                The exception that will be re-raised by the training workflow.
+        """
+        if isinstance(error, KeyboardInterrupt):
+            return
+
+        run = getattr(wandb, "run", None)
+        if run is None or getattr(run, "disabled", False):
+            return
+        mode = getattr(run, "mode", None)
+        if mode is None:
+            settings = getattr(run, "settings", None)
+            mode = getattr(settings, "mode", None)
+        if mode is None:
+            mode = os.environ.get("WANDB_MODE")
+        if mode is not None and str(mode).lower() != "online":
+            return
+
+        exception_type = _sanitise_alert_value(
+            type(error).__name__, limit=_ALERT_IDENTITY_LIMIT
+        )
+        identity_fields: list[str] = []
+        for field in ("entity", "project", "name", "id"):
+            identity_value = _sanitise_alert_value(
+                getattr(run, field, None), limit=_ALERT_IDENTITY_LIMIT
+            )
+            identity_fields.append(f"{field}={identity_value}")
+        run_identity = ", ".join(identity_fields)
+        message = _sanitise_alert_value(error, limit=_ALERT_MESSAGE_LIMIT)
+        alert_levels = getattr(wandb, "AlertLevel", None)
+        error_level = getattr(alert_levels, "ERROR", "error")
+        try:
+            wandb.alert(  # type: ignore[attr-defined]
+                title=f"Training failed: {exception_type}",
+                text=(
+                    f"W&B run identity: {run_identity}\n"
+                    f"Exception: {exception_type}\n"
+                    f"Message: {message}"
+                ),
+                level=error_level,
+            )
+        except BaseException:
+            logger.exception("W&B failure alert could not be delivered")
 
     def run_finalization(self, exit_code: int = 0) -> None:
         """Finish the W&B run and report its process exit status.
@@ -104,6 +155,21 @@ def _resolved_config_payload(config: DictConfig) -> dict[str, object]:
     if not isinstance(resolved, dict):
         raise ValueError("W&B configuration payload must be a mapping")
     return t.cast(dict[str, object], _remove_sensitive_values(resolved))
+
+
+def _sanitise_alert_value(value: object, *, limit: int) -> str:
+    """Convert an alert value to bounded, single-line printable text.
+
+    Returns:
+        A printable, whitespace-normalised value no longer than ``limit``.
+    """
+    try:
+        text = str(value)
+    except BaseException:
+        return "<unavailable>"
+    text = "".join(char if char.isprintable() else " " for char in text)
+    text = " ".join(text.split())
+    return text[:limit] or "<empty>"
 
 
 _SENSITIVE_KEYS = {

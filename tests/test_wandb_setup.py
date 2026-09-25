@@ -271,6 +271,114 @@ def test_tracking_initialises_before_expensive_loading(
     assert events == ["tracking"]
 
 
+def test_training_failure_alert_precedes_tracking_finalisation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure alerting runs while the tracking run is still active."""
+    events: list[str] = []
+
+    class Setup:
+        def report_failure(self, error: BaseException) -> None:
+            events.append(f"alert:{type(error).__name__}")
+
+        def run_finalization(self, exit_code: int = 0) -> None:
+            events.append(f"finish:{exit_code}")
+
+        def run_initialization(self) -> None:
+            events.append("initialise")
+
+    monkeypatch.setattr(
+        finetune_module, "validate_private_only_config", lambda config: None
+    )
+    monkeypatch.setattr(
+        finetune_module, "load_extracking_setup", lambda config: Setup()
+    )
+    monkeypatch.setattr(
+        finetune_module,
+        "download_background_noises",
+        lambda: (_ for _ in ()).throw(RuntimeError("training failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        finetune_module.finetune(config=_config())
+
+    assert events == ["initialise", "alert:RuntimeError", "finish:1"]
+
+
+def test_wandb_alert_delivery_failure_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An alert transport error cannot replace the training exception."""
+    run = type("Run", (), {"mode": "online", "id": "run-id"})()
+    monkeypatch.setattr(wandb_module.wandb, "run", run, raising=False)
+    monkeypatch.setattr(
+        wandb_module.wandb,
+        "alert",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
+        raising=False,
+    )
+
+    WandbSetup(config=_config()).report_failure(RuntimeError("training failed"))
+
+
+def test_wandb_alert_includes_bounded_sanitised_failure_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Online W&B alerts identify the run without unbounded control characters."""
+    alerts: list[dict[str, object]] = []
+    run = type(
+        "Run",
+        (),
+        {
+            "entity": "team",
+            "project": "hviske",
+            "name": "v6.0",
+            "id": "gkxzy9dn",
+            "mode": "online",
+        },
+    )()
+    monkeypatch.setattr(wandb_module.wandb, "run", run, raising=False)
+    monkeypatch.setattr(
+        wandb_module.wandb,
+        "alert",
+        lambda **kwargs: alerts.append(dict(kwargs)),
+        raising=False,
+    )
+
+    setup = WandbSetup(config=_config())
+    setup.report_failure(RuntimeError("bad\n\x00" + "x" * 600))
+
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert["title"] == "Training failed: RuntimeError"
+    text = str(alert["text"])
+    assert "gkxzy9dn" in text
+    assert "Exception: RuntimeError" in text
+    assert "\\n" not in text
+    assert len(text) < 900
+
+
+def test_wandb_alert_skips_keyboard_interrupt_and_non_online_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offline, disabled, and manually interrupted runs do not alert."""
+    alerts: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        wandb_module.wandb,
+        "alert",
+        lambda **kwargs: alerts.append(dict(kwargs)),
+        raising=False,
+    )
+    setup = WandbSetup(config=_config())
+    for mode in ("offline", "disabled"):
+        run = type("Run", (), {"mode": mode, "id": "run-id"})()
+        monkeypatch.setattr(wandb_module.wandb, "run", run, raising=False)
+        setup.report_failure(RuntimeError("failed"))
+    setup.report_failure(KeyboardInterrupt())
+
+    assert alerts == []
+
+
 def test_wandb_finalization_passes_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
     """W&B receives success and failure status from the training process."""
     exit_codes: list[int] = []
