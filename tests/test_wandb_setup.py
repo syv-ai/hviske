@@ -358,6 +358,59 @@ def test_wandb_alert_includes_bounded_sanitised_failure_details(
     assert len(text) < 900
 
 
+def test_wandb_alert_redacts_credentials_urls_and_local_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure alerts do not expose credentials or filesystem and URL details."""
+    alerts: list[dict[str, object]] = []
+    run = type("Run", (), {"mode": "online", "id": "run-id"})()
+    monkeypatch.setattr(wandb_module.wandb, "run", run, raising=False)
+    monkeypatch.setattr(
+        wandb_module.wandb,
+        "alert",
+        lambda **kwargs: alerts.append(dict(kwargs)),
+        raising=False,
+    )
+
+    secret = "not-for-wandb"
+    message = (
+        f"request failed token={secret} "
+        f"https://example.test/audio?X-Amz-Signature={secret} "
+        f"/private/training/{secret}.json"
+    )
+    WandbSetup(config=_config()).report_failure(RuntimeError(message))
+
+    text = str(alerts[0]["text"])
+    assert secret not in text
+    assert "X-Amz-Signature" not in text
+    assert "/private/training" not in text
+    assert "Exception: RuntimeError" in text
+
+
+def test_wandb_alert_redacts_long_private_sample_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Long exception payloads are not retained as a private sample excerpt."""
+    alerts: list[dict[str, object]] = []
+    run = type("Run", (), {"mode": "online", "id": "run-id"})()
+    monkeypatch.setattr(wandb_module.wandb, "run", run, raising=False)
+    monkeypatch.setattr(
+        wandb_module.wandb,
+        "alert",
+        lambda **kwargs: alerts.append(dict(kwargs)),
+        raising=False,
+    )
+
+    private_sample = "private-danish-transcript-" + ("sample-word " * 80)
+    WandbSetup(config=_config()).report_failure(RuntimeError(private_sample))
+
+    text = str(alerts[0]["text"])
+    assert private_sample not in text
+    assert "sample-word" not in text
+    assert "Exception: RuntimeError" in text
+    assert len(text) < 900
+
+
 def test_wandb_alert_skips_keyboard_interrupt_and_non_online_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
