@@ -80,6 +80,8 @@ def test_campaign_safety_defaults_resolve(name: str) -> None:
     config = _config(name)
 
     assert config.model.learning_rate == pytest.approx(5e-6)
+    assert config.dataset_num_workers == 1
+    assert config.dataloader_num_workers == 0
     assert config.experiment_tracking.log_model is False
     assert config.push_to_hub is False
     assert config.resume_from_checkpoint is False

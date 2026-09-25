@@ -39,7 +39,9 @@ evaluation_datasets:
 max_validation_samples_per_dataset: 1000
 min_seconds_per_example: 1.0
 max_seconds_per_example: 8.0
-dataset_num_workers: 0
+# Hugging Face Dataset.map/filter requires a positive worker count; keep it
+# in-process while leaving PyTorch DataLoader workers disabled for unified memory.
+dataset_num_workers: 1
 dataloader_num_workers: 0
 streaming: true
 cache_dir: null
