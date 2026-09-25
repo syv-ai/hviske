@@ -66,7 +66,7 @@ fp16_allowed: true
 bf16_allowed: true
 resume_from_checkpoint: false
 ignore_data_skip: false
-save_total_limit: 8
+save_total_limit: 3
 enable_experiment_tracking: true
 # Progressive stages are deliberately conservative and never upload artefacts.
 model:
