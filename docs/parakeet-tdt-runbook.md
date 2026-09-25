@@ -43,6 +43,9 @@ any checkpoint is created.
 
 ## Gate 2: two-step smoke and lifecycle check
 
+This is a pre-campaign diagnostic. Its local resume check validates checkpoint
+lifecycle handling only and does not authorise resuming any progressive campaign stage.
+
 Use a fresh local directory and a separate W&B identity only if tracking is enabled.
 The smoke must save at step 2; do not reuse a prior output directory. Keep two
 checkpoints: Transformers can retain the tracked `best_model_checkpoint` while
@@ -115,13 +118,15 @@ Steps 250, 500, and 1000 evaluate in-loop. Step 2000 uses the post-training orde
 
 ## Serial Danish-to-bilingual campaign
 
-After the diagnostic gates, run the campaign presets serially. Each stage is an
-independent fresh run: use a new output directory and W&B ID, keep
-`resume_from_checkpoint=false`, and do not pass a checkpoint from an earlier stage.
-A failed or rejected go/no-go stage stops the sequence; it is not silently skipped.
-The presets use total batch 60, per-device batch 4, zero dataset/DataLoader workers,
-1--8-second audio, `push_to_hub=false`, and save/evaluate every 500 steps so early
-checkpoints are useful.
+After the diagnostic gates, run the campaign presets serially. **This campaign is
+fresh-run and local-only for now:** use a new output directory and W&B ID for every
+stage, never resume a local checkpoint or W&B run, never pass a checkpoint from an
+earlier stage, and never publish a model or create a Hub pull request. Keep
+`resume_from_checkpoint=false`, `push_to_hub=false`, and
+`experiment_tracking.log_model=false`. A failed or rejected go/no-go stage stops the
+sequence; it is not silently skipped. The presets use total batch 60, per-device
+batch 4, zero dataset/DataLoader workers, 1--8-second audio, and save/evaluate every
+500 steps so early checkpoints are useful.
 
 The source order (and therefore cap/probability order) is the five-source Danish
 leaderboard baseline `coral_read_aloud`, `coral_conversation`, `ftspeech`, `fleurs`,
@@ -160,5 +165,6 @@ normal evaluation command and a separate results directory. Evaluation is read-o
 never resume training from that checkpoint and never use it as a campaign stage.
 **Gate:** each pilot has finite training and validation losses at every reviewed step,
 has independent checkpoints and metrics, reaches the requested bounded stop without
-changing `config/bilingual.yaml`, and has a clean reload/resume record. Do not start a
-longer run, publish a model, or alter Sparkie until the pilot comparison is reviewed.
+changing `config/bilingual.yaml`, and has a clean local checkpoint reload record. Do
+not start a longer run, publish a model, or alter Sparkie until the pilot comparison is
+reviewed.

@@ -4,6 +4,7 @@ import collections.abc as c
 import logging
 import math
 import os
+import re
 import typing as t
 
 import wandb
@@ -17,6 +18,20 @@ logger = logging.getLogger(__name__)
 
 _ALERT_MESSAGE_LIMIT = 512
 _ALERT_IDENTITY_LIMIT = 128
+_ALERT_DIAGNOSTIC_LIMIT = 256
+_ALERT_REDACTED = "[REDACTED]"
+_URL_PATTERN = re.compile(r"(?i)\b(?:https?|s3|gs|file)://[^\s<>\"']+")
+_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)\b(?P<key>api[_ -]?key|access[_ -]?token|auth[_ -]?token|"
+    r"client[_ -]?secret|password|passwd|refresh[_ -]?token|secret|token)"
+    r"\s*(?:=|:)\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_BEARER_PATTERN = re.compile(r"(?i)\b(?:basic|bearer)\s+[^\s,;]+")
+_POSIX_PATH_PATTERN = re.compile(
+    r"(?<![\w])(?:~|/)(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+"
+)
+_WINDOWS_PATH_PATTERN = re.compile(r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)[^\s,;]+")
+_RELATIVE_PATH_PATTERN = re.compile(r"(?<![\w])(?:\.\.?/)[^\s,;]+")
 
 
 class WandbSetup(ExTrackingSetup):
@@ -70,7 +85,7 @@ class WandbSetup(ExTrackingSetup):
             )
             identity_fields.append(f"{field}={identity_value}")
         run_identity = ", ".join(identity_fields)
-        message = _sanitise_alert_value(error, limit=_ALERT_MESSAGE_LIMIT)
+        message = _sanitise_alert_message(error)
         alert_levels = getattr(wandb, "AlertLevel", None)
         error_level = getattr(alert_levels, "ERROR", "error")
         try:
@@ -155,6 +170,35 @@ def _resolved_config_payload(config: DictConfig) -> dict[str, object]:
     if not isinstance(resolved, dict):
         raise ValueError("W&B configuration payload must be a mapping")
     return t.cast(dict[str, object], _remove_sensitive_values(resolved))
+
+
+def _sanitise_alert_message(value: object) -> str:
+    """Return useful, bounded failure context without exposing private data.
+
+    URLs, credentials, and local paths are removed before the message length is
+    considered. Longer messages are replaced entirely because a bounded prefix
+    could still contain private transcript or sample content.
+
+    Returns:
+        A safe, single-line diagnostic or a redaction marker.
+    """
+    try:
+        text = str(value)
+    except BaseException:
+        return "<unavailable>"
+    text = "".join(char if char.isprintable() else " " for char in text)
+    text = " ".join(text.split())
+    text = _URL_PATTERN.sub(_ALERT_REDACTED, text)
+    text = _CREDENTIAL_PATTERN.sub(
+        lambda match: f"{match.group('key')}={_ALERT_REDACTED}", text
+    )
+    text = _BEARER_PATTERN.sub(_ALERT_REDACTED, text)
+    text = _POSIX_PATH_PATTERN.sub(_ALERT_REDACTED, text)
+    text = _WINDOWS_PATH_PATTERN.sub(_ALERT_REDACTED, text)
+    text = _RELATIVE_PATH_PATTERN.sub(_ALERT_REDACTED, text)
+    if len(text) > _ALERT_DIAGNOSTIC_LIMIT:
+        return f"[REDACTED: diagnostic exceeded {_ALERT_DIAGNOSTIC_LIMIT} characters]"
+    return text[:_ALERT_MESSAGE_LIMIT] or "<empty>"
 
 
 def _sanitise_alert_value(value: object, *, limit: int) -> str:

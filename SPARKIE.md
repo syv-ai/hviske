@@ -1,8 +1,9 @@
 # Sparkie bilingual runbook
 
-This runbook covers the private Parakeet TDT campaign, including integrated Hub
-publication. The production preset uses the pinned TDT base, 1--8-second
-audio, per-device batch 6, effective batch 60, and two DataLoader workers.
+This runbook covers the Parakeet TDT campaign as a local validation exercise.
+The progressive campaign is fresh-run only: do not resume a stage or publish any
+checkpoint for now. The campaign presets keep Hub publication disabled and use the
+pinned TDT base, 1--8-second audio, effective batch 60, and zero DataLoader workers.
 
 ## Prerequisites
 
@@ -18,9 +19,8 @@ uv run python -c 'import torch; print(torch.__version__, torch.version.cuda, tor
 ```
 
 The Sparkie preset requires CUDA and access to the manually gated
-`syvai/p1-segments` dataset. It also requires write access to the private model
-repository. Never put tokens in this runbook, shell history, configuration, or
-commands.
+`syvai/p1-segments` dataset. It does not require model-repository write access.
+Never put tokens in this runbook, shell history, configuration, or commands.
 
 Resolve the production configuration before launching. The immutable P1 revision is
 already pinned in `config/datasets/p1.yaml`:
@@ -75,17 +75,12 @@ tmux new-session -d -s hviske-smoke \
 ```
 
 Inspect the resolved configuration, loss, evaluation metrics, checkpoint, GPU memory,
-and temperature before starting a longer run. Optional 2,000-step learning-rate
-pilots use fresh IDs and separate directories. The full run uses the production
-`max_steps=200000` horizon and `eval_steps=2000` cadence.
+and temperature before starting a longer diagnostic run. Optional 2,000-step learning-
+rate pilots use fresh IDs and separate directories. These bilingual commands are
+smoke/pilot diagnostics only, not progressive campaign stages.
 
-If a run is interrupted, resume its local checkpoint with the same persisted W&B ID:
-
-```bash
-uv run python src/scripts/finetune_asr_model.py \
-  --config-name bilingual resume_from_checkpoint=runs/hviske-v6.0/checkpoint-<step> \
-  experiment_tracking.resume=must
-```
+Do not resume a diagnostic checkpoint as a progressive campaign stage. Start each
+progressive stage with a new output directory and W&B ID.
 
 Do not increase worker counts to work around a data failure. Stop for non-finite loss,
 missing data, failed checkpoint reload, unsafe temperature or insufficient disk space.
@@ -105,9 +100,11 @@ cannot send the scriptable alert. The observed OOM run `gkxzy9dn` was classified
 The campaign is a serial go/no-go ladder, not a set of concurrent jobs. Run each
 preset only after reviewing the prior run's loss, language-appropriate validation,
 and early checkpoints; every stage starts from the pinned base with a new output
-folder and W&B ID. Never resume an earlier stage. The presets all keep
-`push_to_hub=false`, `resume_from_checkpoint=false`, total batch 60, per-device
-batch 4, zero workers, 1--8-second audio, and 500-step evaluation/save milestones.
+folder and W&B ID. **For now, every stage must be a fresh run: never resume a local
+checkpoint or W&B run, and never publish a model or create a Hub PR.** The presets
+all keep `push_to_hub=false`, `resume_from_checkpoint=false`,
+`experiment_tracking.log_model=false`, total batch 60, per-device batch 4, zero
+workers, 1--8-second audio, and 500-step evaluation/save milestones.
 
 Use these config names in order:
 
@@ -139,15 +136,10 @@ An optional read-only evaluation of the old `checkpoint-37500` is allowed for
 comparison in a separate results directory. Do not resume it or use it as a
 training input.
 
-## Private publication
+## Publication is disabled for this campaign
 
-Set the integrated publication options before the final run:
-
-```bash
-uv run python src/scripts/finetune_asr_model.py --config-name bilingual \
-  push_to_hub=true private=true private_only=true
-```
-
-The training command generates the model card and verifies private Hub visibility.
-Never upload raw audio, credentials, training outputs, caches, or experiment-tracking
-artefacts.
+Do not publish progressive campaign checkpoints, create Hub pull requests, or enable
+integrated publication yet. Keep `push_to_hub=false`, `private_only=true`, and
+`create_pr=false`; local checkpoints and W&B metrics are the only outputs. Publication
+instructions from earlier bilingual experiments are historical and are not active
+launch guidance for this campaign.

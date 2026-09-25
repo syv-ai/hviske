@@ -29,6 +29,17 @@ ENGLISH_NAMES = [
     "librispeech_other_train_500",
     "common_voice_19_en",
 ]
+CAMPAIGN_NAMES = [
+    "parakeet_tdt_danish_leaderboard",
+    "parakeet_tdt_danish_05",
+    "parakeet_tdt_danish_20",
+    "parakeet_tdt_danish_50",
+    "parakeet_tdt_danish_100",
+    "parakeet_tdt_bilingual_10",
+    "parakeet_tdt_bilingual_50",
+    "parakeet_tdt_bilingual_100",
+    "parakeet_tdt_bilingual_65_35",
+]
 
 
 def test_campaign_revisions_and_immutable_final_horizon() -> None:
@@ -61,6 +72,17 @@ def test_campaign_revisions_and_immutable_final_horizon() -> None:
 
 def _config(name: str) -> DictConfig:
     return compose(config_name=name)
+
+
+@pytest.mark.parametrize("name", CAMPAIGN_NAMES)
+def test_campaign_safety_defaults_resolve(name: str) -> None:
+    """Every campaign keeps the conservative rate and upload policy."""
+    config = _config(name)
+
+    assert config.model.learning_rate == pytest.approx(5e-6)
+    assert config.experiment_tracking.log_model is False
+    assert config.push_to_hub is False
+    assert config.resume_from_checkpoint is False
 
 
 def test_cap_is_after_filter_and_stream_cap_is_lazy() -> None:

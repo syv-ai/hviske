@@ -17,6 +17,10 @@
 
 ### Fixed
 
+- Hardened W&B failure alerts against credentials, signed URLs, local paths, and
+  private long-form sample content while retaining bounded diagnostic context.
+- Fixed progressive Parakeet TDT campaigns to use learning rate `5e-6`, disable W&B
+  model artefact logging, and remain fresh, local-only, and unpublished.
 - Made transient Hugging Face streaming failures retry indefinitely until manually
   stopped, with credential-safe logs, rate-limit-aware backoff, and W&B health
   heartbeats while training is blocked.

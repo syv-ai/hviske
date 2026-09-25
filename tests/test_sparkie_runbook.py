@@ -14,8 +14,8 @@ _REQUIRED_UNSETS = (
 )
 
 
-def test_sparkie_runbook_documents_p1_gate_and_publication() -> None:
-    """The runbook retains the consumed P1 gate and publication command."""
+def test_sparkie_runbook_documents_p1_gate_and_disables_publication() -> None:
+    """The runbook retains the consumed P1 gate and blocks publication."""
     runbook = RUNBOOK.read_text()
 
     assert "P1_SEGMENTS_REVISION" not in runbook
@@ -23,8 +23,9 @@ def test_sparkie_runbook_documents_p1_gate_and_publication() -> None:
     assert "archives/hviske-p1-pipeline/f3dcf16/" in runbook
     assert "44284e5849b6b1d96b874891c579654a644e0e2f" in runbook
     assert "manually gated" in runbook
-    assert "push_to_hub=true" in runbook
-    assert "private=true private_only=true" in runbook
+    assert "push_to_hub=false" in runbook
+    assert "integrated publication yet" in runbook
+    assert "push_to_hub=true" not in runbook
 
 
 def test_sparkie_tmux_launches_scrub_inherited_wandb_identity() -> None:
