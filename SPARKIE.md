@@ -90,6 +90,16 @@ uv run python src/scripts/finetune_asr_model.py \
 Do not increase worker counts to work around a data failure. Stop for non-finite loss,
 missing data, failed checkpoint reload, unsafe temperature or insufficient disk space.
 
+## W&B failure notifications
+
+W&B User Settings must have email notifications enabled for `wandb.alert()` to send
+email; this is now enabled for the training workspace. Unhandled training failures,
+including CUDA out-of-memory errors, send a bounded alert while the run is active and
+then mark the run Failed. The existing heartbeat-based W&B **Run crashed** email alert
+remains the fallback for abrupt machine or process loss, when the training process
+cannot send the scriptable alert. The observed OOM run `gkxzy9dn` was classified
+**Failed**, not **Crashed**.
+
 ## Private publication
 
 Set the integrated publication options before the final run:

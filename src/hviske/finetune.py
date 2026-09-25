@@ -197,8 +197,9 @@ def finetune(config: DictConfig) -> None:
                     ),
                     finetuned_from_revision=config.model.get("revision"),
                 )
-        except BaseException:
+        except BaseException as error:
             if extracking_setup is not None:
+                _report_tracking_failure(extracking_setup, error)
                 _finalize_tracking_after_failure(extracking_setup)
             raise
         else:
@@ -240,6 +241,17 @@ def _finalize_tracking_after_failure(setup: ExTrackingSetup) -> None:
         setup.run_finalization(exit_code=1)
     except BaseException:
         logger.exception("Experiment tracking finalisation failed after training error")
+
+
+def _report_tracking_failure(setup: ExTrackingSetup, error: BaseException) -> None:
+    """Best-effort failure alerting that cannot replace the training exception."""
+    report_failure = getattr(setup, "report_failure", None)
+    if not callable(report_failure) or isinstance(error, KeyboardInterrupt):
+        return
+    try:
+        report_failure(error)
+    except BaseException:
+        logger.exception("Experiment tracking failure alert could not be delivered")
 
 
 def check_cuda_requirement(config: DictConfig) -> None:

@@ -30,6 +30,8 @@
 
 ### Added
 
+- Added scriptable W&B failure alerts with run identity and bounded exception details;
+  documented email notification prerequisites and the heartbeat crash-alert fallback.
 - Added the Common Voice English bilingual v2 training preset with a pinned Hub revision,
   row-balanced source probabilities, and a 381,000-step training horizon.
 - Added privacy-safe private P1 Hub diagnostics and bounded transient retries, deterministic
