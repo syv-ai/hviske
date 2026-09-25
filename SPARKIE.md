@@ -90,6 +90,45 @@ uv run python src/scripts/finetune_asr_model.py \
 Do not increase worker counts to work around a data failure. Stop for non-finite loss,
 missing data, failed checkpoint reload, unsafe temperature or insufficient disk space.
 
+## Serial Parakeet-TDT campaign
+
+The campaign is a serial go/no-go ladder, not a set of concurrent jobs. Run each
+preset only after reviewing the prior run's loss, language-appropriate validation,
+and early checkpoints; every stage starts from the pinned base with a new output
+folder and W&B ID. Never resume an earlier stage. The presets all keep
+`push_to_hub=false`, `resume_from_checkpoint=false`, total batch 60, per-device
+batch 4, zero workers, 1--8-second audio, and 500-step evaluation/save milestones.
+
+Use these config names in order:
+
+```text
+parakeet_tdt_danish_leaderboard  -> parakeet_tdt_danish_05
+  -> parakeet_tdt_danish_20 -> parakeet_tdt_danish_50
+  -> parakeet_tdt_danish_100 -> parakeet_tdt_bilingual_10
+  -> parakeet_tdt_bilingual_50 -> parakeet_tdt_bilingual_100
+  -> parakeet_tdt_bilingual_65_35
+```
+
+The first five sources are ordered `coral_read_aloud`, `coral_conversation`,
+`ftspeech`, `fleurs`, `common_voice_19`, capped at
+`[299255, 147249, 995677, 1032, 3484]`. P1, DRTV, YouTube, Nota, and NST are
+then added at 5%, 20%, 50%, and 100%; English follows only after full Danish.
+The exact CV19 assumption is intentional: `fsicoli/common_voice_19_0`, Danish
+`train`, revision `590c8abec6cf7c8d06e650f1438e60332a796e11` is the practical
+stand-in because Sparkie has no CV27 MDC asset. Training excludes validation and
+test splits, and caps are lazy after source/duration/text filtering.
+
+At the observed ~403 optimizer steps/hour, the stages are approximately 59.8,
+87.5, 170.6, 336.8, 613.7, 627.3, 681.6, 749.5, and 945.4 hours respectively
+(2.5, 3.6, 7.1, 14.0, 25.6, 26.1, 28.4, 31.2, and 39.4 days). These estimates
+exclude startup, validation, retries, and interruptions. The last preset is an
+immutable 381,000-step 65/35 full bilingual composition equivalent to
+`bilingual_v2`; the historical config remains unchanged.
+
+An optional read-only evaluation of the old `checkpoint-37500` is allowed for
+comparison in a separate results directory. Do not resume it or use it as a
+training input.
+
 ## Private publication
 
 Set the integrated publication options before the final run:

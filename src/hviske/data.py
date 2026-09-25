@@ -553,6 +553,48 @@ def _validate_join_key(
         )
 
 
+def limit_training_dataset(
+    dataset: Dataset | IterableDataset, max_train_samples: object
+) -> Dataset | IterableDataset:
+    """Limit one already-filtered source without eagerly consuming a stream.
+
+    Args:
+        dataset: The source after source, text, and duration filtering.
+        max_train_samples: Optional positive cap for this source.
+
+    Returns:
+        The original dataset when uncapped, or a prefix-limited dataset.
+    """
+    cap = validate_max_train_samples(max_train_samples)
+    if cap is None:
+        return dataset
+    if isinstance(dataset, IterableDataset):
+        return dataset.take(cap)
+    return dataset.select(range(min(cap, len(dataset))))
+
+
+def validate_max_train_samples(value: object) -> int | None:
+    """Validate an optional per-source training example cap.
+
+    ``bool`` is deliberately rejected even though it is an ``int`` subclass.  A
+    ``None`` value preserves the uncapped source behaviour.
+
+    Args:
+        value: Candidate maximum number of training examples.
+
+    Returns:
+        The validated cap, or ``None`` when no cap was configured.
+
+    Raises:
+        ValueError: If ``value`` is not a positive, non-boolean integer.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("max_train_samples must be a positive integer")
+    return value
+
+
 # Dictionary that contains characters to be converted (from the key to the value). Some
 # values contain spaces to ensure that they're separated from other characters, and
 # superfluous spaces are removed later. Note also that these are converted in the order
@@ -936,6 +978,11 @@ def load_data_for_finetuning(
 
         ds = _standardise_training_dataset(
             dataset=ds, sampling_rate=config.model.sampling_rate
+        )
+        # Apply caps only after every source and duration/text filter.  ``take``
+        # keeps streaming sources lazy and avoids decoding/tokenising discarded rows.
+        ds = limit_training_dataset(
+            dataset=ds, max_train_samples=dataset_config.get("max_train_samples")
         )
 
         all_datasets.append(ds)

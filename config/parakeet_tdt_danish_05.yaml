@@ -1,0 +1,45 @@
+# Stage 2: add 5% P1/DRTV/YouTube/Nota/NST to the full leaderboard baseline.
+defaults:
+  - parakeet_tdt_campaign_base
+  - datasets:
+      - coral_read_aloud
+      - coral_conversation
+      - ftspeech
+      - fleurs
+      - common_voice_19
+      - p1
+      - drtv_local
+      - youtube_local
+      - nota
+      - nst
+  - _self_
+
+model_id: parakeet-tdt-da-05-v1
+max_steps: 35274
+datasets:
+  coral_read_aloud: {max_train_samples: 299255}
+  coral_conversation: {max_train_samples: 147249}
+  ftspeech: {max_train_samples: 995677}
+  fleurs: {max_train_samples: 1032}
+  common_voice_19: {max_train_samples: 3484}
+  p1: {max_train_samples: 238397}
+  drtv_local: {max_train_samples: 257191}
+  youtube_local: {max_train_samples: 160037}
+  nota: {max_train_samples: 4930}
+  nst: {max_train_samples: 9130}
+dataset_probabilities:
+  - 0.141399331501
+  - 0.069575813818
+  - 0.470461854240
+  - 0.000487624635
+  - 0.001646205647
+  - 0.112643653178
+  - 0.121523902585
+  - 0.075618201251
+  - 0.002329447141
+  - 0.004313966004
+training_dataset_ids:
+  - syvai/danish-asr-unified
+  - google/fleurs
+  - fsicoli/common_voice_19_0
+  - syvai/p1-segments

@@ -6,4 +6,6 @@ common_voice_19:
   audio_column: audio
   filter_dataset: true
   language: da
-  revision: null
+  # CV19 is the practical Danish stand-in for the unavailable CV27 MDC asset.
+  revision: 590c8abec6cf7c8d06e650f1438e60332a796e11
+  trust_remote_code: true

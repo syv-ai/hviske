@@ -1,0 +1,45 @@
+# Stage 5: full Danish capped campaign (leaderboard baseline plus all Danish sources).
+defaults:
+  - parakeet_tdt_campaign_base
+  - datasets:
+      - coral_read_aloud
+      - coral_conversation
+      - ftspeech
+      - fleurs
+      - common_voice_19
+      - p1
+      - drtv_local
+      - youtube_local
+      - nota
+      - nst
+  - _self_
+
+model_id: parakeet-tdt-da-100-v1
+max_steps: 247340
+datasets:
+  coral_read_aloud: {max_train_samples: 299255}
+  coral_conversation: {max_train_samples: 147249}
+  ftspeech: {max_train_samples: 995677}
+  fleurs: {max_train_samples: 1032}
+  common_voice_19: {max_train_samples: 3484}
+  p1: {max_train_samples: 4767938}
+  drtv_local: {max_train_samples: 5143820}
+  youtube_local: {max_train_samples: 3200734}
+  nota: {max_train_samples: 98600}
+  nst: {max_train_samples: 182605}
+dataset_probabilities:
+  - 0.020164895892
+  - 0.009922175921
+  - 0.067092356173
+  - 0.000069539933
+  - 0.000234764657
+  - 0.321281092672
+  - 0.346609395950
+  - 0.215677157898
+  - 0.006644028454
+  - 0.012304592452
+training_dataset_ids:
+  - syvai/danish-asr-unified
+  - google/fleurs
+  - fsicoli/common_voice_19_0
+  - syvai/p1-segments

@@ -1,0 +1,74 @@
+# Stage 7: English at 50% source caps, retaining all 100% Danish caps.
+defaults:
+  - parakeet_tdt_campaign_base
+  - parakeet_tdt_english_eval
+  - datasets:
+      - coral_read_aloud
+      - coral_conversation
+      - ftspeech
+      - fleurs
+      - common_voice_19
+      - p1
+      - drtv_local
+      - youtube_local
+      - nota
+      - nst
+      - peoples_speech_clean
+      - ami_sdm
+      - ami_ihm
+      - voxpopuli_en
+      - librispeech_clean_train_100
+      - librispeech_clean_train_360
+      - librispeech_other_train_500
+      - common_voice_19_en
+  - _self_
+
+model_id: parakeet-tdt-bilingual-50-v1
+max_steps: 274690
+datasets:
+  coral_read_aloud: {max_train_samples: 299255}
+  coral_conversation: {max_train_samples: 147249}
+  ftspeech: {max_train_samples: 995677}
+  fleurs: {max_train_samples: 1032}
+  common_voice_19: {max_train_samples: 3484}
+  p1: {max_train_samples: 4767938}
+  drtv_local: {max_train_samples: 5143820}
+  youtube_local: {max_train_samples: 3200734}
+  nota: {max_train_samples: 98600}
+  nst: {max_train_samples: 182605}
+  peoples_speech_clean: {max_train_samples: 750636}
+  ami_sdm: {max_train_samples: 53660}
+  ami_ihm: {max_train_samples: 54251}
+  voxpopuli_en: {max_train_samples: 91241}
+  librispeech_clean_train_100: {max_train_samples: 14270}
+  librispeech_clean_train_360: {max_train_samples: 52007}
+  librispeech_other_train_500: {max_train_samples: 74344}
+  common_voice_19_en: {max_train_samples: 550585}
+dataset_probabilities:
+  - 0.018157147930
+  - 0.008934259663
+  - 0.060412205574
+  - 0.000062616085
+  - 0.000211389963
+  - 0.289292261064
+  - 0.312098714016
+  - 0.194202939704
+  - 0.005982505842
+  - 0.011079467336
+  - 0.045544465066
+  - 0.003255793747
+  - 0.003291652378
+  - 0.005536002186
+  - 0.000865825136
+  - 0.003155498797
+  - 0.004510785135
+  - 0.033406470377
+training_dataset_ids:
+  - syvai/danish-asr-unified
+  - google/fleurs
+  - fsicoli/common_voice_19_0
+  - syvai/p1-segments
+  - MLCommons/peoples_speech
+  - edinburghcstr/ami
+  - facebook/voxpopuli
+  - openslr/librispeech_asr
