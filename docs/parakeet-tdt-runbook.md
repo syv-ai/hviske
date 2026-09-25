@@ -110,9 +110,54 @@ for lr in 5e-6 1e-5; do
 ```
 
 Steps 250, 500, and 1000 evaluate in-loop. Step 2000 uses the post-training ordering
-described above and must appear exactly once in the metrics JSONL after the training
-workers have closed.
+ described above and must appear exactly once in the metrics JSONL after the training
+ workers have closed.
 
+## Serial Danish-to-bilingual campaign
+
+After the diagnostic gates, run the campaign presets serially. Each stage is an
+independent fresh run: use a new output directory and W&B ID, keep
+`resume_from_checkpoint=false`, and do not pass a checkpoint from an earlier stage.
+A failed or rejected go/no-go stage stops the sequence; it is not silently skipped.
+The presets use total batch 60, per-device batch 4, zero dataset/DataLoader workers,
+1--8-second audio, `push_to_hub=false`, and save/evaluate every 500 steps so early
+checkpoints are useful.
+
+The source order (and therefore cap/probability order) is the five-source Danish
+leaderboard baseline `coral_read_aloud`, `coral_conversation`, `ftspeech`, `fleurs`,
+`common_voice_19`, followed by P1, DRTV, YouTube, Nota, NST. The Danish baseline
+caps are `[299255, 147249, 995677, 1032, 3484]`; subsequent presets add the five
+latter sources at 5%, 20%, 50%, and 100% caps. CV19 is an explicit practical
+stand-in for the unavailable Sparkie CV27 MDC asset: it uses
+`fsicoli/common_voice_19_0`, Danish `train`, revision
+`590c8abec6cf7c8d06e650f1438e60332a796e11`. No validation or test split is used for
+training. Caps are applied lazily only after source and duration/text filters.
+
+Run these go/no-go stages in order (do not launch the next line until the prior
+metrics and early checkpoints are accepted):
+
+```text
+parakeet_tdt_danish_leaderboard  24,112 steps   ~59.8 h (2.5 d)
+parakeet_tdt_danish_05           35,274 steps   ~87.5 h (3.6 d)
+parakeet_tdt_danish_20           68,758 steps   ~170.6 h (7.1 d)
+parakeet_tdt_danish_50          135,726 steps   ~336.8 h (14.0 d)
+parakeet_tdt_danish_100         247,340 steps   ~613.7 h (25.6 d)
+parakeet_tdt_bilingual_10        252,810 steps   ~627.3 h (26.1 d)
+parakeet_tdt_bilingual_50        274,690 steps   ~681.6 h (28.4 d)
+parakeet_tdt_bilingual_100       302,040 steps   ~749.5 h (31.2 d)
+parakeet_tdt_bilingual_65_35     381,000 steps   ~945.4 h (39.4 d)
+```
+
+Runtime estimates use the observed throughput of approximately 403 optimizer
+steps/hour and exclude startup, validation, Hub retries, and interruptions. Danish
+stages use the Danish leaderboard-aligned CoRal/FLEURS validation suite. English
+validation is added only once English training sources appear. The final preset is
+an immutable 65/35 full bilingual composition equivalent to `bilingual_v2`; the
+historical config is not edited.
+
+An old `checkpoint-37500` may optionally be evaluated for comparison using the
+normal evaluation command and a separate results directory. Evaluation is read-only:
+never resume training from that checkpoint and never use it as a campaign stage.
 **Gate:** each pilot has finite training and validation losses at every reviewed step,
 has independent checkpoints and metrics, reaches the requested bounded stop without
 changing `config/bilingual.yaml`, and has a clean reload/resume record. Do not start a

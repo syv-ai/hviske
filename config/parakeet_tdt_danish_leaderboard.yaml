@@ -1,0 +1,38 @@
+# Stage 1: Danish leaderboard baseline. Source order is the documented cap order.
+defaults:
+  - parakeet_tdt_campaign_base
+  - datasets:
+      - coral_read_aloud
+      - coral_conversation
+      - ftspeech
+      - fleurs
+      - common_voice_19
+  - _self_
+
+model_id: parakeet-tdt-da-leaderboard-v1
+max_steps: 24112
+# CoRal, FTSpeech, FLEURS da_DK, and CV19 train only. CV19 is the practical
+# CV27 MDC stand-in because Sparkie has no CV27 MDC asset.
+datasets:
+  coral_read_aloud:
+    max_train_samples: 299255
+  coral_conversation:
+    max_train_samples: 147249
+  ftspeech:
+    max_train_samples: 995677
+  fleurs:
+    max_train_samples: 1032
+  common_voice_19:
+    max_train_samples: 3484
+
+dataset_probabilities:
+  - 0.206853957670
+  - 0.101782888884
+  - 0.688241559912
+  - 0.000713349098
+  - 0.002408244435
+
+training_dataset_ids:
+  - syvai/danish-asr-unified
+  - google/fleurs
+  - fsicoli/common_voice_19_0
